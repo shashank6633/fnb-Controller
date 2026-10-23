@@ -3,7 +3,7 @@ import { poWriteGate } from '@/lib/po-helpers';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
-import { todayIST } from '@/lib/format-date';
+import { todayIST, fmtIST } from '@/lib/format-date';
 import {
   allocateBillCharges, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT,
   type AllocatedLine,
@@ -23,6 +23,12 @@ import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 import { raiseDeviationAlert, type DeviationDeliveryReport } from '@/lib/po-deviation-alert';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
 import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receipts';
+// SHORT-CLOSED VENDORS (ruling 69) and the merged-PO link flags (ruling 68).
+// The only two hooks this route takes for the merged PO: a closed vendor's
+// undelivered lines are neither offered nor owed (exactly like a store-blocked
+// line), and the link flags are re-derived AFTER the receipt commits. With no
+// closure on the PO and no link rows, both are no-ops.
+import { closedPoItemIds, poVendorClosures, syncPoLinkFlagsAfterCommit } from '@/lib/po-link-lifecycle';
 // "Is there a bill number here?" is ONE definition, shared with the receive
 // modal — see the header of @/lib/bill-no. `.trim()` alone said yes to a zero
 // width space, and both halves of the gate said yes together.
@@ -164,6 +170,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       if (msg) blocked.set(String(it.id), msg);
     }
     const done = receivedPoItemIds(db, id);
+    // Lines of a short-closed vendor that never arrived — not owed, not offered.
+    const closedLines = closedPoItemIds(db, id);
+    const closures = closedLines.size > 0 ? poVendorClosures(db, id) : [];
 
     // Which GRN each received line came in on — the `grn_numbers` badge below.
     // Same ledger as `done` above, from the same helper: a copy of this query
@@ -184,9 +193,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     }
 
     const groups = groupByVendor(items, po).map(g => {
-      const receivable = g.lines.filter(l => !blocked.has(String(l.id)));
+      const receivable = g.lines.filter(l => !blocked.has(String(l.id)) && !closedLines.has(String(l.id)));
       const outstanding = receivable.filter(l => !done.has(String(l.id)));
       const receivedLines = receivable.filter(l => done.has(String(l.id)));
+      const closedHere = g.lines.filter(l => closedLines.has(String(l.id)));
+      const closure = closedHere.length > 0
+        ? closures.find(c => (c.vendor_id && c.vendor_id === g.vendor_id)
+            || c.vendor_name.trim().toLowerCase() === g.key
+            || c.master_name.trim().toLowerCase() === g.key) || null
+        : null;
       return {
         key: g.key,
         vendor_name: g.vendor_name,
@@ -194,6 +209,10 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         line_ids:          outstanding.map(l => String(l.id)),
         received_line_ids: receivedLines.map(l => String(l.id)),
         blocked_line_ids:  g.lines.filter(l => blocked.has(String(l.id))).map(l => String(l.id)),
+        // Short-closed (ruling 69): this vendor's lines that never arrived and
+        // never will on this order. Neither outstanding nor received.
+        closed_line_ids:   closedHere.map(l => String(l.id)),
+        closed: closure ? { reason: closure.reason, closed_by: redactEmail(closure.closed_by), closed_at: closure.closed_at } : null,
         // `outstanding` narrows `items`, the purchase_order_items rows selected
         // at the top of this GET, so quantity is PURCHASE units and unit_price
         // is Rs/purchase-unit by canon. Both halves come off the same row; no
@@ -227,7 +246,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       // so the badge on screen can never disagree with where the stock lands.
       // Store-blocked lines are excluded — they never reach a central receipt.
       direct_issue: (() => {
-        const eligible = items.filter(i => !blocked.has(String(i.id)));
+        const eligible = items.filter(i => !blocked.has(String(i.id)) && !closedLines.has(String(i.id)));
         const targets = resolveDirectIssueBulk(db, eligible.map(i => String(i.material_id || '')));
         return eligible
           .filter(i => targets.has(String(i.material_id)))
@@ -653,14 +672,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // never bump Central stock / purchases / average_price. New POs can't even
     // contain them (create/edit reject). The PO data itself is untouched.
     const storeBlocked: { material_id: string; material_name: string; error: string }[] = [];
+    // SHORT-CLOSED (ruling 69): a closed vendor's lines that never arrived are
+    // off the order — not offered here and not owed by the completion test at
+    // the end of the txn, exactly like a store-blocked line. Empty on every PO
+    // that was never short-closed, which leaves this filter byte-identical.
+    // Read here, in the same synchronous stretch as the txn below (no await
+    // between them), so no close can land in between.
+    const closedLines = closedPoItemIds(db, id);
     const receivable = items.filter((it: any) => {
+      if (closedLines.has(String(it.id))) return false;
       const msg = centralFlowBlock(db, String(it.material_id || ''));
       if (msg) { storeBlocked.push({ material_id: it.material_id, material_name: it.material_name, error: msg }); return false; }
       return true;
     });
     if (receivable.length === 0) {
       return Response.json({
-        error: `Nothing to receive — every line is a store-mapped material. ${storeBlocked[0]?.error || ''}`,
+        error: storeBlocked.length > 0
+          ? `Nothing to receive — every line is a store-mapped material. ${storeBlocked[0]?.error || ''}`
+          : `Nothing to receive on ${po.po_number} — every vendor on it was short-closed.`,
         store_blocked: storeBlocked,
       }, { status: 400 });
     }
@@ -687,9 +716,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // a bill at the gate needs to be told WHICH one it is.
         const settled = groupByVendor(receivable, po).find(g => g.key === vendorKeyReq);
         const blockedOnly = !settled && groupByVendor(items, po).find(g => g.key === vendorKeyReq);
+        // A FOURTH fact since ruling 69: the vendor was short-closed on this PO.
+        // Checked first — a closed vendor may also have lines that DID arrive,
+        // and "already received" would hide why the rest cannot be taken in.
+        const closedGroup = closedLines.size > 0
+          ? groupByVendor(items.filter((it: any) => closedLines.has(String(it.id))), po).find(g => g.key === vendorKeyReq)
+          : undefined;
         let error: string;
         let status: number;
-        if (settled) {
+        if (closedGroup) {
+          const c = poVendorClosures(db, id).find(x => (x.vendor_id && x.vendor_id === closedGroup.vendor_id)
+            || x.vendor_name.trim().toLowerCase() === vendorKeyReq || x.master_name.trim().toLowerCase() === vendorKeyReq);
+          error = `${closedGroup.vendor_name || '(no vendor)'} was short-closed on ${po.po_number}${c ? ` by ${redactEmail(c.closed_by)} on ${fmtIST(c.closed_at)}${c.reason ? ` (${c.reason})` : ''}` : ''} — the ${closedGroup.lines.length} line(s) they had not delivered are off this order and cannot be received against it. Raise a new PO for these goods.`;
+          status = 409;
+        } else if (settled) {
           error = `${settled.vendor_name}'s lines on ${po.po_number} have already been received. Reload the page.`;
           status = 409;
         } else if (blockedOnly) {
@@ -1935,6 +1975,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     });
     txn();
+
+    // ── MERGED-PO LINK FLAGS, AFTER THE COMMIT (ruling 68) ──────────────────
+    // A Direct Issue line on a merged PO has just put its goods on the rule's
+    // department ledger; the requisition lines it was bought for are marked
+    // delivered_direct so the desk cannot issue them again from central.
+    // Derived from what this receipt committed (purchases.direct_issue_dept_id
+    // under a live, value-counted GRN), so a held receipt marks nothing until
+    // it is signed. Never throws; returns at once on a PO with no links.
+    syncPoLinkFlagsAfterCommit(db, id, 'receive');
 
     // Cascade weighted-avg + recipe re-cost outside the transaction (it does its own writes).
     // touchedMaterials is EMPTY on a held receive — nothing was booked — so this

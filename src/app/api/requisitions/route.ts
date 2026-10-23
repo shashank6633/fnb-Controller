@@ -2,7 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
-import { duplicateLineError } from '@/lib/po-helpers';
+import { duplicateLineError, requisitionLinePoState } from '@/lib/po-helpers';
 import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
 import { centralFlowBlock } from '@/lib/store-engine';
 
@@ -251,6 +251,40 @@ export async function GET(request: Request) {
         `).all(id) as any[]) movedPool.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
       }
       for (const it of items) it.party_moved_recipe = movedPool.get(String(it.material_id)) || 0;
+      // MERGED PO STATE, per line (owner rulings #63-#70). ADDITIVE — no field
+      // above changes. One batched read (po-helpers.ts requisitionLinePoState):
+      //   on_po            { po_id, po_number, vendor_name, vendor_id, status,
+      //                      merged, source, qty_purchase } | null — the live PO
+      //                      buying for this line (a merged PO's link row, or the
+      //                      "Also raise a vendor PO" tick's line). Never a
+      //                      cancelled PO.
+      //   arrived          { grn_number, at, qty_purchase } | null — this line's
+      //                      whole share is covered by ACCEPTED goods on a live,
+      //                      not-held receipt (VALUE), shares taken in creation
+      //                      order. The line stays open: the store still issues
+      //                      it from the desk (ruling #64).
+      //   arrived_partial  { grn_number, at, qty_purchase, of_qty_purchase } | null
+      //   delivered_direct bool — a Direct Issue rule sent the goods straight to
+      //                      the rule's department (ruling #68)
+      //   vendor_closed    bool (+ vendor_closed_reason) — the vendor was
+      //                      short-closed before this line came (ruling #69)
+      //   also_on_po       [] normally; a second live PO for the same line
+      // Quantities are PURCHASE units. Read-only: nothing here is written.
+      const poState = requisitionLinePoState(db, items.map(it => String(it.id)));
+      for (const it of items) {
+        const st = poState.get(String(it.id));
+        it.on_po = st?.on_po ?? null;
+        it.arrived = st?.arrived ?? null;
+        it.arrived_partial = st?.arrived_partial ?? null;
+        it.delivered_direct = st?.delivered_direct ?? false;
+        // Where the Direct Issue delivery went (the rule's department — often
+        // not the asking one) and the bill it came on. Null unless delivered_direct.
+        it.delivered_direct_dept_name = st?.delivered_direct_dept_name ?? null;
+        it.delivered_direct_grn = st?.delivered_direct_grn ?? null;
+        it.vendor_closed = st?.vendor_closed ?? false;
+        it.vendor_closed_reason = st?.vendor_closed_reason ?? null;
+        it.also_on_po = st?.also_on_po ?? [];
+      }
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw

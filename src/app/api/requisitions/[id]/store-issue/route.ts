@@ -9,6 +9,7 @@ import {
   type CentralStockShort,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
+import { deliveredDirectLines } from '@/lib/po-helpers';
 
 /**
  * A replayed POST carrying a client_token it already spent is answered 200
@@ -606,6 +607,47 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         blocked: lineChangedRows,
         applied: 0,
       }, { status: 400 });
+    }
+
+    // ── DELIVERED DIRECT (owner ruling #68) ──────────────────────────────────
+    // A merged PO received through a Direct Issue rule sent the goods straight
+    // to the rule's department; the central store never received them. Issuing
+    // the line from central as well hands the department the goods twice and
+    // takes from central stock it never had (measured: COCONUT MILK POWDER
+    // 2 kg delivered direct to Main Kitchen, then 200 here — Main Kitchen 4 kg
+    // against a 2 kg ask, central −2 kg). The store desk hides the controls,
+    // but a tab opened before the receipt still posts them, so the ROUTE says
+    // no. Only an 'issue' that would hand goods over is refused; Reject (the
+    // way the line is closed), Undo, Defer and Unreject move nothing from
+    // central and pass as before. REFUSED WHOLE, nothing written — the same
+    // stance as the stale cap above: the screen is out of date, so every
+    // figure beside the line is too. No await sits between this read and the
+    // transaction, so the flag cannot change in between within this process.
+    // Read through requisitionLinePoState (po-helpers.ts), the reader the
+    // desks' badge uses, so the refusal and the badge agree.
+    {
+      const askedIssue = lines
+        .filter((ln: any) => String(ln?.action || '').toLowerCase() === 'issue'
+          && Number(ln?.quantity) > 0 && itemMap.get(ln?.id))
+        .map((ln: any) => String(ln.id));
+      const direct = deliveredDirectLines(db, askedIssue);
+      if (direct.size > 0) {
+        const blockedDirect = [...direct.entries()].map(([lineId, why]) => {
+          const name = String(itemMap.get(lineId)?.material_name || 'a line');
+          return {
+            code: 'delivered_direct', line_id: lineId, req_item_id: lineId, material: name,
+            message: `${name} was ${why} — it cannot be issued again from central. Nothing was issued and the requisition `
+              + `is unchanged. Reload the page: the line now reads "Delivered direct". Reject it to close the line, or ask that `
+              + `department for a department transfer if the asking department still needs it.`,
+          };
+        });
+        return Response.json({
+          error: blockedDirect.map(x => x.message).join(' '),
+          code: 'delivered_direct',
+          blocked: blockedDirect,
+          applied: 0,
+        }, { status: 400 });
+      }
     }
 
     // ── THE CENTRAL FLOOR, ASKED BEFORE THE TRANSACTION OPENS ───────────────

@@ -5,6 +5,9 @@ import { duplicateLineError } from '@/lib/po-helpers';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { liveReceiptsOnPo, type PoReceiptWitnesses } from '@/lib/po-receipts';
+// A merged PO's requisition links ride on the PO lines this route deletes and
+// re-inserts (po_item_id cascades) — carried across by material, see the lib.
+import { captureRequisitionLinks, restoreRequisitionLinks, type RestoredLinks } from '@/lib/po-link-lifecycle';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * GOODS ALREADY TAKEN IN CLOSE THIS DOOR.
@@ -200,6 +203,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // Hoisted so the post-txn audit event can read what replaced them.
     let newTotal = 0;
     const afterItems: any[] = [];
+    // What happened to a merged PO's requisition links (null until the lines
+    // are rewritten). `as` so the assignment inside the txn is not narrowed away.
+    let links = null as RestoredLinks | null;
 
     const txn = db.transaction(() => {
       // ── Atomic claim (MUST stay the first statement in this txn) ──────────
@@ -241,7 +247,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         throw err;
       }
 
-      // Replace line items
+      // Replace line items. The requisition links are read FIRST: the DELETE
+      // cascades them away with the old line ids, and they are written back by
+      // material once the new lines exist (below).
+      const captured = captureRequisitionLinks(db, id);
       db.prepare('DELETE FROM purchase_order_items WHERE po_id = ?').run(id);
       const ins = db.prepare(`
         INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
@@ -283,6 +292,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // exactly this path and had no caller until here.
       snapshotPoLines(db, id, { takenBy: me.email, source: 'po_edit_approved_add' });
 
+      // Every link whose material is still on the PO follows it to the new
+      // line; a material the edit removed drops its links — those requisition
+      // lines are free to be ordered again. Never drops anything else. No-op on
+      // a PO that carries no links (every PO not built by the merge).
+      links = restoreRequisitionLinks(db, id, captured);
+
       // Money + note follow the claim (status/approved_at/approved_by were
       // already cleared there): newTotal is only known after the re-insert.
       // Keep a note so admins know who edited and why.
@@ -308,11 +323,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         approved_by: po.approved_by, approved_at: po.approved_at,
         items: beforeItems,
       },
-      after: { status: 'pending_reapproval', total_cost: newTotal, items: afterItems },
+      after: {
+        status: 'pending_reapproval', total_cost: newTotal, items: afterItems,
+        // Only on a PO that carried links — the shape of every other po.edit
+        // row (which po-diff reads) is unchanged.
+        ...(links && (links.kept > 0 || links.dropped.length > 0)
+          ? { requisition_links: { kept: links.kept, dropped: links.dropped } }
+          : {}),
+      },
       note: reason,
     });
 
-    return Response.json({ success: true, status: 'pending_reapproval' });
+    return Response.json({
+      success: true, status: 'pending_reapproval',
+      ...(links && (links.kept > 0 || links.dropped.length > 0)
+        ? { requisition_links: { kept: links.kept, dropped: links.dropped.length } }
+        : {}),
+    });
   } catch (e: any) {
     console.error('[edit-approved PO]', e);
     // A lost race against receive/reject is a conflict, not a server fault — the

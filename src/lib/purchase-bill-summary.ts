@@ -385,6 +385,14 @@ export interface PurchaseBillRow {
   bill_no: string;
   /** The GRN behind a PO receive. '' on hand-entered bills. */
   grn_id: string;
+  /** That GRN's own number (GRN-yyyy-####), read off goods_receipt_notes by
+   *  grn_id. '' when the bill has no GRN, or its GRN row is gone. */
+  grn_number: string;
+  /** The PURCHASE ORDER that GRN was received against (goods_receipt_notes.po_id
+   *  → purchase_orders.po_number). A merged PO is delivered on one bill per
+   *  vendor, each its own GRN under the SAME PO number — this is how those
+   *  bills are found and grouped. '' on an ad-hoc GRN and on hand-entered bills. */
+  po_number: string;
   /** true when the vendor's own number is absent. Drives the CSV YES/NO. */
   bill_no_missing: boolean;
   /**
@@ -1178,6 +1186,8 @@ export function getPurchaseBillSummary(
       invoice_id: String(r.invoice_id || ''),
       bill_no: String(r.bill_no || ''),
       grn_id: String(r.grn_id || ''),
+      grn_number: '',   // filled below, one read for all rows
+      po_number: '',
       bill_no_missing: String(r.bill_no || '').trim() === '',
       // PROVENANCE, from the KIND — "this bill's charges were read off its GRN
       // line". It is NOT "the charges are missing": since 2026-09-10 they are
@@ -1204,6 +1214,27 @@ export function getPurchaseBillSummary(
       taxed_lines: num(r.taxed_lines),
     };
   });
+
+  // GRN number + PO number, by grn_id, in ONE read after the bills are chosen.
+  // Pure labels: nothing above (the key, the grouping, a single rupee) reads
+  // them, so every figure on the report is what it was.
+  const grnIds = [...new Set(rows.map(r => r.grn_id).filter(Boolean))];
+  const docs = new Map<string, { grn_number: string; po_number: string }>();
+  if (grnIds.length) {
+    const found = db.prepare(`
+      SELECT g.id AS id, COALESCE(TRIM(g.grn_number), '') AS grn_number,
+             COALESCE(TRIM(po.po_number), '') AS po_number
+      FROM goods_receipt_notes g
+      LEFT JOIN purchase_orders po ON po.id = g.po_id
+      WHERE g.id IN (SELECT value FROM json_each(?))
+    `).all(JSON.stringify(grnIds)) as any[];
+    for (const d of found) docs.set(String(d.id), { grn_number: String(d.grn_number || ''), po_number: String(d.po_number || '') });
+  }
+  for (const r of rows) {
+    const d = r.grn_id ? docs.get(r.grn_id) : undefined;
+    r.grn_number = d?.grn_number || '';
+    r.po_number = d?.po_number || '';
+  }
 
   return {
     rows,
@@ -1599,6 +1630,16 @@ export const PURCHASE_BILL_COLUMNS: PurchaseBillColumn[] = [
       return p == null ? '' : p;
     },
   },
+  /*
+   * GRN NO. AND PO NO. — APPENDED LAST, by the same rule as Tax % above: every
+   * column ahead of them is already pointed at by a saved sheet. The "GRN ID"
+   * column is the raw row id, which nobody can search for; these are the two
+   * numbers printed on the paperwork. A merged PO arrives as one GRN per vendor
+   * bill under ONE PO number, and this is the column that groups those bills
+   * back to their order. Blank on a hand-entered bill (it has neither).
+   */
+  { key: 'grn_number',          label: 'GRN No',                  value: r => r.grn_number },
+  { key: 'po_number',           label: 'PO No',                   value: r => r.po_number },
 ];
 
 /**

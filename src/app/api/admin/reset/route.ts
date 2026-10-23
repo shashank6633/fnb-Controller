@@ -572,6 +572,21 @@ export async function POST(req: Request) {
           WHERE linked_po_id IN (${poSelect})
         `).run(outletId, ...pDc.params).changes;
       } catch {}
+      // Merged POs (rulings #63-#70): the requisition links and the vendor
+      // short-closes go with their PO. Both tables also CASCADE from
+      // purchase_orders, so this is the explicit, counted form of what the
+      // DELETE below would do anyway. The requisitions themselves survive —
+      // a merge never writes to them.
+      try {
+        deleted.po_requisition_lines = db.prepare(`
+          DELETE FROM po_requisition_lines WHERE po_id IN (${poSelect})
+        `).run(outletId, ...pDc.params).changes;
+      } catch { deleted.po_requisition_lines_skipped = 0; }
+      try {
+        deleted.po_vendor_closures = db.prepare(`
+          DELETE FROM po_vendor_closures WHERE po_id IN (${poSelect})
+        `).run(outletId, ...pDc.params).changes;
+      } catch { deleted.po_vendor_closures_skipped = 0; }
       // FK ON DELETE CASCADE handles purchase_order_items
       deleted.purchase_orders = db.prepare(`
         DELETE FROM purchase_orders WHERE outlet_id = ? ${pDc.sql}
@@ -937,6 +952,11 @@ export async function POST(req: Request) {
       // orphan every row against a req_item_id that no longer exists AND let a
       // later cancel/reject guard refuse on a requisition that is gone.
       safeDel('requisition_issue_ledger');
+      // Merged-PO links name requisition lines that go on the next two lines
+      // (and their PO lines go with purchase_order_items below, which would
+      // cascade them anyway). Deleted first and counted, never left pointing
+      // at requisitions that no longer exist.
+      safeDel('po_requisition_lines');
       safeDel('requisition_items');
       safeDel('requisitions');
       safeDel('wastages');

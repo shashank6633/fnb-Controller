@@ -360,6 +360,9 @@ const hoursSince = (stamp: string | null | undefined): number | null => {
 interface GRN {
   id: string; grn_number: string; date: string; time?: string;
   po_id?: string; po_number?: string;
+  /** Live (non-void) vendor bills on this GRN's order — >1 on a merged /
+   *  multi-vendor PO, which is received one GRN per vendor bill under one PO number. */
+  po_bill_count?: number;
   vendor_id?: string; vendor?: string;
   invoice_number?: string; invoice_date?: string;
   received_by?: string; qc_by?: string;
@@ -825,7 +828,10 @@ export default function GrnPage() {
         // and a duplicate rupee column inside that run would let a reader adding
         // across the row count GST twice. Kept byte-identical to the server's
         // own csv branch in src/app/api/grn/route.ts.
-        TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
+        // PO NO. is the 30th, APPENDED: BILL TYPE says AGAINST PO but not which
+        // order, and a merged PO's one-GRN-per-vendor bills share ONE PO
+        // number — this is the column that groups them back to it.
+        TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER, 'PO NO.'];
       // ESCAPED WITH THE SAME `clean` THE DATA ROWS USE — the two tax headings
       // are sentences containing commas, so a raw join would split them into
       // extra fields. The 27 headings ahead of them carry no comma, quote or
@@ -844,6 +850,8 @@ export default function GrnPage() {
         // that print the same figure cannot round differently.
         taxCsvNumber(gstValue(r)),
         taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
+        // The 30th, off the register SQL's own join ('' on a DIRECT bill).
+        r.po_number ?? '',
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -954,7 +962,7 @@ export default function GrnPage() {
         </div>
         <div className="flex items-center gap-2">
           <button onClick={downloadRegister} disabled={exporting}
-                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO), then Tax Value (GST) and Tax % Applied (GST) as its last two columns. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
+                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO), then Tax Value (GST), Tax % Applied (GST) and the PO No. (blank on a direct bill) as its last three columns. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
                   className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
             {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
@@ -1581,6 +1589,17 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               >
                 {g.po_number}
               </a>
+            )}
+            {/* A merged / multi-vendor PO arrives as one GRN per vendor bill
+                under the SAME PO number, so that number repeats down the list.
+                Say so on the row instead of leaving it to look like a duplicate. */}
+            {g.po_number && Number(g.po_bill_count) > 1 && (
+              <span
+                className="text-[10px] text-[#8B7355]"
+                title={`${g.po_number} was delivered on ${Number(g.po_bill_count)} vendor bills, each with its own GRN number under this one PO number.`}
+              >
+                · {Number(g.po_bill_count)} bills
+              </span>
             )}
           </div>
         </td>

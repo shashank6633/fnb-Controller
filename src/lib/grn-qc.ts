@@ -6,6 +6,9 @@ import { getCentralStoreCutoverDate } from './central-cutover';
 import { packFactor } from './pack-units';
 import { mainDeptOf } from './dept-hierarchy';
 import { fulfilRequisitionFromPo } from './po-requisition-fulfil';
+// The post-commit merged-PO link sync — the one hook this file takes for the
+// merged PO (see the end of decideGrnQc). No-op on a PO without links.
+import { syncPoLinkFlagsAfterCommit } from './po-link-lifecycle';
 // READ-ONLY here: "was this receipt paid out of the petty cash box?". Nothing in
 // this file writes to petty_cash_ledger — the money was recorded when the bill
 // was entered, and a sign-off never touches it. See the payment_mode bind below.
@@ -2200,6 +2203,14 @@ export function decideGrnQc(
     });
   });
   txn();
+
+  // ── MERGED-PO LINK FLAGS, AFTER THE COMMIT (ruling 68) ────────────────────
+  // A held receipt's Direct Issue destination is resolved HERE, at sign-off,
+  // so this is the second of the two places a direct delivery becomes real.
+  // Re-derives delivered_direct for the PO's requisition links from what just
+  // committed. Never throws; a PO with no links (every PO not built by the
+  // merge, and every ad-hoc GRN — po_id NULL) returns at once.
+  if (grn.po_id) syncPoLinkFlagsAfterCommit(db, String(grn.po_id), 'qc');
 
   result.materials_touched = [...touched];
   return result;

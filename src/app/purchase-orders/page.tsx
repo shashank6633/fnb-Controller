@@ -48,6 +48,12 @@ import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 // runtime imports (its Database import is `import type`), and this import is
 // itself type-only, so nothing of it reaches the client bundle.
 import type { PoReapprovalChanges, PoQtyChange, PoRateChange, PoVendorChange } from '@/lib/po-diff';
+// THE per-vendor split of a PO (rulings #63-#70) — the receive route's own
+// grouping, shared with the print page and the vendor PDF. No runtime imports.
+import {
+  groupPoLinesByVendor, vendorNameKey, linkArrivals, closureForGroup, vendorProgress, vendorGroupState,
+  type PoVendorGroup, type PoVendorViewPayload, type PoVendorClosure, type PoReqLink,
+} from '@/lib/po-vendor-view';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -58,6 +64,14 @@ import type { PoReapprovalChanges, PoQtyChange, PoRateChange, PoVendorChange } f
 const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+/** SQLite's datetime('now') is UTC written as 'YYYY-MM-DD HH:MM:SS' with no
+ *  zone, which `new Date()` would read as LOCAL time. Mark it UTC first so a
+ *  late-evening stamp does not land on the wrong IST day. ISO strings that
+ *  already carry a zone, and bare dates, pass through untouched. */
+const sqlUtcStamp = (s: string): string =>
+  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(String(s || '').trim())
+    ? String(s).trim().replace(' ', 'T') + 'Z'
+    : String(s || '');
 /** Today on the LOCAL calendar, as YYYY-MM-DD. `toISOString().slice(0,10)`
  *  answers in UTC, which is 5½ h behind IST — before 05:30 it names YESTERDAY,
  *  so a delivery that fell due yesterday would not read as overdue until half
@@ -290,7 +304,27 @@ interface PO {
    *  server did not say" = show nothing. `recorded: false` inside it is the
    *  honest "edit predates change tracking" case and IS shown, as words. */
   reapproval_changes?: PoReapprovalChanges | null;
+  /** purchase_orders.merged — 1 when the PO was built by "Merge into one PO"
+   *  from many requisitions (ruling #63). Rides SELECT po.*; absent on a DB
+   *  that has not run the migration, which reads as not merged. */
+  merged?: number | boolean | null;
+  vendor_id?: string | null;
 }
+
+/** Was this PO built by the merge? Tolerates 1 / true / '1' and absence. */
+const isMergedPo = (p: { merged?: unknown } | null | undefined): boolean =>
+  !!p && (p.merged === true || Number(p.merged) === 1);
+
+/* ── VENDOR-LEVEL DELIVERY ON A LIST ROW ──────────────────────────────────────
+ * "2 of 5 vendors delivered · 1 closed" — counted by vendorProgress() in
+ * @/lib/po-vendor-view from the list API's own line tallies plus the vendor
+ * closures (a closed vendor is never counted as delivered). */
+const vendorProgressOf = (p: PO, closures: PoVendorClosure[] | undefined) =>
+  vendorProgress(
+    Array.isArray(p.delivered_vendors) ? vendorTally(p.delivered_vendors) : undefined,
+    Array.isArray(p.outstanding_vendors) ? vendorTally(p.outstanding_vendors) : undefined,
+    closures,
+  );
 
 const STATUS_COLOR: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
@@ -341,10 +375,25 @@ export default function PurchaseOrdersPage() {
   const initialQ = typeof window !== 'undefined'
     ? (new URLSearchParams(window.location.search).get('q') || '')
     : '';
+  /* /purchase-orders?id=<uuid> — the link a requisition (and the merge modal)
+   * gives to ITS PO. It used to be ignored: the page read only ?q=, so the link
+   * landed on the default Pending tab and an approved or received PO was not
+   * even listed. Now it widens the tab to 'all', opens that PO's detail and
+   * scrolls to it once the list has loaded. Read once at mount, same as ?q=. */
+  const [deepLinkId] = useState(() => typeof window !== 'undefined'
+    ? (new URLSearchParams(window.location.search).get('id') || '').trim()
+    : '');
+  const deepLinkDone = useRef(false);
+  const [deepLinkMissing, setDeepLinkMissing] = useState(false);
   const [tab, setTab] = useState<'all' | 'draft' | 'pending' | 'approved' | 'received' | 'rejected'>(
-    initialQ ? 'all' : 'pending',
+    initialQ || deepLinkId ? 'all' : 'pending',
   );
   const [search, setSearch] = useState(initialQ);
+  /* Vendor closures per PO (po_vendor_closures, via the read-only vendor-view
+   * route) — only for multi-vendor POs past approval, the only ones a vendor
+   * can be closed on. Empty map = none known; the progress chip then simply
+   * counts no closures, which is true of every PO before the feature existed. */
+  const [closuresByPo, setClosuresByPo] = useState<Record<string, PoVendorClosure[]>>({});
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
@@ -371,7 +420,27 @@ export default function PurchaseOrdersPage() {
         // scope=all — POs are a store operation; show every material.
         fetch('/api/inventory?scope=all').then(r => r.json()),
       ]);
-      setPos(posRes.purchase_orders || []);
+      const list: PO[] = posRes.purchase_orders || [];
+      setPos(list);
+      // Closures for the multi-vendor POs a vendor could have been closed on.
+      // Best-effort: a failed read leaves the map as it was.
+      const multiIds = list
+        .filter(p => ['approved', 'received'].includes(p.status)
+          && (vendorProgressOf(p, undefined)?.total || 0) > 1)
+        .map(p => p.id).slice(0, 150);   // bounded: keeps the query string well under any URL limit
+      if (multiIds.length > 0) {
+        fetch(`/api/purchase-orders/vendor-view?ids=${encodeURIComponent(multiIds.join(','))}`)
+          .then(r => (r.ok ? r.json() : null))
+          .then(d => {
+            if (!d?.by_po) return;
+            const next: Record<string, PoVendorClosure[]> = {};
+            for (const [pid, v] of Object.entries(d.by_po as Record<string, { closures?: PoVendorClosure[] }>)) {
+              if (Array.isArray(v?.closures) && v.closures.length) next[pid] = v.closures;
+            }
+            setClosuresByPo(next);
+          })
+          .catch(() => {});
+      }
       // Fail CLOSED to the lower tier. This was `=== 'manager' ? 'manager' : 'admin'`,
       // which handed out 'admin' for anything that wasn't literally "manager" — an
       // absent field, an error body, a future role string. `role` gates the
@@ -390,6 +459,20 @@ export default function PurchaseOrdersPage() {
   }, []);
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
+  /* ?id= deep link: once the first load lands, open that PO and bring it into
+   * view. Done ONCE — a later refresh must not yank the page back to it. If the
+   * PO is not in this list (another outlet's, or deleted), say so rather than
+   * leave the reader on a list that silently lacks it. */
+  useEffect(() => {
+    if (!deepLinkId || deepLinkDone.current || loading) return;
+    deepLinkDone.current = true;
+    if (!pos.some(p => p.id === deepLinkId)) { setDeepLinkMissing(true); return; }
+    setOpenDetailId(deepLinkId);
+    requestAnimationFrame(() => {
+      document.getElementById(`po-row-${deepLinkId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [deepLinkId, loading, pos]);
+
   // Role is now driven by the logged-in user (api/auth/me). Toggle is removed.
 
   const filtered = useMemo(() => {
@@ -402,7 +485,15 @@ export default function PurchaseOrdersPage() {
     }
     if (search) {
       const q = search.toLowerCase();
-      list = list.filter(p => p.po_number.toLowerCase().includes(q) || (p.vendor || '').toLowerCase().includes(q));
+      /* ANY vendor on the PO, not just the header. A merged / mixed PO's header
+         reads "Mixed (N vendors)", so a header-only match could never find it
+         by the supplier the buyer is actually looking for. The line vendors
+         come from the list API's own delivered/outstanding tallies, which
+         between them name every line's filed vendor exactly once. */
+      list = list.filter(p => p.po_number.toLowerCase().includes(q)
+        || (p.vendor || '').toLowerCase().includes(q)
+        || [...vendorTally(p.delivered_vendors), ...vendorTally(p.outstanding_vendors)]
+             .some(v => v.vendor_name.toLowerCase().includes(q)));
     }
     return list;
   }, [pos, tab, search]);
@@ -480,13 +571,21 @@ export default function PurchaseOrdersPage() {
           </div>
           <div className="flex items-center gap-2 flex-1 min-w-[200px]">
             <Search className="w-4 h-4 text-[#8B7355]" />
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="PO number or vendor…"
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="PO number or any vendor on it…"
                    className="flex-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
           </div>
           <button onClick={fetchAll} className="text-xs text-[#6B5744] hover:text-[#af4408] flex items-center gap-1">
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} /> Refresh
           </button>
         </div>
+
+        {deepLinkMissing && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-xs text-amber-900 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>The PO this link points to is not in this list — it may belong to another outlet (switch outlet to see it) or no longer exist.</span>
+            <button onClick={() => setDeepLinkMissing(false)} className="ml-auto text-amber-800 hover:underline">Dismiss</button>
+          </div>
+        )}
 
         {/* List */}
         {loading ? (
@@ -551,7 +650,11 @@ export default function PurchaseOrdersPage() {
                        it is the same COUNT of purchase_order_items rows. */
                     const linesIn    = Number(p.received_line_count) || 0;
                     const linesTotal = Number(p.total_line_count) || Number(p.item_count) || 0;
-                    const owedVendors = vendorTally(p.outstanding_vendors);
+                    // A CLOSED vendor still has un-received lines, but it is not
+                    // "awaited" — it is not coming. Kept out of every "still to
+                    // deliver" phrase on this row (ruling #69).
+                    const closedKeys = new Set((closuresByPo[p.id] || []).map(c => vendorNameKey(c.vendor_name)));
+                    const owedVendors = vendorTally(p.outstanding_vendors).filter(v => !closedKeys.has(vendorNameKey(v.vendor_name)));
                     const inVendors   = vendorTally(p.delivered_vendors);
                     const partReceived = p.status === 'approved' && linesIn > 0;
                     /* The full picture on hover: who came, under which bill, and
@@ -561,20 +664,36 @@ export default function PurchaseOrdersPage() {
                       inVendors.length > 0 && `Delivered: ${inVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
                       (p.vendor_bills || []).length > 0 && `Bills: ${(p.vendor_bills || []).map(b => `${b.vendor_name || '?'} ${b.bill_no || '(no number)'}`).join(' · ')}`,
                       owedVendors.length > 0 && `Still to deliver: ${owedVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
+                      (closuresByPo[p.id] || []).length > 0 && `Closed, not delivered: ${(closuresByPo[p.id] || []).map(c => `${c.vendor_name || 'vendor'}${c.reason ? ` (${c.reason})` : ''}`).join(' · ')}`,
                     ].filter(Boolean).join('\n') || undefined;
+                    /* VENDOR-LEVEL PROGRESS (ruling #63): "2 of 5 vendors
+                       delivered · 1 closed". Only on a PO with more than one
+                       vendor and only once it is approved — before that no
+                       vendor can have delivered, and a single-vendor PO
+                       already says it all with its status. */
+                    const vp = vendorProgressOf(p, closuresByPo[p.id]);
+                    const multiVendor = !!vp && vp.total > 1;
+                    const showVendorProgress = multiVendor && ['approved', 'received'].includes(p.status);
                     return (
                       // Key belongs on the FRAGMENT, not the inner <tr>: a row can
                       // render up to three siblings (row + detail + review), so a
                       // keyless <> makes React reconcile this list by index and
                       // remount everything below an approve/reject reorder.
                       <Fragment key={p.id}>
-                        <tr className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
+                        <tr id={`po-row-${p.id}`}
+                            className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 ${deepLinkId === p.id ? 'bg-[#FFF1E3]/60' : ''}`}>
                           <td className="py-2 px-3 text-xs font-mono">
                             <button onClick={() => setOpenDetailId(isOpen ? null : p.id)}
                                     className="inline-flex items-center gap-1 hover:text-[#af4408]">
                               <ChevronDown className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
                               {p.po_number}
                             </button>
+                            {isMergedPo(p) && (
+                              <span className="ml-1 inline-block px-1 py-px rounded border border-violet-200 bg-violet-50 text-violet-800 text-[9px] font-sans font-semibold align-middle"
+                                    title="Built by Merge into one PO from several requisitions — open it to see which departments each line is for">
+                                MERGED
+                              </span>
+                            )}
                           </td>
                           <td className="py-2 px-3 text-xs">{dateLabel(p.date)}</td>
                           {/* Expected delivery. NULL prints an em-dash — a PO
@@ -588,7 +707,16 @@ export default function PurchaseOrdersPage() {
                               </span>
                             ) : <span className="text-[#8B7355]">—</span>}
                           </td>
-                          <td className="py-2 px-3 text-xs">{p.vendor || <span className="text-[#8B7355]">—</span>}</td>
+                          <td className="py-2 px-3 text-xs">
+                            {p.vendor || <span className="text-[#8B7355]">—</span>}
+                            {/* A Mixed header names no vendor at all — list them,
+                                small, so the row says WHO the order is with. */}
+                            {multiVendor && (
+                              <div className="text-[10px] text-[#8B7355] max-w-[16rem] truncate" title={vp!.names.join(' · ')}>
+                                {vp!.names.join(' · ')}
+                              </div>
+                            )}
+                          </td>
                           <td className="py-2 px-3 text-xs text-right font-mono">{p.item_count ?? '-'}</td>
                           <td className="py-2 px-3 text-xs text-right font-mono font-semibold">{fmt(p.total_cost)}</td>
                           <td className="py-2 px-3 text-xs">
@@ -608,6 +736,13 @@ export default function PurchaseOrdersPage() {
                                     {' · '}{linesIn} of {linesTotal || '?'} lines in
                                     {owedVendors.length > 0 && <> · awaiting {owedVendors.map(v => v.vendor_name).join(' · ')}</>}
                                   </span>
+                                </span>
+                              )}
+                              {showVendorProgress && (
+                                <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${vp!.delivered + vp!.closed >= vp!.total ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-sky-50 text-sky-800 border border-sky-200'}`}
+                                      title={partTitle || `Still to deliver: ${owedVendors.map(v => v.vendor_name).join(' · ') || 'nobody'}`}>
+                                  {vp!.delivered} of {vp!.total} vendors delivered
+                                  {vp!.closed > 0 && <span className="font-normal"> · {vp!.closed} closed</span>}
                                 </span>
                               )}
                               {/* WHAT the re-approval is being asked for, beside
@@ -723,7 +858,8 @@ export default function PurchaseOrdersPage() {
                           <PODetail key={p.id + '-d'} po={p} editing={editingId === p.id}
                                     onCancelEdit={() => setEditingId(null)}
                                     materials={materials}
-                                    onSaved={() => { setEditingId(null); fetchAll(); }} />
+                                    onSaved={() => { setEditingId(null); fetchAll(); }}
+                                    onChanged={fetchAll} />
                         )}
                         {reviewId === p.id && (
                           /* The change-set rides the LIST ROW, so it is handed
@@ -2971,17 +3107,34 @@ function ReapprovalChangesPanel({ rc, approvalNote }: { rc: PoReapprovalChanges;
   );
 }
 
-function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
+function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: {
   po: PO; editing: boolean; materials: Material[]; onCancelEdit: () => void; onSaved: () => void;
+  /** A vendor was closed here — the list row's status/progress must refresh. */
+  onChanged?: () => void;
 }) {
   const [items, setItems] = useState<POItem[]>([]);
   const [loading, setLoading] = useState(true);
+  /* The per-vendor extras (rulings #63-#70): the requisition lines behind each
+     PO line, vendor closures, the "Send PO to vendor" switch and whether this
+     viewer may close a vendor. null = not loaded / failed, in which case the
+     table renders exactly as it did before these existed. */
+  const [view, setView] = useState<PoVendorViewPayload | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [closingGroup, setClosingGroup] = useState<PoVendorGroup<POItem> | null>(null);
 
   useEffect(() => {
-    fetch(`/api/purchase-orders?id=${po.id}`).then(r => r.json()).then(d => {
-      setItems(d.purchase_order?.items || []); setLoading(false);
-    });
-  }, [po.id]);
+    let live = true;
+    Promise.all([
+      fetch(`/api/purchase-orders?id=${po.id}`).then(r => r.json()),
+      fetch(`/api/purchase-orders/vendor-view?id=${po.id}`)
+        .then(r => (r.ok ? r.json() : null)).catch(() => null),
+    ]).then(([d, v]) => {
+      if (!live) return;
+      setItems(d?.purchase_order?.items || []);
+      setView(v && typeof v === 'object' && v.links_by_item ? v as PoVendorViewPayload : null);
+    }).catch(() => {}).finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [po.id, reloadKey]);
 
   if (loading) {
     return <tr><td colSpan={8} className="py-3 px-3 text-xs text-[#8B7355] bg-[#FFF8F0]">Loading items…</td></tr>;
@@ -3060,6 +3213,81 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   const rc = reapprovalOf(po);
   const editedIds = rc?.recorded ? new Set(rc.changed_material_ids) : null;
   const addedIds  = rc?.recorded ? new Set(rc.added.map(a => a.material_id)) : null;
+
+  /* ── VENDOR BY VENDOR (rulings #63, #66, #69, #70) ─────────────────────────
+     The receive route's own split (src/lib/po-vendor-view.ts), so a vendor this
+     table calls delivered is one receiving agrees has nothing left to bring.
+     Grouped only when there is more than one vendor or the PO came from the
+     merge; a single-vendor PO keeps the flat table it always had. */
+  const groups = groupPoLinesByVendor(items, po);
+  const grouped = groups.length > 1 || isMergedPo(po);
+  const colCount = anyReceived ? 11 : 7;
+  const sendOn = !!view?.send_to_vendor;
+  const vendorCopyHref = (g: PoVendorGroup<POItem>) => `/purchase-orders/${po.id}/print?vendor=${encodeURIComponent(g.param)}`;
+  const vendorPdfHref  = (g: PoVendorGroup<POItem>) => `/api/purchase-orders/${po.id}/vendor-pdf?vendor=${encodeURIComponent(g.param)}`;
+  // Per-vendor copies are for an order that can still be supplied against.
+  const showVendorCopies = sendOn && po.status === 'approved';
+  const closureOf = (g: PoVendorGroup<POItem>) =>
+    closureForGroup(view?.closures, g);
+  const owedLinesOf = (g: PoVendorGroup<POItem>) => g.lines.filter(it => (it as any).received_line_total == null);
+  /* Close this vendor: store manager or admin (server re-checks), an APPROVED
+     PO that is merged or carries several vendors, a vendor with lines still
+     owed and not already closed. A legacy line with no vendor-master id cannot
+     be named to the close route, so it is offered greyed with the reason. */
+  const closeState = (g: PoVendorGroup<POItem>): { show: boolean; ok: boolean; why?: string } => {
+    if (!view?.can_close_vendor || po.status !== 'approved' || !grouped) return { show: false, ok: false };
+    if (closureOf(g) || owedLinesOf(g).length === 0) return { show: false, ok: false };
+    if (!g.vendor_id) return { show: true, ok: false, why: 'This vendor is not in the vendor master, so it cannot be closed from here.' };
+    return { show: true, ok: true };
+  };
+
+  /* The requisition lines behind one PO line, with whether each department's
+     share has arrived — VALUE-based (a voided bill or a receipt still held for
+     QC counts as nothing yet), covering the departments in the order they asked. */
+  const renderLinks = (it: POItem, u: string) => {
+    const links: PoReqLink[] = view?.links_by_item?.[it.id] || [];
+    if (links.length === 0) return null;
+    const lineIn = (it as any).received_line_total != null;
+    const held = isHeldLine(it);
+    const arrivals = linkArrivals(links, {
+      acceptedQty: lineIn && !held ? Number((it as any).quantity_accepted ?? (it as any).quantity_received ?? 0) : null,
+      held,
+    });
+    const linked = links.reduce((s, l) => s + (l.qty_purchase != null ? Number(l.qty_purchase) : 0), 0);
+    const allQty = links.every(l => l.qty_purchase != null);
+    const topUp = allQty ? Number(it.quantity) - linked : 0;
+    return (
+      <div className="mt-0.5 space-y-px">
+        {links.map(l => {
+          const a = arrivals.get(l.id);
+          const asked = l.qty_line != null && l.line_unit && l.line_unit.trim().toLowerCase() !== u.trim().toLowerCase()
+            ? ` (asked ${qfmt(l.qty_line)} ${l.line_unit})` : '';
+          const state = !a ? null
+            : a.state === 'arrived' ? <span className="text-emerald-700">arrived</span>
+            : a.state === 'part' ? <span className="text-amber-700">part arrived — {qfmt(a.covered)} of {qfmt(Number(l.qty_purchase))} {u}</span>
+            : a.state === 'none' ? (lineIn ? <span className="text-red-700">not covered — accepted qty ran short</span> : null)
+            : a.state === 'held' ? <span className="text-blue-800">in, held for QC</span>
+            : a.state === 'direct' ? <span className="text-violet-800">delivered direct (Direct Issue rule) — not issued from central</span>
+            : a.state === 'closed' ? <span className="text-red-700">vendor closed — not delivered</span>
+            : null;
+          return (
+            <div key={l.id} className="text-[10px] text-[#6B5744] leading-tight">
+              <span className="font-medium">{l.department_name || '(no department)'}</span>
+              {l.is_party && <span className="text-[#8B7355]"> · party{l.event_name ? `: ${l.event_name}` : ''}</span>}
+              {l.qty_purchase != null && <span className="font-mono"> · {qfmt(l.qty_purchase)} {u}</span>}
+              {asked && <span className={HINT_CLS}>{asked}</span>}
+              {l.req_number && <span className="font-mono text-[#8B7355]"> · {l.req_number}</span>}
+              {state && <> · {state}</>}
+            </div>
+          );
+        })}
+        {topUp > QTY_EPS && (
+          <div className="text-[10px] text-[#8B7355] leading-tight">+ {qfmt(topUp)} {u} store top-up (no requisition)</div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
       {rc && <ReapprovalChangesPanel rc={rc} approvalNote={po.approval_note} />}
@@ -3098,6 +3326,29 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               the accepted quantity is not decided yet.
             </div>
           )}
+          {/* Single-vendor PO: the vendor copy lives here (a grouped PO
+              carries it on each vendor's own row in the table). */}
+          {showVendorCopies && !grouped && groups.map(g => (
+            <div key={g.key} className="pt-1">
+              <span className="font-semibold">Vendor copy:</span>{' '}
+              <a href={vendorCopyHref(g)} target="_blank" rel="noreferrer" className="text-[#af4408] hover:underline inline-flex items-center gap-0.5">
+                <Printer className="w-3 h-3" /> Print
+              </a>{' · '}
+              <a href={vendorPdfHref(g)} className="text-[#af4408] hover:underline">Download PDF</a>
+            </div>
+          ))}
+          {grouped && (view?.closures || []).length > 0 && (
+            <div className="text-red-800 max-w-[22rem] pt-1">
+              {(view?.closures || []).map(c => (
+                <div key={c.vendor_id + c.closed_at}>
+                  <span className="font-semibold">{c.vendor_name || 'A vendor'} closed</span>
+                  {c.closed_at && <> on {dateLabel(sqlUtcStamp(c.closed_at))}</>}
+                  {c.closed_by && <> by {c.closed_by}</>}
+                  {c.reason && <> — {c.reason}</>}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex-1 min-w-0 overflow-x-auto">
         <table className="text-xs w-full min-w-[640px]">
@@ -3121,7 +3372,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
             </tr>
           </thead>
           <tbody>
-            {items.map(it => {
+            {(() => { const renderRow = (it: POItem) => {
               // received_* fields come from /api/purchase-orders when grn_id is set
               // (server folds the linked GRN items into the response). See the
               // PO API GET handler for the join logic.
@@ -3199,6 +3450,8 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                         {lineAdded ? 'new' : 'changed'}
                       </span>
                     )}
+                    {/* Which departments (and requisitions) this line is for. */}
+                    {renderLinks(it, u)}
                     {anyReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
                         {/* quantity_rejected is a GRN qty = PURCHASE units, and
@@ -3209,7 +3462,15 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                       </div>
                     )}
                   </td>
-                  <td className="py-1 px-2 text-[#6B5744]">{(it as any).vendor || <span className="text-[#8B7355] italic">—</span>}</td>
+                  {/* A line with no vendor of its own is FILED under the PO
+                      header (that is whose bill receives it) — say that rather
+                      than print a dash that reads as "no vendor". */}
+                  <td className="py-1 px-2 text-[#6B5744]">
+                    {(it as any).vendor
+                      || (String(po.vendor || '').trim()
+                        ? <span className="italic" title="This line names no vendor of its own; it is received under the PO's vendor">{po.vendor}</span>
+                        : <span className="text-[#8B7355] italic">—</span>)}
+                  </td>
                   <td className="py-1 px-2 text-right font-mono">
                     {it.quantity.toLocaleString('en-IN')}
                     {ordHint && <div className={HINT_CLS}>{ordHint}</div>}
@@ -3279,7 +3540,80 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                   </>}
                 </tr>
               );
-            })}
+            };
+            if (!grouped) return items.map(renderRow);
+            /* One block per vendor: a header row saying where that vendor
+               stands (and its actions), its lines, then its subtotal — the
+               owner's "screen grouped by vendor + subtotals" (ruling #66). */
+            return groups.map(g => {
+              const owed = owedLinesOf(g);
+              const closure = closureOf(g);
+              // Where this vendor stands — vendorGroupState() in @/lib/po-vendor-view,
+              // the same reading the internal print sheet makes.
+              const st = vendorGroupState(g, closure, isReceiptHeldForQc);
+              const inCount = st.in_count;
+              const grns = st.grns;
+              const recSub = r2(g.lines.reduce((s, it) => s + Number((it as any).received_line_total || 0), 0));
+              const cs = closeState(g);
+              const status = st.state === 'delivered'
+                ? { tone: 'bg-green-100 text-green-800', text: `Delivered${grns.length ? ` — ${grns.join(', ')}` : ''}${st.held ? ' (part held for QC)' : ''}` }
+                : st.state === 'closed'
+                  ? { tone: 'bg-red-100 text-red-800', text: `Closed — ${owed.length} line${owed.length === 1 ? '' : 's'} not delivered${inCount ? ` (${inCount} in${grns.length ? `: ${grns.join(', ')}` : ''})` : ''}` }
+                  : st.state === 'part'
+                    ? { tone: 'bg-amber-100 text-amber-800', text: `Part delivered — ${inCount} of ${g.lines.length} lines in${grns.length ? ` (${grns.join(', ')})` : ''}` }
+                    : { tone: 'bg-sky-100 text-sky-800', text:
+                        po.status === 'approved' ? 'Awaiting delivery'
+                        : po.status === 'pending_reapproval' ? 'Awaiting re-approval'
+                        : ['received', 'cancelled', 'rejected'].includes(po.status) ? 'Not received'
+                        : 'Not ordered yet — PO not approved' };
+              return (
+                <Fragment key={'vg-' + g.key}>
+                  <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3]/70">
+                    <td colSpan={colCount} className="py-1.5 px-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Truck className="w-3.5 h-3.5 text-[#af4408]" />
+                        <span className="font-semibold text-[#2D1B0E]">{g.vendor_name}</span>
+                        <span className="text-[10px] text-[#8B7355]">{g.lines.length} line{g.lines.length === 1 ? '' : 's'} · ordered {fmt(g.ordered_total)}</span>
+                        <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold ${status.tone}`}
+                              title={closure ? `Closed${closure.closed_by ? ` by ${closure.closed_by}` : ''}${closure.reason ? `: ${closure.reason}` : ''}` : undefined}>
+                          {status.text}
+                        </span>
+                        <span className="ml-auto inline-flex items-center gap-2">
+                          {showVendorCopies && (
+                            <>
+                              <a href={vendorCopyHref(g)} target="_blank" rel="noreferrer"
+                                 className="text-[10px] text-[#af4408] hover:underline inline-flex items-center gap-0.5"
+                                 title={`Only ${g.vendor_name}'s lines, with rates — safe to give this vendor`}>
+                                <Printer className="w-3 h-3" /> Vendor copy
+                              </a>
+                              <a href={vendorPdfHref(g)} className="text-[10px] text-[#af4408] hover:underline">PDF</a>
+                            </>
+                          )}
+                          {cs.show && (
+                            <button type="button" disabled={!cs.ok} title={cs.why || `Close ${g.vendor_name}: its ${owed.length} undelivered line${owed.length === 1 ? '' : 's'} will read "not delivered" and the rest of the PO can complete`}
+                                    onClick={() => setClosingGroup(g)}
+                                    className="px-2 py-0.5 rounded text-[10px] bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed">
+                              Close this vendor
+                            </button>
+                          )}
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                  {g.lines.map(renderRow)}
+                  <tr className="bg-white/60 text-[10px] font-semibold text-[#6B5744]">
+                    <td colSpan={6} className="py-1 px-2 text-right">Subtotal — {g.vendor_name}</td>
+                    <td className="py-1 px-2 text-right font-mono">{fmt(g.ordered_total)}</td>
+                    {anyReceived && <>
+                      <td colSpan={2}></td>
+                      <td className="py-1 px-2 text-right font-mono bg-emerald-50/40">{inCount > 0 ? fmt(recSub) : '—'}</td>
+                      <td></td>
+                    </>}
+                  </tr>
+                </Fragment>
+              );
+            });
+          })()}
           </tbody>
           {anyReceived && (
             <tfoot>
@@ -3336,10 +3670,119 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               </tr>
             </tfoot>
           )}
+          {/* A grouped PO's vendor subtotals need the figure they add up to. */}
+          {!anyReceived && grouped && (
+            <tfoot>
+              <tr className="border-t border-[#E8D5C4] font-semibold bg-white/60">
+                <td colSpan={6} className="py-1.5 px-2 text-right">Total ordered — {groups.length} vendor{groups.length === 1 ? '' : 's'}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{fmt(items.reduce((s, it) => s + Number(it.total_price || 0), 0))}</td>
+              </tr>
+            </tfoot>
+          )}
         </table>
         </div>
       </div>
+      {closingGroup && typeof document !== 'undefined' && createPortal(
+        <CloseVendorModal po={po} group={closingGroup}
+                          owed={owedLinesOf(closingGroup)}
+                          links={view?.links_by_item || {}}
+                          onClose={() => setClosingGroup(null)}
+                          onClosed={() => { setClosingGroup(null); setReloadKey(k => k + 1); onChanged?.(); }} />,
+        document.body,
+      )}
     </td></tr>
+  );
+}
+
+/* ============================================================ */
+/* Close one vendor on an approved merged / multi-vendor PO     */
+/* ============================================================ */
+/**
+ * Ruling #69: store manager or admin may short-close ONE vendor, with a reason,
+ * so the rest of the PO can complete. POST /api/purchase-orders/<id>/close-vendor
+ * { vendor_id, reason } does the work and re-checks every rule server-side;
+ * this only shows what will happen first — which lines read "not delivered" and
+ * which departments were waiting on them — and requires the reason.
+ */
+function CloseVendorModal({ po, group, owed, links, onClose, onClosed }: {
+  po: PO; group: PoVendorGroup<POItem>; owed: POItem[];
+  links: Record<string, PoReqLink[]>;
+  onClose: () => void; onClosed: () => void;
+}) {
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const depts = [...new Set(owed.flatMap(it => (links[it.id] || []).map(l => l.department_name || '(no department)')))];
+  // 3 = the close-vendor route's own minimum; the UI must not refuse a reason
+  // the server would accept, nor the reverse.
+  const ok = reason.trim().length >= 3 && !!group.vendor_id && !busy;
+  const submit = async () => {
+    if (!ok) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/api/purchase-orders/${po.id}/close-vendor`, {
+        method: 'POST', body: { vendor_id: group.vendor_id, reason: reason.trim() },
+      });
+      const j = await r.json().catch(() => ({} as any));
+      if (!r.ok) { setErr(j.error || `Could not close the vendor (${r.status})`); return; }
+      onClosed();
+    } catch (e: any) {
+      setErr(e?.message || 'Could not close the vendor');
+    } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg my-8 shadow-xl">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+          <div>
+            <h2 className="font-bold text-[#2D1B0E]">Close {group.vendor_name} on {po.po_number}</h2>
+            <p className="text-xs text-[#8B7355] mt-0.5">
+              Use this when this vendor will not deliver the rest. The other vendors on the PO are not touched.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-[#8B7355]" aria-label="Close">✕</button>
+        </div>
+        <div className="p-5 space-y-3 text-xs">
+          <div>
+            <div className="font-semibold text-[#2D1B0E] mb-1">
+              {owed.length} line{owed.length === 1 ? '' : 's'} will be marked <span className="text-red-700">not delivered</span>:
+            </div>
+            <ul className="space-y-0.5 max-h-48 overflow-y-auto">
+              {owed.map(it => {
+                const u = (it as any).material_purchase_unit || it.material_unit || '';
+                return (
+                  <li key={it.id} className="flex justify-between gap-3">
+                    <span>{it.material_name}</span>
+                    <span className="font-mono">{qfmt(it.quantity)} {u} · {fmt(it.total_price)}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+          {depts.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-2 text-amber-900">
+              Departments waiting on these lines: <b>{depts.join(', ')}</b>. Their requisition lines stay open,
+              marked &ldquo;vendor closed — not delivered&rdquo;; the store can still issue them from stock as usual.
+            </div>
+          )}
+          <label className="block text-[#6B5744]">
+            Reason <span className="text-red-600">*</span>
+            <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3}
+                      placeholder="e.g. Vendor out of stock this week — buying locally instead"
+                      className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            <span className="text-[10px] text-[#8B7355]">At least 3 characters. Recorded with your name.</span>
+          </label>
+          {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2 text-red-700">{err}</div>}
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+          <button onClick={onClose} disabled={busy} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
+          <button onClick={submit} disabled={!ok}
+                  className="px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
+            {busy && <Loader2 className="w-4 h-4 animate-spin" />} Close this vendor
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -5017,6 +5460,31 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
       .then(setData).catch(e => setErr(e.message)).finally(() => setLoading(false));
   }, [poId]);
 
+  /* WHO EACH LINE GOES TO, AND WHO ASKED FOR IT (ruling #66: approve the whole
+     PO once, on a screen grouped by vendor with subtotals). approval-context
+     carries no line vendor, so the vendor comes from the PO's own lines and the
+     departments from the vendor-view route. Best-effort: if either read fails
+     the review renders exactly as before — ungrouped, no departments. */
+  const [lineInfo, setLineInfo] = useState<{
+    vendorById: Map<string, { vendor: string; vendor_id: string | null }>;
+    links: Record<string, PoReqLink[]>;
+  } | null>(null);
+  useEffect(() => {
+    let live = true;
+    Promise.all([
+      fetch(`/api/purchase-orders?id=${poId}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+      fetch(`/api/purchase-orders/vendor-view?id=${poId}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+    ]).then(([d, v]) => {
+      if (!live || !d?.purchase_order) return;
+      const vendorById = new Map<string, { vendor: string; vendor_id: string | null }>();
+      for (const it of (d.purchase_order.items || []) as any[]) {
+        vendorById.set(String(it.id), { vendor: String(it.vendor || ''), vendor_id: it.vendor_id ? String(it.vendor_id) : null });
+      }
+      setLineInfo({ vendorById, links: (v && v.links_by_item) || {} });
+    });
+    return () => { live = false; };
+  }, [poId]);
+
   /* THE CHANGE-SET MUST COME FROM THE SAME FETCH AS THE LINES IT ANNOTATES.
      `rc` (the prop) rides the LIST row and is as old as the last list load;
      `data.reapproval_changes` was computed by the approval-context request that
@@ -5080,7 +5548,7 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
               </tr>
             </thead>
             <tbody>
-              {data.items.map((it: any) => {
+              {(() => { const renderRow = (it: any) => {
                 // requested_qty is in PURCHASE units (10 kg) while current_stock and
                 // the usage columns are in RECIPE units (2,000 g) — they differ by
                 // pack_size, so they must not be labelled the same nor divided
@@ -5116,6 +5584,16 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
                     <td className="py-2 px-2">
                       <div className="font-medium text-[#2D1B0E]">{it.material_name}</div>
                       <div className="text-[10px] font-mono text-[#8B7355]">{it.material_sku}</div>
+                      {/* Who asked for it — purchase units first, the same
+                          basis as the Requested column beside it. */}
+                      {(lineInfo?.links[String(it.po_item_id)] || []).map(l => (
+                        <div key={l.id} className="text-[10px] text-[#6B5744] leading-tight">
+                          For {l.department_name || '(no department)'}
+                          {l.is_party && <span className="text-[#8B7355]"> · party{l.event_name ? `: ${l.event_name}` : ''}</span>}
+                          {l.qty_purchase != null && <span className="font-mono"> · {fmtQtyNum(Number(l.qty_purchase))} {poUnit}</span>}
+                          {l.req_number && <span className="font-mono text-[#8B7355]"> · {l.req_number}</span>}
+                        </div>
+                      ))}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {/* A LINE THAT IS NOT ON THE APPROVED PO AT ALL. Stated
@@ -5231,8 +5709,48 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
                     </td>
                   </tr>
                 );
-              })}
+              };
+              if (!lineInfo) return data.items.map(renderRow);
+              /* Grouped by the vendor each line is FILED under (the receive
+                 route's rule), with that vendor's ordered value — the approver
+                 signs the whole PO once, but sees exactly which supplier each
+                 rupee is going to. A single-vendor PO stays one flat list. */
+              const rows = (data.items as any[]).map(it => ({
+                ...it, id: String(it.po_item_id),
+                vendor: lineInfo.vendorById.get(String(it.po_item_id))?.vendor ?? '',
+                vendor_id: lineInfo.vendorById.get(String(it.po_item_id))?.vendor_id ?? null,
+                total_price: Number(it.requested_total) || 0,
+              }));
+              const vgroups = groupPoLinesByVendor(rows, data.po || {});
+              if (vgroups.length <= 1) return data.items.map(renderRow);
+              return vgroups.map(g => (
+                <Fragment key={'avg-' + g.key}>
+                  <tr className="border-t-2 border-amber-200 bg-amber-50/70">
+                    <td colSpan={7} className="py-1.5 px-2 text-[11px]">
+                      <Truck className="w-3.5 h-3.5 text-amber-800 inline-block align-[-3px] mr-1" />
+                      <span className="font-semibold text-[#2D1B0E]">{g.vendor_name}</span>
+                      <span className="text-[#6B5744]"> · {g.lines.length} line{g.lines.length === 1 ? '' : 's'} · subtotal </span>
+                      <span className="font-mono font-semibold text-[#2D1B0E]">{fmt(g.ordered_total)}</span>
+                    </td>
+                  </tr>
+                  {g.lines.map(renderRow)}
+                </Fragment>
+              ));
+              })()}
             </tbody>
+            {lineInfo && (() => {
+              const total = r2((data.items as any[]).reduce((s, it) => s + (Number(it.requested_total) || 0), 0));
+              const nV = new Set((data.items as any[]).map(it => vendorNameKey(lineInfo.vendorById.get(String(it.po_item_id))?.vendor || data.po?.vendor))).size;
+              return nV > 1 ? (
+                <tfoot>
+                  <tr className="border-t border-amber-200 bg-amber-50 text-[11px] font-semibold">
+                    <td colSpan={7} className="py-1.5 px-2 text-right">
+                      Total for approval — {nV} vendors: <span className="font-mono">{fmt(total)}</span>
+                    </td>
+                  </tr>
+                </tfoot>
+              ) : null;
+            })()}
           </table>
         </div>
 
@@ -5432,6 +5950,19 @@ function ApprovePOModal({ po, onClose, onApproved }: {
     fetch(`/api/purchase-orders/${po.id}/approval-context`)
       .then(r => r.json()).then(setCtx).finally(() => setLoading(false));
   }, [po.id]);
+  /* "Vendor: Mixed (3 vendors) · Total ₹…" names nobody. On a PO with several
+     vendors the signer is shown each vendor's ordered value (ruling #66),
+     from the PO's own lines; best-effort — absent, the header reads as before. */
+  const [vendorSubs, setVendorSubs] = useState<PoVendorGroup[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetch(`/api/purchase-orders?id=${po.id}`).then(r => (r.ok ? r.json() : null)).then(d => {
+      if (!live || !d?.purchase_order) return;
+      const gs = groupPoLinesByVendor(d.purchase_order.items || [], d.purchase_order);
+      setVendorSubs(gs.length > 1 ? gs : null);
+    }).catch(() => {});
+    return () => { live = false; };
+  }, [po.id]);
 
   const flagCount = ctx?.summary?.total_flags || 0;
   const requiresNote = flagCount > 0;
@@ -5470,6 +6001,16 @@ function ApprovePOModal({ po, onClose, onApproved }: {
                 <span className="text-amber-800 font-semibold"> (was {fmt(rc.total_before)})</span>
               )}
             </p>
+            {vendorSubs && (
+              <ul className="text-[11px] text-[#6B5744] mt-1 space-y-0.5">
+                {vendorSubs.map(g => (
+                  <li key={g.key} className="flex justify-between gap-4">
+                    <span>{g.vendor_name} <span className="text-[#8B7355]">({g.lines.length} line{g.lines.length === 1 ? '' : 's'})</span></span>
+                    <span className="font-mono">{fmt(g.ordered_total)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>

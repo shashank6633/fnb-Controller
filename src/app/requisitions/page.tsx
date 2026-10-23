@@ -26,6 +26,9 @@ import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
 import StaffCatalogPicker, { type DeptStockLite, type DeptStockProp } from './StaffCatalogPicker';
+// The ONE "Merge into one PO" modal (rulings #63-#70), owned by the store desk
+// and mounted here unchanged — same candidates, same merge route, same rules.
+import MergePoModal, { MergeLineBadge, hasMergeState, isDeliveredDirect, deliveredDirectDept, onOpenPo, type MergeLineFields } from '@/components/MergePoModal';
 
 const fmt = (v: number) => '₹' + (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 /** Quantity formatter — 3 dp, trailing zeros trimmed. Same as the sibling
@@ -609,6 +612,9 @@ export default function RequisitionsPage() {
     }).catch(() => {});
   }, []);
   const [importing, setImporting] = useState(false);
+  // "Merge into one PO" (ruling #65: store manager + admin — viewer.can_store is
+  // the server's canProcessAsStore, the same gate the merge route enforces).
+  const [merging, setMerging] = useState(false);
   const [viewer, setViewer] = useState<{ email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean }>({
     email: '', role: '', can_chef: false, can_mgmt: false, can_store: false, can_issue: false,
   });
@@ -727,11 +733,20 @@ export default function RequisitionsPage() {
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Department Requisitions</h1>
           <p className="text-xs text-[#8B7355]">Internal stock requests → HOD (Head of Department) → Store Manager → Vendor PO (admin approves) → Fulfilled.</p>
         </div>
-        <div className="flex gap-2 shrink-0">
+        {/* flex-wrap: an admin now sees THREE buttons here (Import, Merge,
+            Raise); on a phone they must wrap, not run off the clipped edge. */}
+        <div className="flex flex-wrap gap-2 max-w-full">
           {viewer.role === 'admin' && (
             <button onClick={() => setImporting(true)}
                     className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2 whitespace-nowrap">
               <Upload className="w-4 h-4" /> Import Recaho Transfers
+            </button>
+          )}
+          {viewer.can_store && (
+            <button onClick={() => setMerging(true)}
+                    title="Put the owed lines of many requisitions (all departments) on ONE draft PO — a vendor per item, one GRN per vendor bill"
+                    className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm flex items-center gap-2 whitespace-nowrap">
+              <ClipboardList className="w-4 h-4" /> Merge into one PO
             </button>
           )}
           <button onClick={() => setCreating(true)}
@@ -897,6 +912,9 @@ export default function RequisitionsPage() {
       })()}
       {importing && (
         <RecahoImportModal onClose={() => setImporting(false)} onCommitted={reload} />
+      )}
+      {merging && (
+        <MergePoModal onClose={() => setMerging(false)} onCreated={() => { reload(); }} />
       )}
     </div>
   );
@@ -1505,6 +1523,13 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '·'}</td>
                     <td className="py-1 px-2">
                       {it.material_name}
+                      {/* MERGED PO (rulings #63-#70): where this line stands on
+                          the PO buying it — on PO-x / arrived on GRN-y /
+                          delivered direct to <dept> / vendor closed. Absent on
+                          every line no PO has touched. */}
+                      {!rejected && hasMergeState(it as unknown as MergeLineFields) && (
+                        <div className="mt-0.5 no-underline"><MergeLineBadge line={it as unknown as MergeLineFields} pu={puLbl} /></div>
+                      )}
                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                     </td>
                     <td className="py-1 px-2 text-right font-mono">
@@ -2414,7 +2439,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // a blank box over a line the server fulfils (round-9 verifier,
       // v_c_int_liquor_held). The already-issued floor stays, as on every line.
       const flowBlocked = Number((it as any).central_flow_blocked || 0) > 0;
-      const issuable = isPartyReq ? partySeed
+      // DELIVERED DIRECT (ruling #68): a merged PO's Direct Issue rule sent this
+      // line's goods straight to the rule's department, so the central store
+      // never received them and does not issue them again (store-process
+      // refuses it, code 'delivered_direct'). Seeded at what the line already
+      // holds — this absolute route then moves nothing for it — and its box is
+      // locked below with the reason.
+      const deliveredDirect = isDeliveredDirect(it as unknown as MergeLineFields);
+      const issuable = deliveredDirect ? alreadyIssued
+        : isPartyReq ? partySeed
         : !stockKnown ? effective
         : flowBlocked ? Math.max(alreadyIssued, bookStock > 0 ? Math.min(effective, stockInReqUnits) : effective)
         : Math.max(alreadyIssued, Math.min(effective, alreadyIssued + Math.max(0, stockInReqUnits)));
@@ -2541,9 +2574,38 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         po_entry_unit: buyInPurchaseUnit ? purchaseUnit : (it.material_unit || ''),
         vendor: '',
         vendor_id: '',
+        /** Merged-PO state of this line (GET /api/requisitions?id= — on_po /
+         *  arrived / delivered direct / vendor closed), read by the badge and
+         *  by the tick guard below. Display + gating only; never posted. */
+        merge: {
+          on_po: (it as any).on_po ?? null,
+          arrived: (it as any).arrived ?? null,
+          arrived_partial: (it as any).arrived_partial ?? null,
+          delivered_direct: (it as any).delivered_direct ?? false,
+          delivered_direct_dept_name: (it as any).delivered_direct_dept_name ?? null,
+          vendor_closed: (it as any).vendor_closed ?? false,
+          vendor_closed_reason: (it as any).vendor_closed_reason ?? null,
+          also_on_po: Array.isArray((it as any).also_on_po) ? (it as any).also_on_po : [],
+        } as MergeLineFields & { on_po?: (MergeLineFields['on_po'] & { merged?: boolean; source?: string }) | null },
+        delivered_direct: deliveredDirect,
+        /** Still owed when the modal opened (not complete by the desk rule's
+         *  plain figures) — the tick guard counts only lines a tick PO's
+         *  cascade could strand. */
+        owed_at_open: !it.is_rejected && !Number((it as any).store_rejected || 0) && alreadyIssued + 1e-9 < effective,
       };
     })
   );
+  /* THE TICK GUARD, ON THE SCREEN (merged POs). A PO raised by "Also raise a
+     vendor PO" completes the WHOLE requisition when it arrives
+     (po-requisition-fulfil.ts), so a still-owed line of this requisition that
+     is on a live MERGED PO would be closed before its goods arrive there. The
+     server refuses that gesture (store-process, code 'merged_po_lines'); the
+     tick is locked here with the reason so the storekeeper is never sent into
+     the refusal. Empty on every requisition no merged PO touches. */
+  const mergedHeldLines = lines.filter(ln =>
+    ln.owed_at_open && onOpenPo(ln.merge)
+    && (ln.merge.on_po?.source === 'merge' || ln.merge.on_po?.merged === true));
+  const mergedHeldPos = [...new Set(mergedHeldLines.map(ln => String(ln.merge.on_po?.po_number || '')).filter(Boolean))];
   // Lines whose central BOOK balance is BELOW zero — a data-quality fact, kept
   // separate from "the store cannot cover this line" because the remedy is
   // different: a negative book means issues have outrun recorded purchases and
@@ -2686,6 +2748,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    * 6 BTL → 4,500 ml survives, but a 3-dp display figure in general does not).
    */
   const issuedOf = (ln: Line) => {
+    // Ruling #68: a delivered-direct line posts exactly what it already holds
+    // (its seed) whatever any chip wrote into the box — nothing new from central.
+    if (ln.delivered_direct) return ln.issued_seed;
     // Clamp HERE, not in onChange: a negative issue would hand stock backwards.
     const vPU = Math.max(0, Number(ln.issued_pu) || 0);
     return vPU === ln.U.toPU(ln.issued_seed) ? ln.issued_seed : ln.U.fromPU(vPU);
@@ -4157,8 +4222,24 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           )}
 
           {/* Opt-in: store manager decides whether to also raise a vendor PO. */}
-          <label className="flex items-start gap-2 text-xs cursor-pointer bg-blue-50 border border-blue-200 rounded p-2">
-            <input type="checkbox" checked={raisePo} onChange={e => setRaisePo(e.target.checked)}
+          {/* Locked while a still-owed line of this requisition is on a live
+              MERGED PO — see THE TICK GUARD above (mergedHeldLines). */}
+          {mergedHeldLines.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900">
+              <b>&quot;Also raise a vendor PO&quot; is not available on this requisition</b> —{' '}
+              {mergedHeldLines.map(ln => ln.material_name).join(', ')} {mergedHeldLines.length === 1 ? 'is' : 'are'} already
+              on merged {mergedHeldPos.join(', ')}. A PO raised here completes the WHOLE requisition when it arrives, which
+              would close {mergedHeldLines.length === 1 ? 'that line' : 'those lines'} before {mergedHeldLines.length === 1 ? 'its' : 'their'} goods
+              arrive on the merged PO. Issue what the store holds now; the merged lines are issued from Issue Requisitions
+              when they arrive, and anything else still to buy can go on a merged PO (&quot;Merge into one PO&quot;).
+            </div>
+          )}
+          <label className={mergedHeldLines.length > 0
+            ? 'flex items-start gap-2 text-xs cursor-not-allowed opacity-60 bg-blue-50 border border-blue-200 rounded p-2'
+            : 'flex items-start gap-2 text-xs cursor-pointer bg-blue-50 border border-blue-200 rounded p-2'}>
+            <input type="checkbox" checked={raisePo && mergedHeldLines.length === 0}
+                   disabled={mergedHeldLines.length > 0}
+                   onChange={e => setRaisePo(e.target.checked && mergedHeldLines.length === 0)}
                    className="mt-0.5" />
             <div>
               {/* "…for the shortfall" made a shortfall read as a PRECONDITION.
@@ -4337,6 +4418,19 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       : negStock ? 'bg-red-50/50' : ''}`}>
                       <td className="py-1.5 px-2 font-medium">
                         {ln.material_name}
+                        {/* MERGED PO — where this line stands on its PO (the
+                            store desk's own badge, same feed fields). */}
+                        {hasMergeState(ln.merge) && (
+                          <div className="mt-0.5 font-normal"><MergeLineBadge line={ln.merge} pu={U.pu} /></div>
+                        )}
+                        {ln.delivered_direct && (
+                          <div className="text-[9px] text-violet-800 font-normal mt-0.5">
+                            Not issued here — the vendor delivered it straight to{' '}
+                            {deliveredDirectDept(ln.merge) ? <b>{deliveredDirectDept(ln.merge)}</b> : 'a department'} under a Direct Issue
+                            rule, so the central store never received it. If this department still needs it, that department passes it on
+                            by department transfer; close the line from Issue Requisitions with Reject.
+                          </div>
+                        )}
                         {negStock && (
                           <div className="text-[9px] text-red-700 font-semibold">⚠ Store book balance — recount pending</div>
                         )}
@@ -4417,6 +4511,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             lost work. The cap is said, not enforced. */}
                         <input type="number" step="any" min={0}
                                value={ln.issued_pu}
+                               // Ruling #68: a delivered-direct line is never issued
+                               // from central — locked at what it already holds.
+                               disabled={ln.delivered_direct}
                                onChange={e => update(i, { issued_pu: e.target.value.replace(/^-/, '') })}
                                title={cap.armed
                                  ? (cap.sharedWith > 0

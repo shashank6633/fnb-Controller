@@ -5,6 +5,10 @@ import {
   planRequisitionUndoFromPo, reverseRequisitionFulfilFromPo,
   type RequisitionUndoPlan, type RequisitionUndoOutcome,
 } from './po-requisition-fulfil';
+// Short-closed vendors (ruling 69) and the merged-PO link flags (rulings 68/69).
+// Both are DERIVED from the ledger this void changes, so the void re-reads the
+// first and re-writes the second — see 4. below and the lib's header.
+import { closedPoItemIds, syncPoLinkFlags, type LinkFlagSync } from './po-link-lifecycle';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * VOIDING A PO-SOURCED RECEIPT — THE THREE RAILS THE STOCK REVERSAL DOES NOT
@@ -87,8 +91,14 @@ export interface PoVoidPlan {
   /** Does a SURVIVING receipt still claim every PO line this one claimed? */
   still_complete: boolean;
   /** The po_item_ids this void leaves with no live claim at all. Non-empty ⇒
-   *  the order is no longer complete and must reopen. */
+   *  the order is no longer complete and must reopen — unless every one of
+   *  them belongs to a SHORT-CLOSED vendor (see closed_orphan_po_item_ids). */
   orphaned_po_item_ids: string[];
+  /** The subset of orphaned_po_item_ids whose vendor was short-closed on this
+   *  PO (ruling 69). Those lines are not owed again — the vendor delivers
+   *  nothing more on this order — so they do not reopen it. Empty on every PO
+   *  that has never been short-closed, which keeps that path byte-identical. */
+  closed_orphan_po_item_ids: string[];
   /** Will this void take the order from 'received' back to 'approved'? */
   will_reopen: boolean;
   /** Deliveries on this order still sitting on a quality hold. While any does,
@@ -121,6 +131,9 @@ export interface PoVoidOutcome {
   bill_released: { id: string; vendor_name: string; bill_no: string; bill_date: string } | null;
   bill_matched_by: 'grn_id' | 'notes' | 'none';
   requisition: RequisitionUndoOutcome | null;
+  /** The merged-PO link flags re-derived after this void (null when the PO
+   *  carries no requisition links — every PO not built by the merge). */
+  requisition_links: LinkFlagSync | null;
   /** The verbatim po_vendor_bills row and PO fields, for the caller's audit
    *  snapshot — the released bill row has no other copy once it is deleted. */
   before: Record<string, unknown>;
@@ -260,7 +273,32 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
   const ledger = receivedPoItemIds(db, poId);
   const orphaned_po_item_ids = [...claimedPoItemIds(db, String(grn.id))]
     .filter(pid => !ledger.has(pid));
-  const still_complete = !!surviving && orphaned_po_item_ids.length === 0;
+
+  // ── A SHORT-CLOSED VENDOR'S LINE IS NOT OWED AGAIN (ruling 69) ────────────
+  // closedPoItemIds is read after the claim too, so a line this void un-claims
+  // already counts as closed when its vendor was closed: the vendor delivers
+  // nothing more on this order, so un-receiving their bill cannot put that line
+  // back on anyone's list. Only the orphans that are still OWED reopen the
+  // order. No closure on the PO ⇒ the set is empty ⇒ owed === orphaned and this
+  // is exactly the rule above, untouched.
+  const closedNow = closedPoItemIds(db, poId);
+  const closed_orphan_po_item_ids = orphaned_po_item_ids.filter(pid => closedNow.has(pid));
+  const owedOrphans = orphaned_po_item_ids.filter(pid => !closedNow.has(pid));
+
+  // THE ONE SHAPE THAT HAS NO HONEST STATUS, REFUSED. A received order whose
+  // other vendors were all short-closed, and this is its last standing receipt:
+  // after the void nothing is delivered and nothing is left to receive.
+  // 'received' would claim goods that are not there; 'approved' would be an
+  // open order nobody can ever receive against. Refusing is reversible; the
+  // goods can go back to the vendor as a return instead.
+  if (po.status === 'received' && !surviving && orphaned_po_item_ids.length > 0 && owedOrphans.length === 0) {
+    throw new GrnRefused(409,
+      `${grn.grn_number} is the last receipt standing on ${po.po_number}, and every vendor on that order — this bill's own vendor included — has been short-closed. Voiding it would leave an order with nothing delivered and nothing left to receive. Raise a vendor return for these goods instead. Nothing was changed.`,
+      { grn_number: grn.grn_number, po_number: po.po_number, closed_lines: closed_orphan_po_item_ids.length },
+      'po_closed_last_receipt');
+  }
+
+  const still_complete = !!surviving && owedOrphans.length === 0;
   const will_reopen = po.status === 'received' && !still_complete;
 
   // Held deliveries on this SAME order. Counted before the money below is
@@ -311,7 +349,7 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
 
   return {
     po, bill, bill_matched_by: matchedBy,
-    still_complete, orphaned_po_item_ids, will_reopen, held_siblings,
+    still_complete, orphaned_po_item_ids, closed_orphan_po_item_ids, will_reopen, held_siblings,
     surviving_grn_id: surviving?.id ? String(surviving.id) : null,
     surviving_grn_number: surviving?.grn_number ? String(surviving.grn_number) : null,
     ordered_total: r2(ordered_total),
@@ -409,6 +447,7 @@ export function applyPoReceiptVoid(
     bill_released: null,
     bill_matched_by: plan.bill_matched_by,
     requisition: null,
+    requisition_links: null,
     before: {
       purchase_order: {
         id: po.id, po_number: po.po_number, status: po.status,
@@ -496,6 +535,18 @@ export function applyPoReceiptVoid(
     plan: plan.requisition, actorEmail, poNumber: po.po_number, grnNumber,
   });
   out.requisition = undo.unfulfilled ? undo : null;
+
+  // ── 4. THE MERGED-PO LINK FLAGS ───────────────────────────────────────────
+  // A merged PO never takes rail 3 (requisition_id stays NULL); its requisition
+  // lines read their state from po_requisition_lines instead. Two of those
+  // flags are derived from the very ledger this void just changed:
+  // delivered_direct must come OFF a line whose Direct Issue goods this void
+  // took back out of the department (or the desk would refuse to issue goods
+  // nobody has), and vendor_closed comes ON for a closed vendor's line this
+  // void un-claimed. Inside the void's transaction, so the flags and the
+  // reversal commit together. A PO with no links returns at once.
+  const links = syncPoLinkFlags(db, po.id);
+  out.requisition_links = links.links > 0 ? links : null;
 
   return out;
 }

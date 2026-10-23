@@ -11,6 +11,16 @@
  *                  stays open and surfaces under the Deferred filter.
  *   - Undo     → clear actions on a line (mistakes happen).
  *
+ * MERGE INTO ONE PO (owner rulings #63-#70, 2026-10-23) — the header button and
+ * "Add to a merged PO" on a deferred line open the shared MergePoModal: owed
+ * lines from every department onto ONE draft PO, one vendor per item, many
+ * vendors per PO, a GRN per vendor bill under the same number. Store manager +
+ * admin only. It BUYS; it never issues. Each line then wears one badge from the
+ * feed — On PO-… / Arrived — GRN-… / Delivered direct — do not issue / Vendor
+ * closed — not delivered — and is issued from here as today once it arrives
+ * (#64). A delivered-direct line is the one exception: its goods went straight
+ * to a department, so it is never issued from central (#68).
+ *
  * UNDO IS OFFERED ON A FULFILLED REQUISITION TOO, and that is deliberate. The
  * requisition auto-advances to 'fulfilled' the instant the last line is
  * satisfied, so the ordinary mistake — the storekeeper issues the final line,
@@ -54,9 +64,17 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
-  Hourglass, Split,
+  Hourglass, Split, Merge,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+// MERGED PO (owner rulings #63-#70): the shared "Merge into one PO" modal and
+// the per-line badges it leaves behind (on a PO / arrived / delivered direct /
+// vendor closed). The modal never issues anything — its ticks are its own
+// state, never this desk's Issue Selected set.
+import MergePoModal, {
+  MergeLineBadge, isDeliveredDirect, deliveredDirectDept, onOpenPo, isVendorClosed, hasMergeState,
+  type MergeLineFields,
+} from '@/components/MergePoModal';
 import { fmtIST, fmtISTDate, fmtISTIsoDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import { packFactor, shownPurchaseQty, type PackMeta } from '@/lib/pack-units';
@@ -69,7 +87,15 @@ import {
 } from '@/lib/desk-rule';
 
 interface Department { id: string; name: string; }
-interface ReqLine {
+/* The merged-PO fields (MergeLineFields) ride on every line of the ?id= feed:
+ *   on_po            {po_id, po_number, vendor_name, status} — the PO it is on
+ *   arrived          {grn_number, at} — its department share was received
+ *   delivered_direct a Direct Issue rule sent the goods straight to a
+ *                    department (ruling #68) — never issued again from here
+ *   vendor_closed    the vendor was short-closed before delivering (ruling #69)
+ * All optional: a line that was never on a merged PO carries none of them and
+ * renders exactly as before. */
+interface ReqLine extends MergeLineFields {
   id: string;
   material_id: string;
   material_name: string;
@@ -1570,6 +1596,24 @@ export default function StoreRequisitionsPage() {
   const [logTo, setLogTo] = useState(todayStr);
   const [log, setLog] = useState<{ events: any[]; totals: any } | null>(null);
   const [logLoading, setLogLoading] = useState(false);
+  // MERGE INTO ONE PO — who may (ruling #65: store manager + admin, the same
+  // canProcessAsStore rule the merge route enforces), and the open modal with
+  // the lines it starts ticked ("Add to a merged PO" on a deferred line). Until
+  // the session answers, nobody may: the button stays hidden rather than
+  // flashing at someone the route would refuse.
+  const [canMerge, setCanMerge] = useState(false);
+  const [mergeOpen, setMergeOpen] = useState<{ preselect: string[] } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/me', { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(j => {
+        const u = j?.user;
+        if (!cancelled) setCanMerge(!!u && (u.role === 'admin' || !!u.is_store_manager));
+      })
+      .catch(() => { if (!cancelled) setCanMerge(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   // fetch wrapper that gives a useful error if the server returned HTML (login
   // redirect, 404, etc.) instead of JSON. Avoids the cryptic
@@ -1673,6 +1717,15 @@ export default function StoreRequisitionsPage() {
     batch: { id: string; material_name: string }[], fallback: string,
     reqId?: string,
   ): boolean => {
+    // DELIVERED DIRECT (ruling #68), refused by the route: this screen was
+    // opened before the merged PO's Direct Issue receipt, so it still offered
+    // the line. The server's sentence verbatim, then re-read the list so the
+    // row reads "Delivered direct" and loses its issue controls.
+    if (String(j?.code || '') === 'delivered_direct') {
+      alert(String(j?.error || '').trim() || fallback);
+      setRefreshKey(k => k + 1);
+      return true;
+    }
     const short = readCentralShort(j, batch);
     if (Object.keys(short).length > 0) {
       setCentralShort(s => ({ ...s, ...short }));
@@ -2140,6 +2193,15 @@ export default function StoreRequisitionsPage() {
      writes nothing, when the line has moved since (store-issue/route.ts). An
      ordinary Issue Now sends no such field and is exactly what it was. */
   const issueLine = async (req: Requisition, line: ReqLine, qtyOverride?: number, expectIssued?: number) => {
+    // Ruling #68 — a delivered-direct line is never issued from central. Its
+    // row offers no issue button; this stops any other path (a stale held
+    // panel's cap button) from posting one.
+    if (isDeliveredDirect(line)) {
+      alert(`${line.material_name} was delivered direct`
+        + `${deliveredDirectDept(line) ? ` to ${deliveredDirectDept(line)}` : ' to a department'} on its purchase order, `
+        + `so the central store does not issue it. Nothing was issued.`);
+      return;
+    }
     const outstanding = owedQty(line);
     // The box is in PURCHASE units; /store-issue adds the number to
     // quantity_issued verbatim, which lives in the LINE's own unit → convert
@@ -2563,14 +2625,36 @@ export default function StoreRequisitionsPage() {
         + goods + transfer
         + `\nGive a reason:`;
     })();
-    const ask = partyAsk != null ? partyAsk : s.issued > 0
+    /* A DELIVERED-DIRECT LINE (ruling #68) is closed here, not issued: the
+       vendor already delivered it straight to a department on its merged PO.
+       "The department will not get it" would be false there, so it gets its own
+       words (internal lines; a party line keeps the party prompt above, which
+       also says what the transfer will do). */
+    const directAsk = partyAsk == null && isDeliveredDirect(line)
+      ? `Close "${line.material_name}" without issuing?\n\n`
+        + `• It was delivered direct${deliveredDirectDept(line) ? ` to ${deliveredDirectDept(line)}` : ' to a department'}`
+        + `${line.on_po?.po_number ? ` on ${line.on_po.po_number}` : ''}, so the central store does not issue it.\n`
+        + (s.issued > 0 ? `• ${q(s.issued)} handed over earlier from the store STAYS issued.\n` : '')
+        + `• The remaining ${q(s.outstanding)} on this line is cancelled here — nothing moves from the store.\n\n`
+        + `Give a reason:`
+      : null;
+    const ask = partyAsk != null ? partyAsk : directAsk != null ? directAsk : s.issued > 0
       ? `Reject the balance of "${line.material_name}"?\n\n`
         + `• ${q(s.issued)} of ${q(s.effective)} has already been handed over — that STAYS issued, `
         + `and the goods stay with the department.\n`
         + `• The remaining ${q(s.outstanding)} is cancelled — the department will not get it.\n\n`
         + `Give a reason:`
       : `Reject "${line.material_name}"? Give a reason (the store cannot fulfil this line):`;
-    const reason = prompt(ask, '');
+    // A delivered-direct close is pre-worded with what actually happened —
+    // where the goods went, on which PO and bill — so the record every reader
+    // prints (this row, the issue log) says it, not a bare "Delivered direct".
+    // Editable like any reason; only a delivered-direct line is pre-filled.
+    const directFacts = isDeliveredDirect(line)
+      ? `Delivered direct${deliveredDirectDept(line) ? ` to ${deliveredDirectDept(line)}` : ''}`
+        + `${line.on_po?.po_number ? ` on ${line.on_po.po_number}` : ''}`
+        + `${line.delivered_direct_grn ? ` (${line.delivered_direct_grn})` : ''} — not issued from central`
+      : '';
+    const reason = prompt(ask, directFacts);
     if (reason === null) return;                       // cancelled
     const batch = [{ id: line.id, material_name: line.material_name }];
     setBusyLine(line.id);
@@ -2694,10 +2778,23 @@ export default function StoreRequisitionsPage() {
             Issue full or partial, or defer with a promised time. Every action is time-stamped and traceable per item.
           </p>
         </div>
-        <button onClick={refreshNow}
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-          <RefreshCw className="w-4 h-4" /> Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          {/* MERGE INTO ONE PO (rulings #63-#70) — every department's owed lines
+              into ONE draft PO, many vendors, a GRN per vendor bill under the
+              same number. Store manager + admin only (#65). It buys; it never
+              issues — the issue flow below is untouched (#64). */}
+          {canMerge && (
+            <button onClick={() => setMergeOpen({ preselect: [] })}
+                    title="Put owed requisition lines from every department on ONE draft purchase order — one vendor per item, many vendors on one PO"
+                    className="px-3 py-2 bg-[#af4408] hover:bg-[#8f3706] text-white rounded-lg text-sm flex items-center gap-2">
+              <Merge className="w-4 h-4" /> Merge into one PO
+            </button>
+          )}
+          <button onClick={refreshNow}
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <RefreshCw className="w-4 h-4" /> Refresh
+          </button>
+        </div>
       </div>
 
       {/* Status tabs */}
@@ -2816,7 +2913,9 @@ export default function StoreRequisitionsPage() {
                      onUndo={(line) => undoLine(req, line)}
                      onReject={(line) => rejectLine(req, line)}
                      onUnreject={(line) => unrejectLine(req, line)}
-                     onShowHistory={(line) => setShowHistoryFor(line.id)} />
+                     onShowHistory={(line) => setShowHistoryFor(line.id)}
+                     canMerge={canMerge}
+                     onAddToMergedPo={(line) => setMergeOpen({ preselect: [line.id] })} />
           ))}
         </div>
       )}
@@ -2836,6 +2935,16 @@ export default function StoreRequisitionsPage() {
           busy={issuingAll}
           onCancel={() => { if (!issuingAll) setConfirmIssueAll(null); }}
           onConfirm={() => issueAllOpen(confirmIssueAll)}
+        />
+      )}
+
+      {/* Merge into one PO — the shared modal. A created draft refreshes the
+          queue so each line picks up its "On PO-…" badge. */}
+      {mergeOpen && (
+        <MergePoModal
+          preselectReqItemIds={mergeOpen.preselect}
+          onClose={() => setMergeOpen(null)}
+          onCreated={() => setRefreshKey(k => k + 1)}
         />
       )}
     </div>
@@ -3241,6 +3350,10 @@ function openIssuableLines(req: Requisition): Array<ReqLine & { remaining: numbe
     // it is not "open". Un-reject it first if it should be issuable again.
     if (line.store_rejected) continue;
     if (line.deferred_until) continue;
+    // Delivered direct on a merged PO (ruling #68): the goods went straight to
+    // a department, the central store never held them — never in a batch
+    // issue. Every line no merged PO has touched passes exactly as before.
+    if (isDeliveredDirect(line)) continue;
     const remaining = owedQty(line);
     if (remaining > 0) out.push({ ...line, remaining });
   }
@@ -3587,6 +3700,10 @@ function ReqCard(props: {
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
   onShowHistory: (line: ReqLine) => void;
+  /** Store manager / admin — may put lines on a merged PO (ruling #65). */
+  canMerge?: boolean;
+  /** "Add to a merged PO" on a deferred line: opens the modal with it ticked. */
+  onAddToMergedPo?: (line: ReqLine) => void;
 }) {
   const { req, expanded, onToggle } = props;
   // Feature 3 — selection derived state. Open issuable lines are the only
@@ -3981,7 +4098,8 @@ function ReqCard(props: {
                          centralTake={takeFc?.takes[line.id]}
                          centralParty={takeFc?.party}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
-                         onShowHistory={props.onShowHistory} />
+                         onShowHistory={props.onShowHistory}
+                         canMerge={props.canMerge} onAddToMergedPo={props.onAddToMergedPo} />
                     ); })}
                   </Fragment>
                 ));
@@ -4039,6 +4157,8 @@ function LineRow(props: {
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
   onShowHistory: (line: ReqLine) => void;
+  canMerge?: boolean;
+  onAddToMergedPo?: (line: ReqLine) => void;
 }) {
   const { line, busy } = props;
   const eff = effectiveQty(line);
@@ -4151,7 +4271,18 @@ function LineRow(props: {
   // A line is selectable only when it's an open issuable line: not rejected by
   // chef or store, not deferred, and with a positive outstanding qty. Matches
   // openIssuableLines() so header select-all and per-line boxes stay in sync.
-  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0;
+  // DELIVERED DIRECT (ruling #68): the line's merged PO was received through a
+  // Direct Issue rule, so the goods went straight to the rule's department and
+  // the central store never held them. Not checkable, not in Issue All
+  // (openIssuableLines), and its issue controls are replaced by the reason.
+  const direct = isDeliveredDirect(line);
+  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0 && !direct;
+  // "Add to a merged PO" — offered on a deferred line that is still owed and
+  // is not already held by an open PO (the merge would refuse it). A vendor
+  // closed without delivering frees the line, so it is offered again.
+  const canAddToMerge = !!props.canMerge && !!props.onAddToMergedPo && !line.is_rejected && !line.store_rejected
+    && outstanding > 0 && !direct && (!onOpenPo(line) || isVendorClosed(line));
+  const hasMergeBadge = hasMergeState(line);
   return (
     <tr className={`border-t border-[#E8D5C4]/50 ${rowTone}`}>
       {props.selectable && (
@@ -4168,15 +4299,32 @@ function LineRow(props: {
       <td className="py-1.5 px-2 align-top">
         <div className="font-medium text-[#2D1B0E] flex items-center gap-1.5">
           {line.material_name}
-          {line.store_rejected ? (
+          {/* A delivered-direct line the store closed was not refused — the
+              vendor delivered it, to the Direct Issue rule's department — so it
+              is never labelled a rejection (ruling #68). */}
+          {line.store_rejected ? (direct ? (
+            <span className="text-[8px] px-1 py-0.5 rounded bg-violet-100 text-violet-800 border border-violet-300 font-semibold no-underline">
+              CLOSED — DELIVERED DIRECT
+            </span>
+          ) : (
             <span className="text-[8px] px-1 py-0.5 rounded bg-red-100 text-red-700 border border-red-300 font-semibold no-underline">
               STORE REJECTED
             </span>
-          ) : null}
+          )) : null}
         </div>
+        {/* MERGED PO — where this line stands on its PO, one badge, the most
+            decisive first: delivered direct > vendor closed > arrived > on PO.
+            Absent on every line no PO has touched. */}
+        {hasMergeBadge && (
+          <div className="mt-0.5">
+            <MergeLineBadge line={line} pu={u} at={(iso) => fmtISTDate(iso)} />
+          </div>
+        )}
         {line.store_rejected ? (
-          <div className="text-[10px] text-red-700 mt-0.5 flex flex-wrap items-center gap-1 no-underline">
-            <XCircle className="w-3 h-3" /> Rejected by store
+          <div className={`text-[10px] ${direct ? 'text-violet-800' : 'text-red-700'} mt-0.5 flex flex-wrap items-center gap-1 no-underline`}>
+            <XCircle className="w-3 h-3" /> {direct
+              ? <>Closed by store — delivered direct{deliveredDirectDept(line) ? <> to {deliveredDirectDept(line)}</> : null}, not issued from central</>
+              : 'Rejected by store'}
             {line.store_reject_reason && <span className="text-[#6B5744]">— {line.store_reject_reason}</span>}
             {/* WHAT THE REJECT ACTUALLY DID, when it did two things. Under the
                 Option-A reject a rejection cancels the OUTSTANDING balance and
@@ -4248,17 +4396,19 @@ function LineRow(props: {
                   </span>
                 )}
               </div>
-              {/* Raise Vendor PO — for a deferred line about to come due (or
-                  already past), the store manager can jump straight to the
-                  purchase-orders flow to buy the material instead of waiting.
-                  The PO create flow doesn't accept a material prefill, so we
-                  just link to /purchase-orders. */}
-              {(due.soon || due.overdue) && (
-                <a href="/purchase-orders"
-                   title="Raise a vendor purchase order for this material instead of issuing from store"
-                   className="inline-flex items-center gap-1 text-[10px] text-[#af4408] hover:underline font-medium">
-                  <Send className="w-3 h-3" /> Raise Vendor PO
-                </a>
+              {/* ADD TO A MERGED PO (replaces the bare "Raise Vendor PO" link,
+                  which carried no item, quantity or requisition and only
+                  appeared inside the 4-hour window). Opens the shared merge
+                  modal with THIS line ticked — the storekeeper can add the other
+                  departments' lines for the same buy there. Store manager +
+                  admin only (ruling #65); hidden while the line is already on an
+                  open PO, where its badge above says which. */}
+              {canAddToMerge && (
+                <button type="button" onClick={() => props.onAddToMergedPo!(line)}
+                        title="Open Merge into one PO with this line ticked — one draft PO for every department's owed lines, one vendor per item"
+                        className="inline-flex items-center gap-1 text-[10px] text-[#af4408] hover:underline font-medium">
+                  <Merge className="w-3 h-3" /> Add to a merged PO
+                </button>
               )}
             </div>
           );
@@ -4777,10 +4927,53 @@ function LineRow(props: {
         })()}
         {line.is_rejected ? (
           <span className="text-[10px] text-[#8B7355]">no action — rejected by chef</span>
+        ) : direct && outstanding > 0 ? (
+          /* DELIVERED DIRECT (ruling #68) — no Issue Now, no part-issue, no
+             defer: the goods never came through central, so issuing them from
+             here would hand the department the same item twice. The reason is
+             said where the buttons were. Reject stays — on an internal line it
+             cancels the balance and moves no stock; on a party line its own
+             prompt says what the party rejection and transfer will do — and so
+             does Undo for anything this desk did earlier. */
+          <div className="flex flex-col gap-1 max-w-[15rem] md:max-w-[22rem]">
+            <div className="rounded border border-violet-300 bg-violet-50 px-1.5 py-1 text-[10px] leading-snug text-violet-900">
+              <div className="font-semibold flex items-start gap-1">
+                <AlertCircle className="w-3 h-3 mt-[1px] shrink-0" />
+                <span>Delivered direct{deliveredDirectDept(line) ? <> to {deliveredDirectDept(line)}</> : null} — do not issue</span>
+              </div>
+              <div className="mt-0.5">
+                The vendor delivered this item straight to{' '}
+                {deliveredDirectDept(line) ? <b>{deliveredDirectDept(line)}</b> : 'a department'} under a Direct Issue
+                rule{line.on_po?.po_number ? <> on {line.on_po.po_number}</> : null}, so the central store never received
+                it and does not issue it. If {props.req.department_name || 'this department'} still needs it, the
+                department that received it passes it on by department transfer.
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-1">
+              <button onClick={() => props.onReject(line)} disabled={busy}
+                      title={isPartyLine
+                        ? 'Close this line without issuing it — the prompt says what a rejection does on a party requisition'
+                        : 'Close this line here without issuing anything — the balance is cancelled, no stock moves'}
+                      className="px-2 py-0.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
+                <XCircle className="w-3 h-3" /> Reject
+              </button>
+              {(issued > 0 || line.deferred_until) && (
+                <button onClick={() => props.onUndo(line)} disabled={busy}
+                        title={isPartyLine
+                          ? 'Clear all issue/defer actions on this line. On a party requisition this clears the record only — no stock moves, and anything the party transfer already moved stays with the department'
+                          : 'Clear all issue/defer actions on this line — the goods come back from the kitchen to the store'}
+                        className="px-1.5 py-0.5 bg-white border border-[#E8D5C4] text-[#8B7355] hover:bg-[#FFF1E3] rounded text-[10px] flex items-center gap-1">
+                  <RotateCcw className="w-3 h-3" /> undo
+                </button>
+              )}
+            </div>
+          </div>
         ) : line.store_rejected ? (
           // Store-rejected: only an un-reject action to put the line back in play.
           <button onClick={() => props.onUnreject(line)} disabled={busy}
-                  title="Clear the store rejection — the line becomes issuable again"
+                  title={direct
+                    ? 'Re-open the line — it stays delivered direct, so it is still not issued from central'
+                    : 'Clear the store rejection — the line becomes issuable again'}
                   className="px-2 py-0.5 bg-white border border-red-200 text-red-700 hover:bg-red-50 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
             {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
             Un-reject

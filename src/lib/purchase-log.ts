@@ -669,6 +669,9 @@ function goodsValueCaveatDetail(m: PurchaseLogSourceMoney): string {
  */
 function buildUnion(f: {
   from: string; to: string; vendor: string; materialId: string; source: PurchaseLogSourceFilter;
+  /** po_vendor_closures exists here (merged-PO short-close). Optional: a
+   *  database that has not booted that migration reads exactly as before. */
+  closures?: boolean;
 }): { sql: string; params: any[] } {
   const parts: string[] = [];
   const params: any[] = [];
@@ -765,7 +768,15 @@ function buildUnion(f: {
         ''                                                AS invoice_id,
         -- The GRN header carries the bill number on both writers; po_vendor_bills
         -- is the fallback for older PO receives that left invoice_number blank.
+        -- THIS GRN'S OWN bill row first (po_vendor_bills.grn_id, the hard link),
+        -- and only then the vendor's first bill on the PO: a vendor that
+        -- delivers one PO on two bills has two rows, and "the first one" named
+        -- the wrong bill for the second delivery. With one bill per vendor per
+        -- PO (every PO before the merged PO) both pick the same row.
         COALESCE(NULLIF(TRIM(g.invoice_number), ''),
+                 (SELECT TRIM(b.bill_no) FROM po_vendor_bills b
+                   WHERE b.grn_id = g.id
+                   ORDER BY b.created_at LIMIT 1),
                  (SELECT TRIM(b.bill_no) FROM po_vendor_bills b
                    WHERE b.po_id = g.po_id
                      AND LOWER(TRIM(b.vendor_name)) = LOWER(TRIM(COALESCE(g.vendor, '')))
@@ -844,6 +855,20 @@ function buildUnion(f: {
 
   // ── PO ────────────────────────────────────────────────────────────────────
   if (want('po')) {
+    // '' (nothing appended) unless the closures table exists AND this line's
+    // vendor was closed on this PO AND the line was never received.
+    const closedNote = f.closures
+      ? `COALESCE((SELECT ' · not delivered (vendor closed'
+                        || CASE WHEN TRIM(COALESCE(c.reason, '')) <> ''
+                                THEN ': ' || TRIM(c.reason) ELSE '' END || ')'
+                     FROM po_vendor_closures c
+                    WHERE c.po_id = po.id
+                      AND c.vendor_id = COALESCE(NULLIF(TRIM(poi.vendor_id), ''), po.vendor_id)
+                      AND NOT EXISTS (SELECT 1 FROM goods_receipt_note_items gi7
+                                        ${claimJoin({ grn: 'g7', item: 'gi7', poIdCol: 'po.id' })}
+                                       WHERE gi7.po_item_id = poi.id)
+                    ORDER BY c.closed_at DESC LIMIT 1), '')`
+      : `''`;
     parts.push(`
       SELECT
         'PO'                                              AS source,
@@ -853,7 +878,37 @@ function buildUnion(f: {
         po.date                                           AS date,
         po.po_number                                      AS doc_no,
         ''                                                AS invoice_id,
-        COALESCE((SELECT TRIM(b.bill_no) FROM po_vendor_bills b
+        -- THE BILL THIS ORDERED LINE ARRIVED ON — the bill of the SAME receipt
+        -- link_raw below names (same claimJoin, same ORDER BY g.date), so the
+        -- row cannot say "bill 1" while its link_key points at the receipt of
+        -- bill 2. That is exactly what the vendor's FIRST bill on the PO did
+        -- once one vendor delivered a (merged) PO on two bills.
+        --   claimed line   → that receipt's bill row (po_vendor_bills.grn_id),
+        --                    else its invoice_number, else the old answer;
+        --   unclaimed line on a PO that HAS claimed lines → '' (it has not
+        --                    arrived, so no bill carried it);
+        --   a PO with no claimed line at all → the old answer (the vendor's
+        --                    first bill row), which keeps a legacy receipt
+        --                    whose GRN lines never carried po_item_id reading
+        --                    as before.
+        -- A single-vendor PO received on one bill reads the same row either way.
+        COALESCE(
+          (SELECT COALESCE((SELECT TRIM(b4.bill_no) FROM po_vendor_bills b4
+                             WHERE b4.grn_id = g4.id
+                             ORDER BY b4.created_at LIMIT 1),
+                           NULLIF(TRIM(g4.invoice_number), ''))
+             FROM goods_receipt_note_items gi4
+             ${claimJoin({ grn: 'g4', item: 'gi4', poIdCol: 'po.id' })}
+            WHERE gi4.po_item_id = poi.id
+            ORDER BY g4.date LIMIT 1),
+          CASE WHEN EXISTS (SELECT 1 FROM goods_receipt_note_items gi5
+                              ${claimJoin({ grn: 'g5', item: 'gi5', poIdCol: 'po.id' })}
+                             WHERE gi5.po_item_id IS NOT NULL AND TRIM(gi5.po_item_id) <> '')
+               AND NOT EXISTS (SELECT 1 FROM goods_receipt_note_items gi6
+                                 ${claimJoin({ grn: 'g6', item: 'gi6', poIdCol: 'po.id' })}
+                                WHERE gi6.po_item_id = poi.id)
+               THEN '' END,
+          (SELECT TRIM(b.bill_no) FROM po_vendor_bills b
                    WHERE b.po_id = po.id
                      AND LOWER(TRIM(b.vendor_name)) =
                          LOWER(TRIM(COALESCE(NULLIF(TRIM(poi.vendor), ''), po.vendor, '')))
@@ -897,7 +952,12 @@ function buildUnion(f: {
         0                                                 AS is_mirror,
         -- Status is stamped in because a PO row is a COMMITMENT, and whether it
         -- is still pending or already received changes what the line means.
+        -- A vendor SHORT-CLOSED on a merged PO (po_vendor_closures) leaves its
+        -- undelivered lines here at their ordered value, exactly as a short
+        -- delivery's balance stays on the order today (owner's default, ruling
+        -- 70) — but the row must not read as a live commitment, so it says so.
         TRIM('PO ' || COALESCE(po.status, '')
+             || ${closedNote}
              || CASE WHEN TRIM(COALESCE(poi.notes, '')) <> ''
                      THEN ' · ' || TRIM(poi.notes) ELSE '' END) AS notes
       FROM purchase_order_items poi
@@ -937,7 +997,13 @@ export function getPurchaseLog(
       ? (rawSource as PurchaseLogSourceFilter)
       : 'all';
 
-  const { sql: union, params } = buildUnion({ from, to, vendor, materialId, source });
+  let closures = false;
+  try {
+    closures = !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'po_vendor_closures'`,
+    ).get();
+  } catch { closures = false; }
+  const { sql: union, params } = buildUnion({ from, to, vendor, materialId, source, closures });
 
   const empty: PurchaseLogTotals = {
     lines: 0, purchase_value: 0, po_value: 0, grn_value: 0,

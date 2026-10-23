@@ -700,12 +700,22 @@ export function pendingApprovals(db: DB) {
   //    /api/purchase-orders actions): draft | pending | pending_reapproval |
   //    approved | received | rejected | cancelled. "Awaiting approval" =
   //    submitted-but-undecided = pending / pending_reapproval.
+  //    A merged / multi-vendor PO's header is the label "Mixed (N vendors)"
+  //    with a NULL vendor_id; the vendors themselves are on its LINES, so they
+  //    are named after the label. A single-vendor header reads as before.
   const poAwaiting = db.prepare(`
-    SELECT po_number, COALESCE(NULLIF(TRIM(vendor),''),'(no vendor)') AS vendor,
-           date, status, ROUND(COALESCE(total_cost,0),2) AS total_cost
-    FROM purchase_orders
-    WHERE status IN ('pending','pending_reapproval')
-    ORDER BY date DESC, created_at DESC LIMIT 8
+    SELECT po.po_number,
+           CASE WHEN po.vendor_id IS NULL AND TRIM(COALESCE(po.vendor, '')) LIKE 'Mixed (%'
+                THEN TRIM(po.vendor) || COALESCE(': ' || (
+                       SELECT GROUP_CONCAT(n, ', ') FROM (
+                         SELECT DISTINCT TRIM(poi.vendor) AS n FROM purchase_order_items poi
+                          WHERE poi.po_id = po.id AND TRIM(COALESCE(poi.vendor, '')) <> ''
+                          ORDER BY 1)), '')
+                ELSE COALESCE(NULLIF(TRIM(po.vendor),''),'(no vendor)') END AS vendor,
+           po.date, po.status, ROUND(COALESCE(po.total_cost,0),2) AS total_cost
+    FROM purchase_orders po
+    WHERE po.status IN ('pending','pending_reapproval')
+    ORDER BY po.date DESC, po.created_at DESC LIMIT 8
   `).all() as any[];
 
   // 4. Guest-quiz links expiring within the next 3 days.

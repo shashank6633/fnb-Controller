@@ -161,6 +161,8 @@ interface BillRow {
   invoice_id: string;            // OURS   — PINV-yyyy-####
   bill_no: string;               // VENDOR — their own number, often ''
   grn_id: string;                // the GRN behind a PO receive, '' otherwise
+  grn_number?: string;           // that GRN's own number (GRN-yyyy-####), '' when none
+  po_number?: string;            // the PO that GRN was received against, '' when none
   bill_no_missing: boolean;
   /** PROVENANCE: this bill's charges were read off its GRN line. Not "missing". */
   tax_on_grn: boolean;
@@ -726,6 +728,8 @@ export default function PurchaseBillSummaryPage() {
       (r.bill_no || '').toLowerCase().includes(q) ||
       (r.invoice_id || '').toLowerCase().includes(q) ||
       (r.grn_id || '').toLowerCase().includes(q) ||
+      (r.grn_number || '').toLowerCase().includes(q) ||
+      (r.po_number || '').toLowerCase().includes(q) ||
       (r.vendor || '').toLowerCase().includes(q));
   }, [allRows, search]);
 
@@ -1326,8 +1330,19 @@ export default function PurchaseBillSummaryPage() {
                           against another screen, and the title carries the whole
                           thing for anyone who needs to copy it. */}
                       <td className="py-2 px-3 text-[#6B5744]">
+                        {/* With the GRN's own number known, print it — and the
+                            PO it was received against, which is what groups a
+                            merged PO's one-GRN-per-vendor bills back together.
+                            The truncated id stays as the fallback for a GRN row
+                            that is gone. */}
                         {r.invoice_id
-                          || (r.grn_id
+                          || (r.grn_id && r.grn_number
+                            ? <span title={`This bill came from a PO receive, not a hand entry.${r.po_number ? ` Received against ${r.po_number}.` : ''} GRN id: ${r.grn_id}`}
+                              className="text-[11px] font-mono text-[#8B7355]">
+                                {r.grn_number}
+                                {r.po_number && <span className="block">{r.po_number}</span>}
+                              </span>
+                            : r.grn_id
                             ? <span title={`GRN id — this bill came from a PO receive, not a hand entry. Full id: ${r.grn_id}`}
                               className="text-[11px] font-mono text-[#8B7355]">GRN {r.grn_id.slice(0, 8)}…</span>
                             : '—')}

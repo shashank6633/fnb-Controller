@@ -964,6 +964,11 @@ interface IssueLogSchema {
   /** department_material_transactions carries txn_date (the movement-record
    *  columns), the business date both legs of a transfer are stamped with. */
   txnDate: boolean;
+  /** po_requisition_lines exists (the merged-PO link table: one PO line → many
+   *  requisition lines, one per department). Optional like the rest: without
+   *  it a requisition line's PO is found through purchase_order_items.req_item_id
+   *  alone, exactly as before the merged PO. */
+  poReqLinks: boolean;
 }
 
 function probeSchema(db: DatabaseT.Database): IssueLogSchema {
@@ -1015,10 +1020,15 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
     const cols = db.prepare('PRAGMA table_info(requisition_issue_ledger)').all() as Array<{ name: string }>;
     ledgerShelfMark = cols.some(c => String(c.name) === 'shelf_mark');
   } catch { ledgerShelfMark = false; }
+  let poReqLinks = false;
+  if (has('po_requisition_lines')) {
+    const c = colsOf('po_requisition_lines');
+    poReqLinks = c.has('po_id') && c.has('req_item_id');
+  }
   return {
     deptLedger, deptTrace, skips: has('consumption_skips'), shelfMark, ledgerShelfMark,
     returns: has('material_returns'),
-    transfers, transferDocs, txnDate,
+    transfers, transferDocs, txnDate, poReqLinks,
   };
 }
 
@@ -1207,6 +1217,26 @@ function buildUnion(f: {
   // ── REQUISITION ───────────────────────────────────────────────────────────
   if (want('requisition', reqChain)) {
     stages.push('REQUISITION');
+    // '' (no argument) unless the merged-PO link table exists here. TWO
+    // arguments, on either side of production's req_item_id lookup:
+    //   mergedPoLive — a LIVE merged PO (not cancelled/rejected), newest first.
+    //     Read before the lookup so every department's line names its merged PO.
+    //   mergedPoDead — a cancelled/rejected merged PO, read only AFTER the
+    //     lookup has found nothing. A dead merged PO must never outrank a live
+    //     PO the lookup finds: once the merged PO is cancelled its line is
+    //     released, and the tick may raise the PO that now really buys it
+    //     (measured: REQ-PC-1 named cancelled PO-2026-0025 while the line sat on
+    //     live PO-2026-0026, which production named). With no other PO the dead
+    //     one is still named, as production names a cancelled tick PO.
+    const mergedPoSql = (live: boolean) => `(SELECT po3.po_number
+            FROM po_requisition_lines prl
+            JOIN purchase_orders po3 ON po3.id = prl.po_id
+           WHERE prl.req_item_id = ri.id
+             AND COALESCE(po3.status, '') ${live ? 'NOT IN' : 'IN'} ('cancelled', 'rejected')
+           ORDER BY po3.date DESC, po3.created_at DESC
+           LIMIT 1), `;
+    const mergedPoLive = f.schema.poReqLinks ? mergedPoSql(true) : '';
+    const mergedPoDead = f.schema.poReqLinks ? mergedPoSql(false) : '';
     parts.push(`
       SELECT
         'REQUISITION'                                     AS stage,
@@ -1223,11 +1253,19 @@ function buildUnion(f: {
         -- KNOWN LIMIT: mergeDuplicateLines() folds two requisition lines for one
         -- material into a single PO line keeping the first line's fields, so on
         -- that path the PO names the FIRST line. The joined notes carry both.
-        COALESCE((SELECT po2.po_number
+        -- THE MERGED PO answers it properly: po_requisition_lines carries one
+        -- row per REQUISITION LINE (per department) under the one PO line, so
+        -- every department's line names its merged PO — not only the first.
+        -- Read FIRST when it exists; a line with no link row (every line before
+        -- the merged PO, and the per-requisition "Also raise a vendor PO" tick)
+        -- falls through to the req_item_id lookup exactly as before. A live
+        -- merged PO outranks the lookup; a cancelled/rejected one only fills in
+        -- after it (see mergedPoSql above).
+        COALESCE(${mergedPoLive}(SELECT po2.po_number
                     FROM purchase_order_items poi2
                     JOIN purchase_orders po2 ON po2.id = poi2.po_id
                    WHERE poi2.req_item_id = ri.id
-                   ORDER BY po2.date LIMIT 1), '')        AS ref_no,
+                   ORDER BY po2.date LIMIT 1), ${mergedPoDead}'')        AS ref_no,
         COALESCE(ri.material_id, '')                      AS material_id,
         COALESCE(rm.name, '(unknown item)')               AS material,
         COALESCE(rm.sku, '')                              AS sku,

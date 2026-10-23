@@ -1,8 +1,8 @@
-import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
+import { getDb, generateId, updateMaterialPrice, logAuditEvent } from '@/lib/db';
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
-import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError } from '@/lib/po-helpers';
+import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError, nextPoNumber } from '@/lib/po-helpers';
 import { vendorMappingError, vendorResolver, resolveVendorRef, headerVendorFromLines } from '@/lib/vendor-mapping';
 // THE definition of the figure, and THE writer of the frozen copy. Both are
 // imported, never restated here: if this route computed "in-hand stock" itself
@@ -28,6 +28,10 @@ import {
 // rule); attached only to pending_reapproval rows, so the cost is bounded by
 // how many POs are in that state at once (a handful).
 import { poReapprovalChanges } from '@/lib/po-diff';
+// MERGED-PO LINKS SURVIVE A LINE REWRITE. PUT deletes and re-inserts every
+// line, and po_requisition_lines.po_item_id cascades with the old line — see
+// that module's header.
+import { captureRequisitionLinks, restoreRequisitionLinks, type RestoredLinks } from '@/lib/po-link-lifecycle';
 
 /** A receipt row after the fold below has priced it and tied it to its vendor
  *  bill. Named so the fold is NOT laundered through `any[]`: receivedNet()
@@ -66,16 +70,9 @@ function storeBlockedError(db: ReturnType<typeof getDb>, items: any[]): string |
 // @/lib/po-helpers (route modules may only export HTTP handlers, so the
 // helpers shared with the [id]/* action routes cannot be re-exported here).
 
-function nextPoNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
-  const year = isoDate.slice(0, 4);
-  const lastRow = db.prepare(`
-    SELECT po_number FROM purchase_orders
-    WHERE po_number LIKE 'PO-' || ? || '-%'
-    ORDER BY po_number DESC LIMIT 1
-  `).get(year) as any;
-  const last = lastRow?.po_number ? parseInt(lastRow.po_number.split('-').pop() || '0', 10) : 0;
-  return `PO-${year}-${String(last + 1).padStart(4, '0')}`;
-}
+// The PO number comes from THE one shared nextPoNumber() in @/lib/po-helpers
+// (imported above) and is minted INSIDE the create transaction — this file's
+// own copy, minted before two awaits, is gone. See that function's header.
 
 /**
  * Per-line sanity gate for PO items.
@@ -591,7 +588,9 @@ export async function POST(request: Request) {
     const resolvedVendorName: string = hdr.status === 'known' ? hdr.name : (vendor || '');
 
     const id = generateId();
-    const poNumber = nextPoNumber(db, isoDate);
+    // The number is minted INSIDE the transaction below, not here: two awaits
+    // follow, and a number taken before them could be taken by a second create
+    // in that gap — the second then died with a 500 on po_number UNIQUE.
     const actor = await effectiveActor();
     const outletId = await getCurrentOutletId();
 
@@ -618,6 +617,7 @@ export async function POST(request: Request) {
     const stockAtRaise = stockOnHandBulk(db, items.map((it: any) => String(it?.material_id || '').trim()));
 
     const txn = db.transaction(() => {
+      const poNumber = nextPoNumber(db, isoDate);
       db.prepare(`
         INSERT INTO purchase_orders (id, po_number, date, delivery_date, vendor_id, vendor, status, notes, drafted_by, outlet_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, datetime('now'), datetime('now'))
@@ -778,6 +778,12 @@ export async function PUT(request: Request) {
       stockAtRaise = stockOnHandBulk(db, items.map((it: any) => String(it?.material_id || '').trim()));
     }
 
+    // Hoisted so the response and the audit row below can say what happened to
+    // the requisition links a merged draft carries. Stays null on a header-only
+    // edit, which rewrites no line.
+    // (`as`, not an annotation: it is assigned inside the transaction callback,
+    // and an annotated `= null` would be narrowed to null for the code below.)
+    let links = null as RestoredLinks | null;
     const txn = db.transaction(() => {
       db.prepare(`
         UPDATE purchase_orders SET
@@ -794,6 +800,9 @@ export async function PUT(request: Request) {
              resolvedVendorId ?? null, resolvedVendorName ?? null, notes ?? null, id);
 
       if (Array.isArray(items)) {
+        // READ THE LINKS FIRST — the DELETE below cascades them away with the
+        // old line ids. Written back by material after the re-insert.
+        const captured = captureRequisitionLinks(db, id);
         db.prepare('DELETE FROM purchase_order_items WHERE po_id = ?').run(id);
         const ins = db.prepare(`
           INSERT INTO purchase_order_items (id, po_id, material_id, quantity, unit_price, total_price, vendor, vendor_id, notes)
@@ -828,14 +837,36 @@ export async function PUT(request: Request) {
             source: 'po_edit_add',
             precomputed: stockAtRaise ?? undefined,
           });
+        // Every link whose material is still on the PO follows it to its new
+        // line id; a material this edit removed drops its links, which frees
+        // those requisition lines to be ordered again. A PO with no links (every
+        // PO not built by the merge) passes through untouched.
+        links = restoreRequisitionLinks(db, id, captured);
         recalcTotal(db, id);
         deriveHeaderVendor(db, id);
       }
     });
     txn();
 
+    // A dropped link un-orders a department's requisition line, so it leaves a
+    // trace (best-effort, like every PO audit row).
+    if (links && links.dropped.length > 0) {
+      logAuditEvent(db, {
+        event_type: 'po.links_dropped', entity_type: 'purchase_order', entity_id: String(id),
+        actor_email: lineActor || await effectiveActor(),
+        before: { links: links.dropped },
+        after: { kept: links.kept, dropped: links.dropped.length },
+        note: `${links.dropped.length} requisition line(s) taken off the draft with their item — free to be ordered again`,
+      });
+    }
+
     const fresh = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(id);
-    return Response.json({ purchase_order: fresh });
+    return Response.json({
+      purchase_order: fresh,
+      ...(links && (links.kept > 0 || links.dropped.length > 0)
+        ? { requisition_links: { kept: links.kept, dropped: links.dropped.length } }
+        : {}),
+    });
   } catch (error: any) {
     console.error('[/api/purchase-orders PUT]', error);
     return Response.json({ error: error.message }, { status: 500 });

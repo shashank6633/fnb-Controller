@@ -241,7 +241,7 @@ const csvCell = (v: any): string => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-/** The Inward Register column order. THE SAME 29 HEADINGS, IN THE SAME ORDER,
+/** The Inward Register column order. THE SAME 30 HEADINGS, IN THE SAME ORDER,
  *  as the client-side bulk export at src/app/grn/page.tsx — keep the two in
  *  step: two "inward register" files that disagree about column order are worse
  *  than one. COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS (the
@@ -273,11 +273,16 @@ const csvCell = (v: any): string => {
  *  /reports/purchases, /reports/purchase-bill-summary and the purchase log use,
  *  so a figure on this file and the same figure on those reports cannot round
  *  differently. Kept byte-identical to the /grn page's own bulk export. */
+/*  PO NO. IS THE 30TH, APPENDED for the same reason as the three before it. BILL
+ *  TYPE says a row is AGAINST PO but not WHICH order, and a merged PO arrives as
+ *  one GRN per vendor bill under ONE PO number — so without this column the
+ *  several GRNs of one order could not be grouped back to it in the file the
+ *  owner reconciles. Blank on a DIRECT bill (it has no order). */
 const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
   'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
   'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
   'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
-  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER, 'PO NO.'];
 
 /* ── TAX % APPLIED IS STRUCK ON THE ACCEPTED VALUE (owner's ruling, 2026-10-14) ──
  *  Every GST writer charges the tax on ACCEPTED qty × rate − discount: POST
@@ -327,6 +332,8 @@ const registerRow = (r: any) => [
   // percentage is '' (never 0) when no GST was recorded on the line.
   taxCsvNumber(gstValue(r)),
   taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
+  // The 30th: the order this GRN was received against ('' on a DIRECT bill).
+  r.po_number ?? '',
 ];
 
 /* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
@@ -568,10 +575,15 @@ export async function GET(request: Request) {
                -- Not a column of the file: the base Tax % Applied (the 29th)
                -- divides by. Shipped on the JSON row so the page's own export
                -- prints the same rate this file does (see GST_GOODS_VALUE_SQL).
-               ${GST_GOODS_VALUE_SQL} AS gst_goods_value
+               ${GST_GOODS_VALUE_SQL} AS gst_goods_value,
+               -- The 30th register column (PO NO.). LEFT JOIN: a DIRECT bill
+               -- has no order and still lists; one row per GRN line either way
+               -- (po.id is the primary key), so no line is doubled.
+               COALESCE(po.po_number, '') AS po_number
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
         JOIN raw_materials       rm ON rm.id = gi.material_id
+        LEFT JOIN purchase_orders po ON po.id = g.po_id
         WHERE ${rw.join(' AND ')}
         ORDER BY g.date DESC, g.grn_number, rm.name
       `).all(...rp) as any[];
@@ -627,6 +639,14 @@ export async function GET(request: Request) {
     const rows = db.prepare(`
       SELECT g.*,
              po.po_number AS po_number,
+             -- How many live (non-void) vendor bills this GRN's ORDER was
+             -- delivered on. A merged PO is received one GRN per vendor bill
+             -- under ONE PO number, so the list shows the same PO number on
+             -- several rows; this lets the row say why. 0 on a DIRECT bill.
+             CASE WHEN g.po_id IS NOT NULL AND TRIM(g.po_id) <> ''
+                  THEN (SELECT COUNT(*) FROM goods_receipt_notes g3
+                         WHERE g3.po_id = g.po_id AND COALESCE(g3.status, '') <> 'void')
+                  ELSE 0 END                                                                            AS po_bill_count,
              (SELECT COUNT(*)        FROM goods_receipt_note_items WHERE grn_id = g.id)                    AS line_count,
              (SELECT SUM(quantity_rejected) FROM goods_receipt_note_items WHERE grn_id = g.id)             AS total_rejected,
              -- total_rejected sums the rejected qty of EVERY line, and GRN qtys are

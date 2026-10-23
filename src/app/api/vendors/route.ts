@@ -6,6 +6,7 @@ import {
   VENDOR_APPROVALS, isVendorApproval, vendorApprovalLabel, vendorRegisterReady,
   stripVendorRegister, supplierLicencesByVendor, shapeRegisterRow,
 } from './fssai-register';
+import { splitPoVendorStats } from '@/lib/vendor-po-stats';
 
 /* THE APPROVED-VENDOR REGISTER rides on this route (Hyderabad audit checklist:
  * "Approved vendor list maintained"):
@@ -34,16 +35,52 @@ export async function GET(request: Request) {
     const params = search ? [`%${search}%`] : [];
 
     if (includeStats) {
+      // PO count / Lifetime ₹ follow the LINE vendors (src/lib/vendor-po-stats.ts).
+      // A PO whose lines are all its header's vendor — every single-vendor PO —
+      // stays on the header query below, so its figures are exactly what they
+      // were. A merged / mixed PO (header "Mixed (N vendors)", vendor_id NULL)
+      // used to count for NO vendor; a drifted header credited one vendor with
+      // another's lines. Those "split" POs are taken out of the header query and
+      // each line vendor is credited its own share instead.
+      const split = splitPoVendorStats(db);
+      if (split.splitPoIds.length === 0) {
+        const rows = db.prepare(`
+          SELECT v.*,
+                 (SELECT COUNT(*) FROM purchase_orders po WHERE po.vendor_id = v.id) AS po_count,
+                 (SELECT COALESCE(SUM(total_cost), 0) FROM purchase_orders po
+                  WHERE po.vendor_id = v.id AND po.status IN ('approved', 'received')) AS lifetime_spend,
+                 (SELECT MAX(date) FROM purchase_orders po WHERE po.vendor_id = v.id AND po.status = 'received') AS last_received
+          FROM vendors v
+          ${where}
+          ORDER BY v.name ASC
+        `).all(...params);
+        return Response.json({ vendors: rows.map(stripVendorRegister) });
+      }
+      const notSplit = `AND po.id NOT IN (SELECT value FROM json_each(?))`;
+      const ids = JSON.stringify(split.splitPoIds);
       const rows = db.prepare(`
         SELECT v.*,
-               (SELECT COUNT(*) FROM purchase_orders po WHERE po.vendor_id = v.id) AS po_count,
+               (SELECT COUNT(*) FROM purchase_orders po WHERE po.vendor_id = v.id ${notSplit}) AS po_count,
                (SELECT COALESCE(SUM(total_cost), 0) FROM purchase_orders po
-                WHERE po.vendor_id = v.id AND po.status IN ('approved', 'received')) AS lifetime_spend,
-               (SELECT MAX(date) FROM purchase_orders po WHERE po.vendor_id = v.id AND po.status = 'received') AS last_received
+                WHERE po.vendor_id = v.id AND po.status IN ('approved', 'received') ${notSplit}) AS lifetime_spend,
+               (SELECT MAX(date) FROM purchase_orders po WHERE po.vendor_id = v.id AND po.status = 'received' ${notSplit}) AS last_received
         FROM vendors v
         ${where}
         ORDER BY v.name ASC
-      `).all(...params);
+      `).all(ids, ids, ids, ...params) as any[];
+      for (const r of rows) {
+        const share = split.byVendor.get(String(r.id));
+        if (!share) continue;
+        r.po_count = (Number(r.po_count) || 0) + share.po_count;
+        // Rounded only when a share is actually added, so a vendor whose split
+        // POs carry no spend (draft, pending) keeps the header sum as SQL gave it.
+        if (share.lifetime_spend !== 0) {
+          r.lifetime_spend = Math.round(((Number(r.lifetime_spend) || 0) + share.lifetime_spend) * 100) / 100;
+        }
+        if (share.last_received && (!r.last_received || share.last_received > String(r.last_received))) {
+          r.last_received = share.last_received;
+        }
+      }
       return Response.json({ vendors: rows.map(stripVendorRegister) });
     }
 

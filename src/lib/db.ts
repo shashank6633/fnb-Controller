@@ -1518,6 +1518,90 @@ function initializeSchema(db: Database.Database) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_poi_req_item ON purchase_order_items(req_item_id)`);
   } catch (e) { console.error('po_items.req_item_id migration failed:', e); }
 
+  // ── MERGED PO (owner rulings #63-#70, 2026-10-23) — ADDITIVE ONLY ─────────
+  // ONE master PO built from many requisitions (every department, internal AND
+  // party), many vendors (vendor per line), a GRN per vendor bill under the
+  // SAME PO number. Three additions, nothing existing is altered:
+  //
+  // 1. purchase_orders.merged — 1 = built by POST /api/purchase-orders/merge.
+  //    A merged PO leaves purchase_orders.requisition_id NULL ON PURPOSE:
+  //    receive / kitchen QC / void each act on ONE requisition through that
+  //    column (fulfilRequisitionFromPo, grn-qc, po-void), so stamping it would
+  //    fulfil one requisition and strand every other one on the PO. The link
+  //    table below is the only requisition link a merged PO carries.
+  //
+  // 2. po_requisition_lines — one PO line (one material) -> MANY requisition
+  //    lines, one row per requisition line, carrying that department's share.
+  //      qty_purchase  the share in PURCHASE units (what the PO line counts in)
+  //      qty_line      the same share in the requisition line's own unit
+  //                    (line_unit), exactly as the department asked
+  //      is_party      requisitions.purpose = 'party' at merge time
+  //      delivered_direct  1 = a Direct Issue rule sent the goods straight to
+  //                    the rule's department (ruling #68): this line must not be
+  //                    issued again from central
+  //      vendor_closed 1 = the vendor was short-closed on this PO (ruling #69)
+  //                    before this line was delivered
+  //    "Arrived" is NOT stored: it is derived from the live receipt ledger
+  //    (po-receipts.ts, VALUE predicate) covering the link rows in creation
+  //    order (created_at, then rowid), so a voided or QC-held bill can never
+  //    leave a line reading "arrived".
+  //    po_item_id CASCADES with its PO line: any writer that deletes and
+  //    re-inserts purchase_order_items (PUT on a draft, edit-approved) must
+  //    carry these rows across itself, or the links go with the old lines.
+  //    requisition_id / req_item_id are soft links (no FK), like
+  //    purchase_order_items.req_item_id: requisitions are never deleted once
+  //    they reach the store, and a reset wipes both sides together.
+  //
+  // 3. po_vendor_closures — one row per vendor short-closed on a PO (ruling
+  //    #69: store manager or admin, with a reason). A closed vendor's
+  //    undelivered lines read "not delivered"; the PO completes when every
+  //    vendor is received or closed. vendor_name rides along (receive files
+  //    lines under the vendor NAME), defaulting to '' for writers that only
+  //    know the id.
+  //
+  // One statement per prepare().run() — the same DDL a multi-statement exec
+  // would run, statement by statement, inside this one try.
+  try {
+    const poCols = db.prepare("PRAGMA table_info(purchase_orders)").all() as any[];
+    if (poCols.length > 0 && !poCols.some((c: any) => c.name === 'merged')) {
+      db.prepare(`ALTER TABLE purchase_orders ADD COLUMN merged INTEGER NOT NULL DEFAULT 0`).run();
+    }
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS po_requisition_lines (
+        id               TEXT PRIMARY KEY,
+        po_id            TEXT NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+        po_item_id       TEXT NOT NULL REFERENCES purchase_order_items(id) ON DELETE CASCADE,
+        requisition_id   TEXT NOT NULL,
+        req_item_id      TEXT NOT NULL,
+        department_id    TEXT,
+        qty_purchase     REAL NOT NULL DEFAULT 0,
+        qty_line         REAL NOT NULL DEFAULT 0,
+        line_unit        TEXT NOT NULL DEFAULT '',
+        is_party         INTEGER NOT NULL DEFAULT 0,
+        delivered_direct INTEGER NOT NULL DEFAULT 0,
+        vendor_closed    INTEGER NOT NULL DEFAULT 0,
+        created_by       TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_prl_po       ON po_requisition_lines(po_id)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_prl_po_item  ON po_requisition_lines(po_item_id)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_prl_req      ON po_requisition_lines(requisition_id)`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_prl_req_item ON po_requisition_lines(req_item_id)`).run();
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS po_vendor_closures (
+        id          TEXT PRIMARY KEY,
+        po_id       TEXT NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+        vendor_id   TEXT,
+        vendor_name TEXT NOT NULL DEFAULT '',
+        reason      TEXT NOT NULL DEFAULT '',
+        closed_by   TEXT NOT NULL DEFAULT '',
+        closed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_po_vendor_closures_po ON po_vendor_closures(po_id)`).run();
+  } catch (e) { console.error('merged-PO schema (po_requisition_lines / po_vendor_closures / purchase_orders.merged) failed:', e); }
+
   // Settings: current_role (manager | admin) — fallback when no auth session is present
   try {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('current_role', 'admin')`);

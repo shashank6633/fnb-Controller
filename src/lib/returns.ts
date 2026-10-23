@@ -422,9 +422,15 @@ export function vendorReturnCandidates(
       COALESCE(po.po_number, '')                       AS po_number,
       gi.po_item_id                                    AS po_item_id,
       g.vendor_id                                      AS vendor_id,
+      -- The GRN's own vendor, then the PO LINE's, and the PO HEADER only when
+      -- it names a vendor: on a merged / multi-vendor PO the header is the
+      -- label "Mixed (N vendors)" with a NULL vendor_id, which is nobody, and a
+      -- credit note cannot be raised against it. A single-vendor header (the
+      -- only kind there was before) is used exactly as before.
       COALESCE(NULLIF(TRIM(g.vendor), ''),
                NULLIF(TRIM(poi.vendor), ''),
-               NULLIF(TRIM(po.vendor), ''), '')        AS vendor,
+               NULLIF(TRIM(CASE WHEN po.vendor_id IS NULL AND TRIM(COALESCE(po.vendor, '')) LIKE 'Mixed (%'
+                                THEN '' ELSE po.vendor END), ''), '') AS vendor,
       gi.material_id                                   AS material_id,
       rm.name                                          AS material_name,
       COALESCE(rm.category, '')                        AS category,

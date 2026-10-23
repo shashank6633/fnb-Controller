@@ -1,7 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
-import { mergeDuplicateLines } from '@/lib/po-helpers';
+import { mergeDuplicateLines, nextPoNumber, deliveredDirectLines, mergedPoHolds } from '@/lib/po-helpers';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
@@ -352,6 +352,51 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           req_item_id: it.id,
         }, { status: 400 });
       }
+    }
+
+    // ── DELIVERED DIRECT (owner ruling #68) ──────────────────────────────────
+    // A merged PO received through a Direct Issue rule sent the line's goods
+    // straight to the rule's department; the central store never received
+    // them. Issuing the line here too gives the department the goods twice and
+    // takes from central stock it never had (measured: HONEY 2 kg delivered
+    // direct to Akan Bar, then "Issue to Department" 200 — central 10,445 →
+    // 8,445 g, Main Kitchen +2,000 g). This route is ABSOLUTE, so "would hand
+    // goods over" = the posted quantity_issued is above what the line holds
+    // now; a line posted at (or below) its current figure moves nothing new and
+    // passes exactly as before. Refused WHOLE before anything is written, named
+    // by req_item_ids so the modal outlines the row. Asked here, ahead of the
+    // central floor (whose "the store holds none" would be the wrong reason),
+    // and asked again right before the transaction because an await sits
+    // between (the outlet read), so a receipt landing in between cannot slip by.
+    const selIssuedNow = db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`);
+    const deliveredDirectRefusal = (): Response | null => {
+      const raising = items.filter(it => {
+        const ln = lineMap.get(String(it.id));
+        if (!ln) return false;
+        const now = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
+        return (Number(ln.quantity_issued) || 0) > now + 1e-9;
+      }).map(it => String(it.id));
+      const direct = deliveredDirectLines(db, raising);
+      if (direct.size === 0) return null;
+      const rows = [...direct.entries()].map(([rid, why]) => {
+        const name = String(items.find(it => String(it.id) === rid)?.material_name || 'a line');
+        return {
+          code: 'delivered_direct', req_item_id: rid, material: name,
+          message: `${name} was ${why} — it cannot be issued again from central. Set its Issue Now back to what it already `
+            + `holds (or close the line from Issue Requisitions with Reject); if the asking department still needs it, the `
+            + `department that received it passes it on by department transfer.`,
+        };
+      });
+      return Response.json({
+        error: `Nothing was issued and the requisition is unchanged. ${rows.map(x => x.message).join(' ')}`,
+        code: 'delivered_direct',
+        req_item_ids: rows.map(x => x.req_item_id),
+        blocked: rows,
+      }, { status: 400 });
+    };
+    {
+      const refused = deliveredDirectRefusal();
+      if (refused) return refused;
     }
 
     // ── THE CENTRAL FLOOR, ASKED BEFORE ANYTHING IS WRITTEN ─────────────────
@@ -1044,6 +1089,60 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         (poMerged.some(m => m.ordered) ? ` Check the PO before approving it.` : '');
     }
 
+    // ── RULING #68, ASKED AGAIN — no await from here to the transaction ──────
+    {
+      const refused = deliveredDirectRefusal();
+      if (refused) return refused;
+    }
+
+    // ── THE TICK GUARD (merged POs, rulings #63/#67) ─────────────────────────
+    // The PO this tick raises carries purchase_orders.requisition_id, and when
+    // it completes po-requisition-fulfil.ts marks the WHOLE requisition
+    // fulfilled with no per-line check. If any other line of this requisition
+    // sits on a live MERGED PO, that line is stranded the moment the tick PO
+    // arrives: still owed, its goods coming on the merged PO, its requisition
+    // closed so no desk offers it (measured: REQ-PB-2's SOY on merged
+    // PO-2026-0025, tick PO-2026-0026 for KETCHUP received → REQ-PB-2
+    // 'fulfilled', SOY 0 of 3 issued; and KETCHUP itself ordered twice). The
+    // merge refuses the reverse order (code requisition_po); this is the same
+    // rule from the tick's side. Fires ONLY when a PO would actually be written
+    // (the tick on, a Buy line surviving) AND a still-owed line of this
+    // requisition is held by a live merged PO — every requisition no merged PO
+    // touches gets the tick exactly as before. "Still owed" is judged on the
+    // figures this gesture leaves (a line this POST issues in full is not
+    // stranded by anything). Refused whole, nothing written, before the
+    // transaction; the fix is in the same modal (untick, issue again).
+    if (autoCreatePo && poLines.length > 0) {
+      const owedAfter = items.filter(it => {
+        if (it.is_rejected || Number(it.store_rejected || 0) === 1) return false;
+        const ln = lineMap.get(String(it.id));
+        const issuedAfter = ln ? (Number(ln.quantity_issued) || 0) : (Number(it.quantity_issued) || 0);
+        return !lineIssueComplete({
+          quantity_issued: issuedAfter, chef_approved_qty: it.chef_approved_qty,
+          quantity_requested: it.quantity_requested, line_unit: it.unit,
+          unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size,
+          shelf_emptied_qty: it.shelf_emptied_qty,
+        });
+      }).map(it => String(it.id));
+      const holds = mergedPoHolds(db, owedAfter);
+      if (holds.length > 0) {
+        const pos = [...new Map(holds.map(h => [h.po_id, h])).values()];
+        const poWords = pos.map(p => `${p.po_number} (${p.status})`).join(', ');
+        const names = holds.map(h => String(items.find(it => String(it.id) === h.req_item_id)?.material_name || 'a line'));
+        return Response.json({
+          error: `No vendor PO was raised and nothing was issued: ${names.join(', ')} on ${r.req_number} `
+            + `${holds.length === 1 ? 'is' : 'are'} already on merged ${poWords}. A PO raised with "Also raise a vendor PO" `
+            + `completes the WHOLE requisition when it arrives, which would close ${holds.length === 1 ? 'that line' : 'those lines'} `
+            + `before ${holds.length === 1 ? 'its' : 'their'} goods arrive on the merged PO. Untick "Also raise a vendor PO" and `
+            + `issue again — the merged lines are issued from Issue Requisitions when they arrive, and anything else still to buy `
+            + `can go on a merged PO ("Merge into one PO").`,
+          code: 'merged_po_lines',
+          req_item_ids: holds.map(h => h.req_item_id),
+          merged_pos: pos.map(p => ({ po_id: p.po_id, po_number: p.po_number, status: p.status })),
+        }, { status: 409 });
+      }
+    }
+
     const txn = db.transaction(() => {
       // ── Atomic claim (MUST stay the first statement in this txn) ──────────
       // The status check at the top of this handler is separated from every
@@ -1341,14 +1440,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           }
           deliveryDate = rawDelivery;
         }
-        const year = isoDate.slice(0, 4);
-        const lastPo = db.prepare(`
-          SELECT po_number FROM purchase_orders
-          WHERE po_number LIKE 'PO-' || ? || '-%'
-          ORDER BY po_number DESC LIMIT 1
-        `).get(year) as any;
-        const nextNum = lastPo?.po_number ? parseInt(lastPo.po_number.split('-').pop() || '0', 10) + 1 : 1;
-        const poNumber = `PO-${year}-${String(nextNum).padStart(4, '0')}`;
+        // THE shared PO numbering rule (@/lib/po-helpers), inside this same
+        // transaction — one copy for every PO creator.
+        const poNumber = nextPoNumber(db, isoDate);
 
         linkedPoId = generateId();
         // PO is created in 'pending' (i.e. submitted) so it lands directly in the admin's approval queue.

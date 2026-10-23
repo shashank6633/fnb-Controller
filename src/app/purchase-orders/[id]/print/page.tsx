@@ -13,6 +13,16 @@ import { isReceiptHeldForQc } from '@/lib/po-receipts';
 // The same 2-dp rounding the receive route books money with. po-charges.ts has
 // no imports at all, so this is client-safe too.
 import { r2 } from '@/lib/po-charges';
+// THE per-vendor split of a PO — the receive route's own grouping, shared with
+// the PO detail and the vendor PDF so paper, screen and file list the same lines
+// for the same vendor. No runtime imports (see its header).
+import {
+  groupPoLinesByVendor, vendorParamMatches, closureForGroup, departmentBreakdown, vendorGroupState, type PoVendorGroup, type PoVendorViewPayload,
+  type PoVendorIdentity, type PoVendorClosure, type PoReqLink,
+} from '@/lib/po-vendor-view';
+// The vendor copy itself (?vendor=) — its own component so the one sheet a
+// vendor may hold can be rendered and checked on its own.
+import PoVendorCopy from '@/components/PoVendorCopy';
 // Fixed 2 dp, deliberately the same formatter as the /purchase-orders list page,
 // so the same PO reads identically on screen and on paper (max-only would print
 // ₹354 here and ₹354.00 there).
@@ -55,8 +65,24 @@ export default function POPrintPage() {
      purchase_orders.total_cost, so the printed total and the stored one agree. */
   const [receivedNet, setReceivedNet] = useState<number | null>(null);
   const [biz, setBiz] = useState<{ name: string }>({ name: 'My Restaurant & Pub' });
+  /* ?vendor=<vendor_id | name> → the VENDOR COPY (ruling #70): only that
+     vendor's lines, with rates, and that vendor's own address/GSTIN block — no
+     other vendor, no department breakdown, no internal notes. No param → the
+     internal sheet below, which adds the department breakdown. Read once from
+     window.location (not useSearchParams, so the page needs no Suspense
+     boundary — same choice as /purchase-orders). null = not read yet. */
+  const [vendorParam, setVendorParam] = useState<string | null>(null);
+  /* The requisition lines behind each PO line, the vendor closures and every
+     line vendor's identity block (GET /api/purchase-orders/vendor-view). null
+     while loading or when the read failed — both sheets then simply print
+     without those extras, as they did before. */
+  const [view, setView] = useState<PoVendorViewPayload | null>(null);
+  // The vendor copy waits for that read to SETTLE (ok or failed): printed
+  // before it lands, a closed vendor's copy would omit "closed — do not supply".
+  const [viewSettled, setViewSettled] = useState(false);
 
   useEffect(() => {
+    setVendorParam(new URLSearchParams(window.location.search).get('vendor') || '');
     fetch(`/api/purchase-orders?id=${params.id}`).then(r => r.json()).then(async d => {
       setPo(d.purchase_order);
       setReceipts(Array.isArray(d.receipts) ? d.receipts : []);
@@ -66,12 +92,50 @@ export default function POPrintPage() {
         setVendor(v.vendor);
       }
     });
+    fetch(`/api/purchase-orders/vendor-view?id=${params.id}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => setView(d && typeof d === 'object' && d.links_by_item ? d as PoVendorViewPayload : null))
+      .catch(() => setView(null))
+      .finally(() => setViewSettled(true));
     fetch('/api/settings?key=business_name').then(r => r.json()).then(d => {
       if (d?.value) setBiz({ name: d.value });
     });
   }, [params.id]);
 
-  if (!po) return <div className="p-10 text-center text-gray-500">Loading…</div>;
+  if (!po || vendorParam === null) return <div className="p-10 text-center text-gray-500">Loading…</div>;
+
+  if (vendorParam) {
+    if (!viewSettled) return <div className="p-10 text-center text-gray-500">Loading…</div>;
+    const group = groupPoLinesByVendor(po.items || [], po).find(g => vendorParamMatches(g, vendorParam));
+    if (!group) {
+      return (
+        <div className="p-10 text-center text-gray-600 text-sm">
+          That vendor has no lines on {po.po_number}. <a href={`/purchase-orders/${params.id}/print`} className="text-[#af4408] underline">Open the internal sheet</a>
+        </div>
+      );
+    }
+    const identity = (view?.vendors || []).find(v => v.id === group.vendor_id)
+      || (group.vendor_id && vendor && group.vendor_id === po.vendor_id ? vendor : null);
+    const closure = closureForGroup(view?.closures, group);
+    return <PoVendorCopy po={po} poId={params.id} group={group} identity={identity} closure={closure} biz={biz.name} />;
+  }
+
+  /* ── INTERNAL SHEET EXTRAS ──────────────────────────────────────────────── */
+  const allLinksByItem: Record<string, PoReqLink[]> = view?.links_by_item || {};
+  const vendorGroups = groupPoLinesByVendor(po.items || [], po);
+  /* WHICH LINKS MAKE THIS AN INTERNAL SHEET. Only a MERGED link (a
+     po_requisition_lines row) does. A 'legacy' link is derived from
+     purchase_order_items.req_item_id — the per-requisition "Also raise a vendor
+     PO" tick — and that PO's no-parameter sheet is the one the store has always
+     handed its vendor (the Vendor copy links show only with "Send PO to
+     vendor" on). Counting legacy links headed a single-vendor tick PO "Internal
+     copy — not for a vendor" and printed "For Akan Main Kitchen (REQ-…)" under
+     every line (measured, PO-2026-0029), so a single-vendor tick PO now prints
+     exactly as production. On a sheet that is internal anyway (2+ vendors, or a
+     merged link) the legacy names are true and stay. */
+  const hasLinks = Object.values(allLinksByItem).some(l => l.some(x => x.source === 'merge'));
+  const isInternalCopy = vendorGroups.length > 1 || hasLinks;
+  const linksByItem: Record<string, PoReqLink[]> = isInternalCopy ? allLinksByItem : {};
 
   // Two distinct totals:
   //   orderedSubtotal — sum of ORIGINAL ordered amounts (po_items as drafted)
@@ -178,6 +242,24 @@ export default function POPrintPage() {
     s + r2(Number(it.quantity_received || 0) * Number(it.received_unit_price ?? it.unit_price)), 0));
   const heldGrns = [...new Set(heldLines.map((it: any) => String(it.received_grn_number || '')).filter(Boolean))];
 
+  /* ── WHO ASKED FOR WHAT (internal sheet only — ruling #70) ─────────────────
+     One row per department, from the po_requisition_lines behind each PO line.
+     A department's share is its quantity in PURCHASE units × the PO line's
+     ordered rate, so the rows plus the store's own top-up add back to the
+     ordered subtotal. Legacy links (the per-requisition PO tick) carry no
+     per-department quantity and are named on their line, never valued here. */
+  // Computed by departmentBreakdown() in @/lib/po-vendor-view — one function,
+  // exercised by the lane harness, so the paper cannot drift from the proof.
+  const breakdown = departmentBreakdown(po.items || [], linksByItem);
+  const deptList = breakdown?.rows || [];
+  const topUpLines = breakdown?.top_up_lines || 0;
+  const topUpValue = breakdown?.top_up_value || 0;
+  const overLinked = breakdown?.over_linked || [];
+  const closureOf = (g: PoVendorGroup<any>): PoVendorClosure | null =>
+    closureForGroup(view?.closures, g);
+  const identityOf = (g: PoVendorGroup<any>): PoVendorIdentity | null =>
+    (view?.vendors || []).find(v => v.id === g.vendor_id) || null;
+
   /* ── THE PRINTED COLUMN MODEL ─────────────────────────────────────────────
      The item table is `table-fixed`, and these ARE its columns on paper. It was
      `auto` before, which lets a table grow past its own container to fit its
@@ -275,6 +357,14 @@ export default function POPrintPage() {
           <div>
             <h1 className="text-2xl font-bold">{biz.name}</h1>
             <p className="text-xs text-gray-600 mt-1">PURCHASE ORDER</p>
+            {/* Said on the paper itself: this sheet lists every vendor's
+                lines and rates (and who asked for them), so it must never be
+                the one handed to a vendor — each vendor has its own copy. */}
+            {isInternalCopy && (
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-red-800 mt-0.5">
+                Internal copy — not for a vendor
+              </p>
+            )}
           </div>
           <div className="text-right">
             <div className="text-2xl font-bold text-[#af4408]">{po.po_number}</div>
@@ -403,6 +493,27 @@ export default function POPrintPage() {
                   <td className="border border-gray-300 px-1.5 py-1 font-mono text-[9px] break-words">{it.material_sku || '—'}</td>
                   <td className="border border-gray-300 px-1.5 py-1 break-words">
                     {it.material_name}
+                    {(linksByItem[String(it.id)] || []).length > 0 && (() => {
+                      const links = linksByItem[String(it.id)] || [];
+                      const pu = it.material_purchase_unit || it.material_unit || '';
+                      const linked = links.reduce((s, l) => s + (l.qty_purchase != null ? Number(l.qty_purchase) : 0), 0);
+                      const extra = links.every(l => l.qty_purchase != null) ? (Number(it.quantity) || 0) - linked : 0;
+                      return (
+                        <div className="text-[8px] leading-tight text-gray-600 mt-0.5">
+                          {links.map(l => (
+                            <div key={l.id}>
+                              For {l.department_name || '(no department)'}
+                              {l.is_party && <> · party{l.event_name ? `: ${l.event_name}` : ''}</>}
+                              {l.qty_purchase != null && <> — {qty(l.qty_purchase)} {pu}</>}
+                              {l.req_number && <> ({l.req_number})</>}
+                              {l.delivered_direct && <span className="font-semibold"> · delivered direct</span>}
+                              {l.vendor_closed && <span className="font-semibold"> · vendor closed, not delivered</span>}
+                            </div>
+                          ))}
+                          {extra > 1e-6 && <div>+ {qty(extra)} {pu} store top-up (no requisition)</div>}
+                        </div>
+                      );
+                    })()}
                     {anyReceived && (it.quantity_rejected || 0) > 0 && (
                       <div className="text-[9px] text-red-700 mt-0.5">
                         Rejected: {qty(it.quantity_rejected)} {it.material_purchase_unit || it.material_unit}
@@ -637,6 +748,105 @@ export default function POPrintPage() {
               {!isReceived && outstandingLines > 0
                 && ` — ${outstandingLines} line${outstandingLines > 1 ? 's have' : ' has'} not been delivered yet`}.
             </p>
+          </section>
+        )}
+
+        {/* ── PER VENDOR (mixed PO) ───────────────────────────────────────────
+            The order value each vendor carries, and where that vendor stands.
+            "Delivered" = every one of its lines has a live receipt (a voided
+            bill is not one); "Closed" = the store closed the vendor and its
+            undelivered lines are not coming (po_vendor_closures). */}
+        {vendorGroups.length > 1 && (
+          <section className="mb-4 po-sheet-notes">
+            <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">Vendors on this order ({vendorGroups.length})</p>
+            <table className="po-sheet-table w-full table-fixed text-[10px] border border-gray-300">
+              <colgroup>
+                <col /><col style={{ width: '17%' }} /><col style={{ width: '8%' }} />
+                <col style={{ width: '15%' }} /><col style={{ width: '30%' }} />
+              </colgroup>
+              <thead className="bg-gray-100">
+                <tr>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Vendor</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">GSTIN</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Lines</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Ordered ₹</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {vendorGroups.map(g => {
+                  const cl = closureOf(g);
+                  const st = vendorGroupState(g, cl, isReceiptHeldForQc);
+                  const inCount = st.in_count, owed = st.owed_count;
+                  const status = st.state === 'delivered' ? `Delivered${st.held ? ' (part held for QC)' : ''}`
+                    : st.state === 'closed' ? `${inCount ? `${inCount} of ${g.lines.length} lines in; ` : ''}closed — ${owed} line${owed === 1 ? '' : 's'} not delivered${cl?.reason ? ` (${cl.reason})` : ''}`
+                    : st.state === 'part' ? `Part delivered — ${inCount} of ${g.lines.length} lines in`
+                    : po.status === 'approved' ? 'Awaiting delivery'
+                    : ['draft', 'pending', 'pending_reapproval'].includes(String(po.status)) ? 'Not ordered yet — PO not approved'
+                    : 'Not received';
+                  return (
+                    <tr key={g.key}>
+                      <td className="border border-gray-300 px-1.5 py-1 break-words">{g.vendor_name}</td>
+                      <td className="border border-gray-300 px-1.5 py-1 font-mono break-all">{identityOf(g)?.gstin || '—'}</td>
+                      <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{g.lines.length}</td>
+                      <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{fmt(g.ordered_total)}</td>
+                      <td className="border border-gray-300 px-1.5 py-1 break-words">{status}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              <tfoot className="font-bold bg-gray-50">
+                <tr>
+                  <td colSpan={3} className="border border-gray-300 px-1.5 py-1 text-right">Total ordered</td>
+                  <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{fmt(orderedSubtotal)}</td>
+                  <td className="border border-gray-300 px-1.5 py-1"></td>
+                </tr>
+              </tfoot>
+            </table>
+          </section>
+        )}
+
+        {/* ── DEPARTMENT BREAKDOWN (internal only — never on a vendor copy) ── */}
+        {deptList.length > 0 && (
+          <section className="mb-4 po-sheet-notes">
+            <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">Department breakdown — who asked for this order</p>
+            <table className="po-sheet-table w-full table-fixed text-[10px] border border-gray-300">
+              <colgroup>
+                <col style={{ width: '28%' }} /><col /><col style={{ width: '9%' }} /><col style={{ width: '18%' }} />
+              </colgroup>
+              <thead className="bg-gray-100">
+                <tr>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Department</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Requisitions</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Lines</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Share at PO rates ₹</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deptList.map(d => (
+                  <tr key={d.key}>
+                    <td className="border border-gray-300 px-1.5 py-1 break-words">{d.name}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 font-mono break-words">{d.reqs.join(', ') || '—'}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{d.lines}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{fmt(d.value)}</td>
+                  </tr>
+                ))}
+                {topUpLines > 0 && (
+                  <tr>
+                    <td className="border border-gray-300 px-1.5 py-1 italic">Store top-up</td>
+                    <td className="border border-gray-300 px-1.5 py-1 italic text-gray-600">Ordered beyond what any requisition asked</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{topUpLines}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{fmt(topUpValue)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            {overLinked.length > 0 && (
+              <p className="text-[9px] text-amber-900 mt-1">
+                {overLinked.join(', ')} {overLinked.length === 1 ? 'carries' : 'carry'} more requisition quantity than this PO now orders
+                (the PO was edited after merging), so the department shares above add up to more than the order.
+              </p>
+            )}
           </section>
         )}
 
