@@ -1299,7 +1299,10 @@ function buildUnion(f: {
         COALESCE(r.chef_approved_at, '')                  AS chef_approved_at,
         COALESCE(r.mgmt_approved_at, '')                  AS mgmt_approved_at,
         COALESCE(NULLIF(TRIM(r.submitted_by), ''), TRIM(COALESCE(r.drafted_by, '')), '') AS actor,
-        TRIM(COALESCE(ri.notes, ''))                      AS notes,
+        -- Ruling #68/#73: a line closed because its goods came by Direct Issue carries that reason here,
+        -- so the balance can say 'closed — delivered direct' instead of 'rejected by the store'.
+        TRIM(COALESCE(ri.notes, '') || CASE WHEN COALESCE(ri.store_rejected, 0) = 1 AND COALESCE(ri.store_reject_reason, '') LIKE 'Delivered direct to %'
+             THEN CASE WHEN TRIM(COALESCE(ri.notes, '')) = '' THEN '' ELSE ' · ' END || ri.store_reject_reason ELSE '' END) AS notes,
         r.req_number                                      AS req_number,
         ri.id                                             AS req_item_id,
         COALESCE(rm.unit, '')                             AS rm_unit,

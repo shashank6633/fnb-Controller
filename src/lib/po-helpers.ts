@@ -2,8 +2,12 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, isManagement } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { lineFactor, lineIssueComplete } from '@/lib/issue-stock';
+// Delivered direct by quantity (rulings #68/#73) — the one reader, shared with
+// the close-by-itself in po-link-lifecycle.ts, so badge, guard and close agree.
+import { fmtLineQtyPU } from '@/lib/issue-stock';
+import { reqLineDirectState } from '@/lib/po-link-lifecycle';
 import { packFactor, shownPurchaseQty } from '@/lib/pack-units';
-import { poReceiptLines, isReceiptHeldForQc, liveValueSql } from '@/lib/po-receipts';
+import { poReceiptLines, isReceiptHeldForQc } from '@/lib/po-receipts';
 import { vendorResolver, vendorMappingError, headerVendorFromLines, vendorsForMaterial } from '@/lib/vendor-mapping';
 import { duplicateLineError as duplicateLineErrorRule } from '@/lib/line-dedupe';
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
@@ -332,13 +336,38 @@ export interface ReqLinePoState {
   /** Part of the share is covered, not all of it (short or partly accepted
    *  delivery). `of_qty_purchase` is the whole share. Null when arrived. */
   arrived_partial: (ReqLineArrival & { of_qty_purchase: number }) | null;
-  /** Ruling #68: a Direct Issue rule sent this line's goods straight to the
-   *  rule's department; the line must not be issued again from central. */
+  /** Rulings #68/#73: a Direct Issue rule sent this line's goods straight to
+   *  the rule's department and that delivery covers the line's WHOLE remaining
+   *  balance — nothing more of it may be issued from central. An internal line
+   *  in this state closes by itself (po-link-lifecycle.ts section 4). A line
+   *  only PART delivered direct reads false here and carries
+   *  delivered_direct_partial instead: the rest of it is still owed. */
   delivered_direct: boolean;
+  /** Ruling #73: PURCHASE units of this line delivered direct (0 = none),
+   *  full or part. */
+  delivered_direct_qty_purchase: number;
+  /** Ruling #73: PART of the line was delivered direct; the rest is still
+   *  owed — issuable from central (up to still_issuable_*) or on a later
+   *  bill. Null when nothing, or everything, was delivered direct. */
+  delivered_direct_partial: {
+    qty_purchase: number;
+    /** The line's share on its merged PO(s), PURCHASE units. */
+    of_qty_purchase: number;
+    /** The most the line may still take from central, LINE units / PURCHASE. */
+    still_issuable_line: number;
+    still_issuable_purchase: number;
+  } | null;
+  /** Who closed a delivered-direct line that reads store-closed: 'system' =
+   *  it closed by itself after the receipt (rulings #68/#73,
+   *  po-link-lifecycle.ts), 'store' = a person pressed Reject. Null on an open
+   *  line or one nothing was delivered direct for — so a screen can say who
+   *  closed it instead of "Closed by store" for both. */
+  delivered_direct_closed_by: 'system' | 'store' | null;
   /** Where that Direct Issue delivery went — the department(s) the receipt's
    *  purchases rows were routed to (purchases.direct_issue_dept_id), joined
-   *  with ', ' — and the bill it came on. Null unless delivered_direct. Often
-   *  NOT the asking department (the rule decides), which is why it is named. */
+   *  with ', ' — and the bill it came on. Null unless some of the line was
+   *  delivered direct (full or part). Often NOT the asking department (the
+   *  rule decides), which is why it is named. */
   delivered_direct_dept_name: string | null;
   delivered_direct_grn: string | null;
   /** Ruling #69: the vendor was short-closed on the PO before this line was
@@ -356,6 +385,7 @@ export interface ReqLinePoState {
 
 const EMPTY_STATE = (): ReqLinePoState => ({
   on_po: null, arrived: null, arrived_partial: null, delivered_direct: false,
+  delivered_direct_qty_purchase: 0, delivered_direct_partial: null, delivered_direct_closed_by: null,
   delivered_direct_dept_name: null, delivered_direct_grn: null,
   vendor_closed: false, vendor_closed_reason: null, also_on_po: [], held_by: null,
 });
@@ -469,10 +499,22 @@ export function requisitionLinePoState(db: PoDb, reqItemIds: readonly string[]):
       order.set(r.po_item_id, arr);
     }
   }
-  const coverageOf = (l: LinkRow): { covered: number; share: number; grn?: { grn_number: string; at: string } } => {
+  // ── what was delivered DIRECT (rulings #68/#73) ──
+  // The same walk over the same links, restricted to the direct-routed
+  // accepted quantity (po-link-lifecycle.ts reqLineDirectState). A link's
+  // direct part is NOT "arrived": those goods went to the Direct Issue rule's
+  // department, never into central, so the arrival badge ("issue it from here
+  // as usual") counts only what came in centrally. Zero on every link no
+  // Direct Issue receipt reached — the arrival figures there are unchanged.
+  const directState = reqLineDirectState(db, [...new Set(live.filter(l => l.source === 'merge').map(l => l.req_item_id))]);
+  const directOf = (l: LinkRow): number => l.source === 'merge'
+    ? (directState.get(l.req_item_id)?.link_cover.get(l.link_id) || 0)
+    : 0;
+  const coverageOf = (l: LinkRow): { covered: number; share: number; direct: number; grn?: { grn_number: string; at: string } } => {
     const share = Number(l.qty_purchase) || 0;
+    const direct = directOf(l);
     const got = accepted.get(l.po_item_id);
-    if (!got || !(got.qty > 0)) return { covered: 0, share };
+    if (!got || !(got.qty > 0)) return { covered: 0, share, direct };
     let before = 0;
     if (l.source === 'merge') {
       for (const o of order.get(l.po_item_id) || []) {
@@ -481,7 +523,7 @@ export function requisitionLinePoState(db: PoDb, reqItemIds: readonly string[]):
       }
     }
     const covered = Math.max(0, Math.min(share, got.qty - before));
-    return { covered: r6(covered), share, grn: { grn_number: got.grn_number, at: got.at } };
+    return { covered: r6(covered), share, direct, grn: { grn_number: got.grn_number, at: got.at } };
   };
 
   // ── vendor closures on the POs involved ──
@@ -516,8 +558,6 @@ export function requisitionLinePoState(db: PoDb, reqItemIds: readonly string[]):
     arr.push(l);
     byLine.set(l.req_item_id, arr);
   }
-  /** requisition line → the PO line its delivered-direct pick sits on. */
-  const directPick = new Map<string, string>();
   for (const [reqItemId, rows] of byLine) {
     // Newest first.
     rows.sort((a, b) => (String(b.created_at).localeCompare(String(a.created_at))) || (Number(b.rid) - Number(a.rid)));
@@ -538,16 +578,36 @@ export function requisitionLinePoState(db: PoDb, reqItemIds: readonly string[]):
       po_id: l.po_id, po_number: l.po_number, vendor_name: l.line_vendor, vendor_id: l.line_vendor_id || null,
       status: l.po_status, merged: Number(l.po_merged) === 1, source: l.source, qty_purchase: r6(Number(l.qty_purchase) || 0),
     };
-    if (pick.cov.grn && pick.full) {
-      st.arrived = { grn_number: pick.cov.grn.grn_number, at: pick.cov.grn.at, qty_purchase: r6(pick.cov.share) };
-    } else if (pick.cov.grn && pick.cov.covered > COVER_EPS) {
+    // ARRIVED IN CENTRAL = what the walk covers MINUS the direct part (both in
+    // PURCHASE units, both in creation order). With nothing delivered direct
+    // (direct = 0) these are exactly the figures this reader always gave.
+    const centralGot = r6(Math.max(0, pick.cov.covered - pick.cov.direct));
+    const centralShare = r6(Math.max(0, pick.cov.share - pick.cov.direct));
+    if (pick.cov.grn && centralGot > COVER_EPS && centralGot + COVER_EPS >= centralShare) {
+      st.arrived = { grn_number: pick.cov.grn.grn_number, at: pick.cov.grn.at, qty_purchase: centralShare };
+    } else if (pick.cov.grn && centralGot > COVER_EPS) {
       st.arrived_partial = {
         grn_number: pick.cov.grn.grn_number, at: pick.cov.grn.at,
-        qty_purchase: pick.cov.covered, of_qty_purchase: r6(pick.cov.share),
+        qty_purchase: centralGot, of_qty_purchase: centralShare,
       };
     }
-    st.delivered_direct = Number(l.delivered_direct) === 1;
-    if (st.delivered_direct) directPick.set(reqItemId, String(l.po_item_id));
+    // DELIVERED DIRECT (rulings #68/#73), by quantity, from the one reader the
+    // issue routes' guards and the close-by-itself read too.
+    const dd = directState.get(reqItemId);
+    if (dd && dd.covered_purchase > COVER_EPS) {
+      st.delivered_direct = dd.verdict.full;
+      st.delivered_direct_qty_purchase = dd.covered_purchase;
+      st.delivered_direct_closed_by = dd.store_rejected ? (dd.closed_by_system ? 'system' : 'store') : null;
+      st.delivered_direct_dept_name = dd.dept_names.length > 0 ? dd.dept_names.join(', ') : null;
+      // Oldest first, so the last is the latest bill.
+      st.delivered_direct_grn = dd.grn_numbers.length > 0 ? dd.grn_numbers[dd.grn_numbers.length - 1] : null;
+      st.delivered_direct_partial = dd.verdict.full ? null : {
+        qty_purchase: dd.covered_purchase,
+        of_qty_purchase: dd.share_purchase,
+        still_issuable_line: dd.verdict.max_add_line,
+        still_issuable_purchase: dd.verdict.max_add_purchase,
+      };
+    }
     st.vendor_closed = pick.closedUndelivered;
     st.vendor_closed_reason = pick.closedUndelivered ? (pick.closure?.reason || null) : null;
     st.held_by = holding[0]
@@ -559,75 +619,87 @@ export function requisitionLinePoState(db: PoDb, reqItemIds: readonly string[]):
     out.set(reqItemId, st);
   }
 
-  // ── WHERE A DIRECT ISSUE DELIVERY WENT (ruling #68) ──
-  // The flag says the goods bypassed central; the badge, the desks' refusal and
-  // the reject prompt must also say WHERE, because the rule's department is
-  // often not the one that asked (Bar asked, the rule sent it to Main Kitchen).
-  // Read from the same ledger fact syncPoLinkFlags derives the flag from: a
-  // live, value-counted receipt of the PO line whose purchases row carries
-  // direct_issue_dept_id. Read-only; absent column → names stay null.
-  if (directPick.size > 0) {
-    let hasDirectCol = false;
-    try {
-      hasDirectCol = (db.prepare(`PRAGMA table_info(purchases)`).all() as Array<{ name: string }>)
-        .some(c => String(c.name) === 'direct_issue_dept_id');
-    } catch { hasDirectCol = false; }
-    if (hasDirectCol) {
-      const where = new Map<string, { depts: string[]; grn: string }>();
-      const poItems = [...new Set(directPick.values())];
-      for (const part of chunked(poItems)) {
-        const rows = db.prepare(`
-          SELECT gi.po_item_id AS po_item_id, g.grn_number AS grn_number,
-                 COALESCE(NULLIF(TRIM(d.name), ''), p.direct_issue_dept_id) AS dept_name
-            FROM goods_receipt_note_items gi
-            JOIN goods_receipt_notes g ON g.id = gi.grn_id
-            JOIN purchases p ON p.grn_id = g.id AND p.material_id = gi.material_id
-                            AND COALESCE(TRIM(p.direct_issue_dept_id), '') <> ''
-            LEFT JOIN departments d ON d.id = p.direct_issue_dept_id
-           WHERE gi.po_item_id IN (${part.map(() => '?').join(',')})
-             AND ${liveValueSql('g')}
-           ORDER BY g.date, g.created_at, g.rowid
-        `).all(...part) as Array<{ po_item_id: string; grn_number: string | null; dept_name: string | null }>;
-        for (const r of rows) {
-          const key = String(r.po_item_id);
-          const w = where.get(key) || { depts: [], grn: '' };
-          const dn = String(r.dept_name || '').trim();
-          if (dn && !w.depts.includes(dn)) w.depts.push(dn);
-          // Oldest first, so the last written is the latest bill.
-          if (r.grn_number) w.grn = String(r.grn_number);
-          where.set(key, w);
-        }
-      }
-      for (const [reqItemId, poItemId] of directPick) {
-        const st = out.get(reqItemId);
-        const w = where.get(poItemId);
-        if (!st || !w) continue;
-        st.delivered_direct_dept_name = w.depts.length > 0 ? w.depts.join(', ') : null;
-        st.delivered_direct_grn = w.grn || null;
-      }
-    }
+  return out;
+}
+
+/** One requisition line's delivered-direct position, as both issue routes'
+ *  guards read it (rulings #68/#73). Present only for a line some of which a
+ *  merged PO delivered direct. */
+export interface DeliveredDirectCap {
+  req_item_id: string;
+  /** The line's whole remaining balance was delivered direct: nothing more of
+   *  it may be issued from central. */
+  full: boolean;
+  /** The line is store-closed (by the store, or by itself after the receipt). */
+  closed: boolean;
+  is_party: boolean;
+  covered_purchase: number;
+  covered_line: number | null;
+  approved_line: number;
+  issued_line: number;
+  /** The most quantity_issued may reach while the delivered-direct part stays
+   *  unissued, LINE units — what an ABSOLUTE writer (store-process) may post. */
+  max_issued_line: number;
+  /** max_issued_line − issued_line — what an ADDING writer (store-issue) may add. */
+  max_add_line: number;
+  max_add_purchase: number;
+  line_unit: string;
+  /** "to <dept> on <PO> (<GRN>)". */
+  where: string;
+  /** A line quantity printed the way the desks print it (purchase unit first). */
+  fmt: (lineQty: number) => string;
+  /** One sentence: what was delivered direct and where. */
+  what: string;
+}
+
+/**
+ * RULINGS #68 + #73 AT THE ISSUE ROUTES. For each requisition line some of
+ * which a merged PO delivered DIRECT (a Direct Issue rule sent the goods
+ * straight to the rule's department), how much of it the central store may
+ * still issue. ONLY THE COVERED PART IS REFUSED: a line part delivered direct
+ * may still take its uncovered rest from central; a line FULLY delivered direct
+ * may take nothing more. Read through the same reader as the desks' badge
+ * (requisitionLinePoState) and the close-by-itself (po-link-lifecycle.ts
+ * reqLineDirectState), so the refusal, the badge and the close cannot disagree.
+ * Lines nothing was delivered direct for are absent — every other line is
+ * exactly what it always was.
+ */
+export function deliveredDirectCaps(db: PoDb, reqItemIds: readonly string[]): Map<string, DeliveredDirectCap> {
+  const out = new Map<string, DeliveredDirectCap>();
+  const ids = [...new Set(reqItemIds.map(x => String(x || '').trim()).filter(Boolean))];
+  if (ids.length === 0) return out;
+  for (const [id, st] of reqLineDirectState(db, ids)) {
+    if (!(st.covered_purchase > COVER_EPS)) continue;
+    const v = st.verdict;
+    const meta = { unit: st.line.unit, purchase_unit: st.line.purchase_unit, pack_size: st.line.pack_size };
+    const fmt = (q: number) => fmtLineQtyPU(q, st.line.line_unit, meta);
+    const pu = String(st.line.purchase_unit || st.line.unit || '').trim();
+    const coveredText = v.covered_line != null
+      ? fmt(v.covered_line)
+      : `${(Math.round(st.covered_purchase * 1000) / 1000).toLocaleString('en-IN', { maximumFractionDigits: 3 })}${pu ? ` ${pu}` : ''}`;
+    out.set(id, {
+      req_item_id: id, full: v.full, closed: st.store_rejected, is_party: st.is_party,
+      covered_purchase: st.covered_purchase, covered_line: v.covered_line,
+      approved_line: v.approved_line, issued_line: v.issued_line,
+      max_issued_line: v.max_issued_line, max_add_line: v.max_add_line, max_add_purchase: v.max_add_purchase,
+      line_unit: String(st.line.line_unit ?? ''), where: st.where, fmt,
+      what: `${coveredText} of it was delivered direct ${st.where} under a Direct Issue rule, so the central store never received that part`,
+    });
   }
   return out;
 }
 
 /**
- * RULING #68 AT THE ISSUE ROUTES. Which of these requisition lines a merged PO
- * delivered DIRECT (a Direct Issue rule sent the goods straight to the rule's
- * department), so the central store must not issue them again. The same reader
- * the desks' badge reads (requisitionLinePoState), so the refusal and the
- * badge can never disagree. Map: req_item_id → one sentence naming where the
- * goods went, ready for an error message.
+ * The FULLY delivered-direct lines among these (the line's whole remaining
+ * balance went straight to the rule's department), each with one sentence
+ * naming where the goods went. A line only PART delivered direct is not here —
+ * its rest is still owed (ruling #73); read deliveredDirectCaps for it.
  */
 export function deliveredDirectLines(db: PoDb, reqItemIds: readonly string[]): Map<string, string> {
   const out = new Map<string, string>();
-  const ids = [...new Set(reqItemIds.map(x => String(x || '').trim()).filter(Boolean))];
-  if (ids.length === 0) return out;
-  for (const [id, st] of requisitionLinePoState(db, ids)) {
-    if (!st.delivered_direct) continue;
-    const to = st.delivered_direct_dept_name ? ` to ${st.delivered_direct_dept_name}` : ' to a department';
-    const on = st.on_po?.po_number ? ` on ${st.on_po.po_number}` : '';
-    const bill = st.delivered_direct_grn ? ` (${st.delivered_direct_grn})` : '';
-    out.set(id, `delivered direct${to}${on}${bill} under a Direct Issue rule, so the central store never received it`);
+  for (const [id, cap] of deliveredDirectCaps(db, reqItemIds)) {
+    if (!cap.full) continue;
+    out.set(id, `delivered direct ${cap.where} under a Direct Issue rule, so the central store never received it`);
   }
   return out;
 }

@@ -7256,8 +7256,8 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
                 <div className="pt-1 border-t border-red-200">
                   It is refused — with nothing changed — if the bill belongs to another outlet than the one you are working in, is dated on or
                   before the central-store cutover, has a return ticket against it, or if reversing it would push any material's stock below zero.
-                  {g.po_id && <> On a purchase-order bill it is also refused if a later receipt on the order is still standing (void that one
-                  first), if its vendor bill row cannot be identified, or if a party deduction on its requisition cannot be traced to this order.
+                  {g.po_id && <> On a purchase-order bill it is also refused if a later receipt from the same vendor on that order is still standing (void
+                  that one first), if its vendor bill row cannot be identified, or if a party deduction on its requisition cannot be traced to this order.
                   The reason comes back in full — nothing is changed while you read it.</>}
                 </div>
               </div>

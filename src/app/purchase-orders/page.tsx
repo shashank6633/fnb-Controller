@@ -1703,9 +1703,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           cess_rate: t?.cess_rate ?? 0,
         };
       });
-      const r = await api(`/api/purchase-orders/${poId}/receive`, {
-        method: 'POST',
-        body: {
+      const receiveBody: any = {
           received_at: receivedAt, item_overrides,
           // WHICH VENDOR is delivering. Only their outstanding lines are booked,
           // and the bill below is filed against them alone.
@@ -1745,9 +1743,17 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             // arrived, so it is recorded separately from received_at.
             bill_date: billDate,
           } : undefined,
-        },
-      });
-      const j = await r.json().catch(() => ({}));
+      };
+      let r = await api(`/api/purchase-orders/${poId}/receive`, { method: 'POST', body: receiveBody });
+      let j = await r.json().catch(() => ({}));
+      // RULING 71: the same vendor bill number already received on another PO or
+      // GRN. Same day = refused outright; another date = the server asks, and only
+      // an explicit yes re-posts with confirm_duplicate_bill (the ad-hoc GRN rule).
+      if (r.status === 409 && j.duplicate_bill && j.needs_confirmation
+          && window.confirm(`${j.error || 'This bill number was already received from this vendor.'}\n\nReceive it on this PO anyway?`)) {
+        r = await api(`/api/purchase-orders/${poId}/receive`, { method: 'POST', body: { ...receiveBody, confirm_duplicate_bill: true } });
+        j = await r.json().catch(() => ({}));
+      }
       if (!r.ok) {
         alert(j.error || 'Failed');
         // 409 = this delivery is already in (someone else received the PO, or

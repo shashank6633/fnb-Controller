@@ -4323,7 +4323,7 @@ function LineRow(props: {
         {line.store_rejected ? (
           <div className={`text-[10px] ${direct ? 'text-violet-800' : 'text-red-700'} mt-0.5 flex flex-wrap items-center gap-1 no-underline`}>
             <XCircle className="w-3 h-3" /> {direct
-              ? <>Closed by store — delivered direct{deliveredDirectDept(line) ? <> to {deliveredDirectDept(line)}</> : null}, not issued from central</>
+              ? <>{(line as any).delivered_direct_closed_by === 'system' ? 'Closed automatically' : 'Closed by store'} — delivered direct{deliveredDirectDept(line) ? <> to {deliveredDirectDept(line)}</> : null}, not issued from central</>
               : 'Rejected by store'}
             {line.store_reject_reason && <span className="text-[#6B5744]">— {line.store_reject_reason}</span>}
             {/* WHAT THE REJECT ACTUALLY DID, when it did two things. Under the

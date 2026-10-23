@@ -22,7 +22,7 @@ import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 // @/lib/po-deviation-alert. It never throws, by contract.
 import { raiseDeviationAlert, type DeviationDeliveryReport } from '@/lib/po-deviation-alert';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
-import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receipts';
+import { receivedPoItemIds, poReceiptLines, liveValueSql, liveClaimSql } from '@/lib/po-receipts';
 // SHORT-CLOSED VENDORS (ruling 69) and the merged-PO link flags (ruling 68).
 // The only two hooks this route takes for the merged PO: a closed vendor's
 // undelivered lines are neither offered nor owed (exactly like a store-blocked
@@ -101,6 +101,149 @@ const vendorKeyOf = (name: string): string => String(name || '').trim().toLowerC
  */
 const redactEmail = (v: unknown): string =>
   String(v ?? '').replace(/([A-Za-z0-9._%+-]+)@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}/g, '$1');
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * THE SAME VENDOR BILL, ALREADY IN THROUGH ANOTHER DOOR (OWNER RULING 71)
+ * ══════════════════════════════════════════════════════════════════════════
+ * PRODUCTION BUG: this route's only duplicate guard was uq_po_vendor_bill —
+ * (po_id, vendor_name, bill_no) — so it could see a repeat on THIS PO and
+ * nothing else. The same HYPERPURE bill received on a merged PO and then on a
+ * second PO returned 200 twice, and the stock was booked twice (probe S5-01:
+ * SPAGHETTI 23,000 g → 27,000 g, two purchases rows for one bill). The owner's
+ * ruling: BLOCK — "PO receive refuses a bill no. already received from the same
+ * vendor on ANY PO or GRN (same rule as ad-hoc GRN)".
+ *
+ * IT IS THE AD-HOC GRN ROUTE'S RULE (src/app/api/grn/route.ts, the
+ * duplicate-bill refusal), applied from this door:
+ *   · KEYED ON THE DOCUMENT — this vendor's bill number, at this outlet,
+ *     matched LOWER(TRIM()) on the vendor name AS STORED (what every reader
+ *     keys on), across every receipt that is not void. A voided receipt never
+ *     blocks: a void is the sanctioned way to cancel a bill and re-enter it.
+ *   · SAME DATE → a hard 409, nothing written: the double entry, the retry
+ *     after a save that seemed to fail.
+ *   · ANOTHER DATE → the same 409, carrying `needs_confirmation`, naming the
+ *     earlier receipt and its date; cleared only by `confirm_duplicate_bill:
+ *     true`. His suppliers really do reuse slip numbers on different days (the
+ *     ad-hoc route measured 5.3% of a month's real bills), and a flat wall
+ *     there would leave a genuine delivery no honest way in.
+ *   · A BLANK bill number cannot reach here — this route refuses it outright
+ *     before any of this runs, exactly as it did before the ruling.
+ * Read from THREE places, because a bill can have arrived through three:
+ *   1. goods_receipt_notes — an ad-hoc GRN, or another PO's receipt (this route
+ *      writes the bill number into invoice_number);
+ *   2. po_vendor_bills on ANOTHER PO — the only copy of the number on PO
+ *      receipts keyed before invoice_number was filled on this path;
+ *   3. purchases carrying OUR PINV and no grn_id — a bill recorded by hand (the
+ *      CSV importer, an older direct entry), the ad-hoc route's "other door".
+ * THIS PO's own receipts are left to uq_po_vendor_bill, which has always
+ * answered them (inside the txn, its own sentence) — so a repeat on the same
+ * order reads exactly as it did. One PO line can be received only once, so a
+ * repeat inside one order can never book the same goods twice anyway.
+ * ══════════════════════════════════════════════════════════════════════════ */
+interface PriorVendorBill {
+  source: 'grn' | 'po_bill' | 'purchases';
+  grn_number: string;
+  po_number: string;
+  date: string;
+  received_by: string;
+  invoice_id: string;
+  /** The earlier receipt is still waiting on its quality check (no stock yet). */
+  held: boolean;
+}
+function findPriorVendorBill(
+  db: ReturnType<typeof getDb>,
+  q: { billNo: string; vendorKey: string; outletId: string | null; poId: string; receivedAt: string },
+): { match: PriorVendorBill; sameDay: boolean } | null {
+  if (!q.billNo) return null;
+  const bill = q.billNo.toLowerCase();
+  const out: PriorVendorBill[] = [];
+  const g = db.prepare(`
+    SELECT g.grn_number, g.date, g.received_by, g.status, COALESCE(p.po_number, '') AS po_number
+      FROM goods_receipt_notes g
+      LEFT JOIN purchase_orders p ON p.id = g.po_id
+     WHERE LOWER(TRIM(COALESCE(g.invoice_number, ''))) = ?
+       AND LOWER(TRIM(COALESCE(g.vendor, '')))         = ?
+       AND COALESCE(g.outlet_id, '') = COALESCE(?, '')
+       AND ${liveClaimSql('g')}
+       AND COALESCE(g.po_id, '') <> ?
+     ORDER BY CASE WHEN g.date = ? THEN 0 ELSE 1 END, g.created_at ASC
+     LIMIT 1
+  `).get(bill, q.vendorKey, q.outletId, q.poId, q.receivedAt) as any;
+  if (g) out.push({ source: 'grn', grn_number: String(g.grn_number || ''), po_number: String(g.po_number || ''),
+    date: String(g.date || ''), received_by: String(g.received_by || ''), invoice_id: '',
+    held: String(g.status || '') === QC_AWAITING });
+  // A bill row is released (deleted) by a void, so a standing row is a standing
+  // receipt; the GRN join is belt-and-braces for a row whose GRN was voided by
+  // some path that did not release it. A row with no GRN link is a pre-link
+  // receipt and counts.
+  const b = db.prepare(`
+    SELECT b.received_by, b.bill_date, b.created_at, p.po_number,
+           COALESCE(g.grn_number, '') AS grn_number, g.date AS grn_date, g.status AS grn_status
+      FROM po_vendor_bills b
+      JOIN purchase_orders p ON p.id = b.po_id
+      LEFT JOIN goods_receipt_notes g ON g.id = b.grn_id
+     WHERE LOWER(TRIM(COALESCE(b.bill_no, ''))) = ?
+       AND LOWER(TRIM(COALESCE(b.vendor_name, ''))) = ?
+       AND COALESCE(p.outlet_id, '') = COALESCE(?, '')
+       AND b.po_id <> ?
+       AND (g.id IS NULL OR ${liveClaimSql('g')})
+     ORDER BY CASE WHEN COALESCE(g.date, b.bill_date) = ? THEN 0 ELSE 1 END, b.created_at ASC
+     LIMIT 1
+  `).get(bill, q.vendorKey, q.outletId, q.poId, q.receivedAt) as any;
+  if (b) out.push({ source: 'po_bill', grn_number: String(b.grn_number || ''), po_number: String(b.po_number || ''),
+    date: String(b.grn_date || b.bill_date || String(b.created_at || '').slice(0, 10)),
+    received_by: String(b.received_by || ''), invoice_id: '',
+    held: String(b.grn_status || '') === QC_AWAITING });
+  const m = db.prepare(`
+    SELECT date, invoice_id
+      FROM purchases
+     WHERE LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+       AND LOWER(TRIM(COALESCE(vendor, '')))  = ?
+       AND COALESCE(outlet_id, '') = COALESCE(?, '')
+       AND COALESCE(invoice_id, '') LIKE 'PINV-%'
+       AND COALESCE(grn_id, '') = ''
+     ORDER BY CASE WHEN date = ? THEN 0 ELSE 1 END, created_at ASC
+     LIMIT 1
+  `).get(bill, q.vendorKey, q.outletId, q.receivedAt) as any;
+  if (m) out.push({ source: 'purchases', grn_number: '', po_number: '', date: String(m.date || ''),
+    received_by: '', invoice_id: String(m.invoice_id || ''), held: false });
+  if (out.length === 0) return null;
+  // The hard refusal always wins over the confirmable one, whichever door the
+  // same-day copy came through.
+  const same = out.find(r => r.date === q.receivedAt);
+  return same ? { match: same, sameDay: true } : { match: out[0], sameDay: false };
+}
+
+/** The sentence the receiver reads. Names the earlier receipt, its PO (or that
+ *  it had none) and its date — and says nothing the receive screen cannot do. */
+function priorVendorBillMessage(
+  hit: { match: PriorVendorBill; sameDay: boolean },
+  ctx: { billNo: string; vendor: string; poNumber: string },
+): string {
+  const { match: m, sameDay } = hit;
+  const vendor = ctx.vendor || 'this vendor';
+  if (m.source === 'purchases') {
+    return `Bill ${ctx.billNo} from ${vendor} is already on the Purchases register — recorded ${m.date} as ${m.invoice_id}, without a goods receipt (a CSV upload, or an older direct entry). Nothing has been saved.\n\n`
+      + (sameDay
+        ? `Receiving it on ${ctx.poNumber} as well would add the same goods to stock a second time. If that earlier entry was wrong, correct it on the Purchases register rather than receiving the bill again.`
+        : `If this is that same bill, it is already in — receiving it on ${ctx.poNumber} would add the goods to stock twice. If it is a genuinely different delivery and the vendor reuses the number, it can be received only once it is confirmed as a separate delivery.`);
+  }
+  const where = (m.po_number
+    ? `${m.grn_number ? `${m.grn_number} on ` : 'a receipt on '}${m.po_number}`
+    : `${m.grn_number} (a goods receipt with no purchase order)`)
+    + (m.held ? ', still held for its quality check' : '');
+  const who = m.received_by ? ` by ${redactEmail(m.received_by)}` : '';
+  const voidable = m.grn_number || 'that receipt';
+  if (sameDay) {
+    return `Bill ${ctx.billNo} from ${vendor} is already recorded as ${where}, dated ${m.date}${who} — the same vendor, the same bill number and the same day. `
+      + `Nothing was saved. Receiving it on ${ctx.poNumber} as well would book the same goods twice. `
+      + `If you are re-trying after a save that seemed to fail, it did not: the bill is already in. `
+      + `If that first entry was wrong, an admin voiding ${voidable} releases the bill number, and it can then be received here.`;
+  }
+  return `Bill number ${ctx.billNo} has been used for ${vendor} before — ${where}, dated ${m.date}${who}. Nothing has been saved.\n\n`
+    + `If this is that same delivery being received a second time, stop: it is already recorded, and receiving it on ${ctx.poNumber} would book the same goods twice. `
+    + `If it is a genuinely different delivery and the vendor simply reuses the number (a lot of suppliers write the same figure on every slip), it can be received only once it is confirmed as a separate delivery.`;
+}
 
 // receivedPoItemIds — THE receipt ledger — now lives in src/lib/po-receipts.ts,
 // imported above. It was module-local here and copied, unfiltered, into five
@@ -329,7 +472,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
  *   vendor's bill and are allocated ONLY across THAT vendor's accepted lines —
  *   never spread over the whole PO. `bill_no` + `bill_date` are recorded as a
  *   po_vendor_bills row for the vendor; UNIQUE(po_id, vendor_name, bill_no) is
- *   the duplicate guard and its violation comes back as a friendly 409.
+ *   the duplicate guard ON THIS PO and its violation comes back as a friendly
+ *   409. A bill number this vendor already has on ANOTHER PO or an ad-hoc GRN is
+ *   refused 409 before that (ruling 71 — see findPriorVendorBill).
+ *
+ * Optional body: { confirm_duplicate_bill?: true }
+ *   — clears ONLY the other-date case of that refusal (the vendor reuses slip
+ *   numbers), exactly as POST /api/grn takes it. A same-day repeat is never
+ *   cleared.
  *   Allocated across the accepted lines by src/lib/po-charges. The two rulings
  *   it encodes:
  *     DISCOUNT REDUCES COST — netted into purchases.unit_price, because that is
@@ -788,6 +938,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return Response.json({
         error: `Nothing left to receive for ${group.vendor_name || '(no vendor)'} on ${po.po_number}.`,
       }, { status: 400 });
+    }
+
+    // ── THE SAME VENDOR BILL, ALREADY RECEIVED ELSEWHERE (ruling 71) ────────
+    // See findPriorVendorBill at the top of this file. Keyed on the vendor name
+    // this receipt's GRN will carry (the INSERT below writes exactly
+    // `billVendorName || po.vendor || ''`) and on the date it will be filed
+    // under. As soon as the vendor is known, before any line is judged: a bill
+    // that is already in cannot be received here whatever its lines say, and the
+    // receiver should hear that first. RETURNED, never thrown, so the response
+    // can carry needs_confirmation; re-asserted inside the txn under the write
+    // lock (no await sits between this read and that txn either way).
+    const dupVendorName = String(group.vendor_name || po.vendor || '');
+    const dupQuery = {
+      billNo, vendorKey: vendorKeyOf(dupVendorName), outletId: (po.outlet_id ?? null) as string | null,
+      poId: String(id), receivedAt: String(receivedAt),
+    };
+    const confirmDuplicateBill = body?.confirm_duplicate_bill === true;
+    const priorBill = findPriorVendorBill(db, dupQuery);
+    if (priorBill && (priorBill.sameDay || !confirmDuplicateBill)) {
+      return Response.json({
+        error: priorVendorBillMessage(priorBill, { billNo, vendor: dupVendorName, poNumber: po.po_number }),
+        field: 'bill_no',
+        duplicate_bill: true,
+        // The caller re-posts with confirm_duplicate_bill: true. Nothing else
+        // clears it, and never on the same day — a human decision about which
+        // paper is which, exactly as on the ad-hoc GRN form.
+        ...(priorBill.sameDay ? {} : { needs_confirmation: true }),
+        existing_grn_number: priorBill.match.grn_number || null,
+        existing_po_number: priorBill.match.po_number || null,
+        existing_invoice_id: priorBill.match.invoice_id || null,
+        existing_date: priorBill.match.date,
+      }, { status: 409 });
     }
 
     // Unit LABEL for a PO line = the PURCHASE unit, because a PO line's qty and
@@ -1354,6 +1536,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         throw err;
       }
 
+      // ── The duplicate-bill check, re-read INSIDE the lock (ruling 71) ─────
+      // The same question as the pre-txn refusal, asked again under the write
+      // lock the claim took, so a second connection that filed this bill on
+      // another PO in between loses here, before a unit of stock moves. A
+      // confirmed other-date reuse stays confirmed; a same-day copy never is.
+      const priorNow = findPriorVendorBill(db, dupQuery);
+      if (priorNow && (priorNow.sameDay || !confirmDuplicateBill)) {
+        const err: any = new Error(priorVendorBillMessage(priorNow, { billNo, vendor: dupVendorName, poNumber: po.po_number }));
+        err.httpStatus = 409;
+        throw err;
+      }
+
       // ── The COST row (net basis) ───────────────────────────────────────
       // unit_price / total_price are NET of the bill discount, because
       // updateMaterialPrice() (src/lib/db.ts) averages ONLY
@@ -1426,7 +1620,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // ── The vendor bill row ───────────────────────────────────────────────
       // ONE po_vendor_bills row per vendor receipt, written BEFORE any stock
       // moves so a duplicate bill number costs nothing. Its UNIQUE index
-      // (po_id, vendor_name, bill_no) IS the duplicate guard — the constraint is
+      // (po_id, vendor_name, bill_no) IS the duplicate guard ON THIS PO (another
+      // PO's or an ad-hoc GRN's copy was refused above — ruling 71) — the constraint is
       // caught here and re-thrown as a sentence a storekeeper can act on, rather
       // than surfacing the driver's "UNIQUE constraint failed" as a 500.
       // Written even when bill_no is blank: the row is the receipt event (who
@@ -1863,7 +2058,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // delivery must not be erased when vendor B's lands on Friday, so the
       // prior receipts' net is carried. `prior` is 0 on the first (and, on a
       // single-vendor PO, only) receipt, which makes this byte-identical to the
-      // `SET total_cost = total` it replaces. Read back from the GRN rows rather
+      // `SET total_cost = total` it replaces — for a receipt that is not held
+      // (a held one adds 0; see bookedNet below). Read back from the GRN rows rather
       // than from purchase_orders.total_cost, which holds the ORDERED total
       // right up until the PO closes (see the two branches below).
       //
@@ -1885,6 +2081,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         JOIN goods_receipt_notes g ON g.id = gi.grn_id
         WHERE g.po_id = ? AND g.id != ? AND ${liveValueSql('g')}
       `).get(id, grnId) as any)?.net || 0;
+      // ── AND THIS RECEIPT'S OWN MONEY OBEYS THE SAME RULE ──────────────────
+      // `prior` keeps a HELD bill out of the sum; this receipt's `total` did
+      // not, so a held bill that happened to be the one completing the order
+      // stamped its full value into total_cost with nothing booked — the PO
+      // list then showed that figure beside RECEIVED while the PO detail and
+      // print (received_net) showed the order without it (probe S2-03/S2-04).
+      // A held receipt adds 0 here, exactly as it would as anyone's `prior`;
+      // its value arrives when the checking department signs, because the
+      // sign-off re-stamps total_cost from the GRN rows (grn-qc.ts) on any
+      // received PO. A receipt that is not held adds `total`, as it always has.
+      const bookedNet = qc.required ? 0 : total;
       // status + received_at are written ONLY when the PO is actually complete —
       // this is the sole writer of the approved→received transition, and it is
       // inside the same txn as the claim that took the write lock.
@@ -1902,7 +2109,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           UPDATE purchase_orders
           SET status = 'received', received_at = ?, total_cost = ?, grn_id = ?, updated_at = datetime('now')
           WHERE id = ?
-        `).run(receivedAt, r2(prior + total), grnId, id);
+        `).run(receivedAt, r2(prior + bookedNet), grnId, id);
       } else {
         // STAYS 'approved' — that is what keeps the Receive button alive for the
         // vendors who have not delivered yet. received_at stays NULL: the PO is
@@ -1927,7 +2134,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
       (result as any).grn_id = grnId;
       (result as any).grn_number = grnNumber;
-      (result as any).po_total_cost = r2(prior + total);
+      (result as any).po_total_cost = r2(prior + bookedNet);
       (result as any).is_complete = isComplete;
       (result as any).po_status = isComplete ? 'received' : 'approved';
       (result as any).remaining_lines = stillOwed.length;
@@ -2494,6 +2701,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // The PO's running total across every receipt so far. On a single-vendor
       // PO the two are equal; on a mixed one they never are, and a caller that
       // read `total_cost` as the PO's total would under-report it.
+      // A bill HELD for a quality check is not in it (nothing of it is booked
+      // yet) — the same rule as the stored total_cost; it counts once signed.
       po_total_cost: (result as any).po_total_cost,
       excess_lines: excessLines.length,           // expose to caller so the UI
       excess_value: excessLines.reduce((s, l) => s + l.excess_value, 0),  // can show a "notified admin" confirmation

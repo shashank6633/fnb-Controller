@@ -48,6 +48,12 @@ import {
  * This file reads the `purchases` table and NOTHING ELSE. No join to the GRN
  * header table, the GRN line table, the PO-bill table or the PO line table. No
  * join to raw_materials either.
+ * (Since then, three reads off the GRN side, NONE of which can add a row: the
+ * 1:1 grn_line pairing that supplies a mirror's charges IN PLACE OF its
+ * placeholder zeros, never beside them (§4); the label lookup of GRN and PO
+ * numbers after the bills are chosen; and the EXISTS on goods_receipt_notes.
+ * po_id that files a PO receipt by where it came from (§2a), which moves no
+ * rupee at all. One row per `purchases` line, each counted once.)
  *
  * That is the whole design. src/lib/purchase-log.ts must return THREE totals
  * that may never be added, because a single delivery is written into three
@@ -70,10 +76,14 @@ import {
  * `purchases` holds ONE ROW PER ITEM; a vendor bill spans several rows. The key
  * is derived, in this precedence (see billKeyExpr below):
  *
+ *   0. a PO receipt's grn_id → 'GRN:<grn_id>'   — see §2a, added 2026-10-23.
+ *
  *   1. invoice_id  → 'INV:<invoice_id>'
  *      PINV-yyyy-#### is OUR number, minted ONE PER VENDOR BILL by the
- *      hand-entry path. Where present it IS the bill. Measured: 0 rows carry
- *      both an invoice_id and a grn_id, so branches 1 and 2 cannot fight.
+ *      hand-entry path. Where present it IS the bill. Measured when this was
+ *      written: 0 rows carried both an invoice_id and a grn_id. That is no longer
+ *      structural — the ad-hoc GRN form and a QC release both write both — and
+ *      branch 0 is what keeps a PO receipt out of this branch (§2a).
  *
  *   2. grn_id      → 'GRN:<grn_id>'
  *      DELIBERATELY AHEAD OF bill_no. A PO receive / ad-hoc GRN mints one GRN
@@ -99,6 +109,42 @@ import {
  *
  * outlet_id is IN the key on branches 3 and 4 even though there is one outlet
  * today — a second outlet must never merge into another outlet's bill.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 2a. A PO RECEIPT IS FILED BY WHERE IT CAME FROM, NOT BY ITS PINV (2026-10-23)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Branch 1 above stopped being "hand-entered" once two writers began putting a
+ * PINV on PO-receipt rows: a delivery held for QC is booked when the hold is
+ * released (signed off or overridden) and src/lib/grn-qc.ts gives its lines a
+ * PINV; a correction that books a line for the first time does the same
+ * (src/lib/grn-reversal.ts). The unheld receive gives none. So ONE merged PO's
+ * three vendor bills came out as GRN, INV and GRN, and unticking "include PO
+ * receipts" hid two of them and kept the held one — under a caption saying
+ * "hand-entered bills only" (receive proof R01/R02).
+ *
+ * A row whose GRN was received against a PO (goods_receipt_notes.po_id — see
+ * fromPoReceiptSql) now takes a BRANCH 0 ahead of everything: 'GRN:<grn_id>',
+ * kind GRN, is_po_receipt = 1, dropped with the PO receipts. Its PINV is kept
+ * on the row as a number (invoice_id) and the numbering itself is untouched
+ * (ruling 70). One GRN is still one vendor bill, so a PO GRN whose lines were
+ * booked partly at the receive and partly later is ONE bill, not two.
+ *
+ * WHAT DOES NOT MOVE, and the probe that pins it (harness po-merge/final/
+ * bill-summary, compare.mjs U1): every hand-entered bill (no GRN), every
+ * ad-hoc GRN bill (its GRN has no po_id — INV with a PINV, or GRN for the
+ * legacy rows booked with none), every unheld PO receipt (blank PINV — the
+ * same 'GRN:' key from either branch) and every day-run keys, kinds, filters
+ * and totals exactly as before.
+ *
+ * TWO QUESTIONS THAT USED TO BE ONE EXPRESSION. is_po_receipt (where the bill
+ * came from) and is_mirror (are this row's charges on the GRN line?) were the
+ * same predicate and are not any more: a PO line booked at a QC release is a
+ * PO receipt whose charges sit on its own purchase row, which the grn_line CTE
+ * deliberately never pairs. unpaired_mirror_rows asks is_mirror — asking
+ * is_po_receipt would call that row's charges "unavailable" and blank them.
+ * po_row_charge_rows counts those lines so every caption can say where their
+ * figures came from; their Subtotal is their booked cost (the discount share,
+ * where it could be, is netted into the rate and the Discount column reads 0).
  *
  * MEASURED on a copy of live (2,165 rows): 350 bills —
  *   INV 13 bills / 13 lines · GRN 29 / 31 · BILL 0 / 0 · DAY_RUN 308 / 2,121.
@@ -352,8 +398,10 @@ import {
 /**
  * How firm this bill's identity is. Shown on screen so a reader is never handed
  * 350 rows that all claim to be paper bills.
- *   INV     — our PINV number: one per vendor bill. Firm.
- *   GRN     — a PO receive / ad-hoc GRN: one delivery. Firm, but see §4.
+ *   INV     — our PINV number: one per vendor bill. Firm. A hand-entered bill or
+ *             an ad-hoc GRN bill — never a PO receipt (see §2a).
+ *   GRN     — a delivery received against a PO, WHATEVER its PINV (§2a), or a
+ *             legacy ad-hoc GRN booked with no PINV: one delivery. Firm, but see §4.
  *   BILL    — the vendor's own printed number. Firm.
  *   DAY_RUN — no bill number anywhere: a vendor-day consolidation. NOT a bill.
  */
@@ -379,7 +427,10 @@ export interface PurchaseBillRow {
    * appears, render "VENDOR (+n more)" rather than letting `vendor` lie.
    */
   vendor_count: number;
-  /** OUR number (PINV-yyyy-####). '' when the bill was not hand-entered. */
+  /** OUR number (PINV-yyyy-####). '' when none was given: a PO receipt booked at
+   *  the receive gets none, one booked later (QC sign-off, a correction) gets one.
+   *  It is a number, not a classification — bill_kind says where the bill came
+   *  from (§2a). */
   invoice_id: string;
   /** The VENDOR'S own number. Often '' — never conflate with invoice_id. */
   bill_no: string;
@@ -396,12 +447,26 @@ export interface PurchaseBillRow {
   /** true when the vendor's own number is absent. Drives the CSV YES/NO. */
   bill_no_missing: boolean;
   /**
-   * true on GRN-keyed bills: PROVENANCE, not absence. The charge figures below
-   * were read off the GRN line rather than the cost-mirror `purchases` row.
-   * They are the bill's real figures, so print them as numbers — the em-dash
-   * this flag used to mean was the bug, see §4.
+   * true on GRN-keyed bills that hold a PO-receipt cost mirror: PROVENANCE, not
+   * absence. The charge figures below were read off the GRN line rather than
+   * the cost-mirror `purchases` row. They are the bill's real figures, so print
+   * them as numbers — the em-dash this flag used to mean was the bug, see §4.
+   * FALSE on a PO receipt whose every line was booked after the receive (a QC
+   * hold released, a correction): those lines carry their charges on the
+   * purchase row itself and are read from there — po_row_charge_rows counts them.
    */
   tax_on_grn: boolean;
+  /**
+   * Lines of this PO receipt that were booked AFTER the receive — when a held
+   * delivery was released from its QC hold, signed off or overridden
+   * (decideGrnQc in src/lib/grn-qc.ts), or by a correction that books a line
+   * for the first time (src/lib/grn-reversal.ts). Both writers give the line a
+   * PINV and copy the bill's charges onto the purchase row, netting any
+   * discount share into the booked rate where they can, so the report reads
+   * those lines off the purchase row — their Subtotal is their booked cost.
+   * 0 on every bill that is not a PO receipt. See §2a.
+   */
+  po_row_charge_rows: number;
   /**
    * How many of this bill's `lines` took their charges from a GRN line. Ships
    * beside tax_on_grn because the badge is a provenance claim and this is the
@@ -494,15 +559,24 @@ export interface PurchaseBillTotals {
    * period-wide total this report may legitimately print. See §1.
    */
   total_bill_value: number;
-  /** How many of `bills` are PO/GRN receipts whose tax sits on the GRN. */
+  /** How many of `bills` are PO/GRN receipts — by WHERE they came from (§2a),
+   *  not by whether they carry a PINV. */
   po_receipt_bills: number;
   /** `purchases` rows behind those receipts. */
   po_receipt_lines: number;
-  /** Their share of the GRAND TOTAL — bill face value, read off the GRN. NOT a
-   *  share of the Subtotal: do not subtract it from one. */
+  /** Their share of the GRAND TOTAL — bill face value, read off the GRN line
+   *  (or, on po_row_charge_lines, off the purchase row). NOT a share of the
+   *  Subtotal: do not subtract it from one. */
   po_receipt_value: number;
   /** `purchases` rows in the period whose charges were read off a GRN line. */
   grn_sourced_lines: number;
+  /**
+   * PO-receipt lines booked after the receive (a QC hold released, a
+   * correction), whose charges are read off the purchase row. A subset of
+   * po_receipt_lines and disjoint from grn_sourced_lines. See
+   * PurchaseBillRow.po_row_charge_rows. When it is non-zero `basis` says so.
+   */
+  po_row_charge_lines: number;
   /**
    * PO-receipt mirror rows with no GRN line left to read charges from. Non-zero
    * is a defect worth naming in a caption, not a rounding detail: those rows'
@@ -612,6 +686,9 @@ export interface PurchaseBillDayRow {
   grn_sourced_rows: number;
   /** Mirror lines with no GRN line left to read from — see PurchaseBillRow. */
   unpaired_mirror_rows: number;
+  /** PO-receipt lines booked after the receive, charges read off the purchase
+   *  row — see PurchaseBillRow.po_row_charge_rows. */
+  po_row_charge_rows: number;
   /**
    * true when any of this day's lines took its charges from a GRN line.
    * PROVENANCE, not partiality — the charge figures above are complete WHENEVER
@@ -665,6 +742,8 @@ export interface PurchaseBillDayVendorRow {
   po_receipt_value: number;
   grn_sourced_rows: number;
   unpaired_mirror_rows: number;
+  /** See PurchaseBillDayRow.po_row_charge_rows. */
+  po_row_charge_rows: number;
   /**
    * THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
    * CARRIED GST, plus how many lines that was. See PurchaseBillRow and
@@ -757,6 +836,29 @@ const TOTALS_BASIS =
   + 'what the GRN inward register calls Total Inward — a match worth checking rather than a guarantee, '
   + 'since the register sums every GRN line and this report can only reach a line that has a purchase row '
   + 'behind it. BOOKED COST (Spend) is a THIRD figure: what '
+  + 'was booked into stock and what stock valuation is built on, which on a PO receipt can already be net '
+  + 'of a discount the bill itemises separately. Do not read the three as one.';
+
+/**
+ * THE SAME CAPTION FOR A PERIOD THAT HOLDS A PO RECEIPT BOOKED AFTER THE RECEIVE
+ * (2026-10-23, §2a). TOTALS_BASIS says "on a PO/GRN receipt both are read from
+ * the GRN line", and since a PO bill is filed by where it came from, that
+ * includes a delivery released from a QC hold — whose lines are booked at the
+ * release with their charges on the purchase row, read from there, with the
+ * Subtotal equal to the booked cost. Said in words on exactly the periods where
+ * it happens; every other period prints TOTALS_BASIS character for character.
+ */
+const TOTALS_BASIS_WITH_ROW_CHARGES =
+  'One source for the money (the purchases table), so this period total counts every rupee exactly once. '
+  + 'GRAND TOTAL is what is payable to the vendor: Subtotal less discount, plus tax, both cesses, TCS, '
+  + 'delivery and MRP round-off. SUBTOTAL is the goods themselves at the price the bill charges for them. '
+  + 'On a PO/GRN receipt booked when the goods were received, both are read from the GRN line, the bill '
+  + 'document, so such a receipt totals here what the GRN inward register calls Total Inward — a match worth '
+  + 'checking rather than a guarantee, since the register sums every GRN line and this report can only reach a '
+  + 'line that has a purchase row behind it. A PO receipt line booked later — when a QC hold was released, or by '
+  + 'a correction — carries the bill\'s charges on its own purchase row and is read from there; its Subtotal is '
+  + 'its booked cost, so a discount netted into that rate sits inside the Subtotal rather than in the Discount '
+  + 'column. BOOKED COST (Spend) is a THIRD figure: what '
   + 'was booked into stock and what stock valuation is built on, which on a PO receipt can already be net '
   + 'of a discount the bill itemises separately. Do not read the three as one.';
 
@@ -898,6 +1000,27 @@ function kindFromKey(billKey: string): PurchaseBillKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * SQL: true when this `purchases` row was booked against a GRN that was
+ * RECEIVED AGAINST A PURCHASE ORDER — the WHERE-IT-CAME-FROM test of §2a.
+ *
+ * goods_receipt_notes.po_id and nothing else: the same column, and the same
+ * TRIM rule, the GRN inward register's DIRECT / AGAINST PO label reads
+ * (SOURCE_WHERE in src/app/api/grn/route.ts), so the two reports can never file
+ * one bill two ways. NOT purchases.po_id — no writer sets it when the row is
+ * created (it is back-filled only by a boot migration).
+ *
+ * An EXISTS, not a join: it cannot add a row to any aggregate whatever the data
+ * does, so §1's one-row-per-purchase guarantee is untouched. The grn_id test in
+ * front keeps the lookup off the ~2,100 rows that have no GRN at all.
+ */
+function fromPoReceiptSql(alias = 'p'): string {
+  return `(TRIM(COALESCE(${alias}.grn_id, '')) <> '' AND EXISTS (
+        SELECT 1 FROM goods_receipt_notes g_src
+         WHERE g_src.id = TRIM(${alias}.grn_id)
+           AND g_src.po_id IS NOT NULL AND TRIM(g_src.po_id) <> ''))`;
+}
+
+/**
  * ONE base SELECT over `purchases`, wrapped twice: once for the period totals
  * (an aggregate over the FULL filtered set) and once for the ordered, capped
  * per-bill rows. Both bind the same parameter list, in the same order.
@@ -924,14 +1047,30 @@ function buildBase(f: {
     : '';
   if (f.vendor) params.push(f.vendor);
 
-  // A PO-receive cost mirror: no invoice_id of ours, but a hard grn_id. Must
-  // stay identical to branch 2 of the key below, or the flag and the grouping
-  // would describe different rows.
-  const isPoReceiptExpr = poReceiptMirrorSql('p');
+  // TWO DIFFERENT QUESTIONS, TWO EXPRESSIONS — §2a.
+  //
+  // is_mirror: is this row a PO-receive COST MIRROR (no invoice_id of ours, a
+  // hard grn_id)? That decides WHERE ITS CHARGES ARE READ — the GRN line, via
+  // the grn_line CTE, which pairs exactly these rows. Imported, never re-typed.
+  // It feeds unpaired_mirror_rows and nothing about the bill's classification.
+  const isMirrorExpr = poReceiptMirrorSql('p');
+  // fromPo: was this row booked against a GRN received against a PO?
+  const fromPo = fromPoReceiptSql('p');
+  // is_po_receipt: WHERE THE BILL CAME FROM. A row is a PO/GRN receipt when it
+  // came from a PO receive (whatever its PINV — a QC-held bill gets one at the
+  // release, an unheld one gets none), or when it is a cost mirror, which keeps
+  // the legacy ad-hoc GRN bills booked with no PINV exactly where production
+  // files them. It is TRUE EXACTLY WHEN the key below starts 'GRN:', so the flag
+  // and the grouping describe the same rows by construction.
+  const isPoReceiptExpr = `CASE WHEN (${isMirrorExpr}) = 1 OR ${fromPo} THEN 1 ELSE 0 END`;
 
+  // On a row with fromPo false this is, term for term, the old filter
+  // NOT (blank invoice_id AND a grn_id) — every hand-entered and ad-hoc GRN bill
+  // is kept or dropped exactly as before. What it now also drops is the PO bill
+  // that carries a PINV, which the old filter kept and labelled hand-entered.
   const poFilter = f.includePoReceipts
     ? ''
-    : ` AND NOT (TRIM(COALESCE(p.invoice_id, '')) = '' AND TRIM(COALESCE(p.grn_id, '')) <> '')`;
+    : ` AND NOT ((${isMirrorExpr}) = 1 OR ${fromPo})`;
 
   // Branch 4. 'group' consolidates a vendor's unnumbered purchases for one day
   // into one readable line; 'split' gives one bill per row. See §3.
@@ -939,9 +1078,13 @@ function buildBase(f: {
     ? `'ROW:' || p.id`
     : `'DAY:' || LOWER(TRIM(p.vendor)) || '|' || p.date || '|' || COALESCE(p.outlet_id, '')`;
 
-  // Precedence: invoice_id (ours) > grn_id (one delivery) > vendor bill number
-  // > vendor-day. grn_id sits AHEAD of bill_no on purpose — see §2.
+  // Precedence: a PO receipt's GRN (§2a) > invoice_id (ours) > grn_id (one
+  // delivery) > vendor bill number > vendor-day. grn_id sits AHEAD of bill_no on
+  // purpose — see §2. The first branch only ever catches a row the old CASE
+  // would have keyed differently when that row carries a PINV: a PO row with a
+  // blank invoice_id gets 'GRN:' || TRIM(grn_id) from either branch.
   const billKeyExpr = `CASE
+        WHEN ${fromPo}                              THEN 'GRN:' || TRIM(p.grn_id)
         WHEN TRIM(COALESCE(p.invoice_id, '')) <> '' THEN 'INV:' || TRIM(p.invoice_id)
         WHEN TRIM(COALESCE(p.grn_id, '')) <> ''     THEN 'GRN:' || TRIM(p.grn_id)
         WHEN TRIM(COALESCE(p.bill_no, '')) <> ''    THEN 'BILL:' || LOWER(TRIM(p.vendor)) || '|' || LOWER(TRIM(p.bill_no)) || '|' || p.date || '|' || COALESCE(p.outlet_id, '')
@@ -969,11 +1112,15 @@ function buildBase(f: {
     SELECT
       ${billKeyExpr}                            AS bill_key,
       ${isPoReceiptExpr}                        AS is_po_receipt,
+      ${isMirrorExpr}                           AS is_mirror,
       -- 1 when THIS line's eight charge figures were read off the paired GRN
       -- line rather than off the purchases row. It is the provenance every
-      -- renderer needs: a mirror row with no GRN line left (is_po_receipt = 1
-      -- and grn_sourced = 0) has charges that are UNAVAILABLE, not zero, and
-      -- its cells must go blank instead of printing a filing-grade "Rs 0".
+      -- renderer needs: a mirror row with no GRN line left (is_mirror = 1 and
+      -- grn_sourced = 0) has charges that are UNAVAILABLE, not zero, and its
+      -- cells must go blank instead of printing a filing-grade "Rs 0". It is
+      -- is_MIRROR, not is_po_receipt, that asks this: a PO receipt booked at a
+      -- QC release is never paired either, and its charges are right there on
+      -- the purchase row.
       ${grnSourcedSql('gl')}                    AS grn_sourced,
       p.date                                    AS row_date,
       COALESCE(TRIM(p.vendor), '')              AS vendor,
@@ -1068,8 +1215,11 @@ function computeTotals(
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0) AS po_receipt_lines,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN line_total ELSE 0 END), 0) AS po_receipt_value,
       COALESCE(SUM(grn_sourced), 0)                                   AS grn_sourced_lines,
-      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+      -- is_mirror, NOT is_po_receipt: see the grn_sourced note in buildBase.
+      COALESCE(SUM(CASE WHEN is_mirror = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
                                                                       AS unpaired_mirror_lines,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND is_mirror = 0 THEN 1 ELSE 0 END), 0)
+                                                                      AS po_row_charge_lines,
       COUNT(DISTINCT CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN bill_key END) AS day_run_bills,
       -- THE "Tax % Applied (GST)" BASE: the post-discount value of the LINES
       -- THAT CARRIED GST, and how many lines that was. GST is charged after the
@@ -1103,11 +1253,14 @@ function computeTotals(
     po_receipt_lines: num(agg?.po_receipt_lines),
     po_receipt_value: r2(agg?.po_receipt_value),
     grn_sourced_lines: num(agg?.grn_sourced_lines),
+    po_row_charge_lines: num(agg?.po_row_charge_lines),
     unpaired_mirror_lines: num(agg?.unpaired_mirror_lines),
     day_run_bills: num(agg?.day_run_bills),
     taxed_bill_value: r2(agg?.taxed_bill_value),
     taxed_lines: num(agg?.taxed_lines),
-    basis: TOTALS_BASIS,
+    // The plain caption on every period that holds no PO line booked after the
+    // receive — i.e. character for character what it always printed.
+    basis: num(agg?.po_row_charge_lines) > 0 ? TOTALS_BASIS_WITH_ROW_CHARGES : TOTALS_BASIS,
   };
 }
 
@@ -1141,8 +1294,12 @@ export function getPurchaseBillSummary(
       MAX(bill_no)                          AS bill_no,
       MAX(grn_id)                           AS grn_id,
       MAX(is_po_receipt)                    AS is_po_receipt,
+      COALESCE(SUM(is_mirror), 0)           AS mirror_rows,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND is_mirror = 0 THEN 1 ELSE 0 END), 0)
+                                            AS po_row_charge_rows,
       COALESCE(SUM(grn_sourced), 0)         AS grn_sourced_rows,
-      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+      -- is_mirror, NOT is_po_receipt: see the grn_sourced note in buildBase.
+      COALESCE(SUM(CASE WHEN is_mirror = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
                                             AS unpaired_mirror_rows,
       COUNT(*)                              AS lines,
       COALESCE(SUM(goods), 0)               AS goods,
@@ -1194,7 +1351,12 @@ export function getPurchaseBillSummary(
       // the bill's real figures and print as numbers. The one row that must
       // still blank its cells is caught by unpaired_mirror_rows below, not by
       // this flag. See §4.
-      tax_on_grn: kind === 'GRN',
+      // AND ONLY WHERE A COST MIRROR IS ON THE BILL (§2a). Every GRN bill the
+      // old key produced is all mirrors, so this is the old `kind === 'GRN'` on
+      // each of them; it is false on a PO receipt booked wholly at a QC release,
+      // whose charges were never on a GRN line this report reads.
+      tax_on_grn: kind === 'GRN' && num(r.mirror_rows) > 0,
+      po_row_charge_rows: num(r.po_row_charge_rows),
       grn_sourced_rows: num(r.grn_sourced_rows),
       unpaired_mirror_rows: num(r.unpaired_mirror_rows),
       lines: num(r.lines),
@@ -1277,8 +1439,11 @@ function buildPerBill(base: string): string {
       CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN 1 ELSE 0 END AS is_day_run,
       MAX(is_po_receipt)                                                   AS is_po_receipt,
       COALESCE(SUM(grn_sourced), 0)                                        AS grn_sourced_rows,
-      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+      -- is_mirror, NOT is_po_receipt: see the grn_sourced note in buildBase.
+      COALESCE(SUM(CASE WHEN is_mirror = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
                                                                            AS unpaired_mirror_rows,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND is_mirror = 0 THEN 1 ELSE 0 END), 0)
+                                                                           AS po_row_charge_rows,
       COUNT(*)                                                             AS lines,
       COALESCE(SUM(goods), 0)                                              AS goods,
       COALESCE(SUM(bill_value), 0)                                         AS bill_value,
@@ -1360,6 +1525,7 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
       COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
       COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows,
+      COALESCE(SUM(po_row_charge_rows), 0)                                  AS po_row_charge_rows,
       ${taxAppliedRollupSql()}
     FROM (${perBill})
     GROUP BY bill_day
@@ -1397,6 +1563,7 @@ export function getPurchaseBillDaySummary(
       po_receipt_value: r2(r.po_receipt_value),
       grn_sourced_rows: num(r.grn_sourced_rows),
       unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      po_row_charge_rows: num(r.po_row_charge_rows),
       taxed_bill_value: r2(r.taxed_bill_value),
       taxed_lines: num(r.taxed_lines),
       // PROVENANCE, not partiality. Until 2026-09-10 this said "part of this
@@ -1442,6 +1609,7 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
       COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
       COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows,
+      COALESCE(SUM(po_row_charge_rows), 0)                                  AS po_row_charge_rows,
       ${taxAppliedRollupSql()}
     FROM (${perBill})
     GROUP BY bill_day, LOWER(bill_vendor)
@@ -1486,6 +1654,7 @@ export function getPurchaseBillDaySummary(
       po_receipt_value: r2(r.po_receipt_value),
       grn_sourced_rows: num(r.grn_sourced_rows),
       unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      po_row_charge_rows: num(r.po_row_charge_rows),
       taxed_bill_value: r2(r.taxed_bill_value),
       taxed_lines: num(r.taxed_lines),
       charges_from_grn: num(r.grn_sourced_rows) > 0,
@@ -1549,6 +1718,21 @@ function chargeCsvCell(r: ChargeSourced, key: PurchaseChargeKey, value: number):
 }
 
 /**
+ * THE OTHER PROVENANCE A PO RECEIPT CAN HAVE (§2a), in words for a CSV that is
+ * opened cold. chargeNote() names the lines read off a GRN line; a PO receipt
+ * booked after the receive reads from the purchase row instead, and a forwarded
+ * sheet whose Bill Identity says GRN would otherwise give no hint of it. Only
+ * ever appended where such lines exist, so every other row's note is the
+ * character-for-character string it always was.
+ */
+function rowChargeNote(rowLines: number, lines: number): string {
+  if (!(rowLines > 0)) return '';
+  return `${rowLines} of ${lines} lines — PO receipt lines booked after the receive (a QC hold released, or a correction): `
+    + 'their charges are read from the purchase row, which carries the bill\'s charges, and their Subtotal is the booked cost';
+}
+const joinNotes = (...notes: string[]) => notes.filter(Boolean).join('; ');
+
+/**
  * The columns, in the order the screen shows them, so a row reconciles
  * left-to-right: SUBTOTAL − Discount + GST + cesses + TCS + Delivery +
  * Round-off = GRAND TOTAL.
@@ -1603,7 +1787,7 @@ export const PURCHASE_BILL_COLUMNS: PurchaseBillColumn[] = [
     // stopped being true on 2026-09-10.
     key: 'charges_note',
     label: 'Charges Note',
-    value: r => chargeNote(chargeShape(r)),
+    value: r => joinNotes(chargeNote(chargeShape(r)), rowChargeNote(num(r.po_row_charge_rows), num(r.lines))),
   },
   { key: 'bill_key',            label: 'Bill Key',                value: r => r.bill_key },
   /*
@@ -1835,11 +2019,25 @@ export const PURCHASE_BILL_DAY_COLUMNS: PurchaseBillDayColumn[] = [
  * count of mirror rows with no GRN line left to read) — in the SAME sentence
  * /api/reports/purchases writes, from chargeNote() in purchase-charges.ts.
  */
-function dayChargesNote(r: ChargeSourced, poBills: number, poValue: number): string {
+function dayChargesNote(
+  r: ChargeSourced & { po_row_charge_rows?: number },
+  poBills: number,
+  poValue: number,
+): string {
   const provenance = chargeNote(chargeShape(r));
-  if (!provenance) return '';
+  // §2a: PO-receipt lines booked after the receive read off the purchase row.
+  // Zero on every row that holds none, and then this is the old function.
+  const rowLines = num(r.po_row_charge_rows);
+  if (!provenance && rowLines === 0) return '';
+  const rowNote = rowLines > 0
+    ? ` ${rowLines} of ${num(r.lines)} lines are PO receipt lines booked after the receive (a QC hold released, or a correction), `
+      + 'read from the purchase row, which carries the bill\'s charges.'
+    : '';
+  if (!provenance) {
+    return `${poBills} of these groups came from a PO receipt / GRN, carrying Rs ${poValue} of the Grand Total.${rowNote}`;
+  }
   return poBills > 0
-    ? `${provenance}. ${poBills} of these groups came from a PO receipt / GRN, carrying Rs ${poValue} of the Grand Total.`
+    ? `${provenance}. ${poBills} of these groups came from a PO receipt / GRN, carrying Rs ${poValue} of the Grand Total.${rowNote}`
     : provenance;
 }
 

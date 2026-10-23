@@ -2,7 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { duplicateLineError } from '@/lib/po-helpers';
-import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
+import { vendorMappingError, vendorResolver, headerVendorFromLines, type VendorRefLike } from '@/lib/vendor-mapping';
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { liveReceiptsOnPo, type PoReceiptWitnesses } from '@/lib/po-receipts';
 // A merged PO's requisition links ride on the PO lines this route deletes and
@@ -87,10 +87,17 @@ function receiptRefusal(poNumber: string, r: PoReceipts): string {
  *   - Only `approved` POs can be edited via this endpoint (drafts use the normal PUT)
  *   - Replaces line items with the new array (at least one line; same material +
  *     store guards as create/edit), and writes a `po.edit` audit event
- *   - Recomputes total_cost. The HEADER vendor is deliberately not claimed here:
- *     unlike POST/PUT this route does not call deriveHeaderVendor() (it is
- *     module-local to api/purchase-orders/route.ts), so purchase_orders.vendor
- *     keeps its pre-edit value even if every line moved to another vendor.
+ *   - Recomputes total_cost.
+ *   - Recomputes the HEADER vendor when the edit ADDS OR REMOVES A VENDOR — i.e.
+ *     when the header the new lines derive ("Mixed (N vendors)", or the one
+ *     vendor and its id) differs from the one the old lines derived. Same
+ *     derivation as POST/PUT's deriveHeaderVendor() (headerVendorFromLines over
+ *     the lines that carry a vendor NAME, in rowid order). It used to keep its
+ *     pre-edit value always, so a vendor swap left "Mixed (3 vendors)" over
+ *     four line vendors (finding E6-hdr) or one vendor's name over another's
+ *     lines. An edit that leaves the vendor set as it was writes nothing to the
+ *     header, so it reads exactly as before; and a set whose lines name no
+ *     vendor at all leaves the header alone, as POST/PUT do.
  *   - Status → `pending_reapproval`, clears approved_at/by + sets re-approval
  *     note — claimed atomically (`WHERE status = 'approved'`) as the first
  *     statement of the txn, so a concurrent receive cannot be undone
@@ -179,15 +186,37 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // composer refuses — and this path leads straight to receive, where the
     // money is booked against that vendor.
     //
+    // ── DOES THIS EDIT ADD OR REMOVE A VENDOR? Then the header follows. ──────
+    // Decided HERE, before the rule, because it decides which header a line
+    // with no vendor of its own will inherit at receive. The old lines' derived
+    // header against the new lines' derived header, by the ONE derivation POST/
+    // PUT use (headerVendorFromLines; the old lines read with deriveHeaderVendor's
+    // own SELECT). Equal ⇒ the vendor set did not change and the header is left
+    // exactly as stored. Different ⇒ the header is re-derived inside the txn. A
+    // new set with no named vendor at all ('none') leaves the header alone, as
+    // deriveHeaderVendor does.
+    const namedLinesBefore = db.prepare(`
+      SELECT vendor, vendor_id FROM purchase_order_items
+      WHERE po_id = ? AND vendor IS NOT NULL AND TRIM(vendor) != ''
+      ORDER BY rowid
+    `).all(id) as VendorRefLike[];
+    const hdrBefore = headerVendorFromLines(db, namedLinesBefore);
+    const hdrPlanned = headerVendorFromLines(db, items as VendorRefLike[]);
+    const headerFollows = hdrPlanned.kind !== 'none'
+      && (hdrPlanned.kind !== hdrBefore.kind
+        || hdrPlanned.vendor !== hdrBefore.vendor
+        || hdrPlanned.vendor_id !== hdrBefore.vendor_id);
     // The header is passed because a line with no vendor of its own is received
     // under it — checking such a line against "nothing" would wave through the
-    // exact pair receive then books. `headerIsFinal` because this route does NOT
-    // call deriveHeaderVendor() (see the doctrine block above): purchase_orders
-    // .vendor keeps its pre-edit value, so what is on the row now is literally
-    // what those lines inherit.
+    // exact pair receive then books. `headerIsFinal` when the header is NOT
+    // re-derived (the vendor set is unchanged): purchase_orders.vendor keeps its
+    // pre-edit value, so what is on the row now is literally what those lines
+    // inherit. When it IS re-derived, the rule mirrors that derivation itself —
+    // exactly as it does for POST/PUT — so a vendor-less line is checked against
+    // the header it will really be received under.
     const badPair = vendorMappingError(db, items, {
       headerVendor: { vendor_id: po.vendor_id, vendor: po.vendor },
-      headerIsFinal: true,
+      headerIsFinal: !headerFollows,
     });
     if (badPair) return Response.json({ error: badPair }, { status: 400 });
 
@@ -206,6 +235,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // What happened to a merged PO's requisition links (null until the lines
     // are rewritten). `as` so the assignment inside the txn is not narrowed away.
     let links = null as RestoredLinks | null;
+    // The header this edit wrote, when it differs from the one it found (null
+    // otherwise — every edit that leaves the vendor set alone).
+    let headerAfter = null as { vendor: string | null; vendor_id: string | null } | null;
 
     const txn = db.transaction(() => {
       // ── Atomic claim (MUST stay the first statement in this txn) ──────────
@@ -298,6 +330,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // a PO that carries no links (every PO not built by the merge).
       links = restoreRequisitionLinks(db, id, captured);
 
+      // THE HEADER FOLLOWS THE VENDOR SET (decided before the txn, see the rule
+      // above). Re-derived from the rows just inserted, with deriveHeaderVendor's
+      // own SELECT — the stored names are the resolver's master spellings, so
+      // this is the header POST/PUT would write for these lines.
+      if (headerFollows) {
+        const namedNow = db.prepare(`
+          SELECT vendor, vendor_id FROM purchase_order_items
+          WHERE po_id = ? AND vendor IS NOT NULL AND TRIM(vendor) != ''
+          ORDER BY rowid
+        `).all(id) as VendorRefLike[];
+        const hdr = headerVendorFromLines(db, namedNow);
+        if (hdr.kind !== 'none') {
+          db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = ? WHERE id = ?`)
+            .run(hdr.vendor, hdr.vendor_id, id);
+          if (hdr.vendor !== po.vendor || (hdr.vendor_id ?? null) !== (po.vendor_id ?? null)) {
+            headerAfter = { vendor: hdr.vendor, vendor_id: hdr.vendor_id };
+          }
+        }
+      }
+
       // Money + note follow the claim (status/approved_at/approved_by were
       // already cleared there): newTotal is only known after the re-insert.
       // Keep a note so admins know who edited and why.
@@ -322,6 +374,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         status: po.status, total_cost: po.total_cost,
         approved_by: po.approved_by, approved_at: po.approved_at,
         items: beforeItems,
+        // Only when the header moved — every other po.edit row keeps its shape.
+        ...(headerAfter ? { vendor: po.vendor, vendor_id: po.vendor_id ?? null } : {}),
       },
       after: {
         status: 'pending_reapproval', total_cost: newTotal, items: afterItems,
@@ -330,6 +384,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         ...(links && (links.kept > 0 || links.dropped.length > 0)
           ? { requisition_links: { kept: links.kept, dropped: links.dropped } }
           : {}),
+        ...(headerAfter ? { vendor: headerAfter.vendor, vendor_id: headerAfter.vendor_id } : {}),
       },
       note: reason,
     });
@@ -339,6 +394,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       ...(links && (links.kept > 0 || links.dropped.length > 0)
         ? { requisition_links: { kept: links.kept, dropped: links.dropped.length } }
         : {}),
+      ...(headerAfter ? { vendor: headerAfter.vendor } : {}),
     });
   } catch (e: any) {
     console.error('[edit-approved PO]', e);

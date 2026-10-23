@@ -9,7 +9,8 @@ import {
   type CentralStockShort,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
-import { deliveredDirectLines } from '@/lib/po-helpers';
+import { deliveredDirectCaps } from '@/lib/po-helpers';
+import { reconcileDeliveredDirectLines } from '@/lib/po-link-lifecycle';
 
 /**
  * A replayed POST carrying a client_token it already spent is answered 200
@@ -609,38 +610,74 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 400 });
     }
 
-    // ── DELIVERED DIRECT (owner ruling #68) ──────────────────────────────────
-    // A merged PO received through a Direct Issue rule sent the goods straight
-    // to the rule's department; the central store never received them. Issuing
-    // the line from central as well hands the department the goods twice and
+    // ── DELIVERED DIRECT (owner rulings #68 + #73) ───────────────────────────
+    // A merged PO received through a Direct Issue rule sent goods straight to
+    // the rule's department; the central store never received them. Issuing
+    // that part from central as well hands the department the goods twice and
     // takes from central stock it never had (measured: COCONUT MILK POWDER
     // 2 kg delivered direct to Main Kitchen, then 200 here — Main Kitchen 4 kg
     // against a 2 kg ask, central −2 kg). The store desk hides the controls,
     // but a tab opened before the receipt still posts them, so the ROUTE says
-    // no. Only an 'issue' that would hand goods over is refused; Reject (the
-    // way the line is closed), Undo, Defer and Unreject move nothing from
-    // central and pass as before. REFUSED WHOLE, nothing written — the same
-    // stance as the stale cap above: the screen is out of date, so every
+    // no.
+    //
+    // ONLY THE COVERED PART IS REFUSED (ruling #73). A short Direct Issue
+    // receipt covers the department lines in creation order; a line it reached
+    // only in part still owes its rest and may take exactly that rest from
+    // central (deliveredDirectCaps max_issued / max_add, po-helpers.ts). An
+    // issue that would reach into the delivered-direct part is refused; a line
+    // fully delivered direct takes nothing more. Judged on the line AS THIS
+    // GESTURE LEAVES IT — its 'issue' entries add, an 'undo' entry zeroes, in
+    // batch order — so Reject, Defer and Unreject (which move nothing from
+    // central) pass exactly as before. REFUSED WHOLE, nothing written — the
+    // same stance as the stale cap above: the screen is out of date, so every
     // figure beside the line is too. No await sits between this read and the
-    // transaction, so the flag cannot change in between within this process.
-    // Read through requisitionLinePoState (po-helpers.ts), the reader the
-    // desks' badge uses, so the refusal and the badge agree.
+    // transaction, so the figures cannot change in between within this
+    // process. Read through the one reader the desks' badge and the
+    // close-by-itself read too (po-link-lifecycle.ts reqLineDirectState), so
+    // the refusal and the badge agree. A line nothing was delivered direct for
+    // is not in `caps` and is never refused here.
     {
-      const askedIssue = lines
-        .filter((ln: any) => String(ln?.action || '').toLowerCase() === 'issue'
-          && Number(ln?.quantity) > 0 && itemMap.get(ln?.id))
-        .map((ln: any) => String(ln.id));
-      const direct = deliveredDirectLines(db, askedIssue);
-      if (direct.size > 0) {
-        const blockedDirect = [...direct.entries()].map(([lineId, why]) => {
-          const name = String(itemMap.get(lineId)?.material_name || 'a line');
-          return {
-            code: 'delivered_direct', line_id: lineId, req_item_id: lineId, material: name,
-            message: `${name} was ${why} — it cannot be issued again from central. Nothing was issued and the requisition `
-              + `is unchanged. Reload the page: the line now reads "Delivered direct". Reject it to close the line, or ask that `
-              + `department for a department transfer if the asking department still needs it.`,
-          };
+      const sim = new Map<string, { after: number; raised: boolean }>();
+      for (const ln of lines) {
+        const lineId = String(ln?.id ?? '');
+        if (!itemMap.get(lineId)) continue;
+        const act = String(ln?.action || '').toLowerCase();
+        if (act !== 'issue' && act !== 'undo') continue;
+        let s = sim.get(lineId);
+        if (!s) {
+          const cur = selLine.get(lineId, id) as any;
+          s = { after: Number(cur?.quantity_issued) || 0, raised: false };
+          sim.set(lineId, s);
+        }
+        if (act === 'undo') { s.after = 0; continue; }
+        const q = Number(ln?.quantity);
+        if (!Number.isFinite(q) || q <= 0) continue;
+        s.after += q;
+        s.raised = true;
+      }
+      const caps = deliveredDirectCaps(db, [...sim.entries()].filter(([, s]) => s.raised).map(([k]) => k));
+      const blockedDirect: Array<Record<string, unknown> & { message: string }> = [];
+      for (const [lineId, cap] of caps) {
+        const s = sim.get(lineId);
+        if (!s || s.after <= cap.max_issued_line + 1e-6) continue;
+        const name = String(itemMap.get(lineId)?.material_name || 'a line');
+        const message = cap.full
+          ? `${name}: ${cap.what} — the line's whole remaining balance came that way, so it cannot be issued again from `
+            + `central. Nothing was issued and the requisition is unchanged. Reload the page: the line now reads "Delivered direct".`
+            + (cap.closed ? ' It is already closed as delivered direct.' : ' Reject it to close the line.')
+            + ` If the asking department still needs it, the department that received it passes it on by department transfer.`
+          : `${name}: ${cap.what}. Only the rest is still owed from central: at most ${cap.fmt(cap.max_add_line)} more `
+            + `(the line holds ${cap.fmt(cap.issued_line)} of ${cap.fmt(cap.approved_line)} approved). Nothing was issued `
+            + `and the requisition is unchanged.`;
+        blockedDirect.push({
+          code: 'delivered_direct', line_id: lineId, req_item_id: lineId, material: name,
+          full: cap.full, delivered_direct_purchase: cap.covered_purchase,
+          max_add_qty: cap.max_add_line, max_add_purchase: cap.max_add_purchase,
+          line_unit: cap.line_unit, line_issued: cap.issued_line,
+          message,
         });
+      }
+      if (blockedDirect.length > 0) {
         return Response.json({
           error: blockedDirect.map(x => x.message).join(' '),
           code: 'delivered_direct',
@@ -935,6 +972,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       deskBase?: Map<string, number>;
       pf?: ReturnType<typeof applyPartyFulfillment> | null;
       lineChanged?: Record<string, unknown>;
+      /** Lines this gesture left fully delivered direct, closed by themselves. */
+      directClosed?: ReturnType<typeof reconcileDeliveredDirectLines>['closed'];
     } = {};
     // THE SENTENCE LEADS WITH THE PURCHASE UNIT (round 9, owner rule). Every
     // figure goes through fmtLineQtyPU (issue-stock.ts): the line quantity's
@@ -1224,6 +1263,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       for (const [lineId, it] of deferWritten) {
         const now = selLine.get(lineId, id) as any;
         if (now && !now.deferred_until && lineIssueComplete(now)) droppedDefers.push(deferDropRow(it, now));
+      }
+
+      // ── THE REST ISSUED, THE DELIVERED-DIRECT PART CLOSES (rulings #68/#73) ──
+      // A line part delivered direct owes central only its rest; once this
+      // gesture has issued that rest, all that is left on the line is the part
+      // that went straight to the Direct Issue rule's department — the line is
+      // now FULLY delivered direct and closes by itself, exactly as it would
+      // have at the receipt (po-link-lifecycle.ts reconcileDeliveredDirectLines:
+      // the store's own reject, what was issued kept, reason "Delivered direct
+      // to <dept> on <PO> (<GRN>)", audit row by the system). Here, BEFORE the
+      // auto-advance, so the requisition completes in this gesture when its
+      // other lines are done. Only the lines this gesture issued on; never a
+      // party line (its reject zeroes quantity_issued and fires the transfer).
+      // A line no merged PO delivered direct for is not touched — every other
+      // requisition writes exactly what it always wrote.
+      if (!isParty && issuedLines.size > 0) {
+        gestureOut.directClosed = reconcileDeliveredDirectLines(
+          db, { reqItemIds: [...issuedLines] }, { advanceRequisition: false },
+        ).closed;
       }
 
       // --- Auto-advance parent status if fully fulfilled.
@@ -1648,6 +1706,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (droppedDefers.length > 0) {
       out.defer_dropped = droppedDefers;
       out.defer_dropped_message = droppedDefers.map(d => d.message).join(' ');
+    }
+    // Lines this gesture left fully delivered direct, closed by themselves
+    // (rulings #68/#73). Present only when one was, so every other 200 is
+    // byte-identical.
+    if (gestureOut.directClosed && gestureOut.directClosed.length > 0) {
+      out.delivered_direct_closed = gestureOut.directClosed;
+      out.delivered_direct_closed_message = gestureOut.directClosed
+        .map(c => `${c.material}: the rest is issued, so the line is closed — ${c.reason}.`).join(' ');
     }
     // ── A PARTY LINE THE TRANSFER COULD NOT COVER, LEFT OPEN (round 10) ──────
     // A line this gesture did not touch, whose recorded remainder the shelf

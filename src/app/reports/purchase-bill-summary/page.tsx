@@ -11,10 +11,16 @@
  *
  * WHAT A "BILL" IS HERE — it is DERIVED, not stored. `purchases` holds one row per
  * ITEM, so the API groups rows on a bill key resolved in this precedence:
- *     invoice_id (OUR PINV-yyyy-####, minted one per vendor bill)   → kind INV
+ *     grn_id of a PO receipt (its GRN has a po_id), whatever its PINV → kind GRN
+ *  →  invoice_id (OUR PINV-yyyy-####, minted one per vendor bill)   → kind INV
  *  →  grn_id     (one GRN = one delivery = one vendor bill event)   → kind GRN
  *  →  vendor|bill_no|date|outlet (the VENDOR's own number)          → kind BILL
  *  →  vendor|date|outlet                                            → kind DAY_RUN
+ * The first line (2026-10-23) files a PO bill by WHERE IT CAME FROM: a delivery
+ * released from a QC hold is given a PINV when it is booked, and used to land
+ * here as INV — so one merged PO's bills split across two kinds and the
+ * "Include PO/GRN receipts" switch hid some of them and not others. See §2a of
+ * src/lib/purchase-bill-summary.ts.
  * The last branch is most of the data: the overwhelming majority of purchase rows
  * carry no vendor bill number, so they are that vendor's purchases for that day
  * consolidated for reading. A DAY_RUN group may cover more than one physical bill
@@ -164,8 +170,14 @@ interface BillRow {
   grn_number?: string;           // that GRN's own number (GRN-yyyy-####), '' when none
   po_number?: string;            // the PO that GRN was received against, '' when none
   bill_no_missing: boolean;
-  /** PROVENANCE: this bill's charges were read off its GRN line. Not "missing". */
+  /** PROVENANCE: this bill's charges were read off its GRN line. Not "missing".
+   *  False on a PO bill whose lines were all booked after the receive. */
   tax_on_grn: boolean;
+  /** Lines of this PO bill booked AFTER the receive (a QC hold released, or a
+   *  correction): their charges are on the purchase row and are read from
+   *  there, and their Subtotal is their booked cost. 0 on every other bill.
+   *  Optional so a response from an older server renders as before. */
+  po_row_charge_rows?: number;
   /** How many of `lines` took their charges from a GRN line. */
   grn_sourced_rows: number;
   /** Mirror lines whose GRN line is gone — their charges are UNAVAILABLE, not 0. */
@@ -218,6 +230,10 @@ interface BillTotals {
   po_receipt_lines: number;
   /** Those receipts' share of the GRAND TOTAL — never of the subtotal. */
   po_receipt_value: number;
+  /** PO-receipt lines booked AFTER the receive (a QC hold released, or a
+   *  correction), whose charges are read off the purchase row. Optional: an
+   *  older server sends none and the page renders exactly as it did. */
+  po_row_charge_lines?: number;
   /** How many of `bills` carry no vendor bill number — SQL over the FULL period,
    *  so the day view can state an exact figure instead of counting loaded rows. */
   day_run_bills: number;
@@ -308,11 +324,15 @@ interface DayRow {
   total_bill_value: number;
   po_receipt_bills: number;
   po_receipt_lines: number;
-  /** Those bills' share of the GRAND TOTAL — bill face value, read off the GRN. */
+  /** Those bills' share of the GRAND TOTAL — bill face value, read off the GRN
+   *  line (off the purchase row for po_row_charge_rows). */
   po_receipt_value: number;
   /** true ⇒ some of this day's charges were read off a GRN line. PROVENANCE,
    *  not partiality: the figures are complete. Renamed from charges_partial. */
   charges_from_grn: boolean;
+  /** PO-receipt lines on this day booked after the receive — charges read off
+   *  the purchase row, not the GRN line. See BillRow.po_row_charge_rows. */
+  po_row_charge_rows?: number;
   /** cgst + sgst for the day. ON THE WIRE SINCE THE DAY VIEW SHIPPED and simply
    *  never declared here — the day TABLE prints one net "Taxes & charges" bridge
    *  figure instead of the eight charge columns, so nothing needed them. The
@@ -345,6 +365,8 @@ interface DayVendorRow {
   po_receipt_bills: number;
   po_receipt_value: number;
   charges_from_grn: boolean;
+  /** Same as DayRow.po_row_charge_rows, for this vendor on this day. */
+  po_row_charge_rows?: number;
   /** Same three as DayRow — on the wire already, declared for the tax column. */
   gst: number;
   cgst: number;
@@ -763,6 +785,18 @@ export default function PurchaseBillSummaryPage() {
   const dayRunCount = useMemo(
     () => allRows.filter(r => r.bill_kind === 'DAY_RUN').length, [allRows]);
   const grnRowCount = useMemo(() => allRows.filter(r => r.tax_on_grn).length, [allRows]);
+  // WHERE A PO BILL'S CHARGES CAME FROM, when it is not the GRN line (2026-10-23).
+  // A PO bill is now filed PO/GRN whatever its PINV, so a delivery released from
+  // a QC hold sits under the same badge as the rest of its PO — but its lines
+  // carry their charges on the purchase row. Counted so the note below can say
+  // so; while it is 0 (every period before the first such bill) the note prints
+  // exactly the sentence it always did, because then every PO/GRN bill is a
+  // tax_on_grn bill and grnRowCount is the PO/GRN count.
+  // Plain counts, not useMemo: one pass over at most the server's bill cap, and
+  // a memo keyed on `allRows` (a fresh [] whenever data is null) would only add
+  // the exhaustive-deps warning the two memos above already carry.
+  const poBillCount = allRows.filter(r => r.bill_kind === 'GRN').length;
+  const rowChargeBillCount = allRows.filter(r => num(r.po_row_charge_rows) > 0).length;
   const filtered = search.trim().length > 0;
 
   /**
@@ -1087,6 +1121,13 @@ export default function PurchaseBillSummaryPage() {
               while the bill was written on the full price; the Subtotal is that full price, which is why the grand total is built on the Subtotal and the
               discount gets taken off once, in the Discount column, instead of twice.{t && num(t.bill_value) !== num(t.goods) && (
                 <> Across this period the two differ by <strong>{fmtINR(num(t.bill_value) - num(t.goods))}</strong>.</>
+              )}{/* Only on a period that holds one — every other period reads
+                  exactly as it always did. A PO bill booked at a QC release (or
+                  by a correction) is filed PO/GRN by where it came from, but its
+                  Subtotal is NOT "that full price": it is the booked cost. */}
+              {t && num(t.po_row_charge_lines) > 0 && (
+                <> The exception is a PO bill line booked <em>after</em> the receive — when a QC hold was released, or by a correction: its Subtotal is
+                  its booked cost, so a discount netted into that rate sits inside the Subtotal rather than in the Discount column.</>
               )} On an ordinary hand-written bill the two are the same number, and that is correct, not a fault. Check stock against <em>Booked cost
               (spend)</em>; check a vendor statement against the <em>Grand total</em>.</span></p>
           {/* Both sentences are gated on `t`. In the DAY view the loaded `rows`
@@ -1123,17 +1164,48 @@ export default function PurchaseBillSummaryPage() {
                    and the day's grand total is short. */
                 ? <span><strong>{fmtNum(num(t.po_receipt_bills))}</strong> group{num(t.po_receipt_bills) === 1 ? '' : 's'} in this period came from a PO receive / GRN, carrying <strong>{fmtINR(num(t.po_receipt_value))}</strong> of
                   the <em>grand total</em>. Their charges are read from the <strong>GRN line — the bill document</strong>, the same figures the GRN Inward Register totals as
-                  Total Inward.{num(t.unpaired_mirror_lines) > 0
+                  Total Inward.{/* THE EXCEPTION, only when the period holds one
+                    (2026-10-23): a PO bill released from a QC hold is filed
+                    PO/GRN by where it came from, but its lines carry their
+                    charges on the purchase row. Without this clause the
+                    sentence above would claim a source those lines do not use. */}
+                  {num(t.po_row_charge_lines) > 0 && (num(t.po_row_charge_lines) === 1
+                    ? <> The exception is <strong>1</strong> item line booked <em>after</em> the receive — when a QC hold was released, or by a correction: it
+                        carries the bill’s charges on its own purchase row and is read from there.</>
+                    : <> The exceptions are <strong>{fmtNum(num(t.po_row_charge_lines))}</strong> item lines booked <em>after</em> the receive — when a QC hold was
+                        released, or by a correction: they carry the bill’s charges on their own purchase rows and are read from there.</>
+                  )}{num(t.unpaired_mirror_lines) > 0
                     ? <> <strong>But {fmtNum(num(t.unpaired_mirror_lines))}</strong> item line{num(t.unpaired_mirror_lines) === 1 ? ' has' : 's have'} no GRN line left to read from, so the
                       grand total on the day{num(t.unpaired_mirror_lines) === 1 ? '' : 's'} holding {num(t.unpaired_mirror_lines) === 1 ? 'it' : 'them'} is <strong>understated</strong> by
                       whatever that bill charged — and this table has no charge columns in which the gap would show. Open <em>By bill</em> to find the affected bills.</>
                     : <> No line in this period has lost its GRN line, so every day’s charge figures are <strong>complete</strong>.</>} This table shows document counts, the subtotal and the grand total
                   per day, because it is the paperwork-reconciliation view — <strong>the taxes and charges that make up the difference between those two
-                  columns</strong> are in the <em>Taxes &amp; charges</em> column, in the CSV and in <em>By bill</em>, line by line. Days holding a receipt are marked <em>charges from GRN</em> below.</span>
-                : <span><strong>{fmtNum(grnRowCount)}</strong> loaded bill{grnRowCount === 1 ? '' : 's'} came from a PO receive / GRN. Their charges are read from the
+                  columns</strong> are in the <em>Taxes &amp; charges</em> column, in the CSV and in <em>By bill</em>, line by line. {num(t.po_row_charge_lines) > 0
+                    ? <>Days holding a receipt are marked below with where their charges came from: <em>charges from GRN</em>, <em>charges from purchase rows</em>, or both.</>
+                    : <>Days holding a receipt are marked <em>charges from GRN</em> below.</>}</span>
+                : <span>{/* TWO WORDINGS, chosen by the loaded rows (2026-10-23).
+                    While no loaded PO bill holds a line booked after the
+                    receive, every PO/GRN bill reads its charges off the GRN
+                    line and the first wording — the one this page always
+                    printed — is exactly true. A PO bill released from a QC hold
+                    is filed PO/GRN by where it came from, but its lines carry
+                    their charges on the purchase row; the second wording counts
+                    the PO/GRN bills and says which read from where. */}
+                  {rowChargeBillCount === 0
+                  ? <><strong>{fmtNum(grnRowCount)}</strong> loaded bill{grnRowCount === 1 ? '' : 's'} came from a PO receive / GRN. Their charges are read from the
                   <strong> GRN line — the bill document</strong>, not from the cost row, because the receive route deliberately books no tax there (tax inside a
                   rate would poison the weighted-average cost). So those cells carry the bill’s <em>real</em> discount, tax, cess, TCS, delivery and round-off,
-                  the badge names where they came from, and each of those totals matches the GRN Inward Register’s Total Inward for the same bill on every such bill we hold — a check worth running rather than a guarantee, since the register counts every GRN line and this report can only reach a line that has a purchase row behind it.
+                  the badge names where they came from, and each of those totals matches the GRN Inward Register’s Total Inward for the same bill on every such bill we hold — a check worth running rather than a guarantee, since the register counts every GRN line and this report can only reach a line that has a purchase row behind it.</>
+                  : <><strong>{fmtNum(poBillCount)}</strong> loaded bill{poBillCount === 1 ? '' : 's'} came from a PO receive / GRN.{grnRowCount > 0 && (
+                    <> On <strong>{fmtNum(grnRowCount)}</strong> of them the charges are read from the <strong>GRN line — the bill document</strong>, not from
+                      the cost row, because the receive route deliberately books no tax there (tax inside a rate would poison the weighted-average cost). So
+                      those cells carry the bill’s <em>real</em> discount, tax, cess, TCS, delivery and round-off, and each of those totals matches the GRN Inward
+                      Register’s Total Inward for the same bill on every such bill we hold — a check worth running rather than a guarantee, since the register
+                      counts every GRN line and this report can only reach a line that has a purchase row behind it.</>
+                  )} <strong>{fmtNum(rowChargeBillCount)}</strong> of them {rowChargeBillCount === 1 ? 'holds' : 'hold'} lines booked <em>after</em> the
+                    receive — when a QC hold was released, or by a correction. Those lines carry the bill’s charges on their own purchase row and are read
+                    from there; their Subtotal is their booked cost, so a discount netted into that rate sits inside the Subtotal rather than in the
+                    Discount column.</>}
                   {t && num(t.unpaired_mirror_lines) > 0
                     ? <> <strong>{fmtNum(num(t.unpaired_mirror_lines))}</strong> line{num(t.unpaired_mirror_lines) === 1 ? ' has' : 's have'} no GRN line left to read from; those charge cells are
                       <strong> blank</strong> because the figure is unavailable, never ₹0.</>
@@ -1334,16 +1406,39 @@ export default function PurchaseBillSummaryPage() {
                             PO it was received against, which is what groups a
                             merged PO's one-GRN-per-vendor bills back together.
                             The truncated id stays as the fallback for a GRN row
-                            that is gone. */}
+                            that is gone.
+
+                            A PO/GRN BILL THAT ALSO CARRIES A PINV (2026-10-23):
+                            a delivery released from a QC hold is booked with one,
+                            and is filed PO/GRN by where it came from. It prints
+                            the PINV — it is real, and it is what the lines carry
+                            — with the GRN and PO numbers under it, the same two
+                            numbers its sibling bills on the PO show. Every other
+                            row with a PINV (hand-entered, ad-hoc GRN) prints the
+                            PINV alone, as it always did.
+
+                            The titles say "from a PO receive" ONLY when a PO
+                            number is on record: the legacy ad-hoc GRN bills
+                            booked with no PINV land in this cell too, and they
+                            did not come from a PO. */}
                         {r.invoice_id
-                          || (r.grn_id && r.grn_number
-                            ? <span title={`This bill came from a PO receive, not a hand entry.${r.po_number ? ` Received against ${r.po_number}.` : ''} GRN id: ${r.grn_id}`}
+                          ? (r.bill_kind === 'GRN' && r.grn_number
+                            ? <span title={`Our invoice id. A PO bill is given one when its lines are booked after the receive — when a QC hold is released, or by a correction; lines booked at the receive itself get none. ${r.po_number ? `This bill came from a PO receive, not a hand entry. Received against ${r.po_number}.` : 'This bill came from a GRN.'} GRN id: ${r.grn_id}`}>
+                                {r.invoice_id}
+                                <span className="block text-[11px] font-mono text-[#8B7355]">
+                                  {r.grn_number}
+                                  {r.po_number && <span className="block">{r.po_number}</span>}
+                                </span>
+                              </span>
+                            : r.invoice_id)
+                          : (r.grn_id && r.grn_number
+                            ? <span title={`${r.po_number ? `This bill came from a PO receive, not a hand entry. Received against ${r.po_number}.` : 'This bill came from a GRN with no purchase order on record.'} GRN id: ${r.grn_id}`}
                               className="text-[11px] font-mono text-[#8B7355]">
                                 {r.grn_number}
                                 {r.po_number && <span className="block">{r.po_number}</span>}
                               </span>
                             : r.grn_id
-                            ? <span title={`GRN id — this bill came from a PO receive, not a hand entry. Full id: ${r.grn_id}`}
+                            ? <span title={`GRN id — this bill was booked from a GRN, not a hand entry. Full id: ${r.grn_id}`}
                               className="text-[11px] font-mono text-[#8B7355]">GRN {r.grn_id.slice(0, 8)}…</span>
                             : '—')}
                       </td>
@@ -1618,11 +1713,20 @@ export default function PurchaseBillSummaryPage() {
                           <td className={`p-0 sticky right-0 z-10 border-l-2 border-[#F0E4D6] ${open ? 'bg-[#FFF6EE]' : 'bg-white'}`}>
                             <div className="w-[150px] px-3 py-2 text-right tabular-nums font-semibold whitespace-normal leading-tight">
                             {fmtINR(d.total_bill_value)}
-                            {d.charges_from_grn && (
-                              <span className="block text-[10px] text-[#8B7355] font-normal"
-                                title="Some of this day's bills were received against a PO, so their charge figures are read from their GRN lines — the bill documents, and the same figures the GRN Inward Register totals as Total Inward. This note says WHERE part of this day's figures came from, not that they are all there — a day can carry this note and still be short if a GRN line has been deleted; the caption above the table says so when that happens.">
-                                incl. {fmtINR(d.po_receipt_value)} from {fmtNum(d.po_receipt_bills)} PO/GRN · charges from GRN
-                              </span>
+                            {/* The second condition and the two other wordings
+                                appear only on a day holding a PO line booked after
+                                the receive (a QC hold released, a correction); on
+                                every other day this is the note it always was. */}
+                            {(d.charges_from_grn || num(d.po_row_charge_rows) > 0) && (
+                              num(d.po_row_charge_rows) > 0
+                                ? <span className="block text-[10px] text-[#8B7355] font-normal"
+                                    title={`Some of this day's bills were received against a PO. ${d.charges_from_grn ? 'Lines booked at the receive read their charge figures from their GRN lines — the bill documents. ' : ''}${fmtNum(num(d.po_row_charge_rows))} line${num(d.po_row_charge_rows) === 1 ? ' was' : 's were'} booked after the receive — when a QC hold was released, or by a correction — and carr${num(d.po_row_charge_rows) === 1 ? 'ies' : 'y'} the bill's charges on ${num(d.po_row_charge_rows) === 1 ? 'its' : 'their'} own purchase row, which is where ${num(d.po_row_charge_rows) === 1 ? 'it is' : 'they are'} read from. This note says WHERE this day's figures came from, not that they are all there — the caption above the table says so if a GRN line has been deleted.`}>
+                                    incl. {fmtINR(d.po_receipt_value)} from {fmtNum(d.po_receipt_bills)} PO/GRN · {d.charges_from_grn ? 'charges from GRN and purchase rows' : 'charges from purchase rows'}
+                                  </span>
+                                : <span className="block text-[10px] text-[#8B7355] font-normal"
+                                    title="Some of this day's bills were received against a PO, so their charge figures are read from their GRN lines — the bill documents, and the same figures the GRN Inward Register totals as Total Inward. This note says WHERE part of this day's figures came from, not that they are all there — a day can carry this note and still be short if a GRN line has been deleted; the caption above the table says so when that happens.">
+                                    incl. {fmtINR(d.po_receipt_value)} from {fmtNum(d.po_receipt_bills)} PO/GRN · charges from GRN
+                                  </span>
                             )}
                             </div>
                           </td>
@@ -1661,11 +1765,19 @@ export default function PurchaseBillSummaryPage() {
                             <td className="p-0 sticky right-0 z-10 bg-[#FFFCF8] border-l-2 border-[#F0E4D6]">
                               <div className="w-[150px] px-3 py-1.5 text-right tabular-nums text-[#6B5744] whitespace-normal leading-tight">
                               {fmtINR(v.total_bill_value)}
-                              {v.charges_from_grn && (
-                                <span className="block text-[10px] text-[#8B7355]"
-                                  title="Charges on part of this vendor's day were read from the GRN line — the bill document. The figures are complete.">
-                                  incl. {fmtINR(v.po_receipt_value)} from PO/GRN
-                                </span>
+                              {/* Same rule as the day row above: the other wording
+                                  appears only where a PO line booked after the
+                                  receive sits in this vendor's day. */}
+                              {(v.charges_from_grn || num(v.po_row_charge_rows) > 0) && (
+                                num(v.po_row_charge_rows) > 0
+                                  ? <span className="block text-[10px] text-[#8B7355]"
+                                      title={`${v.charges_from_grn ? "Charges on part of this vendor's day were read from the GRN line — the bill document. " : ''}${fmtNum(num(v.po_row_charge_rows))} PO line${num(v.po_row_charge_rows) === 1 ? ' was' : 's were'} booked after the receive — when a QC hold was released, or by a correction — and ${num(v.po_row_charge_rows) === 1 ? 'is' : 'are'} read from ${num(v.po_row_charge_rows) === 1 ? 'its' : 'their'} own purchase row, which carries the bill's charges.`}>
+                                      incl. {fmtINR(v.po_receipt_value)} from PO/GRN
+                                    </span>
+                                  : <span className="block text-[10px] text-[#8B7355]"
+                                      title="Charges on part of this vendor's day were read from the GRN line — the bill document. The figures are complete.">
+                                      incl. {fmtINR(v.po_receipt_value)} from PO/GRN
+                                    </span>
                               )}
                               </div>
                             </td>

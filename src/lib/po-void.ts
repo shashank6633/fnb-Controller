@@ -74,6 +74,18 @@ import { closedPoItemIds, syncPoLinkFlags, type LinkFlagSync } from './po-link-l
  * not the one that closed the order — and unwinding it would have to un-stamp a
  * completion that a different vendor's bill earned. Voiding the LATEST receipt
  * is always available, which is the mistake an admin actually needs to undo.
+ *
+ * ── …PER VENDOR ON A PO THAT HAS SEVERAL (OWNER RULING 72, 2026-10-23) ─────
+ * "GRN void order — newest-first PER VENDOR on a PO (a vendor's newest bill may
+ * be voided without touching other vendors' later bills); single-vendor POs
+ * unchanged." On a PO whose LINES name more than one vendor (receive's own
+ * grouping — see poVendorScope), only a later live receipt from the SAME vendor
+ * blocks the void. Another vendor's later bill no longer does: if voiding this
+ * one un-claims lines, the order reopens exactly as it does for the latest
+ * receipt (received_at cleared, total_cost back to ORDERED, grn_id to the
+ * newest survivor), and the vendor's re-receipt completes it again. On a PO
+ * with ONE vendor the scope is never built and the rule is the one above,
+ * byte for byte.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 type PoRow = {
@@ -154,6 +166,13 @@ export interface PoVoidOutcome {
  * can be undone as long as it is undone before the next one is taken in, and
  * two receipts can be undone newest-first.
  *
+ * THAT DECISION HAS SINCE BEEN MADE FOR THE MULTI-VENDOR PO (ruling 72): the
+ * completion belongs to the order, not to the bill that happened to land last,
+ * so voiding vendor B's bill while vendor C's later bill stands reopens the
+ * order (received_at cleared, ORDERED total back) and B's re-receipt completes
+ * it again. Only B's OWN later bills still block — laterVendorReceiptRefusal.
+ * This function remains the whole rule on a single-vendor PO.
+ *
  * ── "LATER" MEANS KEYED LATER, NOT DATED LATER. THIS IS THE WHOLE GUARD. ───
  * It used to compare (date, created_at, grn_number) — the ordering poReceipts
  * uses for DISPLAY. goods_receipt_notes.date is the storekeeper-TYPED receipt
@@ -176,6 +195,62 @@ function laterReceiptRefusal(grnNumber: string, poNumber: string, later: any[]):
     `${grnNumber} cannot be voided because ${later.length} receipt(s) on ${poNumber} were entered after it and still stand (${names}). Voiding an earlier bill would reopen the order and clear a completion date and a received total that those later bills stamped. Void the later receipt(s) first, newest first — or raise a vendor return for these goods instead.`,
     { grn_number: grnNumber, po_number: poNumber, later_grns: later.map(r => String(r.grn_number)) },
     'po_later_receipt');
+}
+
+/**
+ * The same refusal on a PO with SEVERAL vendors (ruling 72), where only the
+ * vendor's OWN later bills block. Its own sentence, because the one above would
+ * be untrue here: it says every later receipt blocks, and that a later bill's
+ * completion is what is being protected — on a multi-vendor order neither is
+ * the rule any more. Same code (the void modal keys on it) and the same payload
+ * keys, plus the vendor it was scoped to.
+ */
+function laterVendorReceiptRefusal(grnNumber: string, poNumber: string, vendorLabel: string, later: any[]): GrnRefused {
+  const names = later.map(r => r.grn_number).join(', ');
+  return new GrnRefused(409,
+    `${grnNumber} cannot be voided because ${later.length} later receipt(s) from ${vendorLabel} on ${poNumber} still stand (${names}). One vendor's bills on an order are voided newest first: void ${vendorLabel}'s later receipt(s) first — or raise a vendor return for these goods instead. Receipts from the other vendors on ${poNumber} do not block this void.`,
+    { grn_number: grnNumber, po_number: poNumber, later_grns: later.map(r => String(r.grn_number)), vendor: vendorLabel },
+    'po_later_receipt');
+}
+
+/**
+ * WHICH VENDOR A RECEIPT BELONGS TO, ON A PO THAT HAS MORE THAN ONE (ruling 72).
+ *
+ * THE GROUPING IS RECEIVE'S OWN, restated because a route file cannot export it:
+ *   lineVendorName = (it.vendor && String(it.vendor).trim()) || po.vendor || ''
+ *   vendorKeyOf    = String(name || '').trim().toLowerCase()
+ * (src/app/api/purchase-orders/[id]/receive/route.ts). One bill on such a PO is
+ * one of those groups — receive refuses a bill that spans two — so a receipt's
+ * vendor is the group of the PO lines it claims. The lines are frozen while any
+ * live receipt stands (edit-approved refuses), so that mapping cannot drift
+ * under a receipt that can still be voided. A receipt whose claimed lines are
+ * no longer on the PO falls back to its own header vendor, by the same key.
+ *
+ * Returns null when the PO's lines form ONE group (or none): that is the
+ * single-vendor PO, and the caller keeps today's whole-PO rule untouched.
+ */
+type PoVendorScope = { keysOf: (grnId: string, grnVendor: unknown) => Set<string> };
+function poVendorScope(db: Database.Database, poId: string): PoVendorScope | null {
+  const header = db.prepare(`SELECT vendor FROM purchase_orders WHERE id = ?`).get(poId) as { vendor?: unknown } | undefined;
+  const lines = db.prepare(`SELECT id, vendor FROM purchase_order_items WHERE po_id = ?`).all(poId) as Array<{ id: unknown; vendor: unknown }>;
+  const keyOf = (name: unknown): string => String(name || '').trim().toLowerCase();
+  const keyOfLine = new Map<string, string>();
+  for (const l of lines) {
+    const name = (l.vendor && String(l.vendor).trim()) || header?.vendor || '';
+    keyOfLine.set(String(l.id), keyOf(name));
+  }
+  if (new Set(keyOfLine.values()).size <= 1) return null;
+  return {
+    keysOf: (grnId: string, grnVendor: unknown) => {
+      const keys = new Set<string>();
+      for (const pid of claimedPoItemIds(db, grnId)) {
+        const k = keyOfLine.get(pid);
+        if (k !== undefined) keys.add(k);
+      }
+      if (keys.size === 0) keys.add(keyOf(grnVendor));
+      return keys;
+    },
+  };
 }
 
 /**
@@ -217,12 +292,24 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
   // a detail. This GRN is already 'void' at this point, so liveClaimSql excludes
   // it and the `id <> ?` is belt-and-braces rather than the filter.
   const later = db.prepare(`
-    SELECT grn_number, date, created_at FROM goods_receipt_notes
+    SELECT id, grn_number, vendor, date, created_at FROM goods_receipt_notes
     WHERE po_id = ? AND id <> ? AND ${liveClaimSql('goods_receipt_notes')}
       AND (created_at, grn_number) > (?, ?)
     ORDER BY created_at, grn_number
   `).all(poId, String(grn.id), String(grn.created_at ?? ''), String(grn.grn_number ?? '')) as any[];
-  if (later.length > 0) throw laterReceiptRefusal(String(grn.grn_number), po.po_number, later);
+  if (later.length > 0) {
+    // PER VENDOR on a multi-vendor PO (ruling 72): only this vendor's own later
+    // bills block. The scope is built only when something later stands, and is
+    // null on a single-vendor PO — whose refusal stays the sentence above.
+    const scope = poVendorScope(db, poId);
+    if (!scope) throw laterReceiptRefusal(String(grn.grn_number), po.po_number, later);
+    const mine = scope.keysOf(String(grn.id), grn.vendor);
+    const sameVendor = later.filter(r => [...scope.keysOf(String(r.id), r.vendor)].some(k => mine.has(k)));
+    if (sameVendor.length > 0) {
+      const vendorLabel = String(grn.vendor ?? '').trim() || 'this vendor';
+      throw laterVendorReceiptRefusal(String(grn.grn_number), po.po_number, vendorLabel, sameVendor);
+    }
+  }
 
   // ── THE VENDOR BILL ROW ───────────────────────────────────────────────────
   const { bill, matchedBy } = identifyVendorBill(db, poId, String(grn.id), String(grn.grn_number), po.po_number);

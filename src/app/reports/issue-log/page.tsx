@@ -935,7 +935,10 @@ function FulfilmentCell({ r }: { r: IssueLogRow }) {
   // was rejected — and nothing about where stock sits (a party line can be
   // rejected after its transfer moved part of it; the line's own figure says
   // what the record holds).
-  const openWords = rejectedBy ? `rejected by ${rejectedBy}:` : 'still open';
+  // A line closed because its goods came by Direct Issue (rulings #68/#73) was not
+  // rejected by anyone — its reason travels in notes.
+  const directClosed = r.status === 'store_rejected' && /Delivered direct to /.test(String(r.notes || ''));
+  const openWords = directClosed ? 'closed — delivered direct:' : rejectedBy ? `rejected by ${rejectedBy}:` : 'still open';
   return (
     <span className="inline-block">
       <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${tone}`}>{r.fulfilment}</span>

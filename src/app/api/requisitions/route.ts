@@ -281,6 +281,10 @@ export async function GET(request: Request) {
         // not the asking one) and the bill it came on. Null unless delivered_direct.
         it.delivered_direct_dept_name = st?.delivered_direct_dept_name ?? null;
         it.delivered_direct_grn = st?.delivered_direct_grn ?? null;
+        // Ruling #73: how much came direct, what is still issuable, and who closed it.
+        it.delivered_direct_qty_purchase = (st as any)?.delivered_direct_qty_purchase ?? null;
+        it.delivered_direct_partial = (st as any)?.delivered_direct_partial ?? null;
+        it.delivered_direct_closed_by = (st as any)?.delivered_direct_closed_by ?? null;
         it.vendor_closed = st?.vendor_closed ?? false;
         it.vendor_closed_reason = st?.vendor_closed_reason ?? null;
         it.also_on_po = st?.also_on_po ?? [];
