@@ -3,6 +3,12 @@ import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { toPurchaseQty, csvQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
+import {
+  CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_TAX_CSV, SEMI_GST,
+  closingTaxCells, closingTaxCsv, createClosingGstResolver, storedCountValue, sumClosingTax,
+  type ClosingGstSource, type ClosingTaxTotals,
+} from '@/lib/closing-tax';
 
 /**
  * CLOSING STOCK HISTORY — the download the owner asked for alongside the
@@ -10,6 +16,8 @@ import { todayIST } from '@/lib/format-date';
  * for store manager / HOD / admin."
  *
  * GET /api/closing-stock/history?from=&to=&department_id=&format=csv|json
+ *     &gst=1  (flat view only) add the estimated-GST fields / CSV columns —
+ *             see HistoryRow and src/lib/closing-tax.ts. Opt-in on purpose.
  *
  * ── WHY BOTH TABLES ────────────────────────────────────────────────────────
  * Raw-material counts live in `closing_stock`; semi-finished (sub-recipe)
@@ -127,9 +135,25 @@ export interface HistoryRow {
   value: number | null;
   recorded_by: string;
   type: 'RAW' | 'SUB';
+  /* ── ESTIMATED GST (owner #4, rulings #77/#78/#81 — src/lib/closing-tax.ts).
+   * Flat view, and ONLY when the caller asks with `gst=1` (Closing History &
+   * Compare does; the Dept Closing Sheet's "Download history" does not, so
+   * its file stays exactly as it was — ruling #81). Absent otherwise. The
+   * matrix is unchanged. Same visibility as `value`. ── */
+  /** GST % at this row's COUNT DATE; null = BLANK (never 0). Always null on SUB rows. */
+  gst_pct?: number | null;
+  gst_source?: ClosingGstSource;
+  /** "last bill with GST 12 Oct 2026" / "Master GST %" / "no GST rate on record" / … */
+  gst_note?: string;
+  gst_title?: string;
+  /** value × gst_pct ÷ 100; null when there is no rate or no value. */
+  tax?: number | null;
+  /** value + tax; null when tax is null. */
+  total_incl_tax?: number | null;
 }
 
 interface RawCountRow {
+  material_id: string;
   date: string;
   department: string | null;
   material: string;
@@ -300,6 +324,11 @@ export async function GET(request: Request) {
     // a typo must never silently change the shape of a live download.
     const view = (url.searchParams.get('view') || '').trim().toLowerCase() === 'matrix' ? 'matrix' : 'flat';
     const q = (url.searchParams.get('q') || '').trim();
+    // Estimated GST (rulings #77/#81) is OPT-IN: exactly `gst=1`, sent only by
+    // /inventory/closing-history. Without it the flat JSON and CSV are the
+    // deployed shape byte for byte — the Dept Closing Sheet's "Download
+    // history" calls this route too, and ruling #81 keeps that sheet unchanged.
+    const withGst = view === 'flat' && url.searchParams.get('gst') === '1';
 
     const today = todayIST();
     // The matrix defaults WIDER than the flat list on purpose: its job is to
@@ -697,6 +726,7 @@ export async function GET(request: Request) {
 
     const rawRows = db.prepare(`
       SELECT cs.date                                            AS date,
+             cs.material_id                                     AS material_id,
              d.name                                             AS department,
              rm.name                                            AS material,
              rm.sku                                             AS sku,
@@ -744,6 +774,16 @@ export async function GET(request: Request) {
 
     const rows: HistoryRow[] = [];
 
+    // The GST rate per (material, COUNT DATE) — never today's: a bill dated
+    // after a count can never re-price that count's tax. Liquor / store-mapped
+    // materials are always blank (the store-issued-log lock). Only on gst=1.
+    const gstResolver = withGst && rawRows.length
+      ? createClosingGstResolver(db, {
+          isStoreMapped: (category) => isStoreMappedMaterial(db, category),
+          materialIds: rawRows.map((r) => String(r.material_id)),
+        })
+      : null;
+
     for (const r of rawRows) {
       const meta: PackMeta = {
         unit: r.unit, purchase_unit: r.purchase_unit, pack_size: r.pack_size,
@@ -756,7 +796,7 @@ export async function GET(request: Request) {
       const source = hasStoredRate ? String(r.rate_source || 'none') : 'not_recorded';
       // 'none' = no basis existed at count time; the row is genuinely unpriced.
       const priced = hasStoredRate && source !== 'none';
-      rows.push({
+      const row: HistoryRow = {
         date: r.date,
         department: r.department || STORE_LABEL,
         material: r.material,
@@ -771,7 +811,21 @@ export async function GET(request: Request) {
         value: priced ? r2(num(r.total_value)) : null,
         recorded_by: r.recorded_by || '',
         type: 'RAW',
-      });
+      };
+      if (gstResolver) {
+        const gst = gstResolver.forMaterial(String(r.material_id), r.date);
+        // Tax on the value SAVED with the count — the figure this row prints
+        // as `value` (closing-tax.ts storedCountValue, the one rule all three
+        // surfaces use). An unpriced / pre-capture row has no tax.
+        const taxCells = closingTaxCells(storedCountValue(r), gst);
+        row.gst_pct = gst.gst_pct;
+        row.gst_source = gst.gst_source;
+        row.gst_note = gst.gst_note;
+        row.gst_title = gst.gst_title;
+        row.tax = taxCells.tax;
+        row.total_incl_tax = taxCells.total_incl_tax;
+      }
+      rows.push(row);
     }
 
     for (const s of semiRows) {
@@ -779,7 +833,7 @@ export async function GET(request: Request) {
       // CURRENT yield_unit — the same dated-record principle as the rate.
       const unit = String(s.unit || '').trim() || String(s.yield_unit || '').trim();
       const priced = num(s.rate) > 0 || num(s.total_value) > 0;
-      rows.push({
+      const semi: HistoryRow = {
         date: s.date,
         department: s.department || STORE_LABEL,
         material: s.material,
@@ -801,7 +855,17 @@ export async function GET(request: Request) {
         value: priced ? r2(num(s.total_value)) : null,
         recorded_by: s.recorded_by || '',
         type: 'SUB',
-      });
+      };
+      if (withGst) {
+        // Semi-finished stock is made in-house, never billed: always blank.
+        semi.gst_pct = null;
+        semi.gst_source = SEMI_GST.gst_source;
+        semi.gst_note = SEMI_GST.gst_note;
+        semi.gst_title = SEMI_GST.gst_title;
+        semi.tax = null;
+        semi.total_incl_tax = null;
+      }
+      rows.push(semi);
     }
 
     // Newest day first, then department, then item — the order the two halves
@@ -819,7 +883,12 @@ export async function GET(request: Request) {
     // by the caller via rate_source.
     let value = 0;
     for (const r of rows) if (r.value != null) value += r.value;
-    const totals = { count: rows.length, value: r2(value) };
+    // Estimated GST (gst=1 only) over the rows WITH a rate only, with the
+    // counts the page needs to say "rate known for N of M" — computed after
+    // truncation, from the same per-row figures the table prints, so the
+    // footer foots. Without gst=1 the totals are the deployed { count, value }.
+    const totals: { count: number; value: number; tax?: ClosingTaxTotals } = { count: rows.length, value: r2(value) };
+    if (withGst) totals.tax = sumClosingTax(rows);
 
     const note = truncated
       ? `Showing the first ${ROW_CAP.toLocaleString('en-IN')} rows — the range holds more. Narrow the dates or pick one department to see the rest.`
@@ -830,9 +899,21 @@ export async function GET(request: Request) {
         'Date', 'Department', 'Item', 'SKU', 'Category',
         'Purchase Unit', 'Counted (purchase)',
         'Rate', 'Rate Source', 'Value (INR)', 'Recorded By', 'Type',
+        // Estimated GST (gst=1 only) — APPENDED after the last existing
+        // column; every column above keeps its position. Blank = no rate
+        // (never 0). Without gst=1 the file is the deployed one, unchanged.
+        ...(withGst ? [CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_TAX_CSV, CLOSING_INCL_CSV] : []),
       ];
       const lines = [headers.join(',')];
       for (const r of rows) {
+        const gstCells = withGst
+          ? [
+              closingTaxCsv(r.gst_pct),
+              csvEscape(r.gst_note || ''),
+              closingTaxCsv(r.tax),
+              closingTaxCsv(r.total_incl_tax),
+            ]
+          : [];
         lines.push([
           csvEscape(r.date),
           csvEscape(r.department),
@@ -848,6 +929,7 @@ export async function GET(request: Request) {
           r.value == null ? '' : r.value,
           csvEscape(r.recorded_by),
           r.type,
+          ...gstCells,
         ].join(','));
       }
       // The truncation warning must survive into the file itself — someone will

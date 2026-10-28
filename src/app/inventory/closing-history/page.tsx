@@ -75,6 +75,11 @@ import {
 } from 'lucide-react';
 import { fmtQtyNum } from '@/lib/pack-units';
 import { todayIST, fmtISTDate } from '@/lib/format-date';
+import {
+  CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
+  CLOSING_INCL_LABEL, CLOSING_INCL_TITLE, CLOSING_TAX_LABEL, CLOSING_TAX_TITLE,
+  closingTaxNotes, fmtClosingGstPct, sumClosingTax, type ClosingTaxTotals,
+} from '@/lib/closing-tax';
 
 /* ── Wire types — /api/closing-stock/history ─────────────────────────────── */
 
@@ -134,12 +139,19 @@ interface FlatRow {
   value: number | null;
   recorded_by: string;
   type: 'RAW' | 'SUB';
+  /* Estimated GST (owner #4, rulings #77/#78/#81) — resolved by the route
+   * (src/lib/closing-tax.ts). null = BLANK, never 0. */
+  gst_pct: number | null;
+  gst_note: string;
+  gst_title: string;
+  tax: number | null;
+  total_incl_tax: number | null;
 }
 
 interface FlatResp {
   mode: 'flat';
   rows: FlatRow[];
-  totals: { count: number; value: number };
+  totals: { count: number; value: number; tax: ClosingTaxTotals };
   truncated: boolean;
   from: string;
   to: string;
@@ -276,13 +288,20 @@ const normaliseFlat = (payload: unknown, from: string, to: string): FlatResp => 
       value: numOrNull(o.value),
       recorded_by: str(o.recorded_by),
       type: str(o.type) === 'SUB' ? 'SUB' : 'RAW',
+      gst_pct: numOrNull(o.gst_pct),
+      gst_note: str(o.gst_note),
+      gst_title: str(o.gst_title),
+      tax: numOrNull(o.tax),
+      total_incl_tax: numOrNull(o.total_incl_tax),
     };
   });
   const t = rec(j.totals);
   return {
     mode: 'flat',
     rows,
-    totals: { count: numOrNull(t.count) ?? rows.length, value: num(t.value) },
+    // Re-summed here from the very rows the table prints (the route sends the
+    // same figure), so the footer can never disagree with its own column.
+    totals: { count: numOrNull(t.count) ?? rows.length, value: num(t.value), tax: sumClosingTax(rows) },
     truncated: !!j.truncated,
     from: str(j.from) || from,
     to: str(j.to) || to,
@@ -357,6 +376,10 @@ export default function ClosingHistoryPage() {
     const p = new URLSearchParams({ view, from, to });
     if (deptId) p.set('department_id', deptId);
     if (qSent) p.set('q', qSent);
+    // Estimated GST (rulings #77/#81) on the "All entries" table AND its CSV.
+    // Opt-in on the route, so the Dept Closing Sheet's history file (same
+    // route, no gst=1) stays unchanged. The matrix never carries it.
+    if (view !== 'matrix') p.set('gst', '1');
     return p;
   }, [view, from, to, deptId, qSent]);
 
@@ -870,6 +893,9 @@ function ChangeCell({ row }: { row: MatrixRow }) {
 function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
   const { rows } = data;
   if (rows.length === 0) return <EmptyState filtered={filtered} from={data.from} to={data.to} />;
+  // Every note printed with the GST totals comes from the ONE helper, so it
+  // states the true case: no rate / rates but no value saved at count / taxed.
+  const taxNotes = closingTaxNotes(data.totals.tax, 'entries', inr2);
 
   return (
     <div className="space-y-2">
@@ -883,6 +909,14 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
               <th className="text-right font-semibold px-3 py-2 min-w-[110px]">Counted</th>
               <th className="text-right font-semibold px-3 py-2 min-w-[120px]">Rate</th>
               <th className="text-right font-semibold px-3 py-2 min-w-[100px] bg-[#FBE7D3]">Value</th>
+              {/* Estimated GST beside Value — derived only from it, so it is
+                  shown to exactly the same readers. */}
+              <th className="text-right font-semibold px-3 py-2 min-w-[110px]" title={CLOSING_GST_PCT_TITLE}>
+                {CLOSING_GST_PCT_LABEL}
+                <div className="text-[9px] font-normal text-[#8B7355]">{CLOSING_GST_PCT_SUB}</div>
+              </th>
+              <th className="text-right font-semibold px-3 py-2 min-w-[100px]" title={CLOSING_TAX_TITLE}>{CLOSING_TAX_LABEL}</th>
+              <th className="text-right font-semibold px-3 py-2 min-w-[110px]" title={CLOSING_INCL_TITLE}>{CLOSING_INCL_LABEL}</th>
               <th className="text-left font-semibold px-3 py-2 min-w-[110px]">Recorded by</th>
             </tr>
           </thead>
@@ -926,6 +960,24 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
                 <td className="px-3 py-1.5 text-right tabular-nums bg-[#FEF6EE] text-[#2D1B0E]">
                   {r.value == null ? <span className="text-[#B9A896]">{EM}</span> : inr2(r.value)}
                 </td>
+                {/* Every rate says where it came from; blank is an em-dash,
+                    never 0% / ₹0. */}
+                <td className="px-3 py-1.5 text-right tabular-nums" title={r.gst_title || undefined}>
+                  {r.gst_pct == null
+                    ? <span className="text-[#B9A896]">{EM}</span>
+                    : <span className="text-[#2D1B0E]">{fmtClosingGstPct(r.gst_pct)}</span>}
+                  {r.gst_note && <div className="text-[9px] text-[#B8A590]">{r.gst_note}</div>}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums text-[#2D1B0E]">
+                  {r.tax == null
+                    ? <span className="text-[#B9A896]" title={r.gst_pct == null ? r.gst_title : 'No value basis for this count — nothing to apply the rate to.'}>{EM}</span>
+                    : inr2(r.tax)}
+                </td>
+                <td className="px-3 py-1.5 text-right tabular-nums text-[#2D1B0E]">
+                  {r.total_incl_tax == null
+                    ? <span className="text-[#B9A896]" title={r.gst_pct == null ? r.gst_title : 'No value basis for this count — nothing to apply the rate to.'}>{EM}</span>
+                    : inr2(r.total_incl_tax)}
+                </td>
                 <td className="px-3 py-1.5 text-[10px] text-[#6B5744]">{r.recorded_by || EM}</td>
               </tr>
             ))}
@@ -944,6 +996,18 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
                   title="Quantities cannot be added across different materials.">{EM}</td>
               <td className="px-3 py-2 text-right text-[#B9A896] font-normal">{EM}</td>
               <td className="px-3 py-2 text-right tabular-nums bg-[#FBE7D3]">{inr2(data.totals.value)}</td>
+              {/* A GST % does not add up across materials. Tax and Total incl.
+                  sum ONLY the rows with a rate, and say how many. */}
+              <td className="px-3 py-2 text-right text-[#B9A896] font-normal"
+                  title="A GST % cannot be added across materials.">{EM}</td>
+              <td className="px-3 py-2 text-right tabular-nums" title={`${CLOSING_TAX_TITLE} ${taxNotes.title}`}>
+                {data.totals.tax.taxed > 0 ? inr2(data.totals.tax.tax) : <span className="text-[#B9A896] font-normal">{EM}</span>}
+                <div className="text-[9px] font-normal text-[#8B7355]">{taxNotes.rate}</div>
+              </td>
+              <td className="px-3 py-2 text-right tabular-nums" title={taxNotes.title}>
+                {data.totals.tax.taxed > 0 ? inr2(data.totals.tax.total_incl_tax) : <span className="text-[#B9A896] font-normal">{EM}</span>}
+                <div className="text-[9px] font-normal text-[#8B7355]">{taxNotes.incl}</div>
+              </td>
               <td className="px-3 py-2" />
             </tr>
           </tfoot>
@@ -952,6 +1016,12 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
       <p className="text-[11px] text-[#8B7355]">
         Every count is valued at the rate stored when it was taken, so a past total never
         changes when a purchase price moves today.
+      </p>
+      <p className="text-[11px] text-[#8B7355]">
+        GST is an estimate: Value × the GST % charged on the item&apos;s latest bill that recorded
+        GST, dated on or before that count (else the item master&apos;s GST %). Bills with no GST
+        recorded are skipped, and a later bill never changes it. Liquor / store items and
+        semi-finished items carry no GST here; a blank is never 0%.
       </p>
     </div>
   );
