@@ -1,7 +1,8 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { deptTransferableStock } from '@/lib/dept-stock';
 import { fmtQtyNum } from '@/lib/pack-units';
+import { toSendQueue } from '@/lib/routed-requisitions';
 import { loadDepartments, canSeeDept, canSendFrom, receiversFor } from '../access';
 
 /**
@@ -56,6 +57,23 @@ export async function GET(request: Request) {
 
     const result = deptTransferableStock(db, departmentId);
     if (!result) return Response.json({ error: 'Unknown department' }, { status: 404 });
+    // RULING 45 — a HINT, never a block: what of each material is owed on this
+    // department's To send list (routed-requisitions toSendQueue, the list's
+    // own figures). A plain Send of it moves the goods but fulfils NO
+    // requisition line, so the tray says where the owed lines are.
+    const owed = new Map<string, { purchase: number; lines: number; reqs: Set<string> }>();
+    try {
+      const q = toSendQueue(db, departmentId, await getCurrentOutletId());
+      for (const g of q.groups) {
+        for (const l of g.lines) {
+          const o = owed.get(l.material_id) || { purchase: 0, lines: 0, reqs: new Set<string>() };
+          o.purchase = Math.round((o.purchase + (Number(l.owed_purchase) || 0)) * 1000) / 1000;
+          o.lines += 1;
+          o.reqs.add(g.req_number);
+          owed.set(l.material_id, o);
+        }
+      }
+    } catch { /* the hint is optional; the holdings stand without it */ }
     const usageHere = result.department.usage_booked_here;
     const stationList = result.department.stations.join(', ');
     // Added, never overriding a library field: the basis in words, so no
@@ -97,7 +115,21 @@ export async function GET(request: Request) {
         label = `${dept.name}'s last count plus every movement since.`;
       }
       if (r.available < -1e-9) label += ' The ledger is below zero — record a count before sending.';
-      return { ...r, never_counted: r.upper_bound, basis_label: label };
+      const o = owed.get(r.material_id);
+      const reqs = o ? [...o.reqs] : [];
+      return {
+        ...r, never_counted: r.upper_bound, basis_label: label,
+        /** RULING 45: owed on this department's To send list — null when none. */
+        routed_owed: o ? {
+          purchase: o.purchase,
+          purchase_unit: pu,
+          lines: o.lines,
+          req_numbers: reqs,
+          hint: `${fmtQtyNum(o.purchase)} ${pu} of this is owed on ${dept.name}'s To send list ` +
+            `(${reqs.length === 1 ? reqs[0] : `${reqs.length} requisitions`}). Send it from To send so it fulfils ` +
+            `${o.lines === 1 ? 'that line' : 'those lines'}; a plain transfer here moves the goods but fulfils no requisition line.`,
+        } : null,
+      };
     });
     return Response.json({
       department: { ...result.department, is_active: !!Number(dept.is_active) },

@@ -10,6 +10,10 @@ import {
 // no cycle back into db.ts. Used only by the department-transfer section at the
 // foot of this file, which converts a PURCHASE-unit entry ONCE, at the door.
 import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
+// RULING 45 — the transfer ↔ requisition link columns. A LEAF (better-sqlite3
+// types only), so no cycle back into db.ts. One probe per handle, shared with
+// every lane: NOBODY re-probes these columns.
+import { routedSchema } from './routed-schema';
 
 /**
  * THE department stock rail. One table, one writer, one derivation.
@@ -1861,6 +1865,15 @@ export interface DeptTransferLineInput {
   /** Default 'purchase' — what every screen sends (owner rule). */
   unit?: TransferEntryUnit;
   notes?: string;
+  /**
+   * RULING 45 — the requisition line (requisition_items.id) this transfer line
+   * FULFILS. Set ONLY by the "To send" route (/api/department-transfers/to-send);
+   * the generic send never passes it. Needs SendDeptTransferInput.requisitionId.
+   */
+  reqItemId?: string;
+  /** The LINE units (requisition_items.unit) this transfer line adds to that
+   *  line's quantity_issued — positive, finite. Required with reqItemId. */
+  reqLineQty?: number;
 }
 
 export interface SendDeptTransferInput {
@@ -1873,6 +1886,9 @@ export interface SendDeptTransferInput {
   clientKey: string;
   notes?: string;
   outletId?: string | null;
+  /** RULING 45 — the requisition every linked line belongs to ('' / omitted =
+   *  an ordinary transfer, byte-identical to before). */
+  requisitionId?: string;
 }
 
 export interface DeptTransferLineRow {
@@ -1894,6 +1910,13 @@ export interface DeptTransferLineRow {
   reverses_line_id: string;
   notes: string;
   created_at: string;
+  /** RULING 45: the requisition line this line FULFILS ('' = none; always '' on a
+   *  reverse line — its root line carries the link). */
+  req_item_id: string;
+  /** RULING 45: LINE units this line added to that requisition line when it was
+   *  sent (null when not linked). The requisition line's figure is re-derived
+   *  from it and what still stands (routed-requisitions syncRoutedLine). */
+  req_line_qty: number | null;
   /** Computed: RECIPE units already moved back by reverse transfers. */
   qty_reversed: number;
   /** Computed: qty_sent − qty_reversed — what this line still has in the receiver's books. */
@@ -1971,6 +1994,8 @@ export interface DeptTransferRow {
   reverses_transfer_id: string;
   dispute_status: DeptTransferDisputeStatus;
   updated_at: string;
+  /** RULING 45: the requisition this transfer FULFILS lines of ('' = none). */
+  requisition_id: string;
 }
 
 export interface DeptTransferWithLines extends DeptTransferRow {
@@ -2034,6 +2059,10 @@ interface PreparedLine {
   factor: number;
   notes: string;
   reversesLineId: string;
+  /** RULING 45: the requisition line this line fulfils ('' = none). */
+  reqItemId: string;
+  /** RULING 45: LINE units it adds to that requisition line (null = not linked). */
+  reqLineQty: number | null;
 }
 
 /**
@@ -2041,38 +2070,84 @@ interface PreparedLine {
  * IMMEDIATE transaction and has passed the idempotency gate. Writes the
  * header, then each line, then each line's pair through postDeptTransfer(), and
  * stamps the leg ids on the line. Any refusal rolls everything back.
+ *
+ * RULING 45 — THE LINK. A document that fulfils requisition lines (the "To
+ * send" route) is written with department_transfers.requisition_id and, per
+ * line, department_transfer_lines.req_item_id / req_line_qty. Every other
+ * document goes through the SAME statements as before ruling 45 (the columns
+ * keep their defaults '' / NULL), so an ordinary transfer is byte-identical.
+ * A linked document on a database WITHOUT the columns is refused, never
+ * written unlinked: a send that does not fulfil its line would leave the line
+ * owed and the goods counted twice.
  */
 function writeTransferDoc(db: Database.Database, d: {
   from: TransferDept; to: TransferDept; actor: string; clientKey: string; fingerprint: string;
   notes: string; outletId: string | null; reversesTransferId: string; lines: PreparedLine[];
+  requisitionId?: string;
 }): DeptTransferWithLines {
+  const reqId = String(d.requisitionId || '').trim();
+  const linked = !!reqId || d.lines.some((p) => !!p.reqItemId);
+  if (linked && !routedSchema(db).linkCols) {
+    throw blocked('state',
+      'This database has no requisition link columns on department transfers yet (department_transfers.requisition_id, ' +
+      'department_transfer_lines.req_item_id / req_line_qty), so a send that fulfils a requisition line cannot be recorded. ' +
+      'Nothing was sent. Restart the app so its start-up migration adds them, then send again.');
+  }
   const id = newId();
   const txnDate = todayISTDate();
   const transferNo = nextTransferNo(db);
   const at = nowMs();
-  db.prepare(`
-    INSERT INTO department_transfers
-      (id, transfer_no, outlet_id, from_department_id, from_department_name,
-       to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
-       client_key, request_fingerprint, reverses_transfer_id, dispute_status, updated_at)
-    VALUES (?,?,?,?,?,?,?, 'posted', ?,?,?,?,?,?,?, '', ?)
-  `).run(
-    id, transferNo, d.outletId, d.from.id, d.from.name, d.to.id, d.to.name,
-    txnDate, d.notes, d.actor, at, d.clientKey, d.fingerprint, d.reversesTransferId, at,
-  );
+  if (reqId) {
+    db.prepare(`
+      INSERT INTO department_transfers
+        (id, transfer_no, outlet_id, from_department_id, from_department_name,
+         to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
+         client_key, request_fingerprint, reverses_transfer_id, dispute_status, updated_at, requisition_id)
+      VALUES (?,?,?,?,?,?,?, 'posted', ?,?,?,?,?,?,?, '', ?, ?)
+    `).run(
+      id, transferNo, d.outletId, d.from.id, d.from.name, d.to.id, d.to.name,
+      txnDate, d.notes, d.actor, at, d.clientKey, d.fingerprint, d.reversesTransferId, at, reqId,
+    );
+  } else {
+    db.prepare(`
+      INSERT INTO department_transfers
+        (id, transfer_no, outlet_id, from_department_id, from_department_name,
+         to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
+         client_key, request_fingerprint, reverses_transfer_id, dispute_status, updated_at)
+      VALUES (?,?,?,?,?,?,?, 'posted', ?,?,?,?,?,?,?, '', ?)
+    `).run(
+      id, transferNo, d.outletId, d.from.id, d.from.name, d.to.id, d.to.name,
+      txnDate, d.notes, d.actor, at, d.clientKey, d.fingerprint, d.reversesTransferId, at,
+    );
+  }
   const insLine = db.prepare(`
     INSERT INTO department_transfer_lines
       (id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor,
        qty_sent, entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at)
     VALUES (?,?,?,?,?,?,?,?,?,?, '', '', ?,?,?)
   `);
+  const insLinkedLine = linked ? db.prepare(`
+    INSERT INTO department_transfer_lines
+      (id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor,
+       qty_sent, entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at,
+       req_item_id, req_line_qty)
+    VALUES (?,?,?,?,?,?,?,?,?,?, '', '', ?,?,?, ?,?)
+  `) : null;
   const stamp = db.prepare(`UPDATE department_transfer_lines SET out_txn_id = ?, in_txn_id = ? WHERE id = ?`);
   for (const p of d.lines) {
     const lineId = newId();
-    insLine.run(
-      lineId, id, p.m.id, p.m.name, String(p.m.unit || ''), String(p.m.purchase_unit || p.m.unit || ''),
-      p.factor, p.qty, p.entryQty, p.entryUnit, p.reversesLineId, p.notes, nowMs(),
-    );
+    if (p.reqItemId && insLinkedLine) {
+      insLinkedLine.run(
+        lineId, id, p.m.id, p.m.name, String(p.m.unit || ''), String(p.m.purchase_unit || p.m.unit || ''),
+        p.factor, p.qty, p.entryQty, p.entryUnit, p.reversesLineId, p.notes, nowMs(),
+        p.reqItemId, p.reqLineQty,
+      );
+    } else {
+      insLine.run(
+        lineId, id, p.m.id, p.m.name, String(p.m.unit || ''), String(p.m.purchase_unit || p.m.unit || ''),
+        p.factor, p.qty, p.entryQty, p.entryUnit, p.reversesLineId, p.notes, nowMs(),
+      );
+    }
     const posted = postDeptTransfer(db, {
       fromDepartmentId: d.from.id,
       toDepartmentId: d.to.id,
@@ -2130,14 +2205,28 @@ export function sendDeptTransfer(db: Database.Database, input: SendDeptTransferI
     validateClientKey(clientKey);
     const rawLines = Array.isArray(input.lines) ? input.lines : [];
 
+    // RULING 45: a send that FULFILS requisition lines (the "To send" route).
+    const reqId = String(input.requisitionId || '').trim();
+    const linked = !!reqId || rawLines.some((l) => !!String(l?.reqItemId || '').trim());
+
     // The request's identity: ends + goods as TYPED. Notes are not identity —
     // a retry of the same tray with the note retyped is still the same send.
-    const fingerprint = JSON.stringify({
+    // A LINKED send also names its requisition and which line each material
+    // fulfils; those two keys are added ONLY then, so an ordinary transfer's
+    // fingerprint is exactly what it was before ruling 45.
+    const fp: Record<string, unknown> = {
       kind: 'send', from: fromId, to: toId,
       lines: rawLines
         .map((l) => [String(l?.materialId || '').trim(), l?.unit === 'recipe' ? 'recipe' : 'purchase', Number(l?.quantity)])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
-    });
+    };
+    if (linked) {
+      fp.req = reqId;
+      fp.links = rawLines
+        .map((l) => [String(l?.materialId || '').trim(), String(l?.reqItemId || '').trim()])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    }
+    const fingerprint = JSON.stringify(fp);
     const hit = idempotentHit(db, actor, clientKey, fingerprint);
     if (hit) return { transfer: hit, duplicate: true };
 
@@ -2146,6 +2235,7 @@ export function sendDeptTransfer(db: Database.Database, input: SendDeptTransferI
     if (rawLines.length > 50) throw blocked('invalid', 'At most 50 lines per transfer.');
 
     const seen = new Set<string>();
+    const seenReqItems = new Set<string>();
     const prepared: PreparedLine[] = [];
     for (const ln of rawLines) {
       const matId = String(ln?.materialId || '').trim();
@@ -2164,17 +2254,46 @@ export function sendDeptTransfer(db: Database.Database, input: SendDeptTransferI
       if (!Number.isFinite(qty) || qty <= EPS) {
         throw blocked('invalid', `Quantity for ${m.name} must be a positive number.`, { materialId: matId });
       }
+      // ── RULING 45: the link, checked as DATA (the route decides whether the
+      // line may be sent at all; this only refuses a link that cannot be true).
+      const reqItemId = String(ln?.reqItemId || '').trim();
+      let reqLineQty: number | null = null;
+      if (reqItemId) {
+        if (!reqId) {
+          throw blocked('invalid', `${m.name}: a line that fulfils a requisition line needs the requisition too.`, { materialId: matId });
+        }
+        if (seenReqItems.has(reqItemId)) {
+          throw blocked('invalid', `${m.name}: one requisition line is named on two lines of one transfer.`, { materialId: matId });
+        }
+        seenReqItems.add(reqItemId);
+        const rlq = r6(Number(ln.reqLineQty));
+        if (!Number.isFinite(rlq) || rlq <= EPS) {
+          throw blocked('invalid', `${m.name}: say how much of the requisition line this send fulfils (a positive figure in the line's unit).`, { materialId: matId });
+        }
+        let ri: { req_id: string; material_id: string } | undefined;
+        try {
+          ri = db.prepare('SELECT req_id, material_id FROM requisition_items WHERE id = ?')
+            .get(reqItemId) as { req_id: string; material_id: string } | undefined;
+        } catch { ri = undefined; }
+        if (!ri || String(ri.req_id) !== reqId || String(ri.material_id || '') !== matId) {
+          throw blocked('invalid', `${m.name}: requisition line ${reqItemId} is not a ${m.name} line of that requisition.`, { materialId: matId });
+        }
+        reqLineQty = rlq;
+      } else if (reqId) {
+        throw blocked('invalid', `${m.name}: every line of a send that fulfils a requisition names the requisition line it fulfils.`, { materialId: matId });
+      }
       prepared.push({
         m, qty, entryQty: Number.isFinite(entryQty) ? entryQty : null,
         entryUnit: unit === 'recipe' ? String(m.unit || '') : String(m.purchase_unit || m.unit || ''),
         factor: packFactor(m), notes: String(ln.notes || '').trim(), reversesLineId: '',
+        reqItemId, reqLineQty,
       });
     }
 
     const transfer = writeTransferDoc(db, {
       from, to, actor, clientKey, fingerprint,
       notes: String(input.notes || '').trim(), outletId: input.outletId ?? null,
-      reversesTransferId: '', lines: prepared,
+      reversesTransferId: '', lines: prepared, requisitionId: reqId,
     });
     return { transfer, duplicate: false };
   });
@@ -2606,6 +2725,10 @@ export function reverseDeptTransfer(
         entryQty: p.entryQty != null && Number.isFinite(p.entryQty) ? p.entryQty : toPurchaseQty(p.qty, pm),
         entryUnit: p.entryUnit || (p.line.purchase_unit || p.line.unit),
         factor: packFactor(m), notes: '', reversesLineId: p.line.id,
+        // RULING 45: a reverse line never carries the requisition link — the
+        // ROOT line does, and the requisition line is re-derived from what the
+        // root still has standing (routed-requisitions syncRoutedLine).
+        reqItemId: '', reqLineQty: null,
       };
     });
 
@@ -2809,16 +2932,24 @@ export function deptTransferSettledNote(db: Database.Database, doc: DeptTransfer
  *  computed), its disputes and its reverse links, or null. */
 export function getDeptTransfer(db: Database.Database, transferId: string): DeptTransferWithLines | null {
   try {
+    // RULING 45: the link columns through the ONE probe (routed-schema). A
+    // database without them reads '' / NULL — a missing column is never
+    // SELECTed inside this try, or every document would read as "not found".
+    const link = routedSchema(db).linkCols;
+    const docLink = link ? `COALESCE(requisition_id, '') AS requisition_id` : `'' AS requisition_id`;
+    const lineLink = link
+      ? `COALESCE(req_item_id, '') AS req_item_id, req_line_qty`
+      : `'' AS req_item_id, NULL AS req_line_qty`;
     const doc = db.prepare(`
       SELECT id, transfer_no, outlet_id, from_department_id, from_department_name,
              to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
-             client_key, reverses_transfer_id, dispute_status, updated_at
+             client_key, reverses_transfer_id, dispute_status, updated_at, ${docLink}
         FROM department_transfers WHERE id = ?
     `).get(String(transferId || '')) as DeptTransferRow | undefined;
     if (!doc) return null;
     const rawLines = db.prepare(`
       SELECT id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor, qty_sent,
-             entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at
+             entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at, ${lineLink}
         FROM department_transfer_lines WHERE transfer_id = ? ORDER BY created_at ASC, rowid ASC
     `).all(doc.id) as Array<Omit<DeptTransferLineRow, 'qty_reversed' | 'qty_net' | 'qty_open_disputed' | 'counted_since'>>;
     const disputes = db.prepare(`

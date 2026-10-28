@@ -9,6 +9,8 @@ import {
   lineFactor,
 } from '@/lib/issue-stock';
 import { qtyGrid, planCentralDebit } from '@/lib/central-debit-clamp';
+// ROUTED LINES (rulings #45/#74): the leaf probe only.
+import { routedColSql } from '@/lib/routed-schema';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -130,6 +132,11 @@ export function fulfilRequisitionFromPo(
           -- still carried its quantity_requested into the fallback below.
           AND COALESCE(ri.is_rejected, 0) = 0
           AND COALESCE(ri.store_rejected, 0) = 0
+          -- A ROUTED line (rulings #45/#74) is handed over by its Direct Issue
+          -- department's transfer, never from central: its fallback to the
+          -- approved figure below would debit central for goods it never held.
+          -- '' = '' (every line) on a database without the column.
+          AND ${routedColSql(db)} = ''
       `).all(requisitionId) as any[];
       const decStock = db.prepare(`
         UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')

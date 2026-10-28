@@ -723,7 +723,10 @@ export default function IssueLogPage() {
                     <strong>Not searched in this view, so not a zero:</strong> {left.map(st => STAGE_META[st].label).join(', ')}.
                     The stage filter, or a filter these stages cannot answer, leaves them out (a receipt or a skipped cook has no
                     department, only a receipt has a vendor, a cook has no requisition{left.includes('TRANSFER')
-                      ? ', a transfer between departments has neither a vendor nor a requisition' : ''}).
+                      // A transfer that FULFILS a routed requisition line (rulings
+                      // #45/#74) does answer to that requisition — the server
+                      // searches transfers by requisition once one exists.
+                      ? ', a transfer between departments has no vendor, and answers to a requisition only when it fulfils a routed requisition line' : ''}).
                   </span>
                 </p>
               );

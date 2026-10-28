@@ -55,14 +55,26 @@
  * TABLET FIRST. Big rows, 16px inputs (no iOS zoom), one Send for the whole
  * tray, the last receiver remembered per sender, and the lists refresh once a
  * minute while the page is on screen.
+ *
+ * "TO SEND" (rulings #45, #74). A department a Direct Issue rule routes items to
+ * (Kitchen, for Meat / Poultry / Seafood) also gets the requisition lines other
+ * departments raise for those items — internal and party alike — once the HOD
+ * (and management, where Settings require it) approves. They wait on its own
+ * tab, ./ToSendPanel.tsx, built from GET /api/department-transfers/to-send;
+ * its Send is a one-step transfer that FULFILS the line. The tab is shown only
+ * for a department the server says has a rule or a queue (or when a link asks
+ * for it: ?tab=to_send). A transfer made there names the requisition it
+ * fulfils ("fulfils REQ-…"), and a send-back of one says which requisition line
+ * is owed again (`requisition_sync` on the reverse reply).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   SendHorizontal, ArrowRight, Search, Loader2, AlertTriangle, CircleCheck, X, Plus, Boxes,
-  Inbox, Info, Trash2, Flag, Undo2, ShieldAlert, RefreshCw, Building2, ChevronDown,
+  Inbox, Info, Trash2, Flag, Undo2, ShieldAlert, RefreshCw, Building2, ChevronDown, ClipboardList,
 } from 'lucide-react';
 import TabScroller from '@/components/TabScroller';
+import ToSendPanel, { type ToSendSummary } from './ToSendPanel';
 import { api } from '@/lib/api';
 import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 import { fmtISTShort } from '@/lib/format-date';
@@ -103,6 +115,12 @@ interface Holding {
   transferable_purchase: number;   // server-converted, rounded DOWN to 3 dp
   upper_bound: boolean;            // never counted: "up to", not "holds"
   basis_label: string;
+  /** Ruling #45: requisition lines for this item still waiting on THIS
+   *  department's To send list (a hint only — never a limit on the tray). A
+   *  plain transfer does not fulfil them; the To send tab does. */
+  routed_owed?: unknown;
+  routed_owed_purchase?: number | null;
+  routed_owed_lines?: number | null;
 }
 interface TLine {
   id: string; material_id: string; material_name: string;
@@ -111,6 +129,8 @@ interface TLine {
   qty_sent_purchase: number; qty_reversed_purchase: number; qty_net_purchase: number; qty_open_disputed_purchase: number;
   /** Disputed lines only: an end that COUNTED since it moved (a take-back would correct it twice). */
   counted_since?: { receiver: { at: string } | null; sender: { at: string } | null } | null;
+  /** Ruling #45: the requisition line this transfer line fulfils ('' = none). */
+  req_item_id?: string;
 }
 type DisputeKind = 'short' | 'wrong_item' | 'not_received';
 interface TDispute {
@@ -158,6 +178,24 @@ interface Transfer {
   reversed_by: Array<{ id: string; transfer_no: string; created_at: string; created_by: string }>;
   lines: TLine[]; disputes: TDispute[];
   permissions: Perms;
+  /** Ruling #45: the requisition this transfer fulfils ('' = an ordinary
+   *  transfer), and its number when the server names it. */
+  requisition_id?: string;
+  requisition_no?: string;
+  req_number?: string;
+  requisition_number?: string;
+  requisition?: { id?: string; req_number?: string } | null;
+  /** On a send-back of goods that fulfilled a requisition line: that requisition. */
+  sends_back_against?: { id?: string; req_number?: string } | null;
+}
+/** One entry of `requisition_sync` on a send-back's reply (ruling #45): the
+ *  requisition line the reversed transfer had fulfilled, before and after. */
+interface ReqSync {
+  req_item_id: string; req_number: string; material_name: string;
+  /** The line's purchase unit and the department whose To send list it is on. */
+  purchase_unit: string; sender_name: string;
+  sent_purchase_before: number; sent_purchase_after: number; owed_purchase: number;
+  reopened: boolean;
 }
 /** A line waiting in the tray. `qty` is the RAW typed PURCHASE-unit string. */
 interface TrayLine { material_id: string; qty: string }
@@ -208,6 +246,64 @@ const KIND_HINT: Record<DisputeKind, string> = {
   wrong_item: 'e.g. curry cut came instead of boneless leg',
   not_received: 'e.g. nothing reached the tandoor section',
 };
+
+/** Requisition lines for this item waiting on the sender's To send list
+ *  (ruling #45) — the holdings row's non-blocking hint. A figure is printed
+ *  only when the server gave it in the PURCHASE unit; otherwise just the fact. */
+function routedOwedOf(h: Holding): { pu: number | null; lines: number | null; hint: string } | null {
+  const ro: any = h.routed_owed;
+  const o = ro && typeof ro === 'object' ? ro : null;
+  const nn = (v: unknown) => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+  const pu = nn(h.routed_owed_purchase ?? o?.owed_purchase ?? o?.purchase);
+  const lines = nn(h.routed_owed_lines ?? o?.lines ?? o?.line_count ?? o?.count);
+  const flagged = (pu != null && pu > EPS) || (lines != null && lines > 0)
+    || (typeof ro === 'number' && ro > EPS) || ro === true;
+  if (!flagged) return null;
+  return { pu: pu != null && pu > EPS ? pu : null, lines: lines != null && lines > 0 ? lines : null, hint: str(o?.hint).trim() };
+}
+
+/** The requisition a transfer fulfils (ruling #45), from the link the server
+ *  wrote on it; null for an ordinary transfer. `no` is '' when the payload
+ *  names the requisition by id only — the chip then says no number. */
+function fulfilsOf(t: Transfer): { id: string; no: string } | null {
+  const id = str(t.requisition_id || t.requisition?.id).trim();
+  const no = str(t.requisition_no || t.req_number || t.requisition_number || t.requisition?.req_number).trim();
+  if (!id && !no) return null;
+  return { id, no };
+}
+/** Read `requisition_sync` off a send-back's reply — never throws. */
+function readReqSync(json: any): ReqSync[] {
+  const rows: any[] = Array.isArray(json?.requisition_sync) ? json.requisition_sync : [];
+  return rows.map(r => ({
+    req_item_id: str(r?.req_item_id), req_number: str(r?.req_number), material_name: clean(r?.material_name),
+    purchase_unit: str(r?.purchase_unit), sender_name: clean(r?.sender_name),
+    sent_purchase_before: num(r?.sent_purchase_before), sent_purchase_after: num(r?.sent_purchase_after),
+    owed_purchase: num(r?.owed_purchase), reopened: r?.reopened === true || r?.reopened === 1,
+  })).filter(r => !!r.req_item_id || !!r.req_number);
+}
+/** The sentence a send-back adds about the requisition lines it lowered: the
+ *  server's own (`requisition_message`) verbatim, and only when a reply
+ *  carries rows but no sentence, words built from the rows' own figures. */
+function reqSyncSentence(json: any, sync: ReqSync[], rev: Transfer, sender: string): string {
+  const said = str(json?.requisition_message).trim();
+  if (said) return ` ${said}`;
+  if (sync.length === 0) return '';
+  const puFor = (s: ReqSync) => {
+    if (s.purchase_unit) return s.purchase_unit;
+    const l = (rev.lines || []).find(x => clean(x.material_name) === s.material_name);
+    return l ? puOf(metaOf(l)) : '';
+  };
+  const parts = sync.map(s => {
+    const pu = puFor(s);
+    const u = pu ? ` ${pu}` : '';
+    const list = s.sender_name || sender;
+    return `${s.req_number || 'its requisition'}: ${s.material_name || 'the line'} now counts ${fmtQtyNum(s.sent_purchase_after)}${u} sent`
+      + (s.owed_purchase > EPS
+        ? ` and ${fmtQtyNum(s.owed_purchase)}${u} owed — ${s.reopened ? 'back ' : ''}on ${list ? `${list}'s` : 'the'} To send list`
+        : '');
+  });
+  return ` ${parts.join('; ')}.`;
+}
 
 /** Read a JSON body without throwing on an empty / HTML error page. */
 async function readJson(r: Response): Promise<any> {
@@ -299,6 +395,11 @@ export default function DepartmentTransfersPage() {
     if (viewSeeded.current || !me || viewable.length === 0) return;
     viewSeeded.current = true;
     const ok = (id: string) => !!id && viewable.some(d => d.id === id);
+    // A link that names a department (e.g. the bell's "lines for Kitchen to
+    // send") opens on it, when this person may see it.
+    let linked = '';
+    try { linked = new URLSearchParams(window.location.search).get('department_id') || ''; } catch { /* no URL */ }
+    if (ok(linked)) { setViewId(linked); return; }
     const saved = readLS(viewKey(me.id));
     const own = me.department_id || '';
     if (ok(saved)) { setViewId(saved); return; }
@@ -344,6 +445,39 @@ export default function DepartmentTransfersPage() {
     tabSeeded.current = viewId;
     setTab(canSendView ? 'out' : 'in');
   }, [viewId, canSendView]);
+
+  /* ── "To send" (ruling #45) — the requisition lines routed to the department
+   * in view. ToSendPanel loads its queue whether or not the tab is open (the
+   * tab's count needs it) and tells the page whether the tab belongs here. */
+  // Read after mount (never during render), so the server's first paint and the
+  // browser's agree.
+  const [askedToSend, setAskedToSend] = useState(false);
+  useEffect(() => {
+    try { setAskedToSend(new URLSearchParams(window.location.search).get('tab') === 'to_send'); } catch { /* no URL */ }
+  }, []);
+  const [view, setView] = useState<'to_send' | 'transfers'>('transfers');
+  const [tsRaw, setTsRaw] = useState<ToSendSummary>({ deptId: '', loaded: false, relevant: false, groups: 0, lines: 0, error: null });
+  const onTsSummary = useCallback((s: ToSendSummary) => {
+    setTsRaw(p => (p.deptId === s.deptId && p.loaded === s.loaded && p.relevant === s.relevant
+      && p.groups === s.groups && p.lines === s.lines && p.error === s.error ? p : s));
+  }, []);
+  /** The summary FOR the department in view — another department's is ignored. */
+  const ts: ToSendSummary = tsRaw.deptId === viewId ? tsRaw
+    : { deptId: viewId, loaded: false, relevant: false, groups: 0, lines: 0, error: null };
+  const [tsReloadKey, setTsReloadKey] = useState(0);
+  // A link that asked for the tab shows it even where nothing routes here — the
+  // panel then says so, rather than the link landing nowhere.
+  const showToSendTab = ts.relevant || (askedToSend && ts.loaded);
+  // Per department, once its queue has loaded: open on To send when lines are
+  // waiting and this person can send them (the Kitchen head's tablet) or a
+  // link asked for it; otherwise on the transfers, exactly as before.
+  const toSendSeeded = useRef('');
+  useEffect(() => {
+    if (!viewId || !ts.loaded || toSendSeeded.current === viewId) return;
+    toSendSeeded.current = viewId;
+    setView((askedToSend && showToSendTab) || (ts.lines > 0 && canSendView) ? 'to_send' : 'transfers');
+  }, [viewId, ts.loaded, ts.lines, canSendView, askedToSend, showToSendTab]);
+  useEffect(() => { if (view === 'to_send' && ts.loaded && !showToSendTab) setView('transfers'); }, [view, ts.loaded, showToSendTab]);
 
   /* what the department in view can send, and where to */
   const [holdings, setHoldings] = useState<Holding[]>([]);
@@ -711,8 +845,15 @@ export default function DepartmentTransfersPage() {
       setForm(s => ({ ...s, [t.id]: undefined }));
       const r = out.transfer as Transfer;
       const items = (r.lines || []).map(l => `${showPU(metaOf(l), l.qty_sent, l.qty_sent_purchase)} ${puOf(metaOf(l))} ${l.material_name}`).join(', ');
+      // A send-back of a transfer that fulfilled a requisition line (ruling
+      // #45) lowers what that line counts as sent: the server says which line,
+      // and by how much it is owed again (`requisition_sync`).
+      const sync = readReqSync(json);
       setFlash(`${r.transfer_no}${out.duplicate ? ' (had already gone through)' : ''}: ${items} moved back from ` +
-        `${clean(r.from_department_name)}'s books to ${clean(r.to_department_name)}'s. ${t.transfer_no}'s dispute is settled by it.`);
+        `${clean(r.from_department_name)}'s books to ${clean(r.to_department_name)}'s.` +
+        (t.dispute_status === 'open' ? ` ${t.transfer_no}'s dispute is settled by it.` : '') +
+        reqSyncSentence(json, sync, r, clean(r.to_department_name)));
+      if (sync.length > 0 || fulfilsOf(t)) setTsReloadKey(k => k + 1);
       refreshNow();
       return;
     }
@@ -774,6 +915,21 @@ export default function DepartmentTransfersPage() {
 
   const docChips = (t: Transfer) => (
     <div className="flex flex-wrap justify-end gap-1">
+      {/* Ruling #45: sent from the To send list — it fulfils that requisition's line. */}
+      {(() => {
+        // Never on a send-back: that one takes from the line, it fulfils nothing.
+        const f = t.reverses_transfer_id ? null : fulfilsOf(t);
+        if (!f) return null;
+        // Sent back in full, it no longer counts on the line — said as what it was for.
+        const stands = (t.lines || []).some(l => l.qty_net > EPS);
+        const what = f.no || 'a requisition';
+        return chip('bg-indigo-50 text-indigo-800 normal-case', stands ? `fulfils ${what}` : `was for ${what}`,
+          stands ? 'Sent from the To send list: what stands counts as handed over on that requisition line'
+            : 'Sent from the To send list, then sent back in full: it no longer counts on that requisition line');
+      })()}
+      {t.reverses_transfer_id && str(t.sends_back_against?.req_number) && chip('bg-indigo-50 text-indigo-800 normal-case',
+        `against ${str(t.sends_back_against?.req_number)}`,
+        'A send-back of goods sent from the To send list: it lowers what that requisition line counts as sent')}
       {t.dispute_status === 'open' && chip('bg-amber-100 text-amber-800', 'disputed')}
       {t.dispute_status === 'resolved' && chip('bg-emerald-50 text-emerald-700', 'dispute closed')}
       {t.reverses_transfer_no && chip('bg-[#E8D5C4] text-[#6B5744]', `send-back of ${t.reverses_transfer_no}`)}
@@ -1157,7 +1313,10 @@ export default function DepartmentTransfersPage() {
   const shownList = tab === 'in' ? inList : outList;
   const openIn = inList.filter(t => t.dispute_status === 'open').length;
   const openOut = outList.filter(t => t.dispute_status === 'open').length;
-  const trayVisible = canSendView && (tray.length > 0) && !(pending && pending.body.from_department_id !== viewId);
+  // The tray belongs to the free send (Send & transfers): on the To send tab it
+  // keeps its lines but steps aside, and an unconfirmed send shows at the top.
+  const onToSend = view === 'to_send' && showToSendTab;
+  const trayVisible = canSendView && (tray.length > 0) && !(pending && pending.body.from_department_id !== viewId) && !onToSend;
 
   return (
     <div className={`p-4 sm:p-6 max-w-6xl mx-auto space-y-4 ${trayVisible ? 'pb-80' : ''}`}>
@@ -1246,7 +1405,36 @@ export default function DepartmentTransfersPage() {
         </section>
       )}
 
-      {viewDept && (
+      {/* ── To send | Send & transfers — only for a department something is
+          routed to (or when a link asked for To send). Elsewhere the page is
+          exactly what it was. ── */}
+      {viewDept && showToSendTab && (
+        <TabScroller className="gap-1.5 text-sm">
+          <button type="button" onClick={() => setView('to_send')} aria-pressed={view === 'to_send'}
+                  className={`min-h-[44px] px-3.5 rounded-lg font-semibold flex items-center gap-1.5 ${view === 'to_send'
+                    ? 'bg-[#af4408] text-white' : 'bg-white border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408]'}`}>
+            <ClipboardList className="w-4 h-4" /> To send
+            {ts.lines > 0 && (
+              <span className={`px-1.5 rounded-full text-[10px] ${view === 'to_send' ? 'bg-white text-[#af4408]' : 'bg-[#af4408] text-white'}`}>
+                {ts.lines} line{ts.lines === 1 ? '' : 's'}
+              </span>
+            )}
+          </button>
+          <button type="button" onClick={() => setView('transfers')} aria-pressed={view === 'transfers'}
+                  className={`min-h-[44px] px-3.5 rounded-lg font-semibold flex items-center gap-1.5 ${view === 'transfers'
+                    ? 'bg-[#af4408] text-white' : 'bg-white border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408]'}`}>
+            <SendHorizontal className="w-4 h-4" /> {canSendView ? 'Send & transfers' : 'Transfers'}
+          </button>
+        </TabScroller>
+      )}
+      {viewDept && me && (
+        <ToSendPanel deptId={viewId} deptName={clean(viewDept.name)} me={me}
+                     visible={view === 'to_send' && showToSendTab}
+                     reloadKey={tsReloadKey} onSummary={onTsSummary}
+                     onSent={(msg) => { setFlash(msg); setTab('out'); refreshNow(); }} />
+      )}
+
+      {viewDept && !(view === 'to_send' && showToSendTab) && (
         <div className={`grid grid-cols-1 ${canSendView ? 'lg:grid-cols-5' : ''} gap-4 items-start`}>
           {/* ── LEFT: send ── */}
           {canSendView && (
@@ -1335,6 +1523,7 @@ export default function DepartmentTransfersPage() {
                     const negative = h.available < -EPS;
                     const draftQ = parseQty(draft);
                     const draftErr = open && draft.trim() ? checkQty(h, draft) : null;
+                    const ro = routedOwedOf(h);
                     return (
                       <div key={h.material_id} className={open ? 'bg-[#FFF8F0]' : ''}>
                         <button type="button" onClick={() => !nothing && openRow(h)} disabled={nothing || locked} aria-expanded={open}
@@ -1347,6 +1536,9 @@ export default function DepartmentTransfersPage() {
                                 ? chip('bg-amber-100 text-amber-800', 'not counted · up to', h.basis_label)
                                 : chip('bg-emerald-50 text-emerald-700', 'counted', h.basis_label)}
                               {inTray && chip('bg-[#af4408] text-white normal-case', `in tray: ${fmtQtyNum(Number(inTray.qty))} ${puOf(m)}`)}
+                              {ro && chip('bg-indigo-50 text-indigo-800 normal-case',
+                                ro.pu != null ? `${fmtQtyNum(ro.pu)} ${puOf(m)} owed on requisitions` : 'owed on requisitions',
+                                'Requisition lines for this item wait on the To send tab. Send them from there — a plain transfer does not count on the requisition.')}
                             </div>
                             {negative && (
                               <div className="text-[10px] text-red-700 mt-0.5">
@@ -1365,6 +1557,20 @@ export default function DepartmentTransfersPage() {
                         </button>
                         {open && (
                           <div className="px-3 pb-3 space-y-2">
+                            {ro && showToSendTab && (
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] rounded px-2 py-1.5 border text-indigo-900 bg-indigo-50 border-indigo-200">
+                                <span className="min-w-0 flex-1 break-words">
+                                  {ro.hint || <>
+                                    {ro.lines != null ? `${ro.lines} requisition line${ro.lines === 1 ? '' : 's'}` : 'Requisition lines'} for
+                                    this item wait on the To send tab. Send {ro.lines === 1 ? 'it' : 'them'} from there — a plain transfer
+                                    does not count on the requisition.</>}
+                                </span>
+                                <button type="button" onClick={() => setView('to_send')}
+                                        className="min-h-[40px] px-3 rounded-lg border border-indigo-300 bg-white text-indigo-800 font-semibold">
+                                  Open To send
+                                </button>
+                              </div>
+                            )}
                             {h.basis_label && (
                               <div className={`text-[11px] rounded px-2 py-1.5 border ${h.upper_bound
                                 ? 'text-amber-900 bg-amber-50 border-amber-200' : 'text-[#6B5744] bg-white border-[#E8D5C4]'}`}>
@@ -1449,6 +1655,10 @@ export default function DepartmentTransfersPage() {
         that records it and tells the sender, and moves nothing. The correction is a <strong>send-back</strong>, one tap from
         the disputed transfer. <strong>Not counted · up to</strong> means the sender never counted that item, so the figure is
         its ledger (everything received minus everything used or sent) — a count on the Dept Closing Sheet firms it up.
+        {showToSendTab && viewDept && (
+          <> <strong>To send</strong> lists the approved requisition lines Direct Issue routes to {clean(viewDept.name)}; a
+            Send there is the same one-step transfer, and it counts as handed over on that requisition line.</>
+        )}
       </p>
 
       {/* ── Tray: pinned to the bottom of the screen, one Send for everything ── */}

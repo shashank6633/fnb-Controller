@@ -4,6 +4,9 @@ import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
 import { lineFactor, lineShownAs } from './issue-stock';
 import { issuedCoversAsk, shelfMarkHolds, qtyGrid, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
+// The ONE probe for the routed-requisition columns (owner rulings #45 + #74):
+// a leaf module, so this read-only report can ask without an import cycle.
+import { routedSchema } from './routed-schema';
 
 /**
  * END-TO-END TRACEABILITY LOG — one material followed all the way through:
@@ -76,6 +79,22 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * A line issued 5 before this shipped and 2 after reads 5 pre-ledger + 2 ledger.
  * Never 7 twice, never just 2.
  *
+ * A ROUTED LINE (owner rulings #45 + #74) is the one line whose hand-over is
+ * not the store's. A Direct Issue rule sends its item (chicken, meat, dairy)
+ * from the vendor straight to a department, so the central store never holds
+ * it; a sub-kitchen's line for it is handed over by THAT department's transfer
+ * (department_transfer_lines.req_item_id names the line). The routed writer
+ * still records the line's new Issued To Date in the ledger (skip_reason
+ * 'routed', no stock moved) — so the arithmetic above still holds for it — but
+ * that row is the requisition-side echo of the transfer, so it is NOT listed
+ * on the ISSUE stage: the TRANSFER row that names the requisition is the
+ * line's hand-over row, carrying the same fulfilment snapshot. For such a line:
+ *
+ *     (TRANSFER rows that name it, net of their reverses) === quantity_issued
+ *
+ * with no ISSUE row and no pre-ledger remainder (the stamp routes only lines
+ * with nothing issued). A line is never part store-issued and part routed.
+ *
  * THE PRE-LEDGER ROW IS DERIVED ON READ. This module performs no writes of any
  * kind — it is a SELECT layer and nothing else, which is how it honours the
  * standing "never backfill, never rewrite existing rows" rule structurally
@@ -115,6 +134,8 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *   REVERSAL                       "<req_number>#<req_item_id>"  (same as its ISSUE)
  *   CONSUMPTION / CONS. SKIP       "<material_id>"
  *   TRANSFER                       "<transfer_no>#<transfer line id>"
+ *                                  (+ req_number / req_item_id when the
+ *                                  transfer FULFILS a routed requisition line)
  *
  * The RECEIPT key is the SAME SHAPE purchase-log.ts mints, so the two reports
  * reconcile line for line on a delivery. Its source is now the hard column
@@ -232,7 +253,10 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *   vendor         -> only RECEIPT survives (only a purchase has a vendor)
  *   TRANSFER answers a department filter (EITHER end matches, and the quantity
  *   is then signed from that department's side) and an item filter; a vendor
- *   or a requisition number removes it, like CONSUMPTION.
+ *   removes it. A requisition number removes it too, UNTIL a transfer has
+ *   fulfilled a routed requisition line (schema.routedLinks): from then on it
+ *   answers one, with exactly the transfers that fulfil that requisition (so
+ *   "0 transfers" for a requisition no transfer served is a real zero).
  *
  * CONSUMPTION NOW ANSWERS A DEPARTMENT FILTER, and that is the point of this
  * change. Before the cutover it dropped out beside RECEIPT, so "show me
@@ -333,7 +357,9 @@ export type IssueLogValueBasis = 'spend' | 'memo' | '';
  * '' means nothing was skipped. 'pre_ledger' means it is unknowable.
  *
  * The ISSUE leg's reasons come off requisition_issue_ledger.skip_reason
- * ('party' | 'store_mapped' | 'unit_review'). The CONSUMPTION leg's come off
+ * ('party' | 'store_mapped' | 'unit_review'; 'routed' rows — a routed line's
+ * ledger echo of a department transfer — are never listed on the ISSUE stage,
+ * see ISSUE_NOT_ROUTED). The CONSUMPTION leg's come off
  * consumption_skips.reason, written by applyDeduct when it could not name a
  * department it was entitled to debit ('blank' | 'unmapped' | 'inactive' |
  * 'store_mapped' | 'store_check_unavailable' | 'dept_post_failed' |
@@ -641,6 +667,34 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'side (+ received, − handed on). No money: the goods were valued when they came into the '
     + 'building, so never add this to a receipt, issue or consumption figure.',
 };
+
+/**
+ * ROUTED REQUISITION LINES (owner rulings #45 + #74) — the sentences that say
+ * how such a line is handed over, APPENDED to a stage's basis only while the
+ * database holds one (schema.routedLines / schema.routedLinks), so a building
+ * that has never routed a line keeps every sentence byte-for-byte.
+ */
+const REQUISITION_BASIS_ROUTED =
+  ' A line ROUTED by Direct Issue (a rule sends its item from the vendor straight to another '
+  + 'department — chicken to Kitchen, say — so that department, not the store, hands it over) is handed '
+  + 'over by department transfer: its Issued To Date counts the TRANSFER rows that name its '
+  + 'requisition, never an ISSUE row.';
+const TRANSFER_BASIS_ROUTED =
+  ' A transfer that names a requisition (Requisition No) FULFILS a routed requisition line: Direct '
+  + 'Issue routed that line to the sending department, which sent it from its own stock, and the '
+  + 'central store did not move. The line\'s Issued To Date counts it and no ISSUE row repeats it; a '
+  + 'reverse of such a transfer comes off that figure again.';
+const TOTALS_BASIS_ROUTED =
+  ' A routed requisition line (a Direct Issue rule sends its item straight to another department) is '
+  + 'handed over by that department\'s TRANSFER, which names the requisition — never by an ISSUE row — '
+  + 'so one hand-over is still counted exactly once.';
+
+/** A stage's basis sentence for THIS database (see the ROUTED constants). */
+function stageBasisFor(st: IssueLogStage, sc: IssueLogSchema): string {
+  if (st === 'REQUISITION' && sc.routedLines) return STAGE_BASIS.REQUISITION + REQUISITION_BASIS_ROUTED;
+  if (st === 'TRANSFER' && sc.routedLinks) return STAGE_BASIS.TRANSFER + TRANSFER_BASIS_ROUTED;
+  return STAGE_BASIS[st];
+}
 
 /**
  * Only reversing an ISSUE row through its own pack_factor is exact; everything
@@ -969,6 +1023,23 @@ interface IssueLogSchema {
    *  it a requisition line's PO is found through purchase_order_items.req_item_id
    *  alone, exactly as before the merged PO. */
   poReqLinks: boolean;
+  /**
+   * ROUTED REQUISITION LINES (owner rulings #45 + #74). A DATA probe, like
+   * `transfers`: some requisition line carries routed_department_id — a
+   * Direct Issue rule sends its item to another department, which hands it
+   * over by department transfer. False on a database without the column
+   * (routed-schema.ts's probe) or with no routed line, and then every stage
+   * reads exactly as before this feature.
+   */
+  routedLines: boolean;
+  /**
+   * Some department transfer line FULFILS a requisition line
+   * (department_transfer_lines.req_item_id <> ''). Only then does a TRANSFER
+   * row name the requisition it fulfils, and only then does the TRANSFER stage
+   * answer a requisition-number filter. A data probe: a building that has
+   * never sent against a routed line sees the TRANSFER stage as before.
+   */
+  routedLinks: boolean;
 }
 
 function probeSchema(db: DatabaseT.Database): IssueLogSchema {
@@ -1025,10 +1096,32 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
     const c = colsOf('po_requisition_lines');
     poReqLinks = c.has('po_id') && c.has('req_item_id');
   }
+  // Routed lines and the transfer → requisition link: the columns through the
+  // shared probe (never re-probed here), the data by the partial indexes the
+  // migration builds (idx_req_items_routed, idx_dept_transfer_lines_req_item),
+  // whose predicates the WHEREs below repeat verbatim.
+  const routed = routedSchema(db);
+  let routedLines = false;
+  if (routed.lineCol) {
+    try {
+      routedLines = !!db.prepare(
+        `SELECT 1 FROM requisition_items WHERE routed_department_id IS NOT NULL LIMIT 1`,
+      ).get();
+    } catch { routedLines = false; }
+  }
+  let routedLinks = false;
+  if (routed.linkCols && transferDocs) {
+    try {
+      routedLinks = !!db.prepare(
+        `SELECT 1 FROM department_transfer_lines WHERE req_item_id <> '' LIMIT 1`,
+      ).get();
+    } catch { routedLinks = false; }
+  }
   return {
     deptLedger, deptTrace, skips: has('consumption_skips'), shelfMark, ledgerShelfMark,
     returns: has('material_returns'),
     transfers, transferDocs, txnDate, poReqLinks,
+    routedLines, routedLinks,
   };
 }
 
@@ -1325,6 +1418,24 @@ function buildUnion(f: {
   }
 
   // ── ISSUE ─────────────────────────────────────────────────────────────────
+  // A ROUTED LINE'S LEDGER ROWS ARE NOT LISTED HERE (owner rulings #45 + #74).
+  // A Direct Issue rule sends the item (chicken, meat, dairy) straight to a
+  // department, so the central store never holds it; that department hands a
+  // sub-kitchen's line over by DEPARTMENT TRANSFER, and the routed writer
+  // (routed-requisitions.ts syncRoutedLine → applyIssueDelta, skip 'routed',
+  // stock_applied 0) records the line's new Issued To Date in the ledger so
+  // this report's partition holds. That row is the requisition-side echo of
+  // the transfer, not a store hand-over: the goods are the TRANSFER row that
+  // names the requisition (below). Listing both would print one hand-over
+  // twice — and, filtered to one department and one item, put the same grams
+  // on the ISSUE and the TRANSFER stage, so the department's chain (ISSUE in,
+  // TRANSFER net, CONSUMPTION out) would no longer check against its balance.
+  // The pre-ledger remainder still subtracts EVERY ledger row (routed ones
+  // included), so a routed line has no remainder either. Guarded on
+  // stock_applied = 0: a routed row that ever moved central stock would be a
+  // bug, and an audit log must show it, not hide it.
+  const ISSUE_NOT_ROUTED = `
+        AND NOT (COALESCE(l.skip_reason, '') = 'routed' AND COALESCE(l.stock_applied, 0) = 0)`;
   if (want('issue', reqChain)) {
     stages.push('ISSUE');
     parts.push(`
@@ -1419,7 +1530,7 @@ function buildUnion(f: {
       LEFT JOIN raw_materials rm ON rm.id = l.material_id
       LEFT JOIN departments d ON d.id = l.department_id
       WHERE substr(l.created_at, 1, 10) >= ? AND substr(l.created_at, 1, 10) <= ?
-        ${deptFilter('l.department_id')}${matFilter('l.material_id')}${reqFilter("COALESCE(r.req_number, '')")}
+        ${deptFilter('l.department_id')}${matFilter('l.material_id')}${reqFilter("COALESCE(r.req_number, '')")}${ISSUE_NOT_ROUTED}
     `);
     params.push(f.from, f.to);
     if (f.departmentId) params.push(f.departmentId);
@@ -1941,12 +2052,29 @@ function buildUnion(f: {
   // department_transfer_lines.id), found by SCALAR SUBQUERY and never by a
   // join, for the same no-fan-out reason as the CONSUMPTION attribution above.
   // Like CONSUMPTION it answers a department filter (either end matches) and an
-  // item filter, never a vendor or a requisition: a hand-over between two
-  // kitchens answers to neither.
+  // item filter, never a vendor: a hand-over between two kitchens has none.
   //
   // Runs only once the ledger has held a transfer (schema.transfers) — see the
   // IssueLogStage note: no transfer, no stage, report unchanged.
-  if (want('transfer', cooked && f.schema.transfers)) {
+  //
+  // A TRANSFER THAT FULFILS A REQUISITION LINE (owner rulings #45 + #74). A
+  // sub-kitchen's line for an item a Direct Issue rule sends to Kitchen is
+  // handed over by Kitchen's department transfer, never by the store; the
+  // transfer line carries the requisition line it fulfils
+  // (department_transfer_lines.req_item_id — a reverse line keeps '' and is
+  // walked up reverses_line_id to its root). Such a row names that
+  // requisition in Requisition No / Requisition Line ID, says so in its notes,
+  // and carries the line's fulfilment as the routed writer stamped it at that
+  // send (the ledger row of THIS gesture: client token 'dtl:<transfer line
+  // id>') — so it reads "fulfils REQ-…, PART, 600 of 1,000 g". It is the line's
+  // only hand-over row: the ledger echo is kept off the ISSUE stage (see
+  // ISSUE_NOT_ROUTED). Once such a transfer exists (schema.routedLinks) the
+  // stage also answers a requisition-number filter, with the transfers that
+  // fulfil that requisition and no others. Before it, the branch is byte-for-
+  // byte what it was.
+  const xferLinks = f.schema.routedLinks;
+  const xferOk = !f.vendor && (!f.reqNumber || xferLinks);
+  if (want('transfer', xferOk && f.schema.transfers)) {
     stages.push('TRANSFER');
     // The twin leg's department. The doubled type test matches the partial
     // idx_dmt_transfer_ref predicate verbatim so SQLite can use that index.
@@ -1978,6 +2106,64 @@ function buildUnion(f: {
     const QTY = persp ? `CASE WHEN dmt.department_id = ? THEN dmt.quantity ELSE -dmt.quantity END` : `-dmt.quantity`;
     const STATUS = persp ? `CASE WHEN dmt.department_id = ? THEN 'transfer_out' ELSE 'transfer_in' END` : `'transfer'`;
     const DEPT_ID = persp ? `?` : RECEIVER;
+    // ── THE FULFILS LINK (only once schema.routedLinks; else the literals the
+    // branch always printed). Every join is on a PRIMARY KEY, or on a scalar
+    // subquery that returns at most one id, so none can fan a row out.
+    //   ftl  the transfer line itself (dmt.reference_id is its id, both legs)
+    //   fri  the requisition line it fulfils: its own req_item_id, else — a
+    //        reverse line keeps '' — its root's, walked up reverses_line_id
+    //   frq  that requisition; fld the department the line was raised for
+    //   fl   the ledger row the routed writer wrote for THIS gesture (client
+    //        token 'dtl:' + the transfer line id, idx uq_req_issue_token_item):
+    //        the line's fulfilment as it stood right after this send
+    const FUL_ITEM = `COALESCE(NULLIF(ftl.req_item_id, ''), (
+          WITH RECURSIVE up(id, rev, item, depth) AS (
+            SELECT u0.id, COALESCE(u0.reverses_line_id, ''), COALESCE(u0.req_item_id, ''), 0
+              FROM department_transfer_lines u0
+             WHERE u0.id = COALESCE(ftl.reverses_line_id, '') AND u0.id <> ''
+            UNION ALL
+            SELECT u1.id, COALESCE(u1.reverses_line_id, ''), COALESCE(u1.req_item_id, ''), up.depth + 1
+              FROM department_transfer_lines u1 JOIN up ON u1.id = up.rev
+             WHERE up.item = '' AND up.rev <> '' AND up.depth < 32)
+          SELECT up.item FROM up WHERE up.item <> '' ORDER BY up.depth LIMIT 1))`;
+    const FUL_JOINS = xferLinks ? `
+      LEFT JOIN department_transfer_lines ftl ON ftl.id = dmt.reference_id
+      LEFT JOIN requisition_items fri ON fri.id = ${FUL_ITEM}
+      LEFT JOIN requisitions frq ON frq.id = fri.req_id
+      LEFT JOIN departments fld ON fld.id = COALESCE(NULLIF(fri.department_id, ''), frq.department_id)
+      LEFT JOIN requisition_issue_ledger fl ON fl.id = (
+            SELECT l9.id FROM requisition_issue_ledger l9
+             WHERE l9.client_token = 'dtl:' || dmt.reference_id AND l9.req_item_id = fri.id
+             ORDER BY l9.rowid LIMIT 1)` : '';
+    // The line's fulfilment on THIS row, from the gesture's own ledger row: the
+    // same snapshot an ISSUE row carries (effective_line_qty / after_line_qty
+    // in the LINE unit, restated by the row's pack_factor in JS), so THE RULE
+    // reads it exactly as it reads a store hand-over. NULL — no verdict — on an
+    // ordinary transfer, as always.
+    const F_EFF = xferLinks ? 'fl.effective_line_qty' : 'NULL';
+    const F_ISSUED = xferLinks ? 'fl.after_line_qty' : 'NULL';
+    const F_SF = xferLinks ? 'COALESCE(NULLIF(fl.pack_factor, 0), 1)' : '1';
+    const F_LINE_UNIT = xferLinks ? `COALESCE(fl.line_unit, '')` : `''`;
+    const F_SHELF = xferLinks && f.schema.ledgerShelfMark ? 'fl.shelf_mark' : 'NULL';
+    const F_REQ_NO = xferLinks ? `COALESCE(frq.req_number, '')` : `''`;
+    const F_REQ_ITEM = xferLinks ? `COALESCE(fri.id, '')` : `''`;
+    // The row's own words. No backticks or bare apostrophes inside: this is
+    // SQL inside a template literal (rule 5 of this repo).
+    const F_NOTE = xferLinks ? `
+             || CASE
+                  WHEN fri.id IS NULL THEN ''
+                  WHEN COALESCE(ftl.reverses_line_id, '') = ''
+                    THEN ' | FULFILS ' || COALESCE(NULLIF(frq.req_number, ''), 'a requisition')
+                         || ' (the routed requisition line for ' || COALESCE(NULLIF(fld.name, ''), 'the asking department')
+                         || '): Direct Issue routed that line to the sending department, which sent this from its '
+                         || 'own stock; the central store did not issue it. The line''s Issued To Date counts this '
+                         || 'transfer; no ISSUE row repeats it'
+                  ELSE ' | REVERSES a transfer that fulfilled ' || COALESCE(NULLIF(frq.req_number, ''), 'a requisition')
+                         || ' (the routed requisition line for ' || COALESCE(NULLIF(fld.name, ''), 'the asking department')
+                         || '): this much comes off the line''s Issued To Date, so it is owed again; the central '
+                         || 'store did not move'
+                END` : '';
+    const F_REQ_FILTER = xferLinks ? reqFilter(`COALESCE(frq.req_number, '')`) : '';
     parts.push(`
       SELECT
         'TRANSFER'                                        AS stage,
@@ -2011,9 +2197,9 @@ function buildUnion(f: {
         ''                                                AS skip_reason,
         0                                                 AS needs_unit_review,
         NULL                                              AS requested_qty,
-        NULL                                              AS effective_qty,
-        NULL                                              AS issued_qty,
-        1                                                 AS snapshot_factor,
+        ${F_EFF}                                          AS effective_qty,
+        ${F_ISSUED}                                       AS issued_qty,
+        ${F_SF}                                           AS snapshot_factor,
         ${STATUS}                                         AS status,
         ''                                                AS raised_at,
         ''                                                AS chef_approved_at,
@@ -2021,30 +2207,34 @@ function buildUnion(f: {
         COALESCE(dmt.user, '')                            AS actor,
         TRIM(COALESCE(dmt.notes, '')
              || ' | department to department: the sender''s books went down and the receiver''s '
-             || 'went up in the same moment; central stock did not move') AS notes,
-        ''                                                AS req_number,
-        ''                                                AS req_item_id,
+             || 'went up in the same moment; central stock did not move'${F_NOTE}) AS notes,
+        ${F_REQ_NO}                                       AS req_number,
+        ${F_REQ_ITEM}                                     AS req_item_id,
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        ''                                                AS line_unit,
-        -- No requisition line, so no shelf mark; one row per hand-over line
-        -- (its own link key), so no write-order tie to break.
-        NULL                                              AS shelf_mark,
+        ${F_LINE_UNIT}                                    AS line_unit,
+        -- No shelf mark on an ordinary transfer (no requisition line); a
+        -- transfer that fulfils one carries the mark its ledger row stamped.
+        -- One row per hand-over line (its own link key): no write-order tie.
+        ${F_SHELF}                                        AS shelf_mark,
         0                                                 AS seq
       FROM department_material_transactions dmt
       LEFT JOIN raw_materials rm ON rm.id = dmt.material_id
-      LEFT JOIN departments ds ON ds.id = dmt.department_id
+      LEFT JOIN departments ds ON ds.id = dmt.department_id${FUL_JOINS}
       WHERE dmt.type IN ('transfer_out', 'transfer_in') AND dmt.type = 'transfer_out'
         AND ${XDATE} >= ? AND ${XDATE} <= ?
-        ${f.departmentId ? `AND (dmt.department_id = ? OR ${RECEIVER} = ?)` : ''}${matFilter('dmt.material_id')}
+        ${f.departmentId ? `AND (dmt.department_id = ? OR ${RECEIVER} = ?)` : ''}${matFilter('dmt.material_id')}${F_REQ_FILTER}
     `);
     // POSITIONAL, in textual order: the three SELECT-list placeholders (only
-    // under a department filter: department_id, qty, status), then the WHERE.
+    // under a department filter: department_id, qty, status), then the WHERE
+    // (date, department, item, requisition — the last only once a transfer can
+    // fulfil a requisition line). The joins above carry no placeholder.
     if (persp) params.push(f.departmentId, f.departmentId, f.departmentId);
     params.push(f.from, f.to);
     if (f.departmentId) params.push(f.departmentId, f.departmentId);
     if (f.materialId) params.push(f.materialId);
+    if (F_REQ_FILTER) params.push(f.reqNumber);
   }
 
   return { sql: parts.join('\nUNION ALL\n'), params, stages };
@@ -2123,7 +2313,7 @@ export function getIssueLog(
     // as `value` directly above.
     stock_moved_lines:
       st === 'ISSUE' || st === 'CONSUMPTION' || st === 'REVERSAL' ? 0 : null,
-    basis: STAGE_BASIS[st],
+    basis: stageBasisFor(st, schema),
   });
   // Every stage gets a total object even when the filters excluded it, so a
   // consumer reading totals.receipt never has to null-check and never renders a
@@ -2157,7 +2347,9 @@ export function getIssueLog(
     // THE SAME OBJECTS, not copies — the two views cannot drift apart.
     by_stage: STAGE_ORDER.filter(st => st !== 'TRANSFER' || transferInPlay).map(st => byName[st]),
     lines: 0,
-    basis: transferInPlay ? TOTALS_BASIS + TOTALS_BASIS_TRANSFER : TOTALS_BASIS,
+    basis: (transferInPlay ? TOTALS_BASIS + TOTALS_BASIS_TRANSFER : TOTALS_BASIS)
+      // Only while a routed line exists — see TOTALS_BASIS_ROUTED.
+      + (schema.routedLines || schema.routedLinks ? TOTALS_BASIS_ROUTED : ''),
     stages_present: stages,
   };
 
@@ -2374,7 +2566,94 @@ export function getIssueLog(
     };
   });
 
+  annotateRoutedLines(db, rows, schema);
+
   return { rows, totals, truncated: totals.lines > rows.length, from, to };
+}
+
+/**
+ * A ROUTED requisition line says so on its REQUISITION row (owner rulings #45
+ * + #74): which department sends it, by which Direct Issue rule, and on which
+ * transfers — so "Issued To Date 1 of 1 kg" beside no ISSUE row reads as the
+ * truth (Kitchen sent it) and never as a gap. Notes only: no quantity, total,
+ * verdict or ordering changes, and a line that is not routed — every line on a
+ * database without the column or without a routed line — is untouched. A read,
+ * like everything in this file.
+ */
+function annotateRoutedLines(db: DatabaseT.Database, rows: IssueLogRow[], schema: IssueLogSchema): void {
+  if (!schema.routedLines) return;
+  const ids = [...new Set(rows.filter(r => r.stage === 'REQUISITION' && r.req_item_id).map(r => r.req_item_id))];
+  if (ids.length === 0) return;
+  const info = new Map<string, { dept: string; via: string; ruleId: string; rule: string; dtrs: string[] }>();
+  const CHUNK = 400;
+  try {
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const part = ids.slice(i, i + CHUNK);
+      const ph = part.map(() => '?').join(',');
+      for (const x of db.prepare(`
+        SELECT ri.id, COALESCE(d.name, '') AS dept, COALESCE(ri.routed_via, '') AS via,
+               COALESCE(ri.routed_rule_id, '') AS rule_id
+          FROM requisition_items ri
+          LEFT JOIN departments d ON d.id = ri.routed_department_id
+         WHERE ri.id IN (${ph}) AND ri.routed_department_id IS NOT NULL
+      `).all(...part) as Array<{ id: string; dept: string; via: string; rule_id: string }>) {
+        info.set(String(x.id), { dept: s(x.dept), via: s(x.via), ruleId: s(x.rule_id), rule: '', dtrs: [] });
+      }
+      // The SENDS (root lines; a reverse keeps req_item_id ''), in the order
+      // they were made.
+      if (schema.routedLinks && info.size > 0) {
+        for (const x of db.prepare(`
+          SELECT dtl.req_item_id, COALESCE(NULLIF(TRIM(dt.transfer_no), ''), dt.id) AS transfer_no
+            FROM department_transfer_lines dtl
+            JOIN department_transfers dt ON dt.id = dtl.transfer_id
+           WHERE dtl.req_item_id IN (${ph})
+           ORDER BY dt.created_at ASC, dt.transfer_no ASC
+        `).all(...part) as Array<{ req_item_id: string; transfer_no: string }>) {
+          const hit = info.get(String(x.req_item_id));
+          if (hit && !hit.dtrs.includes(s(x.transfer_no))) hit.dtrs.push(s(x.transfer_no));
+        }
+      }
+    }
+  } catch {
+    return; // a note is never worth failing the report over
+  }
+  // The rule's own label (Settings → Direct Issue: a category's label, or the
+  // item's name) — the words the desks and the To send tab print. Read apart
+  // so a missing rules table only loses the label, never the note.
+  try {
+    const ruleIds = [...new Set([...info.values()].map(x => x.ruleId).filter(Boolean))];
+    const label = new Map<string, string>();
+    for (let i = 0; i < ruleIds.length; i += CHUNK) {
+      const part = ruleIds.slice(i, i + CHUNK);
+      for (const x of db.prepare(`
+        SELECT r.id, r.rule_type, COALESCE(NULLIF(TRIM(r.category_label), ''), r.category_key, '') AS cat,
+               COALESCE(rm.name, '') AS material_name
+          FROM direct_issue_rules r LEFT JOIN raw_materials rm ON rm.id = r.material_id
+         WHERE r.id IN (${part.map(() => '?').join(',')})
+      `).all(...part) as Array<{ id: string; rule_type: string; cat: string; material_name: string }>) {
+        label.set(String(x.id), s(x.rule_type) === 'material' ? s(x.material_name) : s(x.cat));
+      }
+    }
+    for (const v of info.values()) v.rule = label.get(v.ruleId) || '';
+  } catch { /* no rules table: the note names no rule */ }
+  for (const r of rows) {
+    if (r.stage !== 'REQUISITION') continue;
+    const hit = info.get(r.req_item_id);
+    if (!hit) continue;
+    const who = hit.dept || 'another department';
+    // Names the rule that ROUTED the line (stamped at approval, or by the
+    // deploy stamp), not today's config: a rule changed since does not move a
+    // routed line back — it stays the sending department's.
+    const rule = hit.rule
+      ? `${hit.via === 'material' ? 'item rule' : 'category rule'} ${hit.rule} → ${who}`
+      : `→ ${who}`;
+    const sent = hit.dtrs.length > 0
+      ? `sent on ${hit.dtrs.join(', ')}`
+      : 'nothing sent yet';
+    const text = `Routed by Direct Issue (${rule}): ${who} sends this line from its own stock by `
+      + `department transfer (${sent}); the central store does not issue it`;
+    r.notes = r.notes ? `${r.notes} · ${text}` : text;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

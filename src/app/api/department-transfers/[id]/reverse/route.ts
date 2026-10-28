@@ -1,12 +1,13 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import {
-  getDeptTransfer, reverseDeptTransfer, deptTransferSettledNote, isDeptTransferBlocked, type TransferEntryUnit, type DeptReverseBasis,
+  getDeptTransfer, deptTransferSettledNote, isDeptTransferBlocked, type TransferEntryUnit, type DeptReverseBasis,
 } from '@/lib/dept-ledger';
 import {
   loadDepartments, reverseAuthority, canSeeTransfer, canSendFrom, transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from '../../access';
 import { presentChecked, whoClosesCounted } from '../../send-back-check';
+import { reverseWithRequisitionSync, requisitionSyncOf } from '../../routed-send';
 
 /**
  * POST /api/department-transfers/<id>/reverse — THE correction. One tap from
@@ -40,7 +41,14 @@ import { presentChecked, whoClosesCounted } from '../../send-back-check';
  *   · whoever may send from the ORIGINAL SENDER — only on an OPEN dispute,
  *     only up to the disputed quantity (the receiver's flag is the consent).
  *
- * → 201 { transfer (the reverse), original, duplicate: false }
+ * → 201 { transfer (the reverse), original, duplicate: false,
+ *         requisition_sync: [{ req_item_id, req_number, material_name, purchase_unit,
+ *           sent_purchase_before, sent_purchase_after, owed_purchase, complete, reopened }],
+ *         requisition_message? }
+ *   RULING 45: when the goods going back had FULFILLED a routed requisition line
+ *   (a "To send" send), that line's sent figure comes down in the same
+ *   transaction and the line is owed again — back on the sender's To send list.
+ *   requisition_sync is [] for a reverse of an ordinary transfer.
  */
 
 export const dynamic = 'force-dynamic';
@@ -156,7 +164,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
     }
 
-    const res = reverseDeptTransfer(db, {
+    // RULING 45: a send-back of goods that FULFILLED a routed requisition line
+    // lowers what that line was fulfilled with, in the SAME transaction as the
+    // reverse's two legs — the line is owed again and returns to the sending
+    // department's To send list (routed-requisitions applyRoutedSendBack). A
+    // reverse of an ordinary transfer finds no link and changes nothing else.
+    // reverseDeptTransfer nests as a SAVEPOINT; nothing is awaited inside.
+    const { res, sync } = reverseWithRequisitionSync(db, {
       transferId: doc.id,
       user: me.email,
       clientKey,
@@ -166,10 +180,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       notes: String(body.notes ?? body.note ?? '').trim(),
       outletId,
     });
+    const requisitionSync = requisitionSyncOf(db, sync);
     return Response.json({
       transfer: presentChecked(me, res.transfer, depts, db),
       original: presentChecked(me, res.original, depts, db),
       duplicate: res.duplicate,
+      requisition_sync: requisitionSync.rows,
+      ...(requisitionSync.message ? { requisition_message: requisitionSync.message } : {}),
     }, { status: res.duplicate ? 200 : 201 });
   } catch (e: any) {
     // The counted-since refusal reads word-for-word what the screen showed

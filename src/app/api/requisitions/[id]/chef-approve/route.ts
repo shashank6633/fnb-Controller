@@ -1,6 +1,7 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 import { notifyEvent } from '@/lib/whatsapp';
+import { stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 /**
  * Head Chef approves a submitted requisition → moves to 'chef_approved'.
@@ -63,6 +64,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             chef_approved_by = ?, chef_note = ?, updated_at = datetime('now')
         WHERE id = ?
       `).run(me.email, note, id);
+      // ROUTED LINES (owner rulings #45 + #74) — decided HERE, in the same
+      // transaction as the approval, because this is the moment the store's
+      // inbox opens for an internal requisition (requisitions/route.ts
+      // inbox=store). A line for a material a Direct Issue rule sends to
+      // ANOTHER department (Meat/Poultry → Kitchen) goes to that department's
+      // To send list instead of the store desk; the rule's own department's
+      // lines go to the store as before. Internal AND party alike: a party
+      // requisition that Settings send through management is stamped now and
+      // reaches the queue only once management approves (storeStageCheck).
+      // A requisition with no such line is untouched.
+      stampRequisitionRouting(db, id, me.email);
     });
     txn();
     // Audit: complete record of chef approval (req-level), including how many

@@ -1,6 +1,7 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
 import { lineHasMovedStock } from '@/lib/issue-stock';
+import { routedSendsOn, stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 /**
  * Per-item chef edit on a submitted requisition.
@@ -88,6 +89,17 @@ export async function PUT(
             error: 'Cannot reject this item — stock has already been issued against it. Undo the issued quantity on the Store Issue desk first. (A store-rejected line keeps what was already handed over — un-reject it, then undo it.)',
           }, { status: 400 });
         }
+        // ROUTED (rulings #45/#74): goods its Direct Issue department sent by
+        // department transfer are invisible to the central guard above.
+        if (v === 1) {
+          const sent = routedSendsOn(db, { reqItemId: itemId });
+          if (sent.lines.length > 0) {
+            return Response.json({
+              error: `Cannot reject this item — ${sent.message} Then reject it.`,
+              code: 'routed_sent',
+            }, { status: 400 });
+          }
+        }
         changes.is_rejected = v;
         before.is_rejected = !!item.is_rejected;
         after.is_rejected = !!v;
@@ -108,7 +120,14 @@ export async function PUT(
 
     const sets = Object.keys(changes).map(k => `${k} = ?`).join(', ');
     const vals = Object.values(changes);
-    db.prepare(`UPDATE requisition_items SET ${sets} WHERE id = ?`).run(...vals, itemId);
+    db.transaction(() => {
+      db.prepare(`UPDATE requisition_items SET ${sets} WHERE id = ?`).run(...vals, itemId);
+      // ROUTED LINES (rulings #45/#74): an admin edit AFTER approval (a line
+      // un-rejected at chef_approved) is stamped by the same idempotent rule
+      // as the approval itself, so it reaches the right desk. Never un-routes;
+      // a requisition with no such line is untouched.
+      if (reqRow.status === 'chef_approved') stampRequisitionRouting(db, reqId, me.email);
+    })();
 
     // Audit — captures actor + diff + note for compliance
     logAuditEvent(db, {

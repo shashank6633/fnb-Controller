@@ -5,6 +5,12 @@ import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow }
 import { duplicateLineError, requisitionLinePoState } from '@/lib/po-helpers';
 import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
 import { centralFlowBlock } from '@/lib/store-engine';
+// ROUTED REQUISITION LINES (owner rulings #45 + #74) — the readers only. The
+// state of a routed line (who sends it, what was sent on which transfer, THE
+// RULE's verdict, the one sentence) is built ONCE, there, for every screen.
+import { routedLineState, routedOwingCounts, type RoutedLineState } from '@/lib/routed-requisitions';
+// PUT only (rulings #45/#74): re-stamp the lines an admin edit replaces at chef_approved.
+import { stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -289,12 +295,45 @@ export async function GET(request: Request) {
         it.vendor_closed_reason = st?.vendor_closed_reason ?? null;
         it.also_on_po = st?.also_on_po ?? [];
       }
+      // ROUTED LINE STATE, per line (owner rulings #45 + #74). ADDITIVE — no
+      // field above changes; a line the store serves gets `routed: null` and
+      // `routed_department_name: null`, and on a database without the routed
+      // columns every line does (routed-schema.ts, fail-to-store).
+      //   routed   RoutedLineState (src/lib/routed-requisitions.ts): the
+      //            department that SENDS it (a Direct Issue rule routes its item
+      //            there, so the central store never holds it), the asking
+      //            department, the rule's label, approved / sent / owed in the
+      //            LINE unit and in PURCHASE units, THE RULE's verdict
+      //            (complete), closed (rejected), and `sends` — every
+      //            department transfer that FULFILS the line (transfer_no, at,
+      //            by, sent / net after any send-back, open dispute) — plus the
+      //            one server sentence every screen prints verbatim.
+      //   routed_department_name  the sender's name, flat, for a list cell.
+      // quantity_issued on a routed line is what those transfers still leave
+      // with the asking department — written only by the routed writer, never
+      // by a store desk — so it is the Issued figure every other reader
+      // (THE RULE, the party P&L's partyReqSplit) already reads.
+      let routedLinesOwing = 0;
+      let routedState = new Map<string, RoutedLineState>();
+      try {
+        routedState = routedLineState(db, items.map(it => String(it.id)));
+      } catch (rErr) {
+        console.error('[/api/requisitions GET] routed line state failed:', rErr);
+      }
+      for (const it of items) {
+        const rs = routedState.get(String(it.id)) ?? null;
+        it.routed = rs;
+        it.routed_department_name = rs ? rs.department.name : null;
+        if (rs && !rs.complete && !rs.closed) routedLinesOwing++;
+      }
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw
       // view-only even though the API would let them act.)
       const can_approve_chef = visMe ? (canApproveAsChef(visMe) || isMainDeptHead(db, visMe, r.department_id)) : false;
-      return Response.json({ requisition: { ...r, items, can_approve_chef } });
+      // routed_lines_owing: ROUTED lines (above) still owed by THE RULE — the
+      // sending department's work on this requisition, not the store's.
+      return Response.json({ requisition: { ...r, items, can_approve_chef, routed_lines_owing: routedLinesOwing } });
     }
 
     const status       = url.searchParams.get('status');
@@ -419,6 +458,23 @@ export async function GET(request: Request) {
     `).all(...params);
     // lines_owing by the issue desks' own rule — see uncountShownFigureCloses.
     uncountShownFigureCloses(db, rows as Array<{ id: unknown; lines_owing?: unknown }>);
+    // lines_routed_owing (owner rulings #45 + #74), ADDITIVE: of the lines
+    // above, how many are ROUTED — a Direct Issue rule sends their item to
+    // another department, which hands them over by department transfer — and
+    // still owed by THE RULE (lineIssueComplete, computed in JS by
+    // routed-requisitions.ts routedOwingCounts). lines_owing is unchanged: it
+    // is what the asking department is still owed, whoever sends it; the
+    // store's own share is lines_owing − lines_routed_owing. 0 on every
+    // requisition with no routed line, and on a database without the column.
+    let routedOwing = new Map<string, number>();
+    try {
+      routedOwing = routedOwingCounts(db, (rows as Array<{ id: unknown }>).map(r => String(r.id)));
+    } catch (rErr) {
+      console.error('[/api/requisitions GET] routed owing counts failed:', rErr);
+    }
+    for (const r of rows as Array<{ id: unknown; lines_routed_owing?: number }>) {
+      r.lines_routed_owing = routedOwing.get(String(r.id)) || 0;
+    }
 
     const me = await getCurrentUser();
     // Per-requisition approve permission: only the head of THAT requisition's
@@ -870,6 +926,12 @@ export async function PUT(request: Request) {
           const deptId = it.department_id || prev?.department_id || r.department_id;
           ins.run(generateId(), id, it.material_id, qty, unit, it.notes || '', deptId);
         }
+        // ROUTED LINES (rulings #45/#74): an admin edit of a chef-APPROVED
+        // requisition replaces its lines with new ones, so they are stamped
+        // again by the approval's own rule (routed-requisitions.ts). No routed
+        // line can have been sent at this status — the first Send moves the
+        // requisition on — so nothing a department sent is lost here.
+        if (r.status === 'chef_approved') stampRequisitionRouting(db, id, me.email);
       }
     });
     txn();

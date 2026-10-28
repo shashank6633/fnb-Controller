@@ -5,6 +5,7 @@ import { sendPushToUser } from '@/lib/push';
 import type { DeptTransferWithLines, DeptTransferDisputeRow } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
 import { canSendFrom, countDisputesToAct, isAdminOrManager, loadDepartments, type DeptLite } from './access';
+import { toSendGroupCount } from '@/lib/routed-requisitions';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * TELLING THE SENDER'S SIDE A TRANSFER IS DISPUTED.
@@ -122,6 +123,41 @@ export function transferAlertRecipients(
 export function openDisputesToActFor(db: Database.Database, user: SessionUser): number {
   try {
     return countDisputesToAct(db, user, loadDepartments(db));
+  } catch { return 0; }
+}
+
+/**
+ * RULING 45 — "REQUISITION LINES FOR <DEPT> TO SEND", per department this
+ * person may SEND from (access.ts canSendFrom — the same rule the To send POST
+ * refuses on, so a badge always opens a list with a Send the server accepts),
+ * counted with routed-requisitions toSendGroupCount() — the same predicate the
+ * To send queue lists with (owed by THE RULE, requisition at a store stage,
+ * the outlet filter of requisitions/route.ts). A group is one requisition ×
+ * receiving department, as the To send tab shows it. Departments with nothing
+ * owed are left out. Never throws ([] on any failure: a bell must never break
+ * the inbox).
+ */
+export function routedToSendByDept(
+  db: Database.Database, user: SessionUser, outletId: string | null = null,
+): Array<{ department_id: string; department_name: string; groups: number }> {
+  try {
+    const all = loadDepartments(db);
+    const out: Array<{ department_id: string; department_name: string; groups: number }> = [];
+    for (const d of all.values()) {
+      if (!canSendFrom(user, d)) continue;
+      const n = toSendGroupCount(db, [d.id], outletId);
+      if (n > 0) out.push({ department_id: d.id, department_name: d.name, groups: n });
+    }
+    return out.sort((a, b) => b.groups - a.groups || a.department_name.localeCompare(b.department_name));
+  } catch { return []; }
+}
+
+/** The bell's figure for the 'routed_to_send' bucket: requisition groups
+ *  waiting on departments this person may send from (routedToSendByDept,
+ *  summed). Never throws (0 on any failure). */
+export function routedToSendFor(db: Database.Database, user: SessionUser, outletId: string | null = null): number {
+  try {
+    return routedToSendByDept(db, user, outletId).reduce((s, d) => s + d.groups, 0);
   } catch { return 0; }
 }
 
