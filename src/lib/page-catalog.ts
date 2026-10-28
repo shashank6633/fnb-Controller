@@ -1453,15 +1453,8 @@ export function canAccessPage(
   // opened these pages to all 8 null-map users instead of closing them.
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
 
-  // Guest Feedback governs its own door — see `feedbackListedInMap()` for the
-  // measurement and the rule. Reaching this line means the flag gates above
-  // already said YES (greOnly for pages 1-3, mgmtOnly for analytics), so the
-  // only thing left to ask is whether the owner has expressed an opinion about
-  // this module in the role's list. He cannot have, on any role written before
-  // the module existed, and "absent" must not read as "denied" — a Floor
-  // Manager was getting 403 on the page while the API served them the board.
-  // A list that DOES mention the module falls through and is honoured exactly.
-  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
+  // Owner, 2026-10-28: Guest Feedback follows the role's ticks like every other
+  // page — the module no longer opens its own door for a list that never mentions it.
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;
@@ -1624,7 +1617,8 @@ export function canAccessPageStrict(
   // Kept in sync with canAccessPage deliberately: this function is MEASURED,
   // not wired up, and the day it is wired up the feedback module must not
   // silently go back to 403ing every management role whose list predates it.
-  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
+  // Owner, 2026-10-28: Guest Feedback follows the role's ticks like every other
+  // page — the module no longer opens its own door for a list that never mentions it.
   if (!user.page_access) return true;
 
   let allowed: string[];
