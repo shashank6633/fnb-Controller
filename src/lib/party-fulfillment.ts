@@ -5,6 +5,8 @@ import {
   markLedgerShelfClose, issueLedgerWatermark, lineFactor, CentralStockShort, isCentralStockShort,
 } from '@/lib/issue-stock';
 import { qtyGrid } from '@/lib/central-debit-clamp';
+// ROUTED LINES (rulings #45/#74): the leaf probe only.
+import { routedColSql } from '@/lib/routed-schema';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
 // cache itself, so it deliberately does NOT route through postDeptLedger (that
@@ -276,9 +278,12 @@ export function applyPartyFulfillment(
   // Also read INSIDE the transaction. quantity_issued is what this helper
   // deducts; reading it under the same lock as the guard means the quantities
   // written are the quantities that were current when the guard passed.
+  // routed_dept (rulings #45/#74): '' on every line the store serves, and on a
+  // database without the column — then this rail is byte-identical.
   const selItems = db.prepare(`
     SELECT ri.id, ri.material_id, ri.quantity_issued, ri.department_id,
            ri.unit AS req_unit,
+           ${routedColSql(db)} AS routed_dept,
            rm.current_stock, rm.unit, rm.purchase_unit, rm.pack_size
     FROM requisition_items ri
     JOIN raw_materials rm ON rm.id = ri.material_id
@@ -392,6 +397,17 @@ export function applyPartyFulfillment(
     const ledgerSince = opts?.ledgerSince != null && Number.isFinite(Number(opts.ledgerSince))
       ? Number(opts.ledgerSince) : issueLedgerWatermark(db);
     for (const it of items) {
+      // A ROUTED LINE NEVER MOVES ON THIS RAIL (owner rulings #45 + #74). A
+      // Direct Issue rule sends its material straight to the routed department,
+      // which hands it to this party's department by department transfer — that
+      // transfer is the movement, and it is what wrote the line's
+      // quantity_issued (routed-requisitions.ts syncRoutedLine). Debiting
+      // central for it here as well would count the goods twice and take from a
+      // store that never held them. Skipped FIRST — before the moved pool, the
+      // floor and the decline record — so it leaves no trace on this rail at
+      // all; the line is still costed on the party's P&L from quantity_issued
+      // (party-liquor.ts), exactly as a store-issued party line.
+      if (String(it.routed_dept || '') !== '') continue;
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
       const prior = takenBy.get(String(it.material_id));

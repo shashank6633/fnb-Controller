@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { DEPT_TRANSFER_TYPES_SQL } from '@/lib/dept-ledger';
+import { routedColSql } from '@/lib/routed-schema';
 
 /**
  * Department-wise material consumption analytics.
@@ -8,7 +9,10 @@ import { DEPT_TRANSFER_TYPES_SQL } from '@/lib/dept-ledger';
  * TWO SOURCES OF TRUTH, because departments take goods in on two rails:
  *   1. `requisition_items.quantity_issued` — what each kitchen drew from the
  *      main store, aggregated by department & material over a date window and
- *      valued at the material's average_price (rupee context).
+ *      valued at the material's average_price (rupee context). A ROUTED line
+ *      (rulings #45/#74: a Direct Issue department sends it by transfer) is
+ *      not a draw from the main store and is left off this rail — it shows as
+ *      the receiving department's transfer_in below.
  *   2. DIRECT-ISSUE VENDOR RECEIPTS — `department_material_transactions` rows
  *      of type 'direct_receipt' (net of 'direct_receipt_reversal': voids,
  *      downward bill amendments and vendor returns of those goods). Under
@@ -186,6 +190,16 @@ export async function GET(request: Request) {
     const materialId   = url.searchParams.get('material_id') || '';
 
     const where: string[] = ['r.date BETWEEN ? AND ?', `r.status NOT IN ('cancelled', 'chef_rejected')`];
+    // RAIL 1 IS THE MAIN STORE'S HAND-OVERS, so a ROUTED requisition line is
+    // not on it (owner rulings #45 + #74). Its item comes from the vendor
+    // straight to the Direct Issue department (rail 2: already in, say,
+    // Kitchen's total) and Kitchen hands the sub-kitchen's line over by
+    // department transfer — which this report already shows as that
+    // department's transfer_in. Its quantity_issued counted here as well would
+    // count the same kilos twice and call them a draw from the main store.
+    // routedColSql is the literal '' on a database without the column, so the
+    // filter keeps every line there (fail-to-store).
+    where.push(`${routedColSql(db)} = ''`);
     const params: any[] = [from, to];
     const outletId = await getCurrentOutletId();
     if (outletId)     { where.push('(r.outlet_id = ? OR r.outlet_id IS NULL)'); params.push(outletId); }

@@ -3,6 +3,7 @@ import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth'
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines, nextPoNumber, deliveredDirectCaps, mergedPoHolds } from '@/lib/po-helpers';
 import { reconcileDeliveredDirectLines } from '@/lib/po-link-lifecycle';
+import { routedLineState } from '@/lib/routed-requisitions';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
@@ -355,6 +356,52 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     }
 
+    // ── ROUTED LINES (owner rulings #45 + #74) ───────────────────────────────
+    // A routed line is the Direct Issue department's to send (its "To send"
+    // list, by department transfer) — the central store never holds the
+    // goods. `ri.*` carries routed_department_id when the column exists; on a
+    // database without it every line reads '' and nothing below changes.
+    // A posted routed line that asks to ISSUE (a figure other than what it
+    // holds) or to BUY refuses the whole request, nothing written: an issue
+    // would take from central what it never had, and a Buy qty would buy it a
+    // second time. A routed line posted at its own figure (or 0, or omitted)
+    // passes — the write loop leaves routed lines entirely alone, so it moves
+    // nothing either way.
+    const isRoutedItem = (it: any): boolean => String(it?.routed_department_id || '') !== '';
+    {
+      const hits: string[] = [];
+      for (const it of items) {
+        if (!isRoutedItem(it)) continue;
+        const ln = lineMap.get(String(it.id));
+        if (!ln) continue;
+        const want = Number(ln.quantity_issued) || 0;
+        const have = Number(it.quantity_issued) || 0;
+        const buy = Number(ln.quantity_to_purchase) || 0;
+        if ((want > 0 && Math.abs(want - have) > 1e-9) || buy > 0) hits.push(String(it.id));
+      }
+      if (hits.length > 0) {
+        const states = routedLineState(db, hits);
+        const rows = hits.map(rid => {
+          const it = items.find(x => String(x.id) === rid);
+          const st = states.get(rid);
+          const name = String(it?.material_name || st?.material_name || 'a line');
+          const D = st?.department.name || 'its Direct Issue department';
+          return {
+            code: 'routed', req_item_id: rid, material: name,
+            routed_department_id: st?.department.id || '', routed_department_name: D,
+            message: `${name}: ${st?.sentence || `${D} sends this from its own stock by department transfer, so the central store never holds it.`} `
+              + `Leave its Issue and Buy boxes empty here.`,
+          };
+        });
+        return Response.json({
+          error: `Nothing was issued and ${r.req_number} is unchanged. ${rows.map(x => x.message).join(' ')} Reload the requisition and issue the rest again.`,
+          code: 'routed',
+          req_item_ids: hits,
+          blocked: rows,
+        }, { status: 400 });
+      }
+    }
+
     // ── DELIVERED DIRECT (owner rulings #68 + #73) ───────────────────────────
     // A merged PO received through a Direct Issue rule sent goods straight to
     // the rule's department; the central store never received them. Issuing
@@ -537,6 +584,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // a held line writes nothing, so it must not hold a later line that fits.
       const heldShare = new Map<string, { recipe: number; lines: number }>();
       for (const it of items) {
+        // A routed line is never written here (rulings #45/#74), so the floor
+        // has nothing to score for it.
+        if (isRoutedItem(it)) continue;
         const ln = lineMap.get(it.id) || {};
         const beforeIssued = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
         const afterIssued = Number(ln.quantity_issued) || 0;
@@ -674,6 +724,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }
         continue;
       }
+      // A routed line is neither issued nor bought here (rulings #45/#74);
+      // the refusal above has already turned away any posted figure for it.
+      if (isRoutedItem(it)) continue;
       const ln = lineMap.get(it.id) || {};
       const issued   = Number(ln.quantity_issued)      || 0;
       // quantity_to_purchase is ONLY honoured when caller opted into auto-PO.
@@ -1131,6 +1184,37 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // figures this gesture leaves (a line this POST issues in full is not
     // stranded by anything). Refused whole, nothing written, before the
     // transaction; the fix is in the same modal (untick, issue again).
+    // ── THE TICK GUARD, ROUTED (rulings #45/#74) ─────────────────────────────
+    // The same rule for a routed line: the tick's PO completes the WHOLE
+    // requisition on arrival (po-requisition-fulfil.ts), which would close a
+    // routed line its department has not sent — the receiving department
+    // never gets it, and no queue offers it again. Fires ONLY when a PO would
+    // actually be written and a routed line is still owed; a requisition with
+    // no routed line gets the tick exactly as before.
+    if (autoCreatePo && poLines.length > 0) {
+      const routedOwed = items.filter(it => isRoutedItem(it) && !it.is_rejected && Number(it.store_rejected || 0) !== 1
+        && !lineIssueComplete({
+          quantity_issued: it.quantity_issued, chef_approved_qty: it.chef_approved_qty,
+          quantity_requested: it.quantity_requested, line_unit: it.unit,
+          unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size,
+          shelf_emptied_qty: it.shelf_emptied_qty,
+        }));
+      if (routedOwed.length > 0) {
+        const states = routedLineState(db, routedOwed.map(it => String(it.id)));
+        const parts = routedOwed.map(it => {
+          const D = states.get(String(it.id))?.department.name || 'its Direct Issue department';
+          return `${String(it.material_name || 'a line')}, which ${D} still has to send`;
+        });
+        return Response.json({
+          error: `No vendor PO was raised and nothing was issued: a vendor PO raised with "Also raise a vendor PO" completes the WHOLE `
+            + `requisition on arrival and would close ${parts.join('; and ')}. Untick "Also raise a vendor PO" and issue again — `
+            + `anything still to buy can go on a merged PO ("Merge into one PO").`,
+          code: 'routed_open',
+          req_item_ids: routedOwed.map(it => String(it.id)),
+        }, { status: 409 });
+      }
+    }
+
     if (autoCreatePo && poLines.length > 0) {
       const owedAfter = items.filter(it => {
         if (it.is_rejected || Number(it.store_rejected || 0) === 1) return false;
@@ -1259,6 +1343,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const raisedIds = new Set<string>();
 
       for (const it of items) {
+        // ── A ROUTED LINE IS NOT THIS ROUTE'S TO WRITE (rulings #45/#74) ──────
+        // The ONE deliberate exception to "absolute and unfiltered": a routed
+        // line's quantity_issued is written only by the department transfer
+        // that fulfils it (routed-requisitions.ts syncRoutedLine). Rewriting it
+        // here — an omitted line posts 0 — would wipe what that department
+        // sent. No UPDATE, no applyIssueDelta: the line is left exactly as it
+        // stands. `allDone` below still reads it.
+        if (isRoutedItem(it)) continue;
         const ln = lineMap.get(it.id) || {};
         const issued   = Number(ln.quantity_issued)      || 0;
         const purchase = Number(ln.quantity_to_purchase) || 0;
@@ -1749,6 +1841,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // field this route documents as true on every path and the modal prints it
     // verbatim ("Server summary:", requisitions/page.tsx:3036), so a storekeeper
     // learns about a held line without waiting for a client change.
+    // ROUTED LINES STILL OWED (rulings #45/#74) — not the store's, so "everything
+    // else was issued" must not count them. '' when there is none, so every
+    // requisition without one reads exactly as before.
+    let routedOwedSentence = '';
+    {
+      const owed = [...routedLineState(db, items.filter(isRoutedItem).map(it => String(it.id))).values()]
+        .filter(st => !st.complete && !st.closed);
+      if (owed.length > 0) {
+        const byDept = new Map<string, string[]>();
+        for (const st of owed) byDept.set(st.department.name, [...(byDept.get(st.department.name) || []), st.material_name]);
+        routedOwedSentence = [...byDept.entries()].map(([D, names]) =>
+          `${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} ${D}'s to send (Direct Issue), not the store's.`).join(' ');
+      }
+    }
     if (centralShort.length > 0) {
       const n = centralShort.length;
       result.held_lines = centralShort;
@@ -1757,7 +1863,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // must not count them (round 7 verifier). Only lines the POST named:
       // an omitted line was not "entered".
       const zeroNames = items
-        .filter(it => !heldItemIds.has(String(it.id)) && !it.is_rejected && lineMap.has(it.id)
+        .filter(it => !heldItemIds.has(String(it.id)) && !it.is_rejected && !isRoutedItem(it) && lineMap.has(it.id)
           && (Number(lineMap.get(it.id)?.quantity_issued) || 0) <= 0
           && ((it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0) > 0)
         .map(it => String(it.material_name || 'a line'));
@@ -1766,7 +1872,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         + `${n === 1 ? 'stays' : 'stay'} outstanding on ${r.req_number} — the central store does not `
         + `hold the quantity asked. ${centralShort.map(s => s.message).join(' ')}`
         + `${zeroEntriesSentence(zeroNames)} `
-        + `Everything else on this requisition was issued.`;
+        + (routedOwedSentence
+          ? `Everything else the store issues on this requisition was issued; ${routedOwedSentence}`
+          : `Everything else on this requisition was issued.`);
     }
     // `|| result.stock_held_note` so a plain issue (no PO asked for) that held a
     // line still reaches po_note. The `autoCreatePo &&` added to the

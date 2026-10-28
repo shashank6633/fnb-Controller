@@ -6,9 +6,10 @@ import {
 } from '@/lib/dept-ledger';
 import {
   loadDepartments, canSendFrom, canSeeDept, countDisputesToAct,
-  transferErrorResponse, resolveEntryUnit, bodyNumber,
+  transferErrorResponse, resolveEntryUnit, bodyNumber, sendRefusalMessage,
 } from './access';
 import { presentChecked, type SendableCache } from './send-back-check';
+import { toSendView, routedSendPost } from './routed-send';
 
 /**
  * DEPARTMENT → DEPARTMENT TRANSFERS — the HTTP layer. ONE STEP (owner's ruling).
@@ -40,6 +41,11 @@ import { presentChecked, type SendableCache } from './send-back-check';
  *   POST /api/department-transfers/<id>/resolve         close a dispute with a note, moving nothing
  *   GET  /api/department-transfers/holdings?department_id=<id>
  *                                                       what that ONE department can send, + receivers
+ *   GET  /api/department-transfers/to-send?department_id=<id>   (also ?queue=to_send here)
+ *   POST /api/department-transfers/to-send              RULING 45: the routed requisition lines this
+ *          department sends itself, and the send that FULFILS them (./routed-send.ts). A POST to
+ *          THIS url naming requisition_id / req_item_id is handed to it too — it is never sent on
+ *          as an ordinary (unlinked) transfer.
  *
  * ── ONE STEP ───────────────────────────────────────────────────────────────
  * The moment a transfer is SENT the sender's ledger goes down and the
@@ -96,6 +102,16 @@ export async function GET(request: Request) {
 
     const url = new URL(request.url);
     const departmentId = (url.searchParams.get('department_id') || '').trim();
+    // RULING 45: ?queue=to_send is the "To send" list — the same answer as
+    // GET /api/department-transfers/to-send (./routed-send.ts), one code path.
+    const queue = (url.searchParams.get('queue') || '').trim().toLowerCase();
+    if (queue) {
+      if (queue !== 'to_send') return Response.json({ error: "queue must be 'to_send'" }, { status: 400 });
+      const deptForQueue = departmentId || String(me.department_id || '').trim();
+      if (!deptForQueue) return Response.json({ error: 'department_id is required' }, { status: 400 });
+      const out = toSendView(getDb(), me, deptForQueue, await getCurrentOutletId());
+      return Response.json(out.body, { status: out.status });
+    }
     const direction = (url.searchParams.get('direction') || '').trim().toLowerCase();
     const dispute = (url.searchParams.get('dispute') || '').trim().toLowerCase();
     const limitRaw = Number(url.searchParams.get('limit') || 100);
@@ -206,6 +222,22 @@ export async function POST(request: Request) {
   // The outlet is read BEFORE any transaction — nothing is awaited inside one.
   const outletId = await getCurrentOutletId();
   const db = getDb();
+
+  // RULING 45: a send that names requisition lines FULFILS them — it is the
+  // "To send" route's (./routed-send.ts), whichever URL it arrived on. Never
+  // sent on as an ordinary transfer: that would move the goods and leave the
+  // line owed (sent twice, or counted twice).
+  const rawForLink: any[] = Array.isArray(body.lines) ? body.lines : [];
+  if (String(body.requisition_id || '').trim() || rawForLink.some((l) => String(l?.req_item_id || '').trim())) {
+    try {
+      const out = routedSendPost(db, me, body, outletId);
+      return Response.json(out.body, { status: out.status });
+    } catch (e: any) {
+      console.error('[department-transfers POST → to-send]', e);
+      return Response.json({ error: e?.message || 'Send failed' }, { status: 500 });
+    }
+  }
+
   try {
     const fromId = String(body.from_department_id || '').trim();
     const toId = String(body.to_department_id || '').trim();
@@ -219,12 +251,7 @@ export async function POST(request: Request) {
     if (!to) return Response.json({ error: 'Unknown receiving department' }, { status: 404 });
 
     if (!canSendFrom(me, from)) {
-      const parent = from.parent_id ? depts.get(from.parent_id) : undefined;
-      return Response.json({
-        error: `Only ${from.name}'s head (its named head, or an HOD posted to ${from.name}` +
-          `${parent ? ` or to ${parent.name}` : ''}), a manager or an ` +
-          `admin can send its stock. You can still see transfers into and out of your department and flag a dispute.`,
-      }, { status: 403 });
+      return Response.json({ error: sendRefusalMessage(from, depts) }, { status: 403 });
     }
 
     const clientKey = typeof body.client_key === 'string' ? body.client_key.trim() : '';

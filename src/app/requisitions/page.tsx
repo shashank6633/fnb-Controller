@@ -23,6 +23,11 @@ import { packFactor, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
 // scripts/desk-rule-tests.ts. Never re-type any of it on this page.
 import { deskLineComplete, planDeskDebit, forecastDeskTake, type DeskTakeForecast } from '@/lib/desk-rule';
 import { fmtIST } from '@/lib/format-date';
+// ROUTED LINES (rulings #45, #74): a line for an item a Direct Issue rule sends
+// straight to another department (Meat / Poultry / Seafood → Kitchen) is that
+// department's to send, by department transfer — the store never issues or
+// buys it here. The ONE reader the three screens share.
+import { isRoutedLine, routedLineOf, routedDeptWord, routedDeptNames } from '@/app/department-transfers/routed-view';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
 import StaffCatalogPicker, { type DeptStockLite, type DeptStockProp } from './StaffCatalogPicker';
@@ -155,6 +160,13 @@ interface ReqItem {
    *  Written by the server at the take, never inferred here (desk-rule.ts
    *  deskShelfMarkHolds). Arrives with ri.* on the ?id= detail payload. */
   shelf_emptied_qty?: number | null;
+  /** Ruling #45: the department that SENDS this line ('' / null = the store),
+   *  and the server's state of it (RoutedLineState) — read through
+   *  routed-view.ts only. On a routed line quantity_issued is what that
+   *  department's transfers still leave with the asking department. */
+  routed_department_id?: string | null;
+  routed?: unknown;
+  routed_department_name?: string | null;
 }
 interface Requisition {
   id: string; req_number: string;
@@ -197,6 +209,11 @@ interface Requisition {
   lines_issued_any?: number;
   lines_deferred?: number;
   lines_owing?: number;
+  /** Ruling #45 — of lines_owing, the ROUTED ones (another department sends
+   *  them by department transfer). The list carries it; the ?id= detail
+   *  carries routed_lines_owing. Absent on an older payload (reads 0). */
+  lines_routed_owing?: number;
+  routed_lines_owing?: number;
   items?: ReqItem[];
 }
 
@@ -1131,6 +1148,27 @@ function RecahoImportModal({ onClose, onCommitted }: { onClose: () => void; onCo
 }
 
 /* ============================================================ */
+/**
+ * WHERE A ROUTED LINE GOES, AND HOW FAR IT HAS GOT (ruling #45) — on the
+ * department's own view of its requisition. The server's one sentence, verbatim
+ * ("Kitchen sends this — Direct Issue routes Poultry to Kitchen, so the central
+ * store never holds it. Sent 0.5 kg of 1 kg (DTR-0042); 0.5 kg still to send."),
+ * so this screen, the store desk and the To send list say the same thing.
+ * Renders nothing on a line the store serves.
+ */
+function RoutedLineNote({ it }: { it: ReqItem }) {
+  const rv = routedLineOf(it);
+  if (!rv) return null;
+  const D = routedDeptWord(rv);
+  return (
+    <div className="mt-0.5 text-[9px] leading-snug text-indigo-800 no-underline"
+         title={`Sent by ${D} by department transfer — not issued by the store`}>
+      <span className="px-1 py-px mr-1 rounded bg-indigo-100 border border-indigo-200 font-semibold">ROUTED · {D.toUpperCase()}</span>
+      {rv.sentence || `${D} sends this line by department transfer — a Direct Issue rule routes the item there, so the store does not issue it.`}
+    </div>
+  );
+}
+
 function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; expanded: boolean; onToggle: () => void;
   materials: Material[];
@@ -1187,6 +1225,14 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
             <span title={`Part-issued — ${num(r.lines_issued_any)} line(s) handed over, ${num(r.lines_owing)} still owed`}
                   className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium whitespace-nowrap bg-rose-100 text-rose-700">
               Part
+            </span>
+          )}
+          {/* Routed (ruling #45): lines another department still has to send —
+              part of lines_owing, served by department transfer, not the store. */}
+          {num(r.lines_routed_owing) > 0 && !TERMINAL_STATUSES.includes(r.status) && (
+            <span title={`${num(r.lines_routed_owing)} line(s) still to be sent by the department a Direct Issue rule routes the item to — by department transfer, not by the store`}
+                  className="ml-1 text-[10px] px-1.5 py-0.5 rounded font-medium whitespace-nowrap bg-indigo-100 text-indigo-800">
+              {num(r.lines_routed_owing)} routed
             </span>
           )}
         </td>
@@ -1383,7 +1429,10 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       : null;
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
-                        <td className="py-1 px-2">{it.material_name}</td>
+                        <td className="py-1 px-2">
+                          {it.material_name}
+                          {!rejected && <RoutedLineNote it={it} />}
+                        </td>
                         <td className="py-1 px-2 text-right font-mono">
                           {/* Rejected prints an em-dash, same as the full table.
                               It used to print the placeholder 1 that
@@ -1481,7 +1530,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 const rejected = !!it.is_rejected;
                 // Stock is in recipe units; the request may be in the purchase
                 // unit (e.g. BTL) — convert before comparing.
-                const short = (it.current_stock < it.quantity_requested * reqPackFactor(it));
+                // Not on a routed line (ruling #45): it is never served from
+                // the central shelf, so a ⚠ against that shelf would be noise.
+                const short = !isRoutedLine(it) && (it.current_stock < it.quantity_requested * reqPackFactor(it));
                 // Purchase-unit context for display: stock is stored in recipe
                 // units (g/ml) and average_price is ₹/recipe-unit — both are
                 // unreadable raw (18,000 / ₹0). Convert to the ordering unit.
@@ -1530,6 +1581,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       {!rejected && hasMergeState(it as unknown as MergeLineFields) && (
                         <div className="mt-0.5 no-underline"><MergeLineBadge line={it as unknown as MergeLineFields} pu={puLbl} /></div>
                       )}
+                      {!rejected && <RoutedLineNote it={it} />}
                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                     </td>
                     <td className="py-1 px-2 text-right font-mono">
@@ -2330,8 +2382,19 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   //   2) Use chef_approved_qty (when set) as the effective demand instead of
   //      quantity_requested. The store works off what the chef approved, not
   //      what the dept originally asked for.
-  const visibleItems = (req.items || []).filter(it => !it.is_rejected);
-  const rejectedCount = (req.items || []).length - visibleItems.length;
+  //   3) Leave ROUTED lines out of the form (ruling #45): another department
+  //      sends them by department transfer, so this desk neither issues nor
+  //      buys them, and they are not in the POST (store-process skips them and
+  //      refuses a figure on one, code 'routed'). They are listed read-only
+  //      above the form instead, with the server's sentence.
+  const visibleItems = (req.items || []).filter(it => !it.is_rejected && !isRoutedLine(it));
+  const rejectedCount = (req.items || []).filter(it => !!it.is_rejected).length;
+  const routedItems = (req.items || []).filter(it => !it.is_rejected && isRoutedLine(it));
+  /** Routed lines still owed (THE RULE) — what keeps the requisition open after
+   *  this submit, and what a ticked PO's cascade would wrongly close. */
+  const routedOwed = routedItems.filter(it => !Number((it as any).store_rejected || 0) && !lineIssueComplete(it));
+  const routedDepts = routedDeptNames(routedItems);
+  const routedWho = routedDepts.length > 0 ? routedDepts.join(', ') : 'the routed department';
   /** A party requisition's goods move on the party rail, so the central-stock
    *  floor the server added does not apply to ANY of its lines (applyIssueDelta
    *  carves purpose === 'party' out before the debit). Resolved once, from the
@@ -2606,6 +2669,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     ln.owed_at_open && onOpenPo(ln.merge)
     && (ln.merge.on_po?.source === 'merge' || ln.merge.on_po?.merged === true));
   const mergedHeldPos = [...new Set(mergedHeldLines.map(ln => String(ln.merge.on_po?.po_number || '')).filter(Boolean))];
+  /* …AND WHILE A ROUTED LINE IS STILL OWED (ruling #45). The same cascade
+     would close it on arrival, though its department still has to send it;
+     store-process refuses that gesture (409, code 'routed_open'). The tick is
+     locked here with the reason, so the storekeeper is never sent into it. */
+  const tickLocked = mergedHeldLines.length > 0 || routedOwed.length > 0;
   // Lines whose central BOOK balance is BELOW zero — a data-quality fact, kept
   // separate from "the store cannot cover this line" because the remedy is
   // different: a negative book means issues have outrun recorded purchases and
@@ -3669,6 +3737,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // The rows the server named, from either field — `blocked[]` carries them
       // even if req_item_ids is ever absent.
       setErrorRows(new Set(ids.length > 0 ? ids : Object.keys(byItem)));
+      // ROUTED (ruling #45) arrives here too, as itself: 'routed' (this window
+      // was opened before a line was routed, so it posted a figure on a line
+      // its department now sends) and 'routed_open' (a ticked PO would close a
+      // line its department still owes). Their sentences say what happened and
+      // what to do, so they are printed verbatim like every other refusal.
       setErrorText(String(j?.error || 'Failed'));
       setBusy(false);
       const seq = ++rereadSeq.current;
@@ -4083,9 +4156,41 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           )}
 
-          {lines.length === 0 && (
+          {/* ROUTED LINES (ruling #45) — read-only, not in the form or the POST. */}
+          {routedItems.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900 space-y-1">
+              <div>
+                <b>{routedItems.length}</b> line{routedItems.length === 1 ? ' is' : 's are'} sent by <b>{routedWho}</b>, not the
+                store — a Direct Issue rule sends {routedItems.length === 1 ? 'that item' : 'those items'} straight there, so the
+                central store never holds {routedItems.length === 1 ? 'it' : 'them'}. {routedItems.length === 1 ? 'It is' : 'They are'} not
+                in the form below; nothing here issues or buys {routedItems.length === 1 ? 'it' : 'them'}.
+              </div>
+              <ul className="space-y-0.5">
+                {routedItems.map(it => {
+                  const rv = routedLineOf(it);
+                  return (
+                    <li key={it.id} className="break-words">
+                      <b>{it.material_name}</b>
+                      {Number((it as any).store_rejected || 0) ? <> — rejected by the store</> : null}
+                      {rv?.sentence ? <> — {rv.sentence}</> : null}
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="text-[10px] text-indigo-800">
+                Once anything is handed over, the requisition continues on Store Issue (as after any first hand-over).
+              </div>
+            </div>
+          )}
+
+          {lines.length === 0 && routedItems.length === 0 && (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded text-amber-900">
               ⚠ Every line on this requisition was rejected by the chef. Nothing to issue — Cancel out and reject the whole requisition if appropriate.
+            </div>
+          )}
+          {lines.length === 0 && routedItems.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded text-amber-900">
+              ⚠ Nothing on this requisition is the store&apos;s to issue — {routedWho} sends {rejectedCount > 0 ? 'every line the HOD approved' : 'every line'}.
             </div>
           )}
 
@@ -4234,12 +4339,20 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               when they arrive, and anything else still to buy can go on a merged PO (&quot;Merge into one PO&quot;).
             </div>
           )}
-          <label className={mergedHeldLines.length > 0
+          {routedOwed.length > 0 && mergedHeldLines.length === 0 && (
+            <div className="text-[11px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900">
+              <b>&quot;Also raise a vendor PO&quot; is not available on this requisition</b> — a vendor PO raised with it
+              completes the WHOLE requisition when it arrives, and would close{' '}
+              {routedOwed.map(it => it.material_name).join(', ')}, which {routedWho} still has to send. Issue what the store
+              holds now; anything else still to buy can go on a merged PO (&quot;Merge into one PO&quot;).
+            </div>
+          )}
+          <label className={tickLocked
             ? 'flex items-start gap-2 text-xs cursor-not-allowed opacity-60 bg-blue-50 border border-blue-200 rounded p-2'
             : 'flex items-start gap-2 text-xs cursor-pointer bg-blue-50 border border-blue-200 rounded p-2'}>
-            <input type="checkbox" checked={raisePo && mergedHeldLines.length === 0}
-                   disabled={mergedHeldLines.length > 0}
-                   onChange={e => setRaisePo(e.target.checked && mergedHeldLines.length === 0)}
+            <input type="checkbox" checked={raisePo && !tickLocked}
+                   disabled={tickLocked}
+                   onChange={e => setRaisePo(e.target.checked && !tickLocked)}
                    className="mt-0.5" />
             <div>
               {/* "…for the shortfall" made a shortfall read as a PRECONDITION.
@@ -5223,7 +5336,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   issued" — it owes less than one printed step the store cannot
                   give. Said so only when there is one; otherwise the original
                   sentence, byte for byte (round 8). */}
-              {lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
+              {/* A routed line still owed (ruling #45) keeps the requisition open
+                  whatever this submit does — its department still sends it. */}
+              {routedOwed.length > 0
+                ? <>✓ Every line the store serves is {lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
+                    ? 'complete' : 'fully issued'} on submit. The requisition stays open until {routedWho} sends{' '}
+                    {routedOwed.map(it => it.material_name).join(', ')}.</>
+                : lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
                 ? <>✓ Every line complete — the lines marked &quot;takes everything the store holds&quot; close below one printed step — requisition will move to <b>Fulfilled</b> on submit.</>
                 : <>✓ Every line fully issued — requisition will move to <b>Fulfilled</b> on submit.</>}
             </div>
@@ -5246,8 +5365,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           const buyLines = lines.filter(ln => buyOf(ln) > 0);
           const missingPrice  = raisePo ? buyLines.find(ln => !(priceOf(ln) > 0))  : undefined;
           const missingVendor = raisePo ? buyLines.find(ln => !hasVendor(ln))      : undefined;
-          const poReady = !missingPrice && !missingVendor;
-          const blockedReason = missingPrice
+          // Nothing for the store to record (ruling #45): every line is routed.
+          const nothingForStore = lines.length === 0 && routedItems.length > 0;
+          const poReady = !missingPrice && !missingVendor && !nothingForStore;
+          const blockedReason = nothingForStore
+            ? `Nothing here is the store's to issue — ${routedWho} sends ${routedItems.length === 1 ? 'the line' : 'every line'} from its To send list.`
+            : missingPrice
             ? `"${missingPrice.material_name}" has a Buy qty but no unit price — a PO cannot be raised at ₹0, and the server would refuse the whole issue.`
             : missingVendor
               ? `"${missingVendor.material_name}" has a Buy qty but no vendor — pick one, or clear its Buy box to leave it off the PO.`

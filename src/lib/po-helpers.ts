@@ -13,6 +13,9 @@ import { duplicateLineError as duplicateLineErrorRule } from '@/lib/line-dedupe'
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { stockOnHandBulk } from '@/lib/dept-stock';
 import { todayIST } from '@/lib/format-date';
+// ROUTED LINES (rulings #45/#74): the leaf probe — routed-requisitions imports
+// this file, so it is never imported back.
+import { routedSchema } from '@/lib/routed-schema';
 
 /**
  * Shared Purchase Order helpers.
@@ -277,8 +280,10 @@ function chunked<T>(list: T[], size = SQL_CHUNK): T[][] {
  *                                  party at mgmt_approved / store_processed
  *    otherwise                   → chef_approved / mgmt_approved / store_processed
  *  If the two ever disagree, a line shows in the store's inbox but cannot be
- *  merged (or the reverse) — change both together. */
-function storeStageCheck(db: PoDb): (status: string, purpose: string) => boolean {
+ *  merged (or the reverse) — change both together. Exported for the routed
+ *  lines' "To send" queue (routed-requisitions.ts), which opens at exactly the
+ *  point the store inbox does (rulings #45/#74). */
+export function storeStageCheck(db: PoDb): (status: string, purpose: string) => boolean {
   let requireMgmt = false;
   try {
     const row = db.prepare("SELECT value FROM settings WHERE key = 'require_mgmt_approval'").get() as { value?: string } | undefined;
@@ -733,6 +738,7 @@ export type MergeBlockCode =
   | 'not_with_store'      // requisition is not at a store-stage status
   | 'other_outlet'        // requisition belongs to another outlet
   | 'rejected'            // chef- or store-rejected line
+  | 'routed'              // rulings #45/#74: a Direct Issue department sends it from its own stock (its To send list)
   | 'nothing_owed'        // fully issued (THE RULE, lineIssueComplete), or owes less than one printed step
   | 'requisition_po'      // the requisition already has its own vendor PO (the tick)
   | 'on_po'               // the line is already on a live PO
@@ -792,6 +798,8 @@ interface EvalRow {
   quantity_requested: number | null; chef_approved_qty: number | null; quantity_issued: number | null;
   shelf_emptied_qty: number | null; is_rejected: number | null; store_rejected: number | null;
   deferred_until: string | null; defer_reason: string | null;
+  /** Rulings #45/#74: '' unless the line is routed (always '' without the column). */
+  routed_department_id: string | null; routed_department_name: string | null;
 }
 
 interface EvalOptions {
@@ -813,6 +821,14 @@ interface EvalOptions {
  */
 export function evaluateRequisitionLines(db: PoDb, opts: EvalOptions): ReqLineCandidate[] {
   const atStore = storeStageCheck(db);
+  // ROUTED LINES (rulings #45/#74): the sending department, when the column
+  // exists; '' otherwise, so the SELECT is unchanged in meaning.
+  const routed = routedSchema(db).lineCol;
+  const routedSel = routed
+    ? `COALESCE(ri.routed_department_id, '') AS routed_department_id, COALESCE(rtd.name, '') AS routed_department_name`
+    : `'' AS routed_department_id, '' AS routed_department_name`;
+  const routedJoin = routed ? `
+      LEFT JOIN departments rtd ON rtd.id = ri.routed_department_id` : '';
   const select = `
     SELECT ri.id AS req_item_id, ri.req_id AS requisition_id,
            r.req_number, r.date AS req_date, r.status AS req_status,
@@ -828,12 +844,13 @@ export function evaluateRequisitionLines(db: PoDb, opts: EvalOptions): ReqLineCa
            COALESCE(rm.pack_size, 1) AS pack_size, rm.current_stock,
            ri.quantity_requested, ri.chef_approved_qty, ri.quantity_issued, ri.shelf_emptied_qty,
            COALESCE(ri.is_rejected, 0) AS is_rejected, COALESCE(ri.store_rejected, 0) AS store_rejected,
-           ri.deferred_until, COALESCE(ri.defer_reason, '') AS defer_reason
+           ri.deferred_until, COALESCE(ri.defer_reason, '') AS defer_reason,
+           ${routedSel}
       FROM requisition_items ri
       JOIN requisitions r    ON r.id  = ri.req_id
       JOIN raw_materials rm  ON rm.id = ri.material_id
       LEFT JOIN departments d ON d.id = COALESCE(ri.department_id, r.department_id)
-      LEFT JOIN purchase_orders lpo ON lpo.id = r.linked_po_id`;
+      LEFT JOIN purchase_orders lpo ON lpo.id = r.linked_po_id${routedJoin}`;
   const ORDER = `ORDER BY r.date, r.req_number, ri.created_at, ri.rowid`;
   let rows: EvalRow[] = [];
   if (opts.ids) {
@@ -884,6 +901,16 @@ export function evaluateRequisitionLines(db: PoDb, opts: EvalOptions): ReqLineCa
       blocked = { code: 'other_outlet', reason: `${r.req_number} belongs to another outlet.` };
     } else if (Number(r.is_rejected) === 1 || Number(r.store_rejected) === 1) {
       blocked = { code: 'rejected', reason: `${r.material_name} on ${r.req_number} was rejected, so nothing is owed on it.` };
+    } else if (String(r.routed_department_id || '') !== '') {
+      // RULINGS #45/#74. A Direct Issue rule sends this material straight to
+      // the routed department, which hands this line over from its own books
+      // by department transfer; a central PO would buy it a second time, into
+      // a store that never holds it. createMergedPo re-checks through here.
+      const D = String(r.routed_department_name || '') || 'the Direct Issue department';
+      blocked = {
+        code: 'routed',
+        reason: `${r.material_name} on ${r.req_number} is on ${D}'s To send list — ${D} sends it from its own stock (Direct Issue). Buy for ${D} on ${D}'s own requisition.`,
+      };
     } else if (r.linked_po_id && String(r.req_po_status || '') !== PO_DEAD && r.req_po_number) {
       // The tick's PO completes the WHOLE requisition (po-requisition-fulfil.ts
       // marks it fulfilled with no per-line check), which would strand any line

@@ -31,6 +31,7 @@
  */
 import { getDb, generateId } from './db';
 import { lineIssueComplete } from './issue-stock';
+import { routedColSql } from './routed-schema';
 
 const LOOKAHEAD_MS = 4 * 60 * 60 * 1000;   // 4 hours
 const DEFER_DUE_KIND = 'defer_due_soon';
@@ -100,6 +101,10 @@ export async function checkDeferDueSoon(triggeredBy: string = 'cron'): Promise<D
         AND ri.deferred_until != ''
         AND COALESCE(ri.is_rejected, 0) = 0
         AND COALESCE(ri.store_rejected, 0) = 0
+        -- A ROUTED line (rulings #45/#74) is its Direct Issue department's to
+        -- send; the store has nothing to "issue now" on it. '' = '' on a
+        -- database without the column.
+        AND ${routedColSql(db)} = ''
     `).all() as DeferRow[];
 
     const now = new Date();

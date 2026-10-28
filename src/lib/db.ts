@@ -184,6 +184,18 @@ function bootDb(database: Database.Database) {
         applyRegistryRows(rows);
       }
     } catch (e) { console.error('units registry hydration failed:', e); }
+    // ROUTED REQUISITION LINES — THE DEPLOY STAMP (owner rulings #45 + #74).
+    // Once, guarded by the settings marker 'routed_requisitions_backfill_v1':
+    // open requisition lines with NOTHING issued that a Direct Issue rule
+    // sends to another department follow the new routing; part-issued lines
+    // stay with the store. Last, after every migration above, so the columns
+    // it writes exist. DEFERRED require (routed-requisitions imports this file);
+    // never throws — a failure leaves every line with the store, as before.
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { backfillRoutedLines } = require('./routed-requisitions') as typeof import('./routed-requisitions');
+      backfillRoutedLines(database);
+    } catch (e) { console.error('routed requisition backfill failed (every line stays with the store):', e); }
     if (dbBootFailed) console.warn('[db] schema initialisation SUCCEEDED on a retry — the failure reported earlier is cleared.');
     dbBootFailed = false;
     dbBootAttempts = 0;        // healed: start the ladder over if it ever fails again
@@ -3005,6 +3017,28 @@ function initializeSchema(db: Database.Database) {
     const has = (n: string) => cols.some((c: any) => c.name === n);
     if (!has('shelf_emptied_qty')) db.prepare(`ALTER TABLE requisition_items ADD COLUMN shelf_emptied_qty REAL`).run();
   } catch (e) { console.error('requisition_items shelf-mark migration failed:', e); }
+
+  // Migration: ROUTED REQUISITION LINES (owner rulings #45 + #74). A line for a
+  // material a Direct Issue rule sends vendor → department D (Meat/Poultry →
+  // Kitchen) is stamped at approval with D when the line asks for ANOTHER
+  // department: D sends it from its own books by department transfer, the
+  // central store never holds it, so the store desk must not issue it.
+  //   routed_department_id — NULL means the STORE serves the line (as always)
+  //   routed_at            — when the stamp was written
+  //   routed_via           — 'material' | 'category' (which rule matched)
+  //   routed_rule_id       — the direct_issue_rules.id that matched
+  // Additive and NULL/'' by default, so every existing line reads exactly as
+  // before and nothing routes until src/lib/routed-requisitions.ts stamps it.
+  // One statement per prepare().run(); each probed, so a re-boot is a no-op.
+  try {
+    const cols = db.prepare("PRAGMA table_info(requisition_items)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('routed_department_id')) db.prepare(`ALTER TABLE requisition_items ADD COLUMN routed_department_id TEXT`).run();
+    if (!has('routed_at'))            db.prepare(`ALTER TABLE requisition_items ADD COLUMN routed_at TEXT`).run();
+    if (!has('routed_via'))           db.prepare(`ALTER TABLE requisition_items ADD COLUMN routed_via TEXT NOT NULL DEFAULT ''`).run();
+    if (!has('routed_rule_id'))       db.prepare(`ALTER TABLE requisition_items ADD COLUMN routed_rule_id TEXT NOT NULL DEFAULT ''`).run();
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_req_items_routed ON requisition_items(routed_department_id) WHERE routed_department_id IS NOT NULL`).run();
+  } catch (e) { console.error('requisition_items routed-line migration failed:', e); }
 
   // Migration: Unit-audit locks — a curated snapshot of admin-fixed unit fields
   // (recipe_unit, purchase_unit, pack_size, case_size, category) per material.
@@ -7669,6 +7703,34 @@ function initializeSchema(db: Database.Database) {
       if (!row?.name) console.error(`department transfer schema verification failed: table ${t} is absent`);
     }
   } catch (e) { console.error('department transfer schema failed:', e); }
+
+  // ── THE TRANSFER ↔ REQUISITION LINK (owner rulings #45 + #74) ─────────────
+  // A department transfer that FULFILS a routed requisition line says so:
+  //   department_transfers.requisition_id       — the requisition it serves ('' = an ordinary transfer)
+  //   department_transfer_lines.req_item_id     — the requisition line this transfer line fulfils
+  //   department_transfer_lines.req_line_qty    — LINE units this transfer line added to quantity_issued
+  // A reverse line keeps req_item_id = '' and is walked up reverses_line_id to
+  // its root (src/lib/routed-requisitions.ts syncRoutedLine). Additive, '' /
+  // NULL by default: every existing transfer reads exactly as before.
+  try {
+    const tCols = db.prepare(`PRAGMA table_info(department_transfers)`).all() as Array<{ name: string }>;
+    const lCols = db.prepare(`PRAGMA table_info(department_transfer_lines)`).all() as Array<{ name: string }>;
+    if (tCols.length > 0 && !tCols.some((c) => c.name === 'requisition_id')) {
+      db.prepare(`ALTER TABLE department_transfers ADD COLUMN requisition_id TEXT NOT NULL DEFAULT ''`).run();
+    }
+    if (lCols.length > 0 && !lCols.some((c) => c.name === 'req_item_id')) {
+      db.prepare(`ALTER TABLE department_transfer_lines ADD COLUMN req_item_id TEXT NOT NULL DEFAULT ''`).run();
+    }
+    if (lCols.length > 0 && !lCols.some((c) => c.name === 'req_line_qty')) {
+      db.prepare(`ALTER TABLE department_transfer_lines ADD COLUMN req_line_qty REAL`).run();
+    }
+    if (lCols.length > 0) {
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_req_item ON department_transfer_lines(req_item_id) WHERE req_item_id <> ''`).run();
+    }
+    if (tCols.length > 0) {
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_dept_transfers_req ON department_transfers(requisition_id) WHERE requisition_id <> ''`).run();
+    }
+  } catch (e) { console.error('department transfer requisition-link migration failed:', e); }
 
   // ── (e) CONSUMPTION SKIPS ─────────────────────────────────────────────────
   // Recipe consumption that moved NOTHING, and why. Written whenever applyDeduct

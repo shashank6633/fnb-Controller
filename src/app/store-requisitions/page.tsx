@@ -85,6 +85,14 @@ import {
   deskLineComplete, deskLineBasis, planDeskDebit, forecastDeskTake, type DeskTakeForecast,
   forecastDeskPartyTransfer, deskPartyHeadroom, deskCovers, type DeskPartyForecast, type DeskPartyShort,
 } from '@/lib/desk-rule';
+// ROUTED LINES (rulings #45, #74): a line for an item a Direct Issue rule sends
+// straight to another department (Meat / Poultry / Seafood → Kitchen) is that
+// department's to send, by department transfer — never issued from here. The
+// server stamps it (`routed_department_id`, `routed` on the ?id= feed); this
+// desk only reads it, through the ONE reader the three screens share.
+import {
+  isRoutedLine, routedLineOf, routedDeptWord, routedDeptNames, withDeptLabel,
+} from '@/app/department-transfers/routed-view';
 
 interface Department { id: string; name: string; }
 /* The merged-PO fields (MergeLineFields) ride on every line of the ?id= feed:
@@ -149,6 +157,13 @@ interface ReqLine extends MergeLineFields {
    *  this requisition (api/requisitions ?id=, round 9). A later transfer moves
    *  only what the line holds above it (forecastDeskPartyTransfer). */
   party_moved_recipe?: number | null;
+  /** Ruling #45: the department that SENDS this line ('' / null = the store
+   *  does), with the server's state of it (RoutedLineState) — read only
+   *  through routed-view.ts. On a routed line quantity_issued is what that
+   *  department's transfers still leave with the asking department. */
+  routed_department_id?: string | null;
+  routed?: unknown;
+  routed_department_name?: string | null;
 }
 interface Requisition {
   id: string; req_number: string; purpose: string;
@@ -208,6 +223,14 @@ interface Requisition {
   qty_cancelled: number;
   /** Did any line move goods today (IST)? Independent of `status`. */
   issued_today: boolean;
+  /** ROUTED lines (ruling #45) — another department sends them, so they sit
+   *  OUTSIDE the partition above (lines_issued / deferred / open / partial and
+   *  qty_outstanding are the store's own lines only). Still owed by THE RULE,
+   *  and sent in full, counted apart (a rejected one in neither); `routed_depts`
+   *  names the departments the feed says send them. */
+  lines_routed_owing: number;
+  lines_routed_done: number;
+  routed_depts: string[];
   /** 1 once the party transfer has moved any of this requisition's goods
    *  (api/requisitions ?id=, round 8b). Since round 9 a later run moves what
    *  the lines hold above that (each line's party_moved_recipe), so it is no
@@ -493,6 +516,9 @@ function partyRunLead(gesture: string, party: CentralBatchForecast['party'] | un
   // 'closes' (the route's savepoint try) is kept only when every line is then
   // done, so it always completes the requisition; only a 'certain' run can
   // reopen a line.
+  // With a routed line still owed (ruling #45) the gesture finishes the
+  // STORE's part only — its department still sends the rest.
+  if (party?.routedOwed) return `${gesture} leaves none of the store's lines open, so the party transfer runs and`;
   return party && party.runs === 'certain' && !party.fulfils
     ? `${gesture} leaves no line open, so the party transfer runs and`
     : `${gesture} completes the requisition, and the party transfer then`;
@@ -536,6 +562,10 @@ function partyLeftOpenSentence(party: CentralBatchForecast['party'] | undefined,
  */
 function partyMovedOf(req: Requisition, line: ReqLine): { movedLine: number; excessLine: number; first: boolean } | null {
   if (req.purpose !== 'party') return { movedLine: 0, excessLine: 0, first: false };
+  // A routed line (ruling #45) never rides the party transfer: its department
+  // sends it, so nothing the transfer moved is its — and it takes no share of
+  // the pool from a store line of the same item.
+  if (isRoutedLine(line)) return { movedLine: 0, excessLine: 0, first: false };
   if (line.party_moved_recipe == null) return null;
   const mat = String(line.material_id || '');
   let pool = Math.max(0, Number(line.party_moved_recipe) || 0);
@@ -543,6 +573,7 @@ function partyMovedOf(req: Requisition, line: ReqLine): { movedLine: number; exc
   let firstId = '';
   for (const l of req.items || []) {
     if (String(l.material_id || '') !== mat) continue;
+    if (isRoutedLine(l)) continue;
     if (!firstId) firstId = String(l.id);
     const b = deskLineBasis(l);
     const f = b ? b.factor || 1 : 1;
@@ -1078,6 +1109,10 @@ interface CentralBatchForecast {
      *  their record lowered to what actually left (desk-rule.ts `shortTake`,
      *  `complete` false — the route's `party_short`), in the requisition's order. */
     leftOpen: Array<{ line: ReqLine; tk: DeskTakeForecast }>;
+    /** Ruling #45: a ROUTED line is still owed — its department sends it, so
+     *  the transfer (which runs once the store's own lines are done) can never
+     *  complete the requisition on this gesture. */
+    routedOwed?: boolean;
   };
 }
 
@@ -1102,11 +1137,19 @@ function partyForecastFor(
     if (Number.isFinite(q) && q > 0) after.set(line.id, (after.get(line.id) ?? (Number(line.quantity_issued) || 0)) + q);
   }
   return forecastDeskPartyTransfer({
-    lines: req.items || [],
+    lines: storeLinesOf(req),
     approvedOf: l => effectiveQty(l as ReqLine),
     rejectedOf: l => !!((l as ReqLine).is_rejected || (l as ReqLine).store_rejected),
     after, deferIds, transferred: !!Number(req.party_transferred || 0),
   });
+}
+
+/** The lines the STORE serves — every line but the routed ones (ruling #45).
+ *  The party transfer moves these only, and runs once these are done
+ *  (store-issue's storePartDone), so every party forecast on this page walks
+ *  exactly them. With no routed line it is req.items, unchanged. */
+function storeLinesOf(req: Requisition): ReqLine[] {
+  return (req.items || []).filter(l => !isRoutedLine(l));
 }
 
 /**
@@ -1170,7 +1213,7 @@ function liveCentralCap(req: Requisition, line: ReqLine): {
   if (Number(req.party_transferred || 0) && line.party_moved_recipe == null) return null;
   const issued = Number(line.quantity_issued) || 0;
   const pfc = forecastDeskPartyTransfer({
-    lines: req.items || [],
+    lines: storeLinesOf(req),
     approvedOf: l => effectiveQty(l as ReqLine),
     rejectedOf: l => !!((l as ReqLine).is_rejected || (l as ReqLine).store_rejected),
     after: new Map([[line.id, issued + 1e9]]), always: true,
@@ -1376,7 +1419,11 @@ function forecastCentralHolds(
         party.short.push({ line, s, headroomLine, closesAtCap });
       }
     }
-    party.fulfils = pfc.runs !== 'none' && !party.refused && !pfc.unknown
+    // Routed lines still owed (ruling #45) keep the requisition open whatever
+    // the transfer does: it moves the store's lines only.
+    party.routedOwed = (req.items || []).some(l => isRoutedLine(l)
+      && !l.is_rejected && !l.store_rejected && !lineIssueComplete(l));
+    party.fulfils = pfc.runs !== 'none' && !party.refused && !pfc.unknown && !party.routedOwed
       && Object.values(pfc.takes).every(t => t.complete);
   }
   return {
@@ -1564,7 +1611,7 @@ function PartyLeftOpenNote({ party, gesture }: { party: CentralBatchForecast['pa
   if (!s) return null;
   return (
     <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-300 rounded text-amber-900">
-      {gesture} leaves no line open, so the party transfer runs.{s}
+      {gesture} leaves {party.routedOwed ? "none of the store's lines" : 'no line'} open, so the party transfer runs.{s}
     </div>
   );
 }
@@ -1712,6 +1759,17 @@ export default function StoreRequisitionsPage() {
      batch WHOLE ("nothing was issued and the requisition is unchanged") and that
      is a fact about the gesture, not about any one row; the panels then hold the
      per-line numbers for as long as the storekeeper needs them. */
+  /* ROUTED, refused by the route (ruling #45): this screen was opened before
+     the line was routed (the HOD approved it since, or the deploy routed it),
+     so it still offered a store action. The whole gesture was refused — nothing
+     was written. The server's sentence verbatim, then re-read the list so the
+     row reads "routed" and loses its issue controls. True when handled. */
+  const routedRefused = (j: { code?: unknown; error?: unknown } | null | undefined, fallback: string): boolean => {
+    if (String(j?.code || '') !== 'routed') return false;
+    alert(String(j?.error || '').trim() || fallback);
+    setRefreshKey(k => k + 1);
+    return true;
+  };
   const showIssueError = (
     j: { code?: unknown; error?: unknown; blocked?: unknown } | null | undefined,
     batch: { id: string; material_name: string }[], fallback: string,
@@ -1726,6 +1784,7 @@ export default function StoreRequisitionsPage() {
       setRefreshKey(k => k + 1);
       return true;
     }
+    if (routedRefused(j, fallback)) return true;
     const short = readCentralShort(j, batch);
     if (Object.keys(short).length > 0) {
       setCentralShort(s => ({ ...s, ...short }));
@@ -2161,6 +2220,12 @@ export default function StoreRequisitionsPage() {
     () => searched.filter(r => matchesTab(r, filter)),
     [searched, filter],
   );
+  /** "With Kitchen" — the departments the loaded routed lines name (ruling #45). */
+  const routedTabLabel = useMemo(() => {
+    const names: string[] = [];
+    for (const r of list) for (const n of r.routed_depts || []) if (!names.includes(n)) names.push(n);
+    return withDeptLabel(names);
+  }, [list]);
 
   const toggleRow = (id: string) => {
     setExpanded(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -2200,6 +2265,13 @@ export default function StoreRequisitionsPage() {
       alert(`${line.material_name} was delivered direct`
         + `${deliveredDirectDept(line) ? ` to ${deliveredDirectDept(line)}` : ' to a department'} on its purchase order, `
         + `so the central store does not issue it. Nothing was issued.`);
+      return;
+    }
+    // Ruling #45 — a routed line is its department's to send; no path here
+    // (a stale held panel's cap button) may post an issue for it.
+    if (isRoutedLine(line)) {
+      const rv = routedLineOf(line);
+      alert(`${rv?.sentence || `${line.material_name} is sent by ${routedDeptWord(rv)} by department transfer, not issued from the central store.`} Nothing was issued.`);
       return;
     }
     const outstanding = owedQty(line);
@@ -2301,7 +2373,7 @@ export default function StoreRequisitionsPage() {
         body: { lines: [{ id: line.id, action: 'defer', defer_until: cfg.until, reason: cfg.reason || '' }] },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Defer failed'); return; }
+      if (!r.ok) { if (!routedRefused(j, 'Defer failed')) alert(j.error || 'Defer failed'); return; }
       // A defer on a line that is already complete is dropped, not written
       // (round 8) — say so rather than let the panel close as if it were kept.
       announceDeferDropped(j);
@@ -2486,10 +2558,13 @@ export default function StoreRequisitionsPage() {
        the department-reversal reader (which now skips its rows): its figures
        are purchase units. Kept on the pressed line, keyed by it, with the
        requisition's sig so a later load that changes it drops the panel. */
+    if (routedRefused(j, fallback)) return true;
     const central = ctx ? readCentralShort(j, batch) : {};
     if (ctx && Object.keys(central).length > 0) {
       const { req, line, action } = ctx;
-      const others = (req.items || []).filter(o => o.id !== line.id);
+      // The store's other lines (ruling #45: a routed line never holds the
+      // party transfer back — it runs once the store's own lines are done).
+      const others = (req.items || []).filter(o => o.id !== line.id && !isRoutedLine(o));
       const completes = action === 'reject' && req.purpose === 'party'
         && others.every(o => !!(o.is_rejected || o.store_rejected) || lineIssueComplete(o));
       const entry: ReversalShort = {
@@ -2571,34 +2646,14 @@ export default function StoreRequisitionsPage() {
     const U = lineUnits(line);
     const s = lineSplit(line);
     const q = (v: number) => fmtPromptQty(U, v);
-    /* A PARTY REJECT ZEROES THE LINE (final pass, words only — the route's
-       party carve-out, a pre-existing owner decision): quantity_issued goes to
-       0 and the whole approved quantity reads cancelled, while whatever the
-       party transfer already moved stays with the department. "… has already
-       been handed over — that STAYS issued" was printed over exactly that
-       (ta_block_exit: MANGO 0/20 rejected with 15 kg moved; da_reject: 0/14.843
-       with nothing moved). And a reject that leaves no other line open runs the
-       transfer (store-issue/route.ts), so what that transfer will meet is said
-       too, when it is not simply the requisition going out. The internal
-       prompt is unchanged. */
-    const partyAsk = (() => {
-      if (req.purpose !== 'party') return null;
-      const pm = partyMovedOf(req, line);
-      const moved = pm ? pm.movedLine + (pm.first ? pm.excessLine : 0) : null;
-      const goods = moved == null
-        ? `• Whatever the party transfer already moved for it stays with the department — the rejection does not take it back.\n`
-        : moved > 1e-9
-          ? `• ${q(moved)} of it already left the store in the party transfer. Those goods stay with the department — `
-            + `the rejection does not take them back.\n`
-            + (s.issued - moved > 1e-9 ? `• The other ${q(s.issued - moved)} recorded has not left the store, and now will not.\n` : '')
-          : s.issued > 0
-            ? `• Nothing has left the store for it yet (a party requisition's goods leave in one transfer), so the `
-              + `department gets none of the ${q(s.issued)} recorded.\n`
-            : '';
-      // What the transfer this reject runs will meet (desk-rule.ts, the route's
-      // allDone branch: the rejected line carries nothing by then).
+    /* What the party transfer this reject runs will meet (desk-rule.ts, the
+       route's allDone branch: the rejected line carries nothing by then) —
+       '' when nothing is to be said. Asked by the party prompt and by the
+       routed one (ruling #45: the transfer runs once the store's own lines
+       are done, whichever line the gesture is on). */
+    const partyTransferNote = (): string => {
       const rf = forecastDeskPartyTransfer({
-        lines: req.items || [],
+        lines: storeLinesOf(req),
         approvedOf: l => effectiveQty(l as ReqLine),
         rejectedOf: l => !!((l as ReqLine).is_rejected || (l as ReqLine).store_rejected) || l.id === line.id,
         after: new Map([[line.id, 0]]),
@@ -2612,13 +2667,46 @@ export default function StoreRequisitionsPage() {
         : [];
       const shortNames = rf.runs === 'certain'
         ? rf.short.map(x => (req.items || []).find(l => l.id === x.id)?.material_name).filter(Boolean) : [];
-      const transfer = shortNames.length > 0
-        ? `• Rejecting it leaves no other line open, so the party transfer runs — and the store's books cannot cover `
+      // With a routed line still owed (ruling #45) the transfer runs once the
+      // STORE's lines are done, so "no other line" would be untrue.
+      const noOther = (req.items || []).some(l => l.id !== line.id && isRoutedLine(l)
+        && !l.is_rejected && !l.store_rejected && !lineIssueComplete(l))
+        ? "none of the store's other lines" : 'no other line';
+      return shortNames.length > 0
+        ? `• Rejecting it leaves ${noOther} open, so the party transfer runs — and the store's books cannot cover `
           + `${shortNames.join(', ')}, so the store will refuse this reject and change nothing.\n`
         : leftOpen.length > 0
-          ? `• Rejecting it leaves no other line open, so the party transfer runs — and the store's books cannot cover every `
+          ? `• Rejecting it leaves ${noOther} open, so the party transfer runs — and the store's books cannot cover every `
             + `line: ${leftOpen.map(partyLeftOpenWords).join('; ')}.\n`
           : '';
+    };
+    /* A PARTY REJECT ZEROES THE LINE (final pass, words only — the route's
+       party carve-out, a pre-existing owner decision): quantity_issued goes to
+       0 and the whole approved quantity reads cancelled, while whatever the
+       party transfer already moved stays with the department. "… has already
+       been handed over — that STAYS issued" was printed over exactly that
+       (ta_block_exit: MANGO 0/20 rejected with 15 kg moved; da_reject: 0/14.843
+       with nothing moved). And a reject that leaves no other line open runs the
+       transfer (store-issue/route.ts), so what that transfer will meet is said
+       too, when it is not simply the requisition going out. The internal
+       prompt is unchanged. */
+    const partyAsk = (() => {
+      if (req.purpose !== 'party') return null;
+      // A routed line (ruling #45) keeps what was sent — its own prompt below.
+      if (isRoutedLine(line)) return null;
+      const pm = partyMovedOf(req, line);
+      const moved = pm ? pm.movedLine + (pm.first ? pm.excessLine : 0) : null;
+      const goods = moved == null
+        ? `• Whatever the party transfer already moved for it stays with the department — the rejection does not take it back.\n`
+        : moved > 1e-9
+          ? `• ${q(moved)} of it already left the store in the party transfer. Those goods stay with the department — `
+            + `the rejection does not take them back.\n`
+            + (s.issued - moved > 1e-9 ? `• The other ${q(s.issued - moved)} recorded has not left the store, and now will not.\n` : '')
+          : s.issued > 0
+            ? `• Nothing has left the store for it yet (a party requisition's goods leave in one transfer), so the `
+              + `department gets none of the ${q(s.issued)} recorded.\n`
+            : '';
+      const transfer = partyTransferNote();
       return `Reject "${line.material_name}"?\n\n`
         + `• On a party requisition a store rejection clears the line's record: the line then reads 0 issued, and the `
         + `whole ${q(s.effective)} approved reads cancelled — the store will not issue any more of it.\n`
@@ -2638,7 +2726,24 @@ export default function StoreRequisitionsPage() {
         + `• The remaining ${q(s.outstanding)} on this line is cancelled here — nothing moves from the store.\n\n`
         + `Give a reason:`
       : null;
-    const ask = partyAsk != null ? partyAsk : directAsk != null ? directAsk : s.issued > 0
+    /* A ROUTED LINE (ruling #45) — its department sends it by department
+       transfer, so a rejection only closes what is still to send. What was
+       sent STAYS (the route keeps it, party lines too, and a party line stays
+       costed on the party's P&L by it), and nothing moves for this line. */
+    const routedAsk = (() => {
+      if (!isRoutedLine(line)) return null;
+      const rv = routedLineOf(line);
+      const D = routedDeptWord(rv);
+      const to = req.department_name || 'the department';
+      return `Reject the rest of "${line.material_name}"?\n\n`
+        + `• ${D} sends this line by department transfer — a Direct Issue rule routes the item to ${D}, so the central store never holds it.\n`
+        + (s.issued > 0 ? `• ${q(s.issued)} ${D} already sent STAYS with ${to}`
+          + (req.purpose === 'party' ? `, and stays costed on this party's P&L.\n` : `.\n`) : '')
+        + `• The remaining ${q(s.outstanding)} is cancelled — ${D} will not be asked to send it, and nothing moves for this line.\n`
+        + (req.purpose === 'party' ? partyTransferNote() : '')
+        + `\nGive a reason:`;
+    })();
+    const ask = routedAsk != null ? routedAsk : partyAsk != null ? partyAsk : directAsk != null ? directAsk : s.issued > 0
       ? `Reject the balance of "${line.material_name}"?\n\n`
         + `• ${q(s.issued)} of ${q(s.effective)} has already been handed over — that STAYS issued, `
         + `and the goods stay with the department.\n`
@@ -2701,14 +2806,19 @@ export default function StoreRequisitionsPage() {
     // The cancelled clause is dropped when the reject cancelled nothing (the
     // line had already been issued in full), where "0 BTL goes back to
     // outstanding" is noise rather than information.
+    // A routed line (ruling #45) goes back to its department's To send list —
+    // it never becomes the store's to issue.
+    const rD = isRoutedLine(line) ? routedDeptWord(routedLineOf(line)) : '';
     const ask = `Clear the store rejection on "${line.material_name}"?\n\n`
-      + `• The line becomes issuable again`
+      + (rD ? `• The line goes back on ${rD}'s To send list — ${rD} sends it, not the store`
+            : `• The line becomes issuable again`)
       + (s.issued > 0
           ? ` — ${q(s.issued)} already handed over stays issued`
             + (s.cancelled > 0 ? `, ${q(s.cancelled)} goes back to outstanding.\n` : `.\n`)
           : `.\n`)
       + (reopens
-          ? `• This requisition will go back to the store queue and lose its "fulfilled" timestamp.\n`
+          ? (rD ? `• This requisition re-opens and loses its "fulfilled" timestamp.\n`
+                : `• This requisition will go back to the store queue and lose its "fulfilled" timestamp.\n`)
           : '');
     if (!confirm(ask)) return;
     setBusyLine(line.id);
@@ -2776,6 +2886,10 @@ export default function StoreRequisitionsPage() {
             Every requisition currently waiting on the store team to hand over goods —
             <b> internal kitchen</b> reqs (after Chef approval) and <b>party</b> reqs (after Chef + Mgmt approval).
             Issue full or partial, or defer with a promised time. Every action is time-stamped and traceable per item.
+            {list.some(r => (r.lines_routed_owing || 0) + (r.lines_routed_done || 0) > 0) && (
+              <> A line marked <b>ROUTED</b> is for an item a Direct Issue rule sends straight to another department (it
+                never reaches the central store): that department sends it by department transfer, so it is not issued here.</>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -2814,9 +2928,15 @@ export default function StoreRequisitionsPage() {
           // ("1 of 2 kg issued — 1 kg deferred"), which is where a storekeeper
           // actually reads it.
           { k: 'balance_pending',  label: 'Balance Pending',  icon: Hourglass,   tone: 'rose' },
+          // "With Kitchen" (ruling #45): lines a Direct Issue rule routes to
+          // another department, which sends them by department transfer. Shown
+          // only while there are any (or it is the tab in view), named after
+          // the departments the feed names.
+          { k: 'routed',           label: routedTabLabel,     icon: Send,        tone: 'indigo' },
           { k: 'issued_today',     label: 'Issued Today',     icon: CheckCircle2,tone: 'emerald' },
           { k: 'issued_log',       label: 'Issued Items Log', icon: History,     tone: 'amber' },
-        ] as const).map(t => {
+        ] as const).filter(t => t.k !== 'routed' || filter === 'routed'
+          || searched.some(r => matchesTab(r, 'routed'))).map(t => {
           // ONE source for the badge — the same predicate the body filters with.
           // These used to be re-written inline here, so changing a tab's meaning
           // in one place left the badge promising rows the tab wouldn't render.
@@ -2832,6 +2952,7 @@ export default function StoreRequisitionsPage() {
             emerald: active ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-emerald-50 text-emerald-800 border-emerald-200',
             rose: active ? 'bg-rose-600 text-white border-rose-600' : 'bg-rose-50 text-rose-800 border-rose-200',
             violet: active ? 'bg-violet-600 text-white border-violet-600' : 'bg-violet-50 text-violet-800 border-violet-200',
+            indigo: active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-indigo-50 text-indigo-800 border-indigo-200',
           };
           return (
             <button key={t.k} onClick={() => setFilter(t.k)}
@@ -2877,6 +2998,7 @@ export default function StoreRequisitionsPage() {
           {filter === 'deferred' && 'No items promised for a later time.'}
           {filter === 'balance_pending' && 'No balances owed — every issued requisition went out in full.'}
           {filter === 'issued_today' && 'Nothing has been handed over today yet.'}
+          {filter === 'routed' && 'No requisition line is waiting on another department to send it.'}
         </div>
       ) : (
         <div className="space-y-3">
@@ -3354,6 +3476,9 @@ function openIssuableLines(req: Requisition): Array<ReqLine & { remaining: numbe
     // a department, the central store never held them — never in a batch
     // issue. Every line no merged PO has touched passes exactly as before.
     if (isDeliveredDirect(line)) continue;
+    // Routed (ruling #45): its department sends it by department transfer —
+    // never in a store batch. The server refuses it anyway (code 'routed').
+    if (isRoutedLine(line)) continue;
     const remaining = owedQty(line);
     if (remaining > 0) out.push({ ...line, remaining });
   }
@@ -3388,8 +3513,26 @@ function mergeStats(req: any): Requisition {
   let rejectedKept = 0, rejectedCut = 0;
   let qtyIssued = 0, qtyCancelled = 0;
   let issuedToday = false;
+  let routedOwing = 0, routedDone = 0;
   for (const it of items) {
     const got = Number(it.quantity_issued) || 0;
+    // ── A ROUTED LINE (ruling #45) IS NOT THE STORE'S. Another department
+    // sends it by department transfer; nothing of it ever leaves this store.
+    // So it is counted apart and kept OUT of every store roll-up below — the
+    // partition, "sent, not closed", "sent, then cancelled", Issued Today and
+    // the part-issued chip — or the card would say the store handed over
+    // chicken it never held. It does count toward the two figures that only
+    // pick the closed requisition's WORD (deliveryState): what reached the
+    // department and what a rejection cancelled are facts about the
+    // requisition, whoever sent it. With no routed line, nothing here runs.
+    if (isRoutedLine(it)) {
+      qtyIssued += got;
+      if (it.store_rejected) qtyCancelled += owedQty(it);
+      if (it.is_rejected || it.store_rejected) { /* closed — the row says so */ }
+      else if (lineIssueComplete(it)) routedDone++;
+      else routedOwing++;
+      continue;
+    }
     // WHAT LEFT THE STORE IS COUNTED FIRST, BEFORE ANY SKIP. Under the Option-A
     // reject a store-rejected line can carry a REAL hand-over (200 of 240
     // eggs), and the old `continue` pair below dropped it from every roll-up on
@@ -3482,6 +3625,9 @@ function mergeStats(req: any): Requisition {
     qty_issued: qtyIssued,
     qty_cancelled: qtyCancelled,
     issued_today: issuedToday,
+    lines_routed_owing: routedOwing,
+    lines_routed_done: routedDone,
+    routed_depts: routedDeptNames(items),
   } as Requisition;
 }
 
@@ -3533,8 +3679,9 @@ function deliveryState(req: Requisition): 'full' | 'short' | 'none' | null {
   return (req.qty_issued || 0) > 0 ? 'short' : 'none';
 }
 
-/** The queue tabs. 'issued_log' is a separate panel, not a slice of the list. */
-type StoreTab = 'open' | 'deferred' | 'balance_pending' | 'issued_today' | 'issued_log';
+/** The queue tabs. 'issued_log' is a separate panel, not a slice of the list.
+ *  'routed' (ruling #45) = lines another department still has to send. */
+type StoreTab = 'open' | 'deferred' | 'balance_pending' | 'routed' | 'issued_today' | 'issued_log';
 
 /**
  * THE definition of every tab — called by the tab body AND by the tab badges.
@@ -3579,6 +3726,10 @@ function matchesTab(r: Requisition, tab: StoreTab): boolean {
     // "Goods moved today", NOT "requisition closed" — the two are different
     // events and this tab used to conflate them under the name "Fulfilled Today".
     case 'issued_today':    return r.status === 'fulfilled' || r.issued_today;
+    // "With Kitchen" (ruling #45): a line of it still waits on the department
+    // a Direct Issue rule routes it to. Not the store's to issue — listed so
+    // the store can see where the rest of a requisition is, and reject a line.
+    case 'routed':          return r.status !== 'fulfilled' && (r.lines_routed_owing || 0) > 0;
     default:                return false;
   }
 }
@@ -3633,6 +3784,8 @@ const STATUS_LABEL: Record<string, string> = {
 function partialSummary(req: Requisition): string | null {
   const partials = (req.items || []).filter(l => {
     if (l.is_rejected || l.store_rejected) return false;
+    // A routed line's figure is what its department SENT, not an issue.
+    if (isRoutedLine(l)) return false;
     const got = Number(l.quantity_issued) || 0;
     return got > 0 && !lineIssueComplete(l);
   });
@@ -3731,6 +3884,8 @@ function ReqCard(props: {
      is named by that batch's own banner, not by the row.) */
   const rowHold = (line: ReqLine): CentralHoldForecast | undefined => {
     if (line.is_rejected || line.store_rejected) return undefined;
+    // Routed (ruling #45): never issued from central, so nothing to forecast.
+    if (isRoutedLine(line)) return undefined;
     const outstanding = lineSplit(line).outstanding;
     if (!(outstanding > 0)) return undefined;
     const sq = props.splitIssueQty[line.id]?.qty;
@@ -3784,6 +3939,7 @@ function ReqCard(props: {
      requisition" over a transfer that reopens another line. */
   const rowTakeFc = (line: ReqLine): CentralBatchForecast | undefined => {
     if (line.is_rejected || line.store_rejected) return undefined;
+    if (isRoutedLine(line)) return undefined;
     const outstanding = lineSplit(line).outstanding;
     if (!(outstanding > 0)) return undefined;
     const sq = props.splitIssueQty[line.id]?.qty;
@@ -3835,6 +3991,22 @@ function ReqCard(props: {
             + 'department reconcile screen.'
           : 'Closed with nothing handed over — every line was rejected.')
       : undefined;
+  /* KITCHEN SENT FIRST (ruling #45). A routed line's Send moves the
+     requisition to store_processed WITHOUT the store's stamp, so "Issued
+     (partial)" would tell the storekeeper the store had issued part of it. Until
+     the store hands anything over (it stamps store_processed_at), the chip says
+     whose turn it is: the store's, while a line of its own is still owed;
+     otherwise the department still sending. Every other requisition reads as
+     before. */
+  const kitchenFirst = req.status === 'store_processed' && !req.store_processed_at
+    && (req.lines_routed_owing || 0) + (req.lines_routed_done || 0) > 0
+    && (req.lines_issued_any || 0) === 0 && (req.lines_rejected_kept || 0) === 0;
+  const kitchenFirstLabel = !kitchenFirst ? null
+    : (req.lines_open || 0) + (req.lines_deferred || 0) > 0 ? 'With Store'
+    : (req.lines_routed_owing || 0) > 0 ? withDeptLabel(req.routed_depts) : null;
+  const kitchenFirstTitle = kitchenFirstLabel
+    ? `${req.routed_depts.join(', ') || 'Another department'} has sent part of this requisition by department transfer; the store has not handed anything over on it yet.`
+    : undefined;
   const doneTone = delivered === 'short' ? 'bg-amber-100 text-amber-900 border-amber-300'
                  : delivered === 'none'  ? 'bg-red-100 text-red-800 border-red-300'
                  : null;
@@ -3872,6 +4044,20 @@ function ReqCard(props: {
           {req.lines_issued > 0 && <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">{req.lines_issued} issued</span>}
           {req.lines_deferred > 0 && <span className="px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">{req.lines_deferred} deferred</span>}
           {req.lines_open > 0 && <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">{req.lines_open} open</span>}
+          {/* ROUTED (ruling #45) — lines another department sends by department
+              transfer, kept out of the store's counts above. */}
+          {req.lines_routed_owing > 0 && (
+            <span title={`Direct Issue sends these items straight to ${req.routed_depts.join(', ') || 'another department'}, so the central store never holds them: that department sends them from its own stock (its To send list on Department Transfers). Not issued from here.`}
+                  className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-800 border border-indigo-200">
+              {req.lines_routed_owing} {withDeptLabel(req.routed_depts).replace(/^With/, 'with')}
+            </span>
+          )}
+          {req.lines_routed_done > 0 && (
+            <span title="Sent in full by department transfer — not issued from the store"
+                  className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+              {req.lines_routed_done} sent by {req.routed_depts.length === 1 ? req.routed_depts[0] : 'department transfer'}
+            </span>
+          )}
           {/* Lines that DID hand goods over but are not counted in "N issued" —
               part-issued, or fully issued with a promise still parked on them.
               The three counters above partition each line into one bucket, so
@@ -3911,9 +4097,9 @@ function ReqCard(props: {
           {partialText && (
             <span className="px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">{partialText}</span>
           )}
-          <span title={doneTitle}
-                className={`px-2 py-0.5 rounded border ${doneTone || statusTone[req.status] || 'bg-gray-50 text-gray-700 border-gray-200'}`}>
-            {doneLabel || STATUS_LABEL[req.status] || req.status}
+          <span title={doneTitle || kitchenFirstTitle}
+                className={`px-2 py-0.5 rounded border ${doneTone || (kitchenFirstLabel ? statusTone.mgmt_approved : statusTone[req.status]) || 'bg-gray-50 text-gray-700 border-gray-200'}`}>
+            {doneLabel || kitchenFirstLabel || STATUS_LABEL[req.status] || req.status}
           </span>
         </div>
       </button>
@@ -4276,12 +4462,18 @@ function LineRow(props: {
   // the central store never held them. Not checkable, not in Issue All
   // (openIssuableLines), and its issue controls are replaced by the reason.
   const direct = isDeliveredDirect(line);
-  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0 && !direct;
+  // ROUTED (ruling #45): another department sends this line by department
+  // transfer, so it has no issue / defer / undo here and no checkbox — the
+  // server's sentence stands where the buttons were. Reject (and Un-reject)
+  // stay: a rejection closes the rest of the line, keeping what was sent.
+  const routed = routedLineOf(line);
+  const routedDept = routedDeptWord(routed);
+  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0 && !direct && !routed;
   // "Add to a merged PO" — offered on a deferred line that is still owed and
   // is not already held by an open PO (the merge would refuse it). A vendor
   // closed without delivering frees the line, so it is offered again.
   const canAddToMerge = !!props.canMerge && !!props.onAddToMergedPo && !line.is_rejected && !line.store_rejected
-    && outstanding > 0 && !direct && (!onOpenPo(line) || isVendorClosed(line));
+    && outstanding > 0 && !direct && !routed && (!onOpenPo(line) || isVendorClosed(line));
   const hasMergeBadge = hasMergeState(line);
   return (
     <tr className={`border-t border-[#E8D5C4]/50 ${rowTone}`}>
@@ -4302,6 +4494,12 @@ function LineRow(props: {
           {/* A delivered-direct line the store closed was not refused — the
               vendor delivered it, to the Direct Issue rule's department — so it
               is never labelled a rejection (ruling #68). */}
+          {routed && (
+            <span title={`Direct Issue routes this item to ${routedDept}; it is sent by department transfer, never issued from the central store`}
+                  className="text-[8px] px-1 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-300 font-semibold no-underline">
+              ROUTED · {routedDept.toUpperCase()}
+            </span>
+          )}
           {line.store_rejected ? (direct ? (
             <span className="text-[8px] px-1 py-0.5 rounded bg-violet-100 text-violet-800 border border-violet-300 font-semibold no-underline">
               CLOSED — DELIVERED DIRECT
@@ -4429,6 +4627,9 @@ function LineRow(props: {
           somebody else's fridge. */}
       <td className="py-1.5 px-2 text-right font-mono">
         {(() => {
+          // A routed line (ruling #45) is never served from this shelf, so its
+          // red / amber / green would answer a question nobody is asking here.
+          if (routed) return <span className="text-[#C0A98F]" title={`Not issued from the central store — ${routedDept} sends it`}>—</span>;
           const st = stockLevel(line);
           if (st.qty == null) return <span className="text-[#C0A98F]">—</span>;
           return (
@@ -4457,6 +4658,9 @@ function LineRow(props: {
       <td className="py-1.5 px-2 text-right font-mono">
         {puNum(U.toPU(issued), issued)}{unitTag}
         {hint(issued)}
+        {/* On a routed line this is what its department SENT (transfers net of
+            any send-back), not a store hand-over. */}
+        {routed && issued > 0 && <div className="text-[9px] text-indigo-700 font-normal">sent by {routedDept}</div>}
       </td>
       {/* OUTSTANDING, split by who owes what.
           The total stays the lead — the column header and its tooltip promise
@@ -4609,7 +4813,9 @@ function LineRow(props: {
                 <div className="mt-0.5">
                   {/* "would leave", not "completes the requisition" (final pass):
                       the store refused, so nothing was completed. */}
-                  Rejecting this line would leave no other line open, which runs the party transfer — it has to move{' '}
+                  Rejecting this line would leave {(props.req.items || []).some(o => o.id !== line.id && isRoutedLine(o)
+                    && !o.is_rejected && !o.store_rejected && !lineIssueComplete(o)) ? "none of the store's other lines" : 'no other line'} open,
+                  which runs the party transfer — it has to move{' '}
                   {named.join(', ')}, and that is what the store refused:
                 </div>
               )}
@@ -4927,6 +5133,35 @@ function LineRow(props: {
         })()}
         {line.is_rejected ? (
           <span className="text-[10px] text-[#8B7355]">no action — rejected by chef</span>
+        ) : routed && !line.store_rejected ? (
+          /* ROUTED (ruling #45) — no Issue Now, no part-issue, no defer, no
+             undo: the central store never holds this item, and its department
+             sends it from its own stock (To send, on Department Transfers),
+             which is what fills "Issued so far". The server's own sentence
+             says who, why and how far it has got; the store's one action is
+             Reject — it closes what is still to send and keeps what was sent. */
+          <div className="flex flex-col gap-1 max-w-[15rem] md:max-w-[22rem]">
+            <div className="rounded border border-indigo-300 bg-indigo-50 px-1.5 py-1 text-[10px] leading-snug text-indigo-900">
+              <div className="font-semibold flex items-start gap-1">
+                <Send className="w-3 h-3 mt-[1px] shrink-0" />
+                <span>{issued > 0 || outstanding === 0 ? 'Sent by' : 'To be sent by'} {routedDept} — routed item</span>
+              </div>
+              <div className="mt-0.5">
+                {routed.sentence
+                  || <>{routedDept} sends this line by department transfer — a Direct Issue rule routes the item there, so the
+                      central store does not issue it.{issued > 0 ? <> Sent so far: <b>{puNum(U.toPU(issued), issued)}{u ? ` ${u}` : ''}</b>.</> : null}</>}
+              </div>
+            </div>
+            {outstanding > 0 && (
+              <div className="flex flex-wrap items-center gap-1">
+                <button onClick={() => props.onReject(line)} disabled={busy}
+                        title={`Close the rest of this line — ${routedDept} will not be asked to send it. What ${routedDept} already sent stays with the department, and nothing moves from the store.`}
+                        className="px-2 py-0.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
+                  <XCircle className="w-3 h-3" /> Reject
+                </button>
+              </div>
+            )}
+          </div>
         ) : direct && outstanding > 0 ? (
           /* DELIVERED DIRECT (ruling #68) — no Issue Now, no part-issue, no
              defer: the goods never came through central, so issuing them from
@@ -4971,7 +5206,9 @@ function LineRow(props: {
         ) : line.store_rejected ? (
           // Store-rejected: only an un-reject action to put the line back in play.
           <button onClick={() => props.onUnreject(line)} disabled={busy}
-                  title={direct
+                  title={routed
+                    ? `Re-open the line — it goes back on ${routedDept}'s To send list; it is still never issued from the store`
+                    : direct
                     ? 'Re-open the line — it stays delivered direct, so it is still not issued from central'
                     : 'Clear the store rejection — the line becomes issuable again'}
                   className="px-2 py-0.5 bg-white border border-red-200 text-red-700 hover:bg-red-50 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">

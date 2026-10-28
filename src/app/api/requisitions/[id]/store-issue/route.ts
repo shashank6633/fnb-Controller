@@ -11,6 +11,8 @@ import {
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 import { deliveredDirectCaps } from '@/lib/po-helpers';
 import { reconcileDeliveredDirectLines } from '@/lib/po-link-lifecycle';
+import { routedColSql } from '@/lib/routed-schema';
+import { routedLineState } from '@/lib/routed-requisitions';
 
 /**
  * A replayed POST carrying a client_token it already spent is answered 200
@@ -473,15 +475,43 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // (round 7) — the defer rule's "fully satisfied" reads what the desk SHOWS.
     // LEFT JOIN, so a line whose material row is gone is still read exactly as
     // before (its meta is NULL and only the exact comparison applies).
+    // routed_department_id (rulings #45/#74): '' on every line the store
+    // serves, and always '' on a database without the column.
     const selLine = db.prepare(`
       SELECT ri.id, ri.quantity_issued, ri.issue_history, ri.is_rejected, ri.store_rejected,
              ri.store_reject_reason, ri.deferred_until, ri.defer_reason,
              ri.quantity_requested, ri.chef_approved_qty, ri.shelf_emptied_qty,
-             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size,
+             ${routedColSql(db)} AS routed_department_id
       FROM requisition_items ri
       LEFT JOIN raw_materials rm ON rm.id = ri.material_id
       WHERE ri.id = ? AND ri.req_id = ?
     `);
+    const isRoutedRow = (cur: any): boolean => String(cur?.routed_department_id || '') !== '';
+    // An entry that would ACT on a line: an issue with a quantity, a defer with
+    // a date, any undo. (A zero issue or a dateless defer is skipped by the
+    // write loop below and changes nothing, routed or not.)
+    const actsOnLine = (ln: any): boolean => {
+      const act = String(ln?.action || '').toLowerCase();
+      if (act === 'undo') return true;
+      if (act === 'defer') return String(ln?.defer_until || '').trim() !== '';
+      if (act === 'issue') { const q = Number(ln?.quantity); return Number.isFinite(q) && q > 0; }
+      return false;
+    };
+    // The refusal row for a routed line (rulings #45/#74): the server's own
+    // sentence naming the department that sends it.
+    const routedRow = (lineId: string): Record<string, unknown> & { message: string } => {
+      const st = routedLineState(db, [lineId]).get(lineId);
+      const name = String(itemMap.get(lineId)?.material_name || st?.material_name || 'a line');
+      const D = st?.department.name || 'its Direct Issue department';
+      return {
+        code: 'routed', line_id: lineId, req_item_id: lineId, material: name,
+        routed_department_id: st?.department.id || '', routed_department_name: D,
+        sent_purchase: st?.sent_purchase ?? 0, owed_purchase: st?.owed_purchase ?? 0,
+        message: `${name}: ${st?.sentence || `${D} sends this from its own stock by department transfer, so the central store never holds it.`} `
+          + `The store does not issue, defer or undo it. Nothing was issued and the requisition is unchanged. Reload the page.`,
+      };
+    };
 
     // An issue writes the quantity and its history entry and leaves the defer
     // pair alone; whether the line is now complete is THE RULE's answer, and
@@ -608,6 +638,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         blocked: lineChangedRows,
         applied: 0,
       }, { status: 400 });
+    }
+
+    // ── ROUTED LINES (owner rulings #45 + #74) ───────────────────────────────
+    // A Direct Issue rule sends this material straight to another department
+    // (Meat/Poultry → Kitchen), and the line was routed to that department at
+    // approval: it hands the line over from its own books by department
+    // transfer (its "To send" list), and that transfer is what fulfils the
+    // line. The central store never holds the goods, so an issue here would
+    // take from central what it does not have (the owner's REQ-2026-1330:
+    // 1 kg chicken issued, the central book at −2 kg) and the receiving
+    // department would get it twice. The store desk hides the controls; a tab
+    // opened earlier still posts them, so the ROUTE says no. ANY issue, defer
+    // or undo entry on a routed line refuses the WHOLE gesture, nothing
+    // written — the screen is out of date. Reject and Unreject stay allowed
+    // (a reject keeps what was sent). A requisition with no routed line never
+    // reaches the refusal. Asked again inside the transaction (the race).
+    {
+      const routedHits: string[] = [];
+      for (const ln of lines) {
+        const lineId = String(ln?.id ?? '');
+        if (!itemMap.get(lineId) || !actsOnLine(ln)) continue;
+        const cur = selLine.get(lineId, id) as any;
+        if (cur && isRoutedRow(cur) && !routedHits.includes(lineId)) routedHits.push(lineId);
+      }
+      if (routedHits.length > 0) {
+        const rows = routedHits.map(routedRow);
+        return Response.json({
+          error: rows.map(x => x.message).join(' '),
+          code: 'routed',
+          blocked: rows,
+          applied: 0,
+        }, { status: 400 });
+      }
     }
 
     // ── DELIVERED DIRECT (owner rulings #68 + #73) ───────────────────────────
@@ -797,6 +860,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const cur = selLine.get(ln.id, id) as any;
         if (!cur) continue;
         if (cur.is_rejected) continue;
+        // A routed line never moves central stock (rulings #45/#74): only its
+        // reject (which keeps what was sent — zero delta) or unreject reach
+        // here, so there is nothing for the floor to bound.
+        if (isRoutedRow(cur)) continue;
         const action = String(ln.action || '').toLowerCase();
         if (cur.store_rejected && action !== 'unreject') continue;
         // 'defer' and 'unreject' write no quantity at all; the loop calls the
@@ -974,6 +1041,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       lineChanged?: Record<string, unknown>;
       /** Lines this gesture left fully delivered direct, closed by themselves. */
       directClosed?: ReturnType<typeof reconcileDeliveredDirectLines>['closed'];
+      /** A routed line met under the lock (rulings #45/#74) — refused whole. */
+      routed?: Record<string, unknown> & { message: string };
     } = {};
     // THE SENTENCE LEADS WITH THE PURCHASE UNIT (round 9, owner rule). Every
     // figure goes through fmtLineQtyPU (issue-stock.ts): the line quantity's
@@ -1074,6 +1143,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const cur = selLine.get(ln.id, id) as any;
         if (!cur) continue;                         // vanished mid-flight
         if (cur.is_rejected) continue;              // chef rejected — never issue
+        // ROUTED, UNDER THE LOCK (rulings #45/#74): the pre-flight's refusal,
+        // asked again where the write happens — a line routed since the
+        // pre-flight read is refused whole, nothing written.
+        if (isRoutedRow(cur) && actsOnLine(ln)) {
+          gestureOut.routed = routedRow(String(cur.id));
+          throw new Error('routed_line');
+        }
         const action = String(ln.action || '').toLowerCase();
         const before = {
           quantity_issued: cur.quantity_issued || 0,
@@ -1191,7 +1267,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // The grams a part-issued party line handed over are booked nowhere
           // today; that is a separate, pre-existing hole and a separate owner
           // decision, NOT something to fix by side effect here.
-          const keepIssued = !isParty && beforeQty > 0;
+          // A ROUTED line keeps what its department sent, party included
+          // (rulings #45/#74): the party rail never moves a routed line, so
+          // keeping it moves nothing there, and the goods are in the receiving
+          // department's books by the transfer that fulfilled the line.
+          const keepIssued = (!isParty || isRoutedRow(cur)) && beforeQty > 0;
           const keptQty = keepIssued ? beforeQty : 0;
           (keepIssued ? updRejectKeep : updReject).run(reason, cur.id);
           // Called on BOTH paths so this file's "every write to quantity_issued
@@ -1306,16 +1386,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const selFresh = db.prepare(`
         SELECT ri.id, ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
                ri.quantity_issued, ri.deferred_until, ri.shelf_emptied_qty,
-               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size,
+               ${routedColSql(db)} AS routed_department_id
         FROM requisition_items ri
         LEFT JOIN raw_materials rm ON rm.id = ri.material_id
         WHERE ri.req_id = ?
       `);
-      const everyLineDone = () => (selFresh.all(id) as any[]).every(it => {
+      const lineDone = (it: any) => {
         if (it.is_rejected) return true;
         if (it.store_rejected) return true;
         return lineIssueComplete(it) && !it.deferred_until;     // deferred = still pending even if qty matches
-      });
+      };
+      const everyLineDone = () => (selFresh.all(id) as any[]).every(lineDone);
+      // THE STORE'S PART (rulings #45/#74): every line the STORE serves is
+      // done. A routed line is the Direct Issue department's to send, so the
+      // party transfer — which moves the store's lines only — runs once the
+      // store's part is done; waiting for the routed lines too would let that
+      // department's Send meet a central-stock refusal about lines it has
+      // nothing to do with. With no routed line this IS everyLineDone, so
+      // every requisition without one runs exactly as before.
+      const storePartDone = () => (selFresh.all(id) as any[]).every(it => isRoutedRow(it) || lineDone(it));
       let allDone = everyLineDone();
       // Party path also TRANSFERS store → department (store deduction + dept
       // credit). The helper never moves a gram twice: it reads what its party
@@ -1329,7 +1419,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // shelf holds and stays open, instead of refusing a gesture about another
       // line), and where this gesture began in the issue ledger.
       const pfOpts = { deskBeforeLineQty: deskBase, gestureIssuedIds: issuedLines, ledgerSince };
-      if (allDone && r.purpose === 'party') {
+      if (storePartDone() && r.purpose === 'party') {
         pf = applyPartyFulfillment(db, id, me.email, pfOpts);
         allDone = everyLineDone();
       } else if (r.purpose === 'party') {
@@ -1366,8 +1456,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // none. Likewise a deferred line counts as closable only when THIS
         // gesture issued on it ("Issue part, defer rest"); a defer it merely
         // carries — or one this gesture wrote alone — is kept, as written.
+        // The STORE's open lines only (rulings #45/#74): a routed line is not
+        // the store's to close. With no routed line, every open line.
         const openLines = (selFresh.all(id) as any[]).filter(it =>
-          !it.is_rejected && !it.store_rejected && !(lineIssueComplete(it) && !it.deferred_until));
+          !isRoutedRow(it) && !it.is_rejected && !it.store_rejected && !(lineIssueComplete(it) && !it.deferred_until));
         const couldClose = issuedLines.size > 0 && openLines.length > 0 && openLines.every(it =>
           (Number(it.quantity_issued) || 0) > 0 && (!it.deferred_until || issuedLines.has(String(it.id))));
         // NO "already moved" GATE ANY MORE (round 9). The transfer used to be
@@ -1393,11 +1485,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                   dropped.push(String(it.id));
                 }
               }
-              if (!everyLineDone()) throw unwind;
+              // Kept iff the STORE's part is done (rulings #45/#74) — with no
+              // routed line, iff every line is, exactly as before.
+              if (!storePartDone()) throw unwind;
               kept.t = t;
             })();
             pf = kept.t;
-            allDone = true;
+            // ALL lines, routed included: a routed line still owed keeps the
+            // requisition open (store_processed) for its department to send.
+            allDone = everyLineDone();
             for (const lineId of dropped) {
               const it = deferWritten.get(lineId);
               const now = selLine.get(lineId, id) as any;
@@ -1485,6 +1581,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             UPDATE requisitions
             SET status = 'store_processed',
                 store_processed_at = COALESCE(store_processed_at, datetime('now')),
+                store_processed_by = COALESCE(store_processed_by, ?),
+                store_note = CASE WHEN ? != '' THEN ? ELSE store_note END,
+                updated_at = datetime('now')
+            WHERE id = ?
+          `).run(me.email, note, note, id);
+        } else if (rNow.status === 'store_processed'
+          && (selFresh.all(id) as any[]).some(isRoutedRow)
+          && !(db.prepare(
+            `SELECT store_processed_at FROM requisitions WHERE id = ?`,
+          ).get(id) as { store_processed_at?: string | null } | undefined)?.store_processed_at) {
+          // ROUTED (rulings #45/#74): the Direct Issue department's Send moved
+          // this requisition to store_processed before the store touched it,
+          // and wrote no store stamps (no store gesture ran). This is the
+          // store's first gesture on it, so the pair is stamped now — the
+          // same COALESCE pair as the branch above. Only on a requisition
+          // with a routed line: every other one is exactly as before.
+          db.prepare(`
+            UPDATE requisitions
+            SET store_processed_at = COALESCE(store_processed_at, datetime('now')),
                 store_processed_by = COALESCE(store_processed_by, ?),
                 store_note = CASE WHEN ? != '' THEN ? ELSE store_note END,
                 updated_at = datetime('now')
@@ -1603,6 +1718,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           error: String(gestureOut.lineChanged.message || ''),
           code: 'line_changed',
           blocked: [gestureOut.lineChanged],
+          applied: 0,
+        }, { status: 400 });
+      }
+      // A routed line met under the lock (rulings #45/#74): the pre-flight's
+      // refusal, same envelope, nothing written.
+      if (gestureOut.routed) {
+        return Response.json({
+          error: gestureOut.routed.message,
+          code: 'routed',
+          blocked: [gestureOut.routed],
           applied: 0,
         }, { status: 400 });
       }

@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, canApproveAsMgmt } from '@/lib/auth';
+import { stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 /**
  * Phase 1 §2 — Management approves a chef-approved requisition (2nd gate).
@@ -25,12 +26,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const body = await req.json().catch(() => ({}));
     const note: string = body?.note || '';
 
-    db.prepare(`
-      UPDATE requisitions
-      SET status = 'mgmt_approved', mgmt_approved_at = datetime('now'),
-          mgmt_approved_by = ?, mgmt_note = ?, updated_at = datetime('now')
-      WHERE id = ?
-    `).run(me.email, note, id);
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE requisitions
+        SET status = 'mgmt_approved', mgmt_approved_at = datetime('now'),
+            mgmt_approved_by = ?, mgmt_note = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(me.email, note, id);
+      // ROUTED LINES (owner rulings #45 + #74). The HOD's approval already
+      // stamped them (chef-approve); this is the same idempotent stamp asked
+      // again at the second gate, so a line that reached chef_approved before
+      // the stamp existed is routed before the store sees it. It never
+      // un-routes or re-routes a line, and stamps nothing the store has
+      // started on. A requisition with no such line is untouched.
+      stampRequisitionRouting(db, id, me.email);
+    })();
     return Response.json({ success: true, status: 'mgmt_approved' });
   } catch (e: any) {
     console.error('[req mgmt-approve]', e);

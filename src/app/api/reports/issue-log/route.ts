@@ -336,7 +336,13 @@ export async function GET(req: Request) {
         `TOTAL — ISSUE (pre-ledger) (${lineCount(t.pre_ledger.lines)}): hand-overs made before the issue ledger existed, `
         + `reconstructed from the requisition line as quantity issued minus what the ledger accounts for, in the LINE unit. `
         + `Together with the ISSUE rows above every hand-over is counted EXACTLY ONCE — the two partition, they do not `
-        + `overlap.${qtyClause(t.pre_ledger)}`,
+        + `overlap.`
+        // Rulings #45/#74 — only when this file holds a transfer that fulfils a
+        // routed line, so every other file reads as before.
+        + (result.rows.some(r => r.stage === 'TRANSFER' && !!r.req_number)
+          ? ` A line routed by Direct Issue is the one exception: its hand-overs are the TRANSFER rows that name it.`
+          : '')
+        + `${qtyClause(t.pre_ledger)}`,
         { qty: t.pre_ledger.qty, basis: t.pre_ledger.unit_basis, value: t.pre_ledger.value },
       ));
       lines.push(captionRow(
@@ -366,11 +372,20 @@ export async function GET(req: Request) {
       // transfer, or transfers were asked for by name) — a database that has
       // never transferred gets the file it always got, line for line.
       if (t.transfer) {
+        // A transfer that FULFILS a routed requisition line (owner rulings #45
+        // + #74) names its requisition; only when this file holds one is that
+        // said, so every other file reads line for line as before.
+        const fulfils = result.rows.some(r => r.stage === 'TRANSFER' && !!r.req_number);
         lines.push(captionRow(
           `TOTAL — TRANSFER (${lineCount(t.transfer.lines)}): goods handed from one department to another, one line per `
           + `hand-over, in RECIPE units. With a department filter each quantity is signed from that department's side `
           + `(+ received, − handed on). Goods moving between two kitchens' books — never in or out of the building — so `
           + `DO NOT ADD this to any receipt, issue or consumption figure. No money: the goods were valued when they came in.`
+          + (fulfils
+            ? ` A transfer that names a Requisition No FULFILS a routed requisition line (Direct Issue sends that item `
+              + `straight to the sending department, so the central store never holds it): it is that line's hand-over, `
+              + `the line's Issued To Date counts it, and no ISSUE row repeats it.`
+            : '')
           + qtyClause(t.transfer),
           { qty: t.transfer.qty, basis: t.transfer.unit_basis, value: t.transfer.value },
         ));

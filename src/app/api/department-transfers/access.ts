@@ -8,6 +8,7 @@ import {
 import { toPurchaseQty } from '@/lib/pack-units';
 import { resolveDirectIssueBulk } from '@/lib/direct-issue';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+import { routedSchema } from '@/lib/routed-schema';
 
 /**
  * 'purchase' | 'recipe' | a unit's own NAME ('kg', 'g', 'btl') → the entry
@@ -162,6 +163,15 @@ export function canSendFrom(
   if (dept.head_user_id && dept.head_user_id === user.id) return true;
   if (!user.is_head_chef || !user.department_id) return false;
   return user.department_id === dept.id || (!!dept.parent_id && user.department_id === dept.parent_id);
+}
+
+/** The refusal words for someone canSendFrom() turns away — ONE copy, so the
+ *  generic send (../route.ts) and the "To send" queue (./to-send) say the same. */
+export function sendRefusalMessage(from: DeptLite, all: Map<string, DeptLite>): string {
+  const parent = from.parent_id ? all.get(from.parent_id) : undefined;
+  return `Only ${from.name}'s head (its named head, or an HOD posted to ${from.name}` +
+    `${parent ? ` or to ${parent.name}` : ''}), a manager or an ` +
+    `admin can send its stock. You can still see transfers into and out of your department and flag a dispute.`;
 }
 
 export function canSeeDept(user: SessionUser, deptId: string, all: Map<string, DeptLite>): boolean {
@@ -522,6 +532,55 @@ export function permissionsFor(
   };
 }
 
+/**
+ * RULING 45 — which requisition a document serves, for the screen's "Fulfils
+ * REQ-x" (and "Sends back against REQ-x" on a reverse): the document's own
+ * requisition_id, or — on a reverse, whose lines never carry the link — the
+ * requisition of the transfer it reverses, walked up the reverses chain.
+ * null for an ordinary transfer. Never throws.
+ */
+export interface TransferRequisitionLink {
+  relation: 'fulfils' | 'sends_back';
+  /** The requisition's id (also as `requisition_id`). */
+  id: string;
+  requisition_id: string;
+  req_number: string;
+  purpose: string;
+  event_name: string;
+  status: string;
+}
+
+export function transferRequisitionLink(db: Database.Database, doc: DeptTransferWithLines): TransferRequisitionLink | null {
+  try {
+    // No link columns (routed-schema) → no document can carry a link.
+    if (!routedSchema(db).linkCols) return null;
+    let reqId = String(doc.requisition_id || '');
+    let relation: TransferRequisitionLink['relation'] = 'fulfils';
+    if (!reqId && doc.reverses_transfer_id) {
+      relation = 'sends_back';
+      const upStmt = db.prepare(`SELECT COALESCE(requisition_id, '') AS requisition_id, reverses_transfer_id FROM department_transfers WHERE id = ?`);
+      let cur = String(doc.reverses_transfer_id);
+      for (let hops = 0; cur && !reqId && hops < 20; hops++) {
+        const up = upStmt.get(cur) as { requisition_id: string; reverses_transfer_id: string } | undefined;
+        if (!up) break;
+        reqId = String(up.requisition_id || '');
+        cur = String(up.reverses_transfer_id || '');
+      }
+    }
+    if (!reqId) return null;
+    const r = db.prepare(`
+      SELECT id, req_number, COALESCE(NULLIF(TRIM(purpose), ''), 'internal') AS purpose,
+             COALESCE(event_name, '') AS event_name, status
+        FROM requisitions WHERE id = ?
+    `).get(reqId) as { id: string; req_number: string; purpose: string; event_name: string; status: string } | undefined;
+    if (!r) return null;
+    return {
+      relation, id: r.id, requisition_id: r.id, req_number: String(r.req_number || ''),
+      purpose: r.purpose, event_name: r.event_name, status: String(r.status || ''),
+    };
+  } catch { return null; }
+}
+
 /** A document for the wire: the stored rows (RECIPE units, as the ledger keeps
  *  them) plus each quantity in the PURCHASE unit through toPurchaseQty() with
  *  the line's own snapshotted pack factor — the screen leads with these.
@@ -530,8 +589,17 @@ export function presentTransfer(
   user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>, db: Database.Database,
 ) {
   const lineMeta = new Map(doc.lines.map((l) => [l.id, { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor }]));
+  const link = transferRequisitionLink(db, doc);
   return {
     ...doc,
+    /** RULING 45: the requisition this document FULFILS, or null — never set
+     *  on a send-back, so no screen can print "Fulfils REQ-x" on goods going
+     *  the other way. Each line's own link is `req_item_id` ('' on a reverse
+     *  line — its root carries it). */
+    requisition: link?.relation === 'fulfils' ? link : null,
+    /** RULING 45: on a send-back (or a re-reverse) of goods that fulfilled a
+     *  requisition, the requisition it moves goods against; null otherwise. */
+    sends_back_against: link?.relation === 'sends_back' ? link : null,
     lines: doc.lines.map((l) => {
       const meta = lineMeta.get(l.id)!;
       return {
@@ -661,6 +729,13 @@ export function receiversFor(db: Database.Database, fromId: string, all: Map<str
  * both bases so a screen never has to convert.
  */
 export function transferErrorResponse(db: Database.Database, e: unknown): Response | null {
+  const out = transferErrorBody(db, e);
+  return out ? Response.json(out.body, { status: out.status }) : null;
+}
+
+/** transferErrorResponse()'s status and JSON body, for a caller that answers
+ *  with plain data (./routed-send.ts). */
+export function transferErrorBody(db: Database.Database, e: unknown): { status: number; body: Record<string, unknown> } | null {
   if (!isDeptTransferBlocked(e)) return null;
   let purchase: { purchase_unit: string; unit: string; requested_purchase: number; available_purchase: number } | null = null;
   if (e.materialId) {
@@ -677,13 +752,16 @@ export function transferErrorResponse(db: Database.Database, e: unknown): Respon
       }
     } catch { /* the message already says it in the purchase unit */ }
   }
-  return Response.json({
-    error: e.message,
-    code: e.code,
-    reason: e.reason,
-    material_id: e.materialId || null,
-    requested: e.requested,
-    available: e.available,
-    ...(purchase || {}),
-  }, { status: e.httpStatus });
+  return {
+    status: e.httpStatus,
+    body: {
+      error: e.message,
+      code: e.code,
+      reason: e.reason,
+      material_id: e.materialId || null,
+      requested: e.requested,
+      available: e.available,
+      ...(purchase || {}),
+    },
+  };
 }

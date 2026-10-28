@@ -199,14 +199,20 @@ import {
   planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep,
   shelfMarkHolds, onGrid, type ShownAs,
 } from '@/lib/central-debit-clamp';
+// ROUTED LINES (rulings #45/#74): the leaf probe only — never routed-requisitions
+// itself, which imports this file.
+import { routedColSql } from '@/lib/routed-schema';
 
 export interface IssueDeltaInput {
   reqItemId: string;
   beforeLineQty: number;
   afterLineQty: number;
   /** issue | store_process | undo | store_reject | admin_adjust | party_shelf
+   *  | routed_send | routed_send_back
    *  (party_shelf: the party rail correcting a line to what its transfer took
-   *  off the shelf — recordPartyShelfTake). */
+   *  off the shelf — recordPartyShelfTake; routed_send / routed_send_back: a
+   *  ROUTED line written by the department transfer that fulfils it —
+   *  routed-requisitions.ts syncRoutedLine, rulings #45/#74). */
   reason: string;
   actor?: string;
   /** Per-gesture token. Present => a replay collides on uq_req_issue_token_item. */
@@ -221,7 +227,7 @@ export interface IssueDeltaResult {
    * skip_reason. Note that 'party' / 'store_mapped' / 'unit_review' do NOT mean
    * "nothing was written" — a ledger row is still recorded; see the header.
    */
-  skipped?: 'party' | 'store_mapped' | 'unit_review' | 'zero_delta' | 'missing_line';
+  skipped?: 'routed' | 'party' | 'store_mapped' | 'unit_review' | 'zero_delta' | 'missing_line';
   /** Recipe units removed from current_stock — 0 unless applied. */
   deltaRecipeQty?: number;
   /** Recipe units recorded as handed over, deducted or not. */
@@ -1918,6 +1924,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
            ri.quantity_requested, ri.chef_approved_qty,
            r.purpose, r.outlet_id,
            COALESCE(ri.department_id, r.department_id) AS department_id,
+           ${routedColSql(db)} AS routed_department_id,
            rm.unit, rm.purchase_unit, rm.pack_size
       FROM requisition_items ri
       JOIN requisitions  r  ON r.id  = ri.req_id
@@ -1925,6 +1932,17 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
      WHERE ri.id = ?
   `).get(input.reqItemId) as any;
   if (!line) return { applied: false, skipped: 'missing_line' };
+
+  // ROUTED CARVE-OUT (owner rulings #45 + #74). A Direct Issue rule sends this
+  // material vendor → the line's ROUTED department, which hands it over by
+  // department transfer (routed-requisitions.ts syncRoutedLine — the only
+  // writer of a routed line's quantity_issued). The central store never held
+  // it, so NEITHER SIDE MOVES here: the transfer's own two legs are the
+  // department movement. The row is still written (recorded_recipe_qty = the
+  // hand-over, delta 0, skip_reason 'routed') so the issue log keeps one row
+  // per hand-over. '' on every line the store serves, and on a database
+  // without the column (routed-schema.ts) — then this is byte-identical.
+  const isRouted = String(line.routed_department_id || '') !== '';
 
   // Party requisitions already deduct at fulfilment, from three separate
   // implementations that all dedup on inventory_transactions.type =
@@ -1983,7 +2001,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
 
   // ── THE DEDUCT: unconditional, minus the three carve-outs ─────────────────
   let stockQty = 0;
-  if (!isParty && !storeMapped && !needsReview) {
+  if (!isRouted && !isParty && !storeMapped && !needsReview) {
     stockQty = deltaRecipe;
     // NEVER GIVE BACK MORE THAN THIS RAIL TOOK.
     //
@@ -2224,7 +2242,9 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // party and store_mapped are PERMANENT facts about the rail; unit_review is a
   // fixable data problem, so it comes last — telling a storekeeper to fix a
   // unit on a liquor line would send him after a deduct that is never coming.
-  const skipReason = isParty ? 'party' : storeMapped ? 'store_mapped' : needsReview ? 'unit_review' : '';
+  // 'routed' FIRST: it is the most specific fact (a routed party line is
+  // routed before it is party — the transfer moved it, not the party rail).
+  const skipReason = isRouted ? 'routed' : isParty ? 'party' : storeMapped ? 'store_mapped' : needsReview ? 'unit_review' : '';
 
   const ledgerId = insertLedger(db, input, line, {
     factor, deltaLine, deltaRecipe: stockQty, recordedRecipe: recordQty,

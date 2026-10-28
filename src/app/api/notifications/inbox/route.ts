@@ -2,6 +2,9 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canProcessAsStore } from '@/lib/auth';
 import { requisitionVisibility } from '@/lib/dept-hierarchy';
 import { canApproveTasks } from '@/lib/tasks';
+// The routed-requisition column probe (owner rulings #45 + #74): a leaf
+// module, so it can be a static import without dragging the routing code in.
+import { routedSchema, routedColSql } from '@/lib/routed-schema';
 
 /**
  * Action Inbox — the global notification bell.
@@ -13,7 +16,13 @@ import { canApproveTasks } from '@/lib/tasks';
  * computed for THE CALLER's role:
  *   - HOD/admin        : requisitions waiting for chef approval (page-identical
  *                        dept scoping via requisitionVisibility)
- *   - store mgr/admin  : approved requisitions waiting at the issue desk
+ *   - store mgr/admin  : approved requisitions waiting at the issue desk (the
+ *                        store's own lines — a requisition every line of which
+ *                        a Direct Issue rule routes to a department is not
+ *                        the store's work)
+ *   - sending head/mgr : requisitions waiting for THEIR department to send —
+ *                        lines for items a Direct Issue rule routes to it
+ *                        (rulings #45/#74), → Department Transfers "To send"
  *   - admin            : vendor POs awaiting approval ('pending' | 'pending_reapproval')
  *   - kitchen/admin    : open KOT trouble alerts (kot_alerts.resolved_at IS NULL)
  *   - HOD/store/admin  : materials at/below reorder level
@@ -198,13 +207,102 @@ export async function GET() {
     }
 
     // ── Store issue desk ──────────────────────────────────────────────────
+    // ROUTED LINES (owner rulings #45 + #74) change WHOSE work a line is, so
+    // the store is badged for the store's work only — and only once the
+    // database carries the routed column (routed-schema.ts); until then this
+    // is the statement it always was.
+    //   · A requisition EVERY live line of which is routed (a Direct Issue
+    //     rule sends the item to Kitchen, so Kitchen sends it by department
+    //     transfer) has nothing for the store to issue: not counted here — it
+    //     is on the sending department's bucket below.
+    //   · Kitchen may send FIRST: its send moves an approved requisition to
+    //     store_processed WITHOUT store stamps (store_processed_at NULL) while
+    //     the store's own lines are untouched. Still the store's to issue, so
+    //     still counted — exactly as it was before Kitchen's tap.
     if (canProcessAsStore(me)) {
-      const n = one(
-        `SELECT COUNT(*) AS n FROM requisitions r
-         WHERE r.status IN ('chef_approved', 'mgmt_approved')${reqOutletSql}`,
-        reqOutletParams,
-      );
+      let n = 0;
+      if (routedSchema(db).lineCol) {
+        const R = routedColSql(db, 'x');
+        n = one(
+          `SELECT COUNT(*) AS n FROM requisitions r
+           WHERE (r.status IN ('chef_approved', 'mgmt_approved')
+                  OR (r.status = 'store_processed' AND COALESCE(r.store_processed_at, '') = ''
+                      AND EXISTS (SELECT 1 FROM requisition_items x
+                                   WHERE x.req_id = r.id AND ${R} <> ''
+                                     AND COALESCE(x.quantity_issued, 0) > 0)))
+             AND NOT (EXISTS (SELECT 1 FROM requisition_items x
+                               WHERE x.req_id = r.id AND ${R} <> ''
+                                 AND COALESCE(x.is_rejected, 0) = 0 AND COALESCE(x.store_rejected, 0) = 0)
+                      AND NOT EXISTS (SELECT 1 FROM requisition_items x
+                                       WHERE x.req_id = r.id AND ${R} = ''
+                                         AND COALESCE(x.is_rejected, 0) = 0 AND COALESCE(x.store_rejected, 0) = 0))${reqOutletSql}`,
+          reqOutletParams,
+        );
+      } else {
+        n = one(
+          `SELECT COUNT(*) AS n FROM requisitions r
+           WHERE r.status IN ('chef_approved', 'mgmt_approved')${reqOutletSql}`,
+          reqOutletParams,
+        );
+      }
       push('store_issue', 'Approved requisitions to issue', n, '/store-requisitions');
+    }
+
+    // ── Requisition lines a DEPARTMENT sends (Direct Issue routing) ───────
+    // Owner rulings #45 + #74: a sub-kitchen's requisition line for an item a
+    // Direct Issue rule sends vendor → Kitchen (chicken, meat, poultry, dairy)
+    // is Kitchen's to send by department transfer, internal and party alike —
+    // it never reaches the store desk. This is the bell that tells Kitchen.
+    //
+    // WHO: exactly the people who may SEND from that department (access.ts
+    // canSendFrom — its named head, an HOD posted there or to its parent,
+    // managers, admin): the same predicate the To send queue's POST enforces,
+    // so nobody is badged for a Send the server would refuse. canAccessPage is
+    // consulted as for the dispute bucket above: nobody is badged into a page
+    // the proxy would bounce them from.
+    //
+    // COUNT ≡ DESTINATION: department-transfers/notify.ts routedToSendByDept →
+    // routed-requisitions.ts toSendGroupCount — the same owed-line read (THE
+    // RULE, store-stage requisitions, this outlet) the To send tab lists —
+    // counting (requisition, asking department) groups, the rows that tab
+    // shows. It falls the moment the last line of a group is sent, and rises
+    // again if a send-back re-opens one.
+    //
+    // The label names the department(s). A group is one requisition for one
+    // asking department, so the count is the requisitions waiting — a
+    // requisition whose lines name two asking departments would be two cards
+    // on the tab and two here (measured on the worktree copy: 0 of 1,630
+    // requisitions do).
+    // Isolated behind its own try/catch + dynamic import like every other
+    // additive bucket, so a routing fault can never darken the bell; absent on
+    // a database without the routed column (no routed line can exist there).
+    try {
+      if (routedSchema(db).lineCol) {
+        const { canAccessPage } = await import('@/lib/page-catalog');
+        if (canAccessPage('/department-transfers', me)) {
+          // ONE count, the transfer module's (notify.ts routedToSendByDept:
+          // canSendFrom per department × routed-requisitions toSendGroupCount)
+          // — the same figure the To send tab is built from. Never re-derived
+          // here; [] on any failure.
+          const { routedToSendByDept } = await import('@/app/api/department-transfers/notify');
+          const byDept = routedToSendByDept(db, me, outletId);
+          const groups = byDept.reduce((sum, d) => sum + (Number(d.groups) || 0), 0);
+          if (groups > 0) {
+            const named = byDept.map(d => d.department_name || 'a department');
+            const who = named.length <= 1 ? (named[0] || 'your department')
+              : `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`;
+            // Open ON the department with the most waiting (byDept is sorted
+            // busiest first). Without department_id the page falls back to the
+            // person's remembered view, which can be another department's
+            // empty To send tab while the bell counts lines elsewhere.
+            push('routed_to_send',
+              `Requisitions waiting for ${who} to send (Direct Issue items)`,
+              groups, `/department-transfers?tab=to_send&department_id=${encodeURIComponent(byDept[0].department_id)}`);
+          }
+        }
+      }
+    } catch (rtErr) {
+      console.error('[/api/notifications/inbox] routed to-send bucket failed:', rtErr);
     }
 
     // ── Vendor PO approvals (admin approves; see purchase-orders/[id]/approve) ──

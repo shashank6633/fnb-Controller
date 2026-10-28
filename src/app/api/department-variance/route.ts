@@ -3,6 +3,7 @@ import { getCurrentUser, isManagement } from '@/lib/auth';
 import { cutoverAt, deptKey, deptOnHandBulk, type DeptOnHandResult } from '@/lib/dept-ledger';
 import { resolveDeptSet } from '@/lib/dept-stock';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+import { routedColSql } from '@/lib/routed-schema';
 
 /**
  * DEPARTMENT variance — what a kitchen was given, what its recipes say it used,
@@ -800,13 +801,18 @@ export async function GET(request: Request) {
     const q = (sql: string, ...p: any[]): number => {
       try { return Number((db.prepare(sql).get(...p) as any)?.n) || 0; } catch { return 0; }
     };
+    // A ROUTED line (owner rulings #45 + #74) is not on this rail: a Direct
+    // Issue department sent it by department transfer, which the department
+    // books as a transfer, not as a store issue. routedColSql is the literal
+    // '' on a database without the column, so every line qualifies there.
     const ISSUE_QUALIFIERS = `
       JOIN requisitions r ON r.id = ri.req_id
       WHERE r.status NOT IN ('cancelled','chef_rejected')
         AND COALESCE(r.purpose,'internal') <> 'party'
         AND ri.quantity_issued > 0
         AND COALESCE(ri.is_rejected,0) = 0
-        AND COALESCE(ri.store_rejected,0) = 0`;
+        AND COALESCE(ri.store_rejected,0) = 0
+        AND ${routedColSql(db)} = ''`;
 
     const materialsIssued = q(`SELECT COUNT(DISTINCT ri.material_id) AS n FROM requisition_items ri ${ISSUE_QUALIFIERS}`);
     const materialsIssuedAll = q('SELECT COUNT(DISTINCT material_id) AS n FROM requisition_items WHERE quantity_issued > 0');
