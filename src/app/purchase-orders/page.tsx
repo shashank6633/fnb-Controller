@@ -999,6 +999,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   /* Per-line "why does this differ from the PO" reason. (There is no longer a
      per-line rate LOCK — see the note above canEditRate.) */
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  /* ONE reason for the whole vendor bill — owner ruling #78, "bottom fills
+     blanks". It covers every differing line left without a reason of its own;
+     a line's own reason always wins. Per bill, so it is cleared with the other
+     per-vendor fields (load() and the vendor tab switch). */
+  const [billReason, setBillReason] = useState('');
   /* RAW keystrokes for the rate box, per line. The committed rate lives in
      `overrides` as a NUMBER, but a controlled number input fed straight from it
      is untypeable: `<input type="number">` reports "" for a half-typed "900.",
@@ -1148,7 +1153,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     // Every per-line and per-bill entry belongs to ONE vendor's delivery — none
     // of it may carry over to the next vendor, so it is cleared with the reload.
     setReasons({}); setRateDraft({}); setExcluded({});
-    setBillNo(''); setChargesNote('');
+    setBillNo(''); setChargesNote(''); setBillReason('');
     /* THE STORE CHECKLIST IS PER BILL, so it is cleared with everything else.
        Carrying it across a vendor switch would sign vendor B's delivery with the
        ticks somebody gave for vendor A's — goods they never had in front of
@@ -1332,7 +1337,19 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
   // reason the server would reject can never look accepted here.
   const MIN_REASON = 3;
-  const missingReason = activeDeviations.filter(d => d.deviates && (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  /* ── "BOTTOM FILLS BLANKS" (owner ruling #78, 2026-10-28) ─────────────────
+     A reason on each differing line is OPTIONAL. `missingReason` is the
+     differing lines on this bill with no reason of their own (under the
+     floor); while there is at least one, the bill reason at the bottom is
+     REQUIRED and is filed on exactly those lines (the receive route copies
+     deviation_reason_all onto every line whose own reason is under 3
+     characters). A line's own reason always wins. No item-count threshold —
+     the same rule on a 2-line bill and a 40-line one. `reasonBlocked` is the
+     one gate the banner, the disabled Confirm and submit() all read. */
+  const differingLines = activeDeviations.filter(d => d.deviates);
+  const missingReason = differingLines.filter(d => (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  const billReasonOk = billReason.trim().length >= MIN_REASON;
+  const reasonBlocked = missingReason.length > 0 && !billReasonOk;
   const missingList = (prefix: string) =>
     prefix + missingReason.map(d => `• ${d.it.material_name} — ${d.label}`).join('\n');
 
@@ -1622,8 +1639,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       alert('Tick at least one line to put on this bill.');
       return;
     }
-    if (missingReason.length > 0) {
-      alert(missingList('Add a reason for these lines before receiving:\n'));
+    if (reasonBlocked) {
+      alert(missingList('These lines differ from the PO and have no reason yet. Type one on each line, '
+        + 'or one "Reason for the differences on this bill" at the bottom — it fills every line left blank:\n'));
       return;
     }
     // The store-check gate on a deviating receipt — same belt-and-braces
@@ -1744,6 +1762,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             bill_date: billDate,
           } : undefined,
       };
+      /* THE BILL REASON (ruling #78) — sent only while it is filling a blank:
+         at least one differing line has no reason of its own. The route copies
+         it onto exactly those lines; a line's own reason is sent as its
+         deviation_reason above and always wins. When every differing line has
+         its own reason nothing is sent, so the payload is the one this screen
+         always posted. */
+      if (missingReason.length > 0 && billReasonOk) receiveBody.deviation_reason_all = billReason.trim();
       let r = await api(`/api/purchase-orders/${poId}/receive`, { method: 'POST', body: receiveBody });
       let j = await r.json().catch(() => ({}));
       // RULING 71: the same vendor bill number already received on another PO or
@@ -2064,7 +2089,8 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 about who may change a price is worse than no header at all. */}
             <p className="text-xs text-[#8B7355] mt-0.5">
               Adjust the qty if you got more / less. The rate starts at the PO rate and can be corrected
-              to what the vendor actually billed — any line that differs from the PO needs a reason, and the admin is
+              to what the vendor actually billed — any line that differs from the PO needs a reason: type it on the
+              line, or once for the whole bill at the bottom (it fills every line left blank), and the admin is
               notified with it. GST is worked out per line after discount and recorded on its own; it never enters the rate.
               Stock + recipe costs update on submit.
               {isMultiVendor && ' This PO spans several vendors — each is received separately, on their own bill.'}
@@ -2131,6 +2157,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     <button key={v.key} type="button" disabled={v.done}
                             onClick={() => {
                               setVendorKey(v.key); setBillNo('');
+                              // A bill-level statement, like the bill number:
+                              // vendor A's reason must never be filed on B's lines.
+                              setBillReason('');
                               setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
                               // Clears any picked bill photo with it — see the
                               // note on the same call inside load().
@@ -2256,7 +2285,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     const t = tax.byId.get(it.id);
                     // Only a line ON this bill can be off-PO — an excluded one
                     // is not being received at all, so it owes no explanation.
-                    const needsReason = included && deviates && reason.trim().length < MIN_REASON;
+                    // Ruling #78: the line's own reason is optional — a blank
+                    // one is filled by the bill reason at the bottom. It still
+                    // NEEDS one only while the bill reason is missing too.
+                    const ownBlank = included && deviates && reason.trim().length < MIN_REASON;
+                    const needsReason = ownBlank && !billReasonOk;
+                    const coveredByBill = ownBlank && billReasonOk;
                     return (
                       <Fragment key={it.id}>
                       <tr className={`border-t border-[#E8D5C4]/50 ${!included ? 'opacity-45' : deviates ? 'bg-amber-50/40' : ''}`}>
@@ -2351,7 +2385,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                 PO ₹{it.unit_price.toFixed(2)}{u && `/${u}`}
                                 {' · '}{priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`}
                               </div>
-                              <div className="text-[9px] text-right text-amber-800">reason required · admin notified</div>
+                              <div className="text-[9px] text-right text-amber-800">reason needed (line or bill) · admin notified</div>
                             </>
                           )}
                           {/* Restores the PO rate — a half-typed change must not
@@ -2451,9 +2485,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         </td>
                       </tr>
                       {/* REASON — appears the moment a line stops matching the
-                          PO (short, excess, or a changed rate). Required: the
-                          receive route rejects a deviating line without one, and
-                          the admin alert quotes it. */}
+                          PO (short, excess, or a changed rate). OPTIONAL on the
+                          line (ruling #78): a blank one is filled by the bill
+                          reason at the bottom, and the receive route rejects a
+                          deviating line only when it has neither. The admin
+                          alert quotes whichever one the line carries. */}
                       {deviates && included && (
                         <tr className="bg-amber-50/40">
                           {/* colSpan matches the 10 columns above (6 goods + 4 tax). */}
@@ -2461,11 +2497,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                             <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
                               <span className={`text-[10px] shrink-0 ${needsReason ? 'text-amber-800 font-semibold' : 'text-[#6B5744]'}`}>
                                 <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
-                                {label}{needsReason ? ' — reason required' : ''}
+                                {label}
+                                {needsReason ? ' — needs a reason: here, or the bill reason below'
+                                  : coveredByBill ? ' — covered by the bill reason below' : ''}
                               </span>
                               <input value={reason}
                                      onChange={e => setReasons(r => ({ ...r, [it.id]: e.target.value }))}
-                                     placeholder="Why does this differ from the PO? e.g. vendor short-supplied; rate revised on bill #1234"
+                                     placeholder="Why does this line differ? optional — or use the bill reason below"
                                      className={`flex-1 min-w-0 px-2 py-1 border rounded text-[11px] bg-white ${needsReason ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
                             </div>
                           </td>
@@ -2683,9 +2721,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               all three ticks mandatory, Confirm stays disabled (qcBlocked) and
               the route refuses the payload anyway (400, field 'qc_store'). On
               a CLEAN receipt nothing disables Confirm — ticks stay optional
-              and an unticked receive files unsigned, exactly as before. The
-              typed per-line reason stays mandatory on every deviating line;
-              the tick is IN ADDITION to it, never instead of it. */}
+              and an unticked receive files unsigned, exactly as before. A
+              reason stays mandatory on every deviating line (its own, or the
+              bill reason that fills the blanks — ruling #78); the tick is IN
+              ADDITION to it, never instead of it. */}
           {!loading && stake && (
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
               <div className="text-xs font-semibold text-[#2D1B0E]">
@@ -2801,21 +2840,50 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             </div>
           )}
 
-          {/* Names every line still blocking the receive, so the receiver never
-              has to hunt for which row the disabled button is waiting on. */}
-          {missingReason.length > 0 && (
-            <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+          {/* ── ONE REASON FOR THE WHOLE BILL (owner ruling #78) ────────────
+              Shown whenever a line on this bill differs from the PO. It FILLS
+              THE BLANKS: required only while a differing line has no reason of
+              its own, and then filed on exactly those lines (the receive route
+              copies deviation_reason_all onto them). A line's own reason always
+              wins. It also names every line still blocking the receive, so the
+              receiver never has to hunt for which row the disabled button is
+              waiting on. */}
+          {!loading && stake && differingLines.length > 0 && (
+            <div className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-[11px] ${
+              reasonBlocked ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-[#E8D5C4] bg-[#FFF8F0] text-[#2D1B0E]'}`}>
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-              <div>
-                <div className="font-semibold">
-                  {missingReason.length} line(s) differ from the PO and still need a reason (min {MIN_REASON} characters):
+              <div className="flex-1 min-w-0">
+                <label className="block">
+                  <span className="font-semibold">Reason for the differences on this bill</span>
+                  <span className="ml-1 text-[10px] font-normal">
+                    {missingReason.length > 0
+                      ? `— required: it fills the ${missingReason.length} line(s) left blank (min ${MIN_REASON} characters)`
+                      : '— not needed: every line that differs has its own reason'}
+                  </span>
+                  <textarea value={billReason} rows={2}
+                            onChange={e => setBillReason(e.target.value)}
+                            placeholder="e.g. vendor short-supplied this delivery; rates revised on the vendor's bill"
+                            className={`mt-1 w-full px-2 py-1 border rounded text-[11px] bg-white ${reasonBlocked ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
+                </label>
+                {missingReason.length > 0 ? (
+                  <>
+                    <div className="mt-1 font-semibold">
+                      {billReasonOk
+                        ? `This reason will be filed on the ${missingReason.length} line(s) left blank:`
+                        : `${missingReason.length} line(s) differ from the PO and still need a reason — type one on the line, or the bill reason above:`}
+                    </div>
+                    <ul className="mt-0.5 space-y-0.5">
+                      {missingReason.map(d => (
+                        <li key={d.it.id}>• <span className="font-medium">{d.it.material_name}</span> — {d.label}</li>
+                      ))}
+                    </ul>
+                  </>
+                ) : billReason.trim() ? (
+                  <div className="mt-1 text-[10px]">Every line that differs has its own reason, so this bill reason is not used.</div>
+                ) : null}
+                <div className="mt-1 text-[10px]">
+                  A line&apos;s own reason always wins on that line. The admin is alerted with the reason each line carries.
                 </div>
-                <ul className="mt-0.5 space-y-0.5">
-                  {missingReason.map(d => (
-                    <li key={d.it.id}>• <span className="font-medium">{d.it.material_name}</span> — {d.label}</li>
-                  ))}
-                </ul>
-                <div className="mt-1 text-[10px]">The admin is alerted with the reason you give.</div>
               </div>
             </div>
           )}
@@ -2840,10 +2908,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           </button>
           <button onClick={submit}
                   disabled={saving || loading || !stake || activeDeviations.length === 0
-                            || missingReason.length > 0 || qcBlocked || chargeBlockers.length > 0}
+                            || reasonBlocked || qcBlocked || chargeBlockers.length > 0}
                   title={!stake ? 'Pick which vendor is delivering'
                        : activeDeviations.length === 0 ? 'Tick at least one line to put on this bill'
-                       : missingReason.length > 0 ? missingList('Reason still needed on:\n')
+                       : reasonBlocked ? missingList('A reason is still needed on these lines — type one on each line, or one bill reason at the bottom that fills every line left blank:\n')
                        : qcBlocked ? 'This delivery differs from the PO — tick all three store checks to receive it'
                        : chargeBlockers.length > 0 ? chargeBlockers.join('\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">

@@ -40,13 +40,14 @@
  * whether to show the button; both routes enforce it regardless.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertCircle, CheckCircle2, ChevronDown, ChevronRight, ExternalLink, Loader2, Merge, RefreshCw, Search, X,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { packFactor, shownPurchaseQty } from '@/lib/pack-units';
+import { categoryKey, categoryLabel, compareCategory, UNCATEGORISED } from '@/lib/category-order';
 
 /* ════════════════════════════════════════════════════════════════════════════
  * PROPS — the contract every mounting page builds to.
@@ -113,6 +114,8 @@ export interface NotOrderable {
   purpose: 'internal' | 'party';
   material_id: string;
   material_name: string;
+  /** rm.category as the feed sends it ('' = none) — the category filter reads it. */
+  material_category: string;
   purchase_unit: string;
   owed_purchase: number;
   code: string;
@@ -229,6 +232,7 @@ export function normalizeFeed(payload: any): MergeFeed {
       department_name: str(r.department_name) || 'No department',
       purpose: r.purpose === 'party' ? 'party' : 'internal',
       material_id: str(r.material_id), material_name: str(r.material_name) || str(r.material_id),
+      material_category: str(r.material_category),
       purchase_unit: str(r.purchase_unit) || str(r.recipe_unit),
       owed_purchase: num(r.owed_purchase), code: str(r.code), reason: str(r.reason),
     }));
@@ -291,6 +295,60 @@ export function tickedOwedPurchase(g: MaterialGroup, ticked: Set<string>): numbe
   let s = 0;
   for (const l of g.lines) if (ticked.has(l.req_item_id)) s += l.owed_purchase;
   return r3(s);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * CATEGORIES (owner #9, 2026-10-28) — DISPLAY ONLY. The chips in the heading,
+ * the category filter and the one heading row per category all read these;
+ * none of them re-sorts `groups`, so the PO line order and the POST body
+ * (buildMergeBody) are exactly what they were. Category rule: src/lib/category-order.ts.
+ * ══════════════════════════════════════════════════════════════════════════ */
+export interface CategoryCount {
+  /** categoryKey(material_category): the group — letter case and spacing
+   *  ignored, blank → "Uncategorised". The filter and the headings match on it. */
+  key: string;
+  /** What the chip and the heading print: the spelling (categoryLabel) most of
+   *  this category's items carry; a tie goes to the first in plain string
+   *  order. "Uncategorised" for the blank group. */
+  label: string;
+  /** Items (materials, one row each) of this category. */
+  items: number;
+  /** Of those, the items with at least one ticked line — each one becomes a PO line. */
+  ticked: number;
+}
+
+/** Every category the given materials fall into, in category order, with how
+ *  many items each holds and how many of those items are ticked. */
+export function categoryCounts(groups: readonly MaterialGroup[], ticked: Set<string>): CategoryCount[] {
+  const by = new Map<string, CategoryCount>();
+  const spellings = new Map<string, Map<string, number>>();
+  for (const g of groups) {
+    const key = categoryKey(g.material_category);
+    let c = by.get(key);
+    if (!c) { c = { key, label: key, items: 0, ticked: 0 }; by.set(key, c); spellings.set(key, new Map()); }
+    c.items++;
+    if (g.lines.some(l => ticked.has(l.req_item_id))) c.ticked++;
+    const sp = spellings.get(key)!;
+    const label = categoryLabel(g.material_category);
+    sp.set(label, (sp.get(label) || 0) + 1);
+  }
+  for (const c of by.values()) {
+    if (c.key === UNCATEGORISED) { c.label = UNCATEGORISED; continue; }
+    let best = c.key, most = 0;
+    for (const [label, n] of spellings.get(c.key)!) {
+      if (n > most || (n === most && label < best)) { best = label; most = n; }
+    }
+    c.label = best;
+  }
+  return [...by.values()].sort((a, b) => compareCategory(a.key, b.key));
+}
+
+/** The shown rows category by category (category-order.ts), items A-Z inside
+ *  each. Returns a NEW array — the input is never re-sorted. */
+export function byCategoryThenName<T extends { g: MaterialGroup }>(rows: readonly T[]): T[] {
+  return [...rows].sort((a, b) =>
+    compareCategory(categoryKey(a.g.material_category), categoryKey(b.g.material_category))
+    || a.g.material_name.localeCompare(b.g.material_name, undefined, { sensitivity: 'base' }));
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -836,6 +894,8 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
   const [q, setQ] = useState('');
   const [deptF, setDeptF] = useState('');
   const [purposeF, setPurposeF] = useState<'' | 'internal' | 'party'>('');
+  /** A categoryKey from the heading chips; '' = All. */
+  const [catF, setCatF] = useState('');
   const [showBlocked, setShowBlocked] = useState(false);
   const departments = useMemo(() => {
     const m = new Map<string, string>();
@@ -848,15 +908,33 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
   };
   const lineShown = (l: MergeCandidate) => (!deptF || l.department_id === deptF)
     && (!purposeF || l.purpose === purposeF)
+    && (!catF || categoryKey(l.material_category) === catF)
     && matchText(l.material_name, l.material_category, l.department_name, l.req_number, l.event_name);
+  // Category by category, A-Z inside each (owner #9). A sorted COPY: `groups`
+  // keeps its own order, which is the order buildMergeBody writes PO lines in.
   const shownGroups = useMemo(
-    () => groups.map(g => ({ g, lines: g.lines.filter(lineShown) })).filter(x => x.lines.length > 0),
+    () => byCategoryThenName(groups.map(g => ({ g, lines: g.lines.filter(lineShown) })).filter(x => x.lines.length > 0)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [groups, q, deptF, purposeF]);
+    [groups, q, deptF, purposeF, catF]);
   const shownBlocked = (feed?.not_orderable || []).filter(n =>
     (!deptF || n.department_id === deptF)
     && (!purposeF || n.purpose === purposeF)
+    && (!catF || categoryKey(n.material_category) === catF)
     && matchText(n.material_name, n.department_name, n.req_number, n.reason));
+  // The heading chips: every category in the list, whatever the other filters.
+  const catAll = useMemo(() => categoryCounts(groups, ticked), [groups, ticked]);
+  const catAllOf = useMemo(() => new Map(catAll.map(c => [c.key, c])), [catAll]);
+  // The heading rows count what is shown under them.
+  const catShownOf = useMemo(
+    () => new Map(categoryCounts(shownGroups.map(x => x.g), ticked).map(c => [c.key, c])),
+    [shownGroups, ticked]);
+  const catItemsAll = catAll.reduce((s, c) => s + c.items, 0);
+  const catTickedAll = catAll.reduce((s, c) => s + c.ticked, 0);
+  // A category that left the list on a reload (its lines went onto a PO) must
+  // not keep filtering everything out behind a chip that is no longer there.
+  useEffect(() => {
+    if (catF && !catAllOf.has(catF)) setCatF('');
+  }, [catF, catAllOf]);
   /** Orderable = some vendor can take it (or nothing says otherwise). */
   const orderable = (g: MaterialGroup) => { const m = mappedOf(g); return m == null || m.length > 0; };
   const shownOrderableIds = shownGroups.filter(x => orderable(x.g)).flatMap(x => x.lines.map(l => l.req_item_id));
@@ -946,7 +1024,7 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
            onClick={e => e.stopPropagation()}>
         {/* ── header ── */}
         <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-start justify-between gap-3">
-          <div>
+          <div className="min-w-0 flex-1">
             <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
               <Merge className="w-4 h-4 text-[#af4408]" /> Merge requisitions into one PO
             </div>
@@ -956,6 +1034,34 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
               and submit it for approval on Purchase Orders. Each vendor&apos;s bill gets its own GRN under the same PO
               number. Nothing is issued from here.
             </div>
+            {/* ── item categories in this list (owner #9): count + ticked, tap to filter ── */}
+            {!created && catAll.length > 0 && (
+              <div role="group" aria-label="Item categories in this list"
+                   className="mt-2 flex flex-wrap gap-1 max-h-14 sm:max-h-24 overflow-y-auto">
+                <button type="button" onClick={() => setCatF('')} aria-pressed={!catF}
+                        title={`Every category: ${catItemsAll} item${catItemsAll === 1 ? '' : 's'}, ${catTickedAll} with a ticked line`}
+                        className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
+                          !catF ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
+                  All <span className="opacity-75">{catItemsAll}</span>
+                  {catTickedAll > 0 && <span className="opacity-90"> · {catTickedAll} ticked</span>}
+                </button>
+                {catAll.map(c => {
+                  const on = catF === c.key;
+                  return (
+                    <button key={c.key} type="button" onClick={() => setCatF(on ? '' : c.key)} aria-pressed={on}
+                            title={`${c.label}: ${c.items} item${c.items === 1 ? '' : 's'} in this list, `
+                              + `${c.ticked === 0 ? 'none' : c.ticked} with a ticked line (a ticked item is one PO line). `
+                              + (on ? 'Tap again (or All) to show every category.' : `Tap to show only ${c.label}.`)}
+                            className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
+                              on ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#6B5744] hover:bg-[#F5EDE2]'}`}>
+                      <span className="uppercase tracking-wide font-semibold">{c.label}</span>
+                      {' '}<span className="opacity-75">{c.items}</span>
+                      {c.ticked > 0 && <span className={on ? '' : 'text-[#af4408] font-semibold'}> · {c.ticked} ticked</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
           <button onClick={close} disabled={saving} aria-label="Close"
                   className="p-1 rounded hover:bg-[#FFF1E3] text-[#8B7355] disabled:opacity-50">
@@ -1075,7 +1181,13 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
                       <th className="text-right py-1.5 px-2 font-medium">Amount</th>
                     </tr>
                   </thead>
-                  {shownGroups.map(({ g, lines }) => {
+                  {shownGroups.map(({ g, lines }, gi) => {
+                    // ONE heading row per category, before its first item
+                    // (shownGroups is category-ordered, so each category is one run).
+                    const catK = categoryKey(g.material_category);
+                    const catHead = gi === 0 || categoryKey(shownGroups[gi - 1].g.material_category) !== catK
+                      ? catShownOf.get(catK) : undefined;
+                    const catHidden = catHead ? Math.max(0, (catAllOf.get(catK)?.items ?? catHead.items) - catHead.items) : 0;
                     const pu = g.purchase_unit || g.recipe_unit;
                     const ru = g.recipe_unit;
                     const meta = { unit: g.recipe_unit, purchase_unit: g.purchase_unit, pack_size: g.pack_size };
@@ -1096,7 +1208,22 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
                     const buyShown = ch.buy != null ? ch.buy : (ck.included ? plain3(owedTicked) : '');
                     const rh = rateHintFor(g, ch.vendor_id);
                     return (
-                      <tbody key={g.material_id} ref={el => { groupRefs.current[g.material_id] = el; }}
+                      <Fragment key={g.material_id}>
+                      {catHead && (
+                        <tbody>
+                          <tr className="bg-[#FFF1E3] border-t-2 border-[#E8D5C4]">
+                            {/* colSpan 8 = every column of the thead above */}
+                            <td colSpan={8} className="py-1 px-2 text-[10px] text-[#8B7355]"
+                                title="Items of this category shown below. 'Ticked' = items with at least one ticked line; each becomes one PO line.">
+                              <span className="font-semibold uppercase tracking-wide text-[#6B5744]">{catAllOf.get(catK)?.label ?? catHead.label}</span>
+                              {' · '}{catHead.items} item{catHead.items === 1 ? '' : 's'}
+                              {' · '}<span className={catHead.ticked > 0 ? 'font-semibold text-[#af4408]' : ''}>{catHead.ticked} ticked</span>
+                              {catHidden > 0 && <> · {catHidden} more hidden by the filter</>}
+                            </td>
+                          </tr>
+                        </tbody>
+                      )}
+                      <tbody ref={el => { groupRefs.current[g.material_id] = el; }}
                              className={`border-t-2 border-[#E8D5C4] ${ck.included ? 'bg-amber-50/30' : ''}`}>
                         <tr className="align-top">
                           <td className="py-1.5 px-2 text-center">
@@ -1109,7 +1236,7 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
                           <td className="py-1.5 px-2">
                             <div className="font-semibold text-[#2D1B0E]">{g.material_name}</div>
                             <div className="text-[10px] text-[#8B7355]">
-                              {g.material_category || 'Uncategorised'} · {g.lines.length} line{g.lines.length === 1 ? '' : 's'}
+                              {categoryLabel(g.material_category)} · {g.lines.length} line{g.lines.length === 1 ? '' : 's'}
                               {nTicked > 0 && <> · <b className="text-[#af4408]">{nTicked} ticked</b></>}
                             </div>
                           </td>
@@ -1245,6 +1372,7 @@ function MergePoModalInner({ onClose, onCreated, preselectReqItemIds }: MergePoM
                           );
                         })}
                       </tbody>
+                      </Fragment>
                     );
                   })}
                 </table>

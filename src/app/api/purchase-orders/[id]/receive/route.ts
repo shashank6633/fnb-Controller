@@ -427,6 +427,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
  *   part-rejected at QC counts), or the rate ≠ the ordered rate.
  *   It is stored on the GRN line + the purchases row and alerted to the admin.
  *
+ * Optional body: { deviation_reason_all? }
+ *   — ONE reason for the whole vendor bill (owner ruling #78, "bottom fills
+ *   blanks"). It is copied onto every override whose own deviation_reason is
+ *   under 3 characters, so a deviating line passes the gate with EITHER its own
+ *   reason or this one; a line's own reason always wins. It lands only on lines
+ *   that actually deviate (see where it is parsed). Absent = per-line reasons
+ *   only, exactly as before.
+ *
  *   THE RATE IS EDITABLE BY ANYONE PERMITTED TO RECEIVE (owner ruling).
  *   It used to be a hard admin-only 403 on this route (see the removed lock in
  *   the per-line loop below). The bill the vendor hands over at the gate IS the
@@ -618,6 +626,56 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
       }
     }
+    /* ── ONE REASON FOR THE WHOLE BILL — "BOTTOM FILLS BLANKS" (owner ruling
+     * #78, 2026-10-28) ────────────────────────────────────────────────────
+     * Typing a reason on every line that differs is hard on a long bill, so the
+     * receive modal now has ONE reason box at the bottom of each vendor bill
+     * (`deviation_reason_all`). It FILLS THE BLANKS: it is copied onto every
+     * override whose own deviation_reason is under the same 3-character floor
+     * the gate below enforces. A line's own reason ALWAYS wins on that line —
+     * a reason of 3+ characters is never overwritten.
+     *
+     * WHY COPYING HERE IS THE WHOLE CHANGE: a line with no override cannot
+     * deviate (effRcv / effAcc / effPrice fall back to the PO line in the
+     * preflight loop), so every line that CAN deviate has an override, and the
+     * per-line gate and the GRN write loop below keep reading
+     * `ov.deviation_reason` exactly as they always have. Every existing reader
+     * then carries the bill reason on the lines it covers: the GRN line's
+     * 'PO deviation:' note, the purchases row's '— off-PO:' cost note, and
+     * deviationLines[].reason (audit row, Slack, the HOD/admin alert, /grn,
+     * the print).
+     *
+     * A LINE THAT MATCHES THE PO NEVER CARRIES IT. An override can exist on a
+     * clean line (a taxed line is always sent, to carry its gst_rate), and it
+     * gets the copy too — but the route reads deviation_reason ONLY inside the
+     * qtyOff/rateOff/accOff branch of the preflight loop and ONLY behind
+     * `deviated` in the write loop ('PO deviation:', '— off-PO:', and the
+     * deviationLines push), so on a clean line the copy is never written
+     * anywhere. For the same reason the bill reason is deliberately NOT put on
+     * the GRN header notes: purchase-log.ts reads
+     * COALESCE(gi.notes, g.notes) per line, and only a CLEAN line has an empty
+     * gi.notes — the header would print the reason under exactly the lines it
+     * does not apply to.
+     *
+     * Absent / blank / non-string = nothing is filled, so an old payload that
+     * sends only per-line reasons (a stale tab) is byte-identical in effect to
+     * what this route has always done. */
+    const billDeviationReason = typeof body?.deviation_reason_all === 'string'
+      ? body.deviation_reason_all.trim() : '';
+    const billReasonFilled = new Set<string>();
+    if (billDeviationReason.length >= 3) {
+      for (const [poItemId, ov] of overrides) {
+        if (String(ov.deviation_reason || '').trim().length < 3) {
+          ov.deviation_reason = billDeviationReason;
+          billReasonFilled.add(String(poItemId));
+        }
+      }
+    }
+    // The deviating lines the bill reason actually covered — filled by the
+    // preflight loop below (same qtyOff/rateOff/accOff detection) and recorded
+    // on the audit row, so the bill-level reason is stated against the lines
+    // it explains and nothing else.
+    const billReasonCovered: string[] = [];
     /**
      * Was a usable gst_rate sent for this line?
      * ABSENT means exactly what it meant before this field existed — no tax
@@ -1171,12 +1229,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const devReason = String(ov?.deviation_reason || '').trim();
         if (devReason.length < 3) {
           return Response.json({
-            error: `Reason required on "${it.material_name}" — ${what.join(' and ')}. Enter why this line differs from the PO (at least 3 characters); the admin is alerted with that reason.`,
+            error: `Reason required on "${it.material_name}" — ${what.join(' and ')}. Enter why this line differs from the PO on the line, or one reason for the whole bill at the bottom (at least 3 characters); the admin is alerted with that reason.`,
             material: it.material_name,
             field: 'deviation_reason',
           }, { status: 400 });
         }
         deviatingPreflight.push({ material_name: String(it.material_name || ''), detail: what.join(' and ') });
+        if (billReasonFilled.has(String(it.id))) billReasonCovered.push(String(it.material_name || ''));
       }
     }
 
@@ -2372,6 +2431,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             rate_changed_lines: rateChangedLines.length,
             acc_short_lines:    accShortLines.length,
             lines: deviationLines,
+            // The ONE bill-level reason (ruling #78, "bottom fills blanks") and
+            // the deviating lines it was filled onto — present only when it
+            // covered at least one. Each of those lines already quotes it as its
+            // own `reason` above; this says which reasons came from the bottom.
+            ...(billReasonCovered.length > 0 ? {
+              bill_deviation_reason: billDeviationReason,
+              bill_deviation_reason_lines: billReasonCovered,
+            } : {}),
             // What the bill's own figures did to this receive. `basis` is the
             // point of the block: one number changed the cost of the stock, the
             // other was filed against it.
