@@ -3,6 +3,7 @@ import { generateId } from './db';
 import { centralFlowBlock, catNorm } from './store-engine';
 import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
 import { rateMap, materialRate, valueCount } from './closing-valuation';
+import { centralHeldSql } from './count-list-active';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -691,9 +692,15 @@ export function listCutoverSheet(
              OR EXISTS (SELECT 1 FROM requisition_items ri WHERE ri.material_id = m.id)
            ) AS has_activity
       FROM raw_materials m
-     WHERE COALESCE(m.is_active, 1) = 1
+     -- A switched-OFF material stays on the sheet while central still holds a
+     -- non-zero balance of it, or while this draft has it staged; it drops off
+     -- at zero (owner #6 / ruling 78, ./count-list-active.ts). Nothing switched
+     -- off → the first arm is true for every row → the sheet is unchanged.
+     WHERE (COALESCE(m.is_active, 1) = 1
+            OR ${centralHeldSql('m')}
+            OR m.id IN (SELECT material_id FROM central_cutover_lines WHERE batch_id = ?))
      ORDER BY m.name COLLATE NOCASE
-  `).all() as Array<{
+  `).all(opts?.draftBatchId ?? '') as Array<{
     id: string; name: string; sku: string; category: string; current_stock: number;
     unit: string; purchase_unit: string; pack_size: number; average_price: number;
     has_activity: number;
@@ -1447,10 +1454,16 @@ export function previewBatch(db: Database.Database, batchId: string): CutoverPre
   }
 
   // Uncounted = every central material with no line. Stated plainly because it
-  // is the number that reassures: those materials are left untouched.
+  // is the number that reassures: those materials are left untouched. "Every
+  // central material" = the materials listCutoverSheet puts on the sheet: a
+  // switched-off one counts while central holds a non-zero balance of it or
+  // this batch has it staged (owner #6 / ruling 78).
   const activeIds = db.prepare(
-    'SELECT id FROM raw_materials WHERE COALESCE(is_active,1) = 1',
-  ).all() as Array<{ id: string }>;
+    `SELECT id FROM raw_materials
+      WHERE COALESCE(is_active,1) = 1
+         OR ${centralHeldSql('raw_materials')}
+         OR id IN (SELECT material_id FROM central_cutover_lines WHERE batch_id = ?)`,
+  ).all(batchId) as Array<{ id: string }>;
   const centralCount = activeIds.filter((r) => !storeMappedSet.has(r.id)).length;
 
   const blockers: string[] = [];

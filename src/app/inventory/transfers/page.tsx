@@ -45,7 +45,7 @@ import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import { api } from '@/lib/api';
 import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
-import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
+import MaterialTypeahead, { MaterialLite, offeredInPicker } from '@/components/MaterialTypeahead';
 import {
   entryMode, tripleToRecipe, breakdownQty, fmtBreakdown, caseFactor, packFactor, PackMeta,
 } from '@/lib/pack-units';
@@ -63,6 +63,43 @@ type TransferStatus = 'requested' | 'issued' | 'received' | 'cancelled';
 interface ItemMeta {
   material_id: string; name: string; category: string; unit: string;
   purchase_unit: string; pack_size: number; case_size: number; average_price: number;
+  /** PICKER ONLY (ruling #78): raw_materials.is_active and what the SOURCE holds
+   *  of it in RECIPE units — central current_stock, or the store's own ledger
+   *  qty. Read by MaterialTypeahead inactive="with-stock" to keep a switched-off
+   *  material on this screen only while the source still has some. Nothing on
+   *  this page computes, posts or displays either field. */
+  is_active?: number | null;
+  source_qty?: number;
+}
+
+/** material_id → raw_materials.is_active, for a STORE source (/api/stores/:id/stock
+ *  rows do not carry it). Any failure → an empty map, which every reader treats
+ *  as "on" (COALESCE(is_active, 1)) — the picker then lists what it always did. */
+async function fetchActiveFlags(): Promise<Map<string, number | null>> {
+  try {
+    const r = await fetch('/api/inventory?scope=all');
+    if (!r.ok) return new Map();
+    const j = await r.json().catch(() => ({}));
+    return new Map(((j.materials || []) as any[]).map(m => [String(m.id), m.is_active ?? null]));
+  } catch { return new Map(); }
+}
+
+/** A SCAN obeys the picker's rule (inactive="with-stock", ruling #78): a
+ *  switched-off material is taken only while the source holds some. Reads the
+ *  same two ItemMeta fields the picker is fed (is_active, source_qty), through
+ *  the shared offeredInPicker — so the list and the scan can never disagree. */
+function scanOffered(meta: ItemMeta | undefined): boolean {
+  if (!meta) return false;
+  return offeredInPicker({ is_active: meta.is_active ?? null, current_stock: meta.source_qty }, 'with-stock');
+}
+
+/** material_id → the store's held qty (recipe units) from /api/stores/:id/stock. */
+function storeHeldQty(j: any): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of ([...(j?.catalog || []), ...(j?.stock || [])] as any[])) {
+    if (r?.material_id && !out.has(String(r.material_id))) out.set(String(r.material_id), Number(r.qty) || 0);
+  }
+  return out;
 }
 interface TransferItem {
   id: string; transfer_id: string; material_id: string; material_name: string;
@@ -910,6 +947,8 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
             purchase_unit: m.purchase_unit || m.unit,
             pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
             average_price: Number(m.average_price) || 0,
+            // Picker only — see ItemMeta. Central holds current_stock.
+            is_active: m.is_active ?? null, source_qty: Number(m.current_stock) || 0,
           }));
         } else {
           const r = await fetch(`/api/stores/${from}/items`);
@@ -917,17 +956,25 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
             const j = await r.json();
             // Normalize even the happy path: a missing purchase_unit would
             // silently kill the pack conversion (see ItemMeta note above).
+            // No is_active here: this payload's held qty is not known to this
+            // page, and an unknown balance must not hide a row — so every row
+            // is offered, exactly as before.
             list = ((j.items || []) as any[]).map(m => ({
               ...m, purchase_unit: m.purchase_unit || m.unit,
             })) as ItemMeta[];
           } else {
+            const flagsP = fetchActiveFlags();
             const sr = await fetch(`/api/stores/${from}/stock`);
             const sj = await sr.json().catch(() => ({}));
+            const flags = await flagsP;
+            const held = storeHeldQty(sj);
             list = (sj.materials || []).map((m: any) => ({
               material_id: m.id, name: m.name, category: m.category, unit: m.unit,
               purchase_unit: m.purchase_unit || m.unit,
               pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
               average_price: Number(m.average_price) || 0,
+              // Picker only — see ItemMeta. The STORE's own held qty.
+              is_active: flags.get(String(m.id)) ?? null, source_qty: held.get(String(m.id)) ?? 0,
             }));
           }
         }
@@ -940,9 +987,12 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
 
   const matLite: MaterialLite[] = useMemo(
     // Carries pack meta for the typeahead's opt-in purchase basis: on a STORE
-    // surface the picked chip must read "(BTL)", not "(ml)".
+    // surface the picked chip must read "(BTL)", not "(ml)". is_active +
+    // current_stock (= what the SOURCE holds) feed inactive="with-stock" only;
+    // showStock stays off, so neither is printed.
     () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit,
-                            purchase_unit: m.purchase_unit, pack_size: m.pack_size })),
+                            purchase_unit: m.purchase_unit, pack_size: m.pack_size,
+                            is_active: m.is_active ?? null, current_stock: m.source_qty })),
     [items],
   );
   const metaById = useMemo(() => new Map(items.map(m => [m.material_id, m])), [items]);
@@ -956,6 +1006,12 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
   const scanIntoLines = (m: ResolvedMaterial): ScanVerdict => {
     if (!metaById.has(m.id)) {
       return { kind: 'warn', text: `${m.name} isn't available from this source.` };
+    }
+    // Same rule as the picker (inactive="with-stock", ruling #78): a material
+    // switched off in Raw Materials is taken only while this source holds some.
+    // A scan must not be the way round the list.
+    if (!scanOffered(metaById.get(m.id))) {
+      return { kind: 'warn', text: `${m.name} is switched off in Raw Materials and this source holds none — not offered for a new transfer.` };
     }
     const already = lines.some(l => l.material_id === m.id);
     if (already) return { kind: 'warn', text: `${m.name} is already added.` };
@@ -1057,6 +1113,9 @@ function CreateModal({ stores, accessByStore, elevated, onClose, onSaved }: {
                     <div className="flex-1 min-w-0">
                       <MaterialTypeahead
                         materials={matLite} value={l.material_id}
+                        // Ruling #78: a switched-off material stays on a transfer
+                        // only while the source still holds some.
+                        inactive="with-stock"
                         excludeIds={chosenIds.filter(id => id !== l.material_id)}
                         onPick={id => setLine(l.key, { material_id: id, cbl: { ...CBL_EMPTY } })}
                         showStock={false} compact={false} purchaseBasis
@@ -1398,13 +1457,18 @@ function EmptiesModal({ stores, onClose, onSaved }: {
     setItemsLoading(true); setMaterialId('');
     (async () => {
       try {
+        const flagsP = fetchActiveFlags();
         const r = await fetch(`/api/stores/${storeId}/stock`);
         const j = await r.json().catch(() => ({}));
+        const flags = await flagsP;
+        const held = storeHeldQty(j);
         const list: ItemMeta[] = (j.materials || []).map((m: any) => ({
           material_id: m.id, name: m.name, category: m.category, unit: m.unit,
           purchase_unit: m.purchase_unit || m.unit,
           pack_size: Number(m.pack_size) || 1, case_size: Number(m.case_size) || 1,
           average_price: Number(m.average_price) || 0,
+          // Picker only — see ItemMeta. The STORE's own held qty.
+          is_active: flags.get(String(m.id)) ?? null, source_qty: held.get(String(m.id)) ?? 0,
         }));
         if (!cancelled) setItems(list);
       } catch { if (!cancelled) setItems([]); }
@@ -1415,9 +1479,11 @@ function EmptiesModal({ stores, onClose, onSaved }: {
 
   const matLite: MaterialLite[] = useMemo(
     // Carries pack meta for the typeahead's opt-in purchase basis: on a STORE
-    // surface the picked chip must read "(BTL)", not "(ml)".
+    // surface the picked chip must read "(BTL)", not "(ml)". is_active +
+    // current_stock (= the store's held qty) feed inactive="with-stock" only.
     () => items.map(m => ({ id: m.material_id, name: m.name, category: m.category, unit: m.unit,
-                            purchase_unit: m.purchase_unit, pack_size: m.pack_size })),
+                            purchase_unit: m.purchase_unit, pack_size: m.pack_size,
+                            is_active: m.is_active ?? null, current_stock: m.source_qty })),
     [items],
   );
   const metaById = useMemo(() => new Map(items.map(m => [m.material_id, m])), [items]);
@@ -1426,6 +1492,10 @@ function EmptiesModal({ stores, onClose, onSaved }: {
 
   const scanInto = (rm: ResolvedMaterial): ScanVerdict => {
     if (!metaById.has(rm.id)) return { kind: 'warn', text: `${rm.name} isn't stocked in this store.` };
+    // Same rule as the picker above (inactive="with-stock", ruling #78).
+    if (!scanOffered(metaById.get(rm.id))) {
+      return { kind: 'warn', text: `${rm.name} is switched off in Raw Materials and this store holds none — not offered here.` };
+    }
     setMaterialId(rm.id); setCbl({ ...CBL_EMPTY });
     return { kind: 'ok', text: `Selected ${rm.name} — enter a quantity.` };
   };
@@ -1496,6 +1566,9 @@ function EmptiesModal({ stores, onClose, onSaved }: {
         ) : (
           <MaterialTypeahead
             purchaseBasis
+            // Empties / breakage / spillage leave THIS store: a switched-off
+            // material is offered only while the store still holds some (#78).
+            inactive="with-stock"
             materials={matLite} value={materialId}
             onPick={id => { setMaterialId(id); setCbl({ ...CBL_EMPTY }); }}
             showStock={false} compact={false}

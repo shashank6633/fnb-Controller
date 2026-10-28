@@ -21,12 +21,17 @@ import {
   Sparkles,
   MapPin,
   ListChecks,
+  Power,
+  RefreshCw,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
 import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import Toggle from '@/components/Toggle';
+// THE one reading of raw_materials.is_active every picker shares: absent / null
+// = ON, exactly like the server's COALESCE(is_active, 1).
+import { isSwitchedOff } from '@/components/MaterialTypeahead';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -66,7 +71,26 @@ interface RawMaterial {
    *  from a carcass — the same item may also be bought from a vendor, and only a
    *  butchering_outputs row counts towards yield. */
   is_butchering_output?: number;
+  /** raw_materials.is_active — 1 on / 0 SWITCHED OFF (owner #6, ruling 78).
+   *  Off = not offered on NEW entries (PO, bill/GRN, requisition, recipe
+   *  pickers); still on the count lists while it holds stock, still in stock,
+   *  still in every report. Only an
+   *  admin may change it. Absent (a semi-finished 'sub:' row) reads as on. */
+  is_active?: number | null;
 }
+
+/** A material is LOW only while it is switched on: a switched-off item is not
+ *  being re-ordered, so it is not an alert here — the same rule the alert and
+ *  low-stock-count routes apply (COALESCE(is_active, 1) = 1). Its stock still
+ *  counts in every value and report. */
+function isLowItem(m: RawMaterial): boolean {
+  return !isSwitchedOff(m) && m.current_stock < m.reorder_level;
+}
+
+/** What "switched off" does, in one wording for every place this page says it.
+ *  Scoped to the pickers that apply it (ruling #78 build): the Liquor Store
+ *  screens do not apply it yet, so the sentence says so rather than overclaim. */
+const OFF_EFFECT = 'not offered on new purchase orders, GRNs / vendor bills, requisitions or recipes (the Liquor Store screens still list it)';
 
 /** One DIRECT-FLAGGED material's destination + department-held balance, from
  *  GET /api/inventory/direct-dept-stock (Settings → Direct Issue rules resolved
@@ -143,6 +167,9 @@ interface FormData {
    *  by pack_size and store in recipe units (current_stock < reorder_level → low
    *  stock). Raw input string for the same reason as avg_price_per_purchase_unit. */
   reorder_level_purchase_unit?: string;
+  /** 1 on / 0 off. Edit form only, ADMIN only — sent to PUT /api/inventory ONLY
+   *  when an admin actually changed it (see handleSubmit). */
+  is_active?: number;
 }
 
 /** Entry-field sanitiser: keep the user's raw text (so "355." stays typable),
@@ -309,6 +336,8 @@ export default function InventoryPage() {
   const [categoryFilter, setCategoryFilter] = useState('');
   const [showLowStock, setShowLowStock] = useState(false);
   const [showAutoDiscovered, setShowAutoDiscovered] = useState(false);
+  /** The list shows ACTIVE items; switched-off ones appear only when this is on. */
+  const [showInactive, setShowInactive] = useState(false);
 
   // Sorting
   const [sortKey, setSortKey] = useState<SortKey>('name');
@@ -328,6 +357,21 @@ export default function InventoryPage() {
   /** Raw text of the Reorder-Level "cases" box while it is being typed; null =
    *  show the figure derived from the packs box. */
   const [reorderCasesRaw, setReorderCasesRaw] = useState<string | null>(null);
+  /** is_active as stored when the edit form opened — is_active is sent only
+   *  when the admin moved it away from this. */
+  const [seededActive, setSeededActive] = useState<number>(1);
+  /** The switch-off warning over the edit form (ruling #78: warn with stock +
+   *  open documents BEFORE switching off). Holds the material being switched. */
+  const [offWarn, setOffWarn] = useState<{ id: string; name: string } | null>(null);
+  /** An admin's re-upload that would switch items OFF, held until the warning
+   *  (stock + open requisition / PO lines) has been seen and confirmed. */
+  const [reuploadOff, setReuploadOff] = useState<{
+    fileName: string; rows: Record<string, unknown>[]; deactivate: boolean;
+    /** existing items the file's is_active cell switches off */
+    byCell: string[];
+    /** Replace mode: active items not in the file */
+    notInFile: string[];
+  } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -357,6 +401,9 @@ export default function InventoryPage() {
       .catch(() => setMe(null));
   }, []);
   const canBulkPriority = !!me && (me.role === 'admin' || me.is_store_manager);
+  /** WHO may switch a raw material on/off: ADMIN ONLY (owner, 2026-10-28). Store
+   *  managers keep every other Bulk Edit field. The server enforces the same. */
+  const isAdmin = !!me && me.role === 'admin';
 
   // DIRECT-FLAGGED materials: material_id → destination department + its held
   // balance. Fetched from its own authenticated route — NOT from /api/inventory,
@@ -428,7 +475,12 @@ export default function InventoryPage() {
 
   /* ---- Filtering + Sorting ---- */
 
-  const filtered = useMemo(() => {
+  /** How many materials are switched off — the number on the toggle. */
+  const inactiveCount = useMemo(() => materials.filter((m) => isSwitchedOff(m)).length, [materials]);
+
+  /** Rows matching every filter EXCEPT the active/inactive one, so the empty
+   *  state can say "N switched-off items match — tick Show inactive". */
+  const [filtered, hiddenInactiveMatches] = useMemo(() => {
     let list = [...materials];
 
     if (searchQuery.trim()) {
@@ -439,10 +491,16 @@ export default function InventoryPage() {
       list = list.filter((m) => m.category === categoryFilter);
     }
     if (showLowStock) {
-      list = list.filter((m) => m.current_stock < m.reorder_level);
+      list = list.filter((m) => isLowItem(m));
     }
     if (showAutoDiscovered) {
       list = list.filter((m) => !!m.is_auto_discovered);
+    }
+    let hidden = 0;
+    if (!showInactive) {
+      const before = list.length;
+      list = list.filter((m) => !isSwitchedOff(m));
+      hidden = before - list.length;
     }
 
     list.sort((a, b) => {
@@ -453,15 +511,15 @@ export default function InventoryPage() {
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return list;
-  }, [materials, searchQuery, categoryFilter, showLowStock, showAutoDiscovered, sortKey, sortDir]);
+    return [list, hidden] as const;
+  }, [materials, searchQuery, categoryFilter, showLowStock, showAutoDiscovered, showInactive, sortKey, sortDir]);
 
   /* ---- Summary ---- */
 
   const summary = useMemo(() => {
     const totalItems = materials.length;
     const totalValue = materials.reduce((s, m) => s + (m.stock_value ?? 0), 0);
-    const lowStockItems = materials.filter((m) => m.current_stock < m.reorder_level).length;
+    const lowStockItems = materials.filter((m) => isLowItem(m)).length;
     const categories = new Set(materials.map((m) => m.category)).size;
     return { totalItems, totalValue, lowStockItems, categories };
   }, [materials]);
@@ -516,7 +574,7 @@ export default function InventoryPage() {
   /* ---- Low-stock items ---- */
 
   const lowStockMaterials = useMemo(
-    () => materials.filter((m) => m.current_stock < m.reorder_level),
+    () => materials.filter((m) => isLowItem(m)),
     [materials],
   );
 
@@ -540,6 +598,8 @@ export default function InventoryPage() {
       avgStored: 0, reorderStored: EMPTY_FORM.reorder_level,
     });
     setReorderCasesRaw(null);
+    setSeededActive(1);
+    setOffWarn(null);
     setFormError(null);
     setModalOpen(true);
   }
@@ -562,8 +622,12 @@ export default function InventoryPage() {
       reorderStored: Number(m.reorder_level) || 0,
     });
     setReorderCasesRaw(null);
+    const activeSeed = isSwitchedOff(m) ? 0 : 1;
+    setSeededActive(activeSeed);
+    setOffWarn(null);
     setFormData({
       id: m.id,
+      is_active: activeSeed,
       name: m.name,
       sku: (m as any).sku || '',
       category: m.category,
@@ -650,6 +714,14 @@ export default function InventoryPage() {
       }
       delete bodyToSend.avg_price_per_purchase_unit;
       delete bodyToSend.reorder_level_purchase_unit;
+      // ACTIVE ON/OFF — sent ONLY when an admin moved the switch on an existing
+      // material. Everyone else (and an untouched switch) sends no is_active at
+      // all, so the PUT leaves the stored flag exactly as it is; a store
+      // manager's save can never be refused over a field they did not touch.
+      const activeWanted = Number(formData.is_active) === 0 ? 0 : 1;
+      const sendActive = isEdit && isAdmin && activeWanted !== seededActive;
+      if (sendActive) bodyToSend.is_active = activeWanted;
+      else delete bodyToSend.is_active;
       // Use the api() helper so the X-CSRF-Token header is injected automatically.
       const res = await api('/api/inventory', {
         method: isEdit ? 'PUT' : 'POST',
@@ -658,6 +730,20 @@ export default function InventoryPage() {
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
         throw new Error(errBody.error || 'Request failed');
+      }
+      if (sendActive) {
+        // Read the switch back off the saved row — a 200 that did not move it
+        // must not close the form as if it had.
+        const saved = await res.json().catch(() => ({} as any));
+        if (!saved?.material) {
+          await fetchMaterials(true);
+          throw new Error('Saved, but the server did not send the item back, so the Active switch could not be confirmed — check the Status column in the list.');
+        }
+        const nowOff = isSwitchedOff(saved.material);
+        if (nowOff !== (activeWanted === 0)) {
+          await fetchMaterials(true);
+          throw new Error(`The other changes were saved, but the Active switch did not change — the item is still ${nowOff ? 'switched OFF' : 'ON'}.`);
+        }
       }
       setModalOpen(false);
       await fetchMaterials();
@@ -716,22 +802,42 @@ export default function InventoryPage() {
     e.target.value = ''; // reset so re-selecting same file fires onChange
     if (!file) return;
 
-    // Step 1 — confirmation dialog with the "Remove old inventory details" option
-    const deactivate = window.confirm(
-      `Re-upload ${file.name}?\n\n` +
-      `• Rows with an id will UPDATE existing materials.\n` +
-      `• Rows with no id will CREATE new materials.\n\n` +
-      `🟡 OK = Replace mode (deactivate any active material NOT in the file).\n` +
-      `⚪ Cancel = Merge mode (keep all existing materials, only apply file rows).\n\n` +
-      `(Deactivate = soft-delete only; purchase / recipe history is preserved.)`,
-    );
-    // Use a clearer 3-state prompt: yes / no / abort
-    // window.confirm only gives 2 options, so re-prompt for explicit abort.
-    if (!deactivate) {
+    // Step 1 — the mode. Replace mode ("Remove old inventory details") switches
+    // items OFF, and WHO may switch a raw material on or off is ADMIN ONLY
+    // (owner, 2026-10-28) — the route refuses it for anyone else — so only an
+    // admin is asked; everyone else gets Merge mode, as a plain yes / abort.
+    let deactivate = false;
+    if (isAdmin) {
+      deactivate = window.confirm(
+        `Re-upload ${file.name}?\n\n` +
+        `• Rows with an id will UPDATE existing materials.\n` +
+        `• Rows with no id will CREATE new materials.\n` +
+        `• An is_active column (1 = on, 0 = off) switches items on or off.\n` +
+        `  A file WITHOUT that column (an older export) switches every item in it back ON.\n` +
+        `• If the upload would switch any item OFF, you see each one's stock and open requisition / PO lines first, and can still cancel.\n\n` +
+        `🟡 OK = Replace mode (switch OFF any active material NOT in the file).\n` +
+        `⚪ Cancel = Merge mode (keep all existing materials, only apply file rows).\n\n` +
+        `(Switch off = shown as Inactive — soft-delete only; purchase / recipe history is preserved.)`,
+      );
+      // Use a clearer 3-state prompt: yes / no / abort
+      // window.confirm only gives 2 options, so re-prompt for explicit abort.
+      if (!deactivate) {
+        const proceed = window.confirm(
+          'Proceed in MERGE mode (nothing removed)?\n\n' +
+          'OK = upload edits, keep everything else.\n' +
+          'Cancel = abort the upload entirely.',
+        );
+        if (!proceed) return;
+      }
+    } else {
       const proceed = window.confirm(
-        'Proceed in MERGE mode (no deactivations)?\n\n' +
-        'OK = upload edits, keep everything else.\n' +
-        'Cancel = abort the upload entirely.',
+        `Re-upload ${file.name}?\n\n` +
+        `• Rows with an id will UPDATE existing materials.\n` +
+        `• Rows with no id will CREATE new materials.\n` +
+        `• Nothing is removed (Merge mode). Switching items on or off — the is_active column, or removing items ` +
+        `not in the file — is admin only: your upload leaves every item on or off as it is, and says how many rows it left.\n\n` +
+        `OK = upload edits.\n` +
+        `Cancel = abort the upload entirely.`,
       );
       if (!proceed) return;
     }
@@ -747,20 +853,47 @@ export default function InventoryPage() {
       const rows = (parsed.data as any[]).filter(r => r && (r.id || r.name));
       if (rows.length === 0) throw new Error('No rows with name (or id) found in CSV');
 
-      const res = await api('/api/inventory/round-trip-import', {
-        method: 'POST',
-        body: { rows, deactivateMissing: deactivate },
-      });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+      // Step 2 (admin) — warn BEFORE switching anything off (ruling 78). A dry
+      // run of the very same import (rolled back, nothing written) names every
+      // item this file would switch OFF: by an is_active cell of 0, or — Replace
+      // mode — by not being in the file. Those get the same stock / open-lines
+      // warning as the item form; the real upload waits for the admin's word.
+      // A non-admin's upload can switch nothing, so it needs no warning.
+      if (isAdmin) {
+        const dry = await api('/api/inventory/round-trip-import', {
+          method: 'POST',
+          body: { rows, deactivateMissing: deactivate, dryRun: true },
+        });
+        const dj = await dry.json().catch(() => ({}));
+        if (!dry.ok) throw new Error(dj.error || `HTTP ${dry.status}`);
+        const byCell: string[] = Array.isArray(dj.switched_off_ids) ? dj.switched_off_ids.map(String) : [];
+        const notInFile: string[] = Array.isArray(dj.deactivated_ids) ? dj.deactivated_ids.map(String) : [];
+        if (!dj.aborted && byCell.length + notInFile.length > 0) {
+          setReuploadOff({ fileName: file.name, rows, deactivate, byCell, notInFile });
+          return;   // the dialog runs the real upload, or cancels it
+        }
+      }
 
-      setImportResult({ message: '✓ ' + (j.summary || 'Done'), type: 'success' });
-      await fetchMaterials();
+      await runRoundTripUpload(rows, deactivate);
     } catch (err: any) {
       setImportResult({ message: 'Re-upload failed: ' + err.message, type: 'error' });
     } finally {
       setRoundtripImporting(false);
     }
+  }
+
+  /** The real re-upload — straight after the mode question, or once an admin
+   *  has seen the switch-off warning and confirmed it. */
+  async function runRoundTripUpload(rows: Record<string, unknown>[], deactivate: boolean) {
+    const res = await api('/api/inventory/round-trip-import', {
+      method: 'POST',
+      body: { rows, deactivateMissing: deactivate },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+
+    setImportResult({ message: '✓ ' + (j.summary || 'Done'), type: 'success' });
+    await fetchMaterials();
   }
 
   /* ---- CSV Import ---- */
@@ -879,7 +1012,7 @@ export default function InventoryPage() {
               <button
                 onClick={() => setShowBulkEdit(true)}
                 className="flex items-center gap-2 px-4 py-2.5 border border-violet-600 text-violet-700 hover:bg-violet-50 rounded-lg text-sm font-medium transition-colors"
-                title="Tick many items and set one field on all of them: Master GST %, Cess %, or the butchering source / output tags. Shows exactly which items change before anything is written."
+                title={`Tick many items and set one field on all of them: Master GST %, Cess %, the butchering source / output tags${isAdmin ? ', or Active (switch items on / off)' : ''}. Shows exactly which items change before anything is written.`}
               >
                 <ListChecks className="w-4 h-4" />
                 Bulk Edit Items
@@ -953,6 +1086,15 @@ export default function InventoryPage() {
               <Toggle checked={showAutoDiscovered} onChange={(v) => setShowAutoDiscovered(v)} label="Needs Review" />
               <span className="text-sm text-[#6B5744]">⚠ Needs Review</span>
             </label>
+
+            {/* The list shows ACTIVE items; switched-off ones (ruling #78) are one
+                tick away and say how many there are, so nothing is out of sight
+                without the screen saying so. */}
+            <label className="flex items-center gap-2 select-none whitespace-nowrap cursor-pointer"
+                   title={`A switched-off material is ${OFF_EFFECT}. Its stock, history and reports are unchanged.`}>
+              <Toggle checked={showInactive} onChange={(v) => setShowInactive(v)} label={`Show inactive (${inactiveCount})`} />
+              <span className="text-sm text-[#6B5744]">Show inactive ({inactiveCount})</span>
+            </label>
           </div>
         </div>
 
@@ -960,7 +1102,7 @@ export default function InventoryPage() {
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-4 gap-4">
           <SummaryCard
             icon={<Package className="w-5 h-5" />}
-            label="Total Items"
+            label={inactiveCount > 0 ? `Total Items (${inactiveCount} inactive)` : 'Total Items'}
             value={summary.totalItems.toString()}
             color="blue"
           />
@@ -1044,19 +1186,23 @@ export default function InventoryPage() {
                     <td colSpan={10} className="px-4 py-12 text-center text-[#8B7355]">
                       {materials.length === 0
                         ? 'No raw materials found. Add your first material to get started.'
-                        : 'No materials match the current filters.'}
+                        : hiddenInactiveMatches > 0
+                          ? <>No active materials match the current filters. {hiddenInactiveMatches} switched-off item{hiddenInactiveMatches === 1 ? '' : 's'} match{hiddenInactiveMatches === 1 ? 'es' : ''} —{' '}
+                              <button onClick={() => setShowInactive(true)} className="text-[#af4408] underline">show inactive</button>.</>
+                          : 'No materials match the current filters.'}
                     </td>
                   </tr>
                 ) : (
                   filtered.map((m) => {
-                    const isLow = m.current_stock < m.reorder_level;
+                    const isOff = isSwitchedOff(m);
+                    const isLow = isLowItem(m);
                     const catColor = CATEGORY_COLORS[m.category] ?? CATEGORY_COLORS.other;
 
                     return (
                       <tr
                         key={m.id}
                         className={`border-b border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 transition-colors ${
-                          isLow ? 'bg-red-500/5' : ''
+                          isOff ? 'bg-gray-100/70 text-gray-500' : isLow ? 'bg-red-500/5' : ''
                         }`}
                       >
                         <td className="px-4 py-3 text-[#2D1B0E] font-medium">
@@ -1320,7 +1466,15 @@ export default function InventoryPage() {
                           })()}
                         </td>
                         <td className="px-4 py-3 text-center">
-                          {isLow ? (
+                          {isOff ? (
+                            // Grey, not red: a switched-off item is not an alert. Its
+                            // stock still counts everywhere; it just is not offered
+                            // on new entries.
+                            <span title={`Switched off — ${OFF_EFFECT}. Stock, history and reports are unchanged. An admin can switch it back on.`}
+                                  className="inline-block px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-200 text-gray-600 border border-gray-300">
+                              Inactive
+                            </span>
+                          ) : isLow ? (
                             <span className="inline-block px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-500/15 text-red-400">
                               Low Stock
                             </span>
@@ -1494,6 +1648,57 @@ export default function InventoryPage() {
                   />
                 </div>
               </div>
+
+              {/* ACTIVE ON / OFF — ADMIN ONLY (owner #6, ruling 78; WHO = admin,
+                  owner 2026-10-28). Edit only: a new material starts on.
+                  Switching OFF opens the warning (stock + open requisition / PO
+                  lines) first; the change itself is written on Update Material.
+                  Switching back ON needs no warning. */}
+              {!!formData.id && isAdmin && (
+                <div className={`rounded-lg border px-3 py-2.5 ${Number(formData.is_active) === 0 ? 'bg-gray-50 border-gray-300' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-[#2D1B0E] flex items-center gap-1.5">
+                        <Power className="w-4 h-4 text-[#8B7355]" /> Active
+                        {Number(formData.is_active) === 0 && (
+                          <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-200 border border-gray-300 rounded px-1.5 py-px">Inactive</span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-[#8B7355] mt-0.5">
+                        {Number(formData.is_active) === 0
+                          ? `Switched off: ${OFF_EFFECT}. Stock, history and reports are unchanged.`
+                          : 'On: offered on every new entry.'}
+                      </p>
+                    </div>
+                    <Toggle
+                      checked={Number(formData.is_active) !== 0}
+                      label="Active"
+                      onChange={(next) => {
+                        if (next) { setFormData((f) => ({ ...f, is_active: 1 })); return; }
+                        // OFF: warn first. Only an item that is ON as stored needs
+                        // the warning; re-ticking OFF an item that was already off
+                        // (after toggling it on in this form) just puts it back.
+                        if (seededActive === 0) { setFormData((f) => ({ ...f, is_active: 0 })); return; }
+                        setOffWarn({ id: String(formData.id), name: formData.name });
+                      }}
+                    />
+                  </div>
+                  {Number(formData.is_active) !== seededActive && (
+                    <p className="text-[11px] font-medium text-[#af4408] mt-1.5">
+                      Will be switched {Number(formData.is_active) === 0 ? 'OFF' : 'back ON'} when you click Update Material.
+                    </p>
+                  )}
+                </div>
+              )}
+              {/* Everyone else: read-only, and only when it is off — so a store
+                  manager editing a switched-off item knows why it is missing from
+                  the pickers and who can change that. */}
+              {!!formData.id && !isAdmin && seededActive === 0 && (
+                <div className="rounded-lg border bg-gray-50 border-gray-300 px-3 py-2 text-[11px] text-gray-600">
+                  <b>Inactive</b> — switched off by an admin: {OFF_EFFECT}.
+                  Only an admin can switch it back on.
+                </div>
+              )}
 
               {/* Category */}
               <div>
@@ -1957,6 +2162,56 @@ export default function InventoryPage() {
         </div>
       )}
 
+      {/* Switch-off warning over the edit form — confirm sets the form's switch
+          OFF; the write happens on Update Material. */}
+      {offWarn && (
+        <SwitchOffDialog
+          ids={[offWarn.id]}
+          title={`Switch off ${offWarn.name}?`}
+          confirmLabel="Switch off"
+          onCancel={() => setOffWarn(null)}
+          onConfirm={() => { setFormData((f) => ({ ...f, is_active: 0 })); setOffWarn(null); }}
+        />
+      )}
+
+      {/* Re-upload switch-off warning (admin): nothing has been written yet —
+          confirm runs the upload, cancel leaves every item exactly as it is. */}
+      {reuploadOff && (() => {
+        const ids = [...new Set([...reuploadOff.byCell, ...reuploadOff.notInFile])];
+        const n = ids.length;
+        return (
+          <SwitchOffDialog
+            ids={ids}
+            title={`This upload switches off ${n} item${n === 1 ? '' : 's'}`}
+            confirmLabel={`Upload and switch off ${n}`}
+            cancelLabel="Cancel upload"
+            note={<>
+              <b>{reuploadOff.fileName}</b> has not been uploaded yet.{' '}
+              {reuploadOff.byCell.length > 0 && <>{reuploadOff.byCell.length} item{reuploadOff.byCell.length === 1 ? '' : 's'} by an is_active cell of 0. </>}
+              {reuploadOff.notInFile.length > 0 && <>{reuploadOff.notInFile.length} item{reuploadOff.notInFile.length === 1 ? ' is' : 's are'} not in the file (Replace mode — &quot;Remove old inventory details&quot;). </>}
+              Cancel uploads nothing.
+            </>}
+            onCancel={() => {
+              setReuploadOff(null);
+              setImportResult({ message: `Re-upload of ${reuploadOff.fileName} cancelled — nothing was changed.`, type: 'error' });
+            }}
+            onConfirm={async () => {
+              const pending = reuploadOff;
+              setReuploadOff(null);
+              setRoundtripImporting(true);
+              setImportResult(null);
+              try {
+                await runRoundTripUpload(pending.rows, pending.deactivate);
+              } catch (err: unknown) {
+                setImportResult({ message: 'Re-upload failed: ' + (err instanceof Error ? err.message : String(err)), type: 'error' });
+              } finally {
+                setRoundtripImporting(false);
+              }
+            }}
+          />
+        );
+      })()}
+
       {showRates && (
         <UpdateRatesModal onClose={() => setShowRates(false)} onApplied={() => fetchMaterials(true)} canAudit={canBulkPriority} />
       )}
@@ -1994,6 +2249,7 @@ export default function InventoryPage() {
              Nothing is ticked on open — selection is always his own clicks. */
           initialSearch={searchQuery}
           initialCategory={categoryFilter}
+          isAdmin={isAdmin}
           onClose={() => setShowBulkEdit(false)}
           onApplied={() => fetchMaterials(true)}
         />
@@ -3057,25 +3313,39 @@ const BULK_FIELDS = [
     hint: 'Tagged items are the ONLY ones offered in the "Source carcass" picker on Butchering — a whole carcass / bird you break down.' },
   { key: 'is_butchering_output', label: 'Butchering output',  kind: 'flag' as const,
     hint: 'Tagged items are the ONLY ones offered as cuts inside a carcass batch. This never means "only comes from butchering" — a tagged item can still be bought from a vendor, and only an actual batch counts towards yield.' },
+  { key: 'is_active',            label: 'Active',            kind: 'flag' as const,
+    hint: `Switch items ON or OFF. A switched-off item is ${OFF_EFFECT}; its stock, history and reports are unchanged, and it can be switched back on. Switching off shows each item's stock and open requisition / PO lines first. Admin only.` },
 ] as const;
 
 type BulkFieldKey = typeof BULK_FIELDS[number]['key'];
 
+/** Fields only an ADMIN may set (owner, 2026-10-28: who may switch a raw
+ *  material on/off = admin only). Hidden from everyone else; the route refuses
+ *  them too. Store managers keep every other field. */
+const ADMIN_ONLY_BULK_FIELDS: ReadonlySet<BulkFieldKey> = new Set<BulkFieldKey>(['is_active']);
+
 /** Current stored value of the chosen field on a material, as a number. */
 function bulkCurrent(m: RawMaterial, field: BulkFieldKey): number {
+  // is_active defaults ON (COALESCE(is_active, 1)), unlike the tag/percent
+  // columns, which default 0.
+  if (field === 'is_active') return isSwitchedOff(m) ? 0 : 1;
   return Number((m as any)[field] ?? 0) || 0;
 }
 
-function BulkFieldEditModal({ materials, categories, initialSearch, initialCategory, onClose, onApplied }: {
+function BulkFieldEditModal({ materials, categories, initialSearch, initialCategory, isAdmin = false, onClose, onApplied }: {
   materials: RawMaterial[];
   categories: string[];
   initialSearch: string;
   initialCategory: string;
+  /** Shows the admin-only fields (Active). Default false: never shown. */
+  isAdmin?: boolean;
   onClose: () => void;
   onApplied: () => void;
 }) {
+  const fields = BULK_FIELDS.filter(f => isAdmin || !ADMIN_ONLY_BULK_FIELDS.has(f.key));
   const [field, setField] = useState<BulkFieldKey>('tax_percent');
   const spec = BULK_FIELDS.find(f => f.key === field)!;
+  const isActiveField = field === 'is_active';
 
   // Percent value is held as the RAW input string for the same reason the edit
   // modal does it (see FormData.avg_price_per_purchase_unit): Number() on every
@@ -3109,16 +3379,22 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
     if (!Number.isFinite(n) || n < 0 || n > 100) return null;
     return Math.round(n * 100) / 100;
   })();
-  const valueLabel = spec.kind === 'flag'
-    ? (flagVal === 1 ? 'TAGGED' : 'not tagged')
-    : (valueNum == null ? '—' : `${valueNum}%`);
+  const valueLabel = isActiveField
+    ? (flagVal === 1 ? 'ON' : 'OFF')
+    : spec.kind === 'flag'
+      ? (flagVal === 1 ? 'TAGGED' : 'not tagged')
+      : (valueNum == null ? '—' : `${valueNum}%`);
+  /** A flag value as words, per field: on/off for Active, tagged/— for tags. */
+  const flagWord = (v: number) => isActiveField ? (Number(v) === 1 ? 'on' : 'off') : (Number(v) === 1 ? 'tagged' : '—');
 
   /* ---- rows visible under the panel's own filter ---- */
   const shown = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return materials.filter((m) => {
       if (onlyPicked && !picked.has(m.id)) return false;
-      if (onlySet && bulkCurrent(m, field) === 0) return false;
+      // For Active the useful narrowing is the other way round: "show me the
+      // switched-off ones" (to switch them back on).
+      if (onlySet && (isActiveField ? bulkCurrent(m, field) !== 0 : bulkCurrent(m, field) === 0)) return false;
       if (cat && m.category !== cat) return false;
       if (!needle) return true;
       // Name OR SKU — the list's own search box is name-only, which makes an
@@ -3126,6 +3402,7 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
       return m.name.toLowerCase().includes(needle)
         || String((m as any).sku || '').toLowerCase().includes(needle);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [materials, q, cat, onlyPicked, onlySet, picked, field]);
 
   const shownIds = useMemo(() => new Set(shown.map(m => m.id)), [shown]);
@@ -3135,6 +3412,18 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
   );
   const byId = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
   const shownPickedCount = shown.reduce((n, m) => n + (picked.has(m.id) ? 1 : 0), 0);
+
+  /* SWITCHING OFF WARNS FIRST (ruling #78): once the server dry-run has been
+     reviewed, the items that would actually go ON → OFF are checked for stock
+     and open requisition / PO lines, and Apply waits for that answer. */
+  const switchingOffIds = useMemo(
+    () => (isActiveField && flagVal === 0)
+      ? [...picked].filter(id => { const m = byId.get(id); return !!m && !isSwitchedOff(m); })
+      : [],
+    [isActiveField, flagVal, picked, byId],
+  );
+  const impact = useActiveImpact(switchingOffIds, stage === 'confirm' && switchingOffIds.length > 0);
+  const impactBlocks = stage === 'confirm' && switchingOffIds.length > 0 && !impact.ready;
 
   /** Any edit to the selection or the value invalidates a server preview — a
    *  confirmation that describes a different set than the one Apply would send
@@ -3212,6 +3501,9 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
 
   const renderCurrent = (m: RawMaterial) => {
     const v = bulkCurrent(m, field);
+    if (isActiveField) return v === 1
+      ? <span className="text-emerald-700 font-semibold">on</span>
+      : <span className="text-gray-600 font-semibold">off</span>;
     if (spec.kind === 'flag') return v === 1
       ? <span className="text-emerald-700 font-semibold">tagged</span>
       : <span className="text-[#B8A590]">—</span>;
@@ -3236,8 +3528,8 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
           {/* 1. field */}
           <div>
             <div className="text-xs font-medium text-[#6B5744] mb-1.5">1. Field to set</div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              {BULK_FIELDS.map(f => (
+            <div className={`grid grid-cols-2 gap-2 ${fields.length > 4 ? 'sm:grid-cols-5' : 'sm:grid-cols-4'}`}>
+              {fields.map(f => (
                 <button key={f.key} onClick={() => { setField(f.key); invalidate(); }} title={f.hint}
                         className={`px-2 py-2 rounded-lg border text-xs text-left ${field === f.key ? 'border-[#af4408] bg-[#af4408]/10 text-[#af4408] font-semibold' : 'border-[#D4B896] bg-[#FFF1E3] text-[#6B5744]'}`}>
                   {f.label}
@@ -3277,11 +3569,11 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
               <div className="flex gap-2">
                 <button onClick={() => { setFlagVal(1); invalidate(); }}
                         className={`px-3 py-1.5 rounded-lg border text-xs ${flagVal === 1 ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
-                  Tag as {spec.label.replace('Butchering ', 'butchering ')}
+                  {isActiveField ? 'Switch ON' : <>Tag as {spec.label.replace('Butchering ', 'butchering ')}</>}
                 </button>
                 <button onClick={() => { setFlagVal(0); invalidate(); }}
                         className={`px-3 py-1.5 rounded-lg border text-xs ${flagVal === 0 ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
-                  Remove the tag
+                  {isActiveField ? 'Switch OFF' : 'Remove the tag'}
                 </button>
               </div>
             )}
@@ -3315,9 +3607,9 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
                 Selected only
               </label>
               <label className="flex items-center gap-1.5 text-xs text-[#6B5744] whitespace-nowrap cursor-pointer"
-                     title={`Show only items that already have ${spec.label} set to a non-zero value`}>
+                     title={isActiveField ? 'Show only switched-off items' : `Show only items that already have ${spec.label} set to a non-zero value`}>
                 <input type="checkbox" checked={onlySet} onChange={e => setOnlySet(e.target.checked)} className="w-3.5 h-3.5 accent-[#af4408]" />
-                Already set
+                {isActiveField ? 'Inactive only' : 'Already set'}
               </label>
             </div>
 
@@ -3363,7 +3655,15 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
                                aria-label={`Select ${m.name}`} className="w-3.5 h-3.5 accent-[#af4408]" />
                       </td>
                       <td className="px-2 py-1.5">
-                        <div className="text-[#2D1B0E] font-medium">{m.name}</div>
+                        <div className="text-[#2D1B0E] font-medium">
+                          {m.name}
+                          {isSwitchedOff(m) && (
+                            <span title="Switched off in Raw Materials"
+                                  className="ml-1.5 text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                              Inactive
+                            </span>
+                          )}
+                        </div>
                         <div className="text-[9px] font-mono text-[#8B7355]">{(m as any).sku || ''}</div>
                       </td>
                       <td className="px-2 py-1.5 text-[#6B5744]">{categoryLabel(m.category)}</td>
@@ -3393,9 +3693,9 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
                     <div key={r.id} className="px-3 py-1 flex items-center justify-between gap-3">
                       <span className="text-[#2D1B0E] truncate">{byId.get(r.id)?.name || r.name}</span>
                       <span className="text-[#8B7355] whitespace-nowrap font-mono">
-                        {spec.kind === 'flag' ? (Number(r.from) === 1 ? 'tagged' : '—') : `${r.from}%`}
+                        {spec.kind === 'flag' ? flagWord(Number(r.from)) : `${r.from}%`}
                         {' → '}
-                        <b className="text-[#af4408]">{spec.kind === 'flag' ? (flagVal === 1 ? 'tagged' : '—') : `${valueNum}%`}</b>
+                        <b className="text-[#af4408]">{spec.kind === 'flag' ? flagWord(flagVal) : `${valueNum}%`}</b>
                       </span>
                     </div>
                   ))}
@@ -3407,6 +3707,14 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
               {preview.changed === 0 && (
                 <div className="px-3 py-2 text-xs text-[#6B5744]">
                   Every selected item already holds this value — applying would change nothing.
+                </div>
+              )}
+              {/* Switching OFF: what each item still holds and what is still open
+                  against it — shown BEFORE Apply is reachable (ruling #78). */}
+              {switchingOffIds.length > 0 && (
+                <div className="border-t border-[#E8D5C4] px-3 py-2.5 space-y-2 bg-white">
+                  <SwitchOffExplainer />
+                  <ActiveImpactPanel impact={impact} />
                 </div>
               )}
             </div>
@@ -3428,13 +3736,289 @@ function BulkFieldEditModal({ materials, categories, initialSearch, initialCateg
                       className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
                 Back
               </button>
-              <button onClick={apply} disabled={busy || !preview || preview.targeted === 0}
+              <button onClick={apply} disabled={busy || !preview || preview.targeted === 0 || impactBlocks}
+                      title={impactBlocks ? 'Waiting for the stock / open-document check above' : undefined}
                       className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
                 Set {spec.label} = {valueLabel} on {preview?.targeted ?? 0} item{(preview?.targeted ?? 0) === 1 ? '' : 's'}
               </button>
             </>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Switching a raw material OFF — the warning (owner #6, ruling 78) ─────
+// GET /api/inventory/active-impact?ids=a,b (ADMIN only, read-only) answers, per
+// material: its CENTRAL stock (purchase units first), stock held elsewhere
+// (labelled, never summed), and the requisition / PO lines still open against
+// it. Shown BEFORE an admin switches anything off — from the item form and from
+// Bulk Edit — and the switch waits for it. Purely informational: switching off
+// never touches those documents.
+
+interface ImpactReqLine {
+  req_item_id: string; requisition_id: string; req_number: string;
+  status: string; purpose?: string; date: string; department: string;
+  /** Still owed, in the LINE's own unit (line_unit). */
+  qty_open: number; line_unit: string;
+  /** The same in PURCHASE units; null when the line's unit cannot be resolved. */
+  qty_open_purchase_units: number | null;
+}
+interface ImpactPoLine {
+  po_item_id: string; po_id: string; po_number: string;
+  status: string; date: string; vendor: string;
+  /** PURCHASE units. */
+  quantity: number; purchase_unit: string;
+}
+interface ImpactElsewhere { kind: 'store' | 'department'; id: string; name: string; qty: number; stock_purchase_units: number; }
+interface ImpactItem {
+  id: string; name: string; is_active: number;
+  /** CENTRAL store holding, RECIPE units. */
+  current_stock: number; unit?: string;
+  purchase_unit: string;
+  /** current_stock in PURCHASE units — the figure that LEADS. */
+  stock_purchase_units: number;
+  open_requisition_lines: ImpactReqLine[];
+  open_po_lines: ImpactPoLine[];
+  /** True totals; the arrays above may be capped. Absent → the array length. */
+  open_requisition_count?: number;
+  open_po_count?: number;
+  /** Absent = the route did not report it; null = it could not be read. */
+  stock_elsewhere?: ImpactElsewhere[] | null;
+}
+interface ActiveImpactState {
+  loading: boolean; error: string | null; ready: boolean;
+  items: ImpactItem[]; notFound: string[];
+  retry: () => void;
+}
+
+/** Ids per GET — keeps the URL far below the server's header limit. */
+const IMPACT_CHUNK = 100;
+
+function useActiveImpact(ids: string[], enabled: boolean): ActiveImpactState {
+  const key = enabled && ids.length > 0 ? [...new Set(ids)].sort().join(',') : '';
+  const [nonce, setNonce] = useState(0);
+  const [st, setSt] = useState<{ key: string; loading: boolean; error: string | null; items: ImpactItem[]; notFound: string[] }>(
+    { key: '', loading: false, error: null, items: [], notFound: [] },
+  );
+  useEffect(() => {
+    if (!key) return;
+    let cancelled = false;
+    setSt({ key, loading: true, error: null, items: [], notFound: [] });
+    (async () => {
+      try {
+        const all = key.split(',');
+        const items: ImpactItem[] = [];
+        const notFound: string[] = [];
+        for (let i = 0; i < all.length; i += IMPACT_CHUNK) {
+          const chunk = all.slice(i, i + IMPACT_CHUNK);
+          const r = await fetch(`/api/inventory/active-impact?ids=${chunk.map(encodeURIComponent).join(',')}`);
+          const j = await r.json().catch(() => ({} as any));
+          if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+          if (!Array.isArray(j?.items)) throw new Error('Unexpected answer from the server');
+          items.push(...(j.items as ImpactItem[]));
+          if (Array.isArray(j?.not_found)) notFound.push(...j.not_found.map(String));
+        }
+        items.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        if (!cancelled) setSt({ key, loading: false, error: null, items, notFound });
+      } catch (e: any) {
+        if (!cancelled) setSt({ key, loading: false, error: e?.message || 'Could not load', items: [], notFound: [] });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [key, nonce]);
+  const current = st.key === key && !!key;
+  return {
+    loading: !!key && (!current || st.loading),
+    error: current ? st.error : null,
+    ready: current && !st.loading && !st.error,
+    items: current ? st.items : [],
+    notFound: current ? st.notFound : [],
+    retry: () => setNonce((n) => n + 1),
+  };
+}
+
+/** What switching off does and does not do — one wording for both entry points. */
+function SwitchOffExplainer() {
+  return (
+    <div className="text-[11px] text-[#6B5744] leading-relaxed">
+      A switched-off item is <b>not offered</b> when making new purchase orders, GRNs / vendor bills, requisitions or recipes.
+      It stays on the counting, wastage and transfer screens while the store or department concerned still holds stock of it.
+      Open documents keep their lines — nothing listed below is cancelled — and stock, history and reports are unchanged.
+      An admin can switch it back on at any time.
+      {/* "counting": every count list keeps a switched-off item while the place
+          it counts holds a non-zero balance of it (src/lib/count-list-active.ts —
+          closing-stock overview, by-location + locations, dept_items, the
+          Department Closing Sheet and its template, the Central Store Cutover
+          sheet). The Store / Overall "Record Closing Stock" sheet lists it
+          whatever its stock, as it always did — so "stays … while" is true there
+          too. */}
+      <span className="block text-[10px] text-[#8B7355] mt-0.5">The Liquor Store screens do not apply this yet.</span>
+    </div>
+  );
+}
+
+const statusWord = (s: string) => String(s || '').replace(/_/g, ' ');
+/** Purchase figure first; the recipe figure follows only when the units differ. */
+function ImpactStock({ it }: { it: ImpactItem }) {
+  const pu = it.purchase_unit || it.unit || '';
+  const showRecipe = !!it.unit && it.unit.trim().toLowerCase() !== pu.trim().toLowerCase();
+  return (
+    <span className="font-mono">
+      {fmtQtyNum(Number(it.stock_purchase_units) || 0)} {pu}
+      {showRecipe && <span className="text-[10px] text-[#B8A590]"> (= {fmtQtyNum(Number(it.current_stock) || 0)} {it.unit})</span>}
+    </span>
+  );
+}
+
+function ActiveImpactPanel({ impact }: { impact: ActiveImpactState }) {
+  if (impact.loading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-[#8B7355]">
+        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking stock and open requisition / PO lines…
+      </div>
+    );
+  }
+  if (impact.error) {
+    return (
+      <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-xs text-red-700 flex items-start justify-between gap-2">
+        <span>Could not check stock and open documents: {impact.error}. Nothing can be switched off until this check has run.</span>
+        <button type="button" onClick={impact.retry} className="shrink-0 inline-flex items-center gap-1 text-[#af4408] hover:underline">
+          <RefreshCw className="w-3 h-3" /> Retry
+        </button>
+      </div>
+    );
+  }
+  if (!impact.ready) return null;
+
+  const reqCount = (it: ImpactItem) => Number(it.open_requisition_count ?? it.open_requisition_lines?.length ?? 0) || 0;
+  const poCount = (it: ImpactItem) => Number(it.open_po_count ?? it.open_po_lines?.length ?? 0) || 0;
+  const elsewhere = (it: ImpactItem) => (Array.isArray(it.stock_elsewhere) ? it.stock_elsewhere : []).filter(l => Number(l.qty) !== 0);
+  const holds = (it: ImpactItem) => Math.abs(Number(it.current_stock) || 0) > 1e-9 || elsewhere(it).length > 0;
+  const flagged = impact.items.filter(it => holds(it) || reqCount(it) > 0 || poCount(it) > 0 || it.stock_elsewhere === null);
+  const clean = impact.items.filter(it => !flagged.includes(it));
+  const nStock = impact.items.filter(holds).length;
+  const nReq = impact.items.filter(it => reqCount(it) > 0).length;
+  const nPo = impact.items.filter(it => poCount(it) > 0).length;
+
+  return (
+    <div className="space-y-2">
+      {impact.items.length > 1 && (
+        <div className="text-xs text-[#2D1B0E]">
+          <b>{impact.items.length}</b> items to switch off: <b>{nStock}</b> still hold{nStock === 1 ? 's' : ''} stock · <b>{nReq}</b> {nReq === 1 ? 'has' : 'have'} open requisition lines · <b>{nPo}</b> {nPo === 1 ? 'has' : 'have'} open PO lines.
+        </div>
+      )}
+      <div className="max-h-64 overflow-y-auto space-y-1.5">
+        {flagged.map(it => {
+          const rc = reqCount(it), pc = poCount(it);
+          const els = elsewhere(it);
+          return (
+            <div key={it.id} className="border border-amber-200 bg-amber-50/60 rounded-lg px-2.5 py-2 text-[11px] text-[#3D2614]">
+              <div className="font-semibold text-[#2D1B0E]">{it.name}</div>
+              <div>Central stock: <ImpactStock it={it} /></div>
+              {els.length > 0 && (
+                <div title="Each figure is held by that store / department — not part of central and never added to it.">
+                  Also held: {els.map((l, i) => (
+                    <span key={`${l.kind}-${l.id}`}>{i > 0 ? ' · ' : ''}{l.name} <span className="font-mono">{fmtQtyNum(Number(l.stock_purchase_units) || 0)} {it.purchase_unit}</span></span>
+                  ))}
+                </div>
+              )}
+              {it.stock_elsewhere === null && (
+                <div className="text-[10px] text-[#8B7355] italic">Stock held outside central could not be read.</div>
+              )}
+              {rc > 0 && (
+                <div className="mt-1">
+                  <div className="font-medium">Open requisition lines ({rc}):</div>
+                  {it.open_requisition_lines.slice(0, 5).map(l => (
+                    <div key={l.req_item_id} className="pl-2 text-[#6B5744]">
+                      {l.req_number || 'Requisition'}{l.department ? ` · ${l.department}` : ''} · {statusWord(l.status)}{l.purpose === 'party' ? ' · party' : ''} —{' '}
+                      {l.qty_open_purchase_units != null
+                        ? <span className="font-mono">{fmtQtyNum(Number(l.qty_open_purchase_units) || 0)} {it.purchase_unit} not yet issued</span>
+                        /* The line's unit does not convert to the purchase unit
+                           (lib/issue-stock.ts lineFactor needsReview: a blank or
+                           unrecognised unit on a packed material). Any figure here
+                           would be a guess at its basis, so none is printed — the
+                           rule the other screens already keep for such a line
+                           (department-transfers ToSendPanel figures_known=false
+                           prints none; reports/issue-log says "unit needs review"). */
+                        : <span className="text-amber-900">open amount not shown in {it.purchase_unit}: {l.line_unit ? <>the line&apos;s unit &ldquo;{l.line_unit}&rdquo; does not convert to it</> : <>the line has no unit</>} (unit needs review)</span>}
+                    </div>
+                  ))}
+                  {rc > Math.min(5, it.open_requisition_lines.length) && (
+                    <div className="pl-2 text-[#8B7355]">…and {rc - Math.min(5, it.open_requisition_lines.length)} more</div>
+                  )}
+                </div>
+              )}
+              {pc > 0 && (
+                <div className="mt-1">
+                  <div className="font-medium">Open PO lines ({pc}):</div>
+                  {it.open_po_lines.slice(0, 5).map(l => (
+                    <div key={l.po_item_id} className="pl-2 text-[#6B5744]">
+                      {l.po_number || 'PO'}{l.vendor ? ` · ${l.vendor}` : ''} · {statusWord(l.status)} —{' '}
+                      <span className="font-mono">{fmtQtyNum(Number(l.quantity) || 0)} {l.purchase_unit || it.purchase_unit} on order</span>
+                    </div>
+                  ))}
+                  {pc > Math.min(5, it.open_po_lines.length) && (
+                    <div className="pl-2 text-[#8B7355]">…and {pc - Math.min(5, it.open_po_lines.length)} more</div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {clean.length > 0 && (
+          <div className="text-[11px] text-[#6B5744] px-1">
+            No stock and nothing open: {clean.slice(0, 10).map(it => it.name).join(', ')}{clean.length > 10 ? ` +${clean.length - 10} more` : ''}.
+          </div>
+        )}
+        {impact.notFound.length > 0 && (
+          <div className="text-[10px] text-[#8B7355] px-1">{impact.notFound.length} selected id(s) are not raw materials.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** The switch-off confirm (item form, and a re-upload that would switch items
+ *  off): shows the impact, then hands back. */
+function SwitchOffDialog({ ids, title, confirmLabel, cancelLabel = 'Keep it on', note, onCancel, onConfirm }: {
+  ids: string[];
+  title: string;
+  confirmLabel: string;
+  cancelLabel?: string;
+  /** Optional line above the impact — e.g. WHY a re-upload switches these off. */
+  note?: React.ReactNode;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const impact = useActiveImpact(ids, true);
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/50 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onCancel}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Power className="w-5 h-5 text-gray-600" /> {title}
+          </div>
+          <button type="button" onClick={onCancel} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3">
+          {note && <div className="text-xs text-[#2D1B0E]">{note}</div>}
+          <SwitchOffExplainer />
+          <ActiveImpactPanel impact={impact} />
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          <button type="button" onClick={onCancel}
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm">
+            {cancelLabel}
+          </button>
+          <button type="button" onClick={onConfirm} disabled={!impact.ready}
+                  title={!impact.ready ? 'Waiting for the stock / open-document check' : undefined}
+                  className="px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+            <Power className="w-4 h-4" /> {confirmLabel}
+          </button>
         </div>
       </div>
     </div>

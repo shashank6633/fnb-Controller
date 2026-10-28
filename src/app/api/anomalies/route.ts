@@ -209,11 +209,16 @@ export async function GET() {
       });
     }
 
-    // 5. Materials below reorder level (any)
+    // 5. Materials below reorder level (any ACTIVE one). A switched-off
+    // material (is_active = 0, owner #6 / ruling 78) is not reordered, so it is
+    // not an anomaly to act on — the same filter Smart Reorder applies; NULL
+    // reads as on. Detectors 1 and 3 (price spikes, count variances) report
+    // things that HAPPENED and keep every material.
     const lowStock = db.prepare(`
       SELECT id, name, current_stock, reorder_level, unit
       FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1
       ORDER BY (reorder_level - current_stock) DESC
       LIMIT 5
     `).all() as any[];

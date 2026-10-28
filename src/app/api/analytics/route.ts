@@ -29,9 +29,14 @@ export async function GET(request: Request) {
       ? Math.round((totals.gross_profit / totals.total_revenue) * 10000) / 100
       : 0;
 
-    // Low stock count
+    // Low stock count. Switched-off materials (is_active = 0, owner #6 / ruling
+    // 78) are not reordered, so they are not "low" — the same filter Smart
+    // Reorder applies. NULL reads as on. The purchase / consumption figures
+    // further down are history and keep every material.
     const lowStockResult = db.prepare(`
-      SELECT COUNT(*) as count FROM raw_materials WHERE reorder_level > 0 AND current_stock < reorder_level
+      SELECT COUNT(*) as count FROM raw_materials
+      WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1
     `).get() as any;
 
     // Active recipes count
@@ -206,6 +211,7 @@ export async function GET(request: Request) {
         ROUND(reorder_level - current_stock, 2) as deficit
       FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1   -- switched-off: not reordered (see low stock count)
       ORDER BY (reorder_level - current_stock) DESC
     `).all();
 

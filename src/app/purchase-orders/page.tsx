@@ -42,6 +42,9 @@ import {
 // never add a runtime import to it.
 import { vendorIdentityKey, normalizeVendorName } from '@/lib/vendor-mapping';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
+// The ONE "is this raw material switched off?" rule every picker shares
+// (Raw Materials → Active, owner ruling #78). Pure functions on a row.
+import { offeredInPicker, isSwitchedOff, notOfferedNote } from '@/components/MaterialTypeahead';
 import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 // TYPE-ONLY: the change-set a pending_reapproval row carries (computed server-
 // side by the list API from the po.edit audit trail). @/lib/po-diff has NO
@@ -138,7 +141,10 @@ const RATE_EPS = 0.005;   // ₹ — half a paisa
  */
 const GST_RATES = ['0', '5', '12', '18', '28'] as const;
 
-interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
+interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number;
+  /** raw_materials.is_active (GET /api/inventory selects rm.*). 0 = switched off:
+   *  not offered by SimpleMaterialPicker for a NEW line; null/absent = on. */
+  is_active?: number | null; }
 
 /* ── PO UNIT BASIS ────────────────────────────────────────────────────────────
  * A Purchase Order is raised to a VENDOR, so it must be expressed in the
@@ -4938,19 +4944,34 @@ function SimpleMaterialPicker({
   // Portal the dropdown to <body> (fixed position) so the PO modal's overflow
   // can't clip it — the same clipping that hid this list inside the modal.
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  // The CURRENT value is resolved from the full lists, switched off or not — a
+  // line that already holds an item never loses it (ruling #78 filters the
+  // offer, never a line's value).
   const sel = materials.find(m => m.id === value) || unmapped.find(m => m.id === value);
   const matches = (m: Material, norm: string) =>
     !norm || m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm);
+  // Every mount of this picker raises a NEW line (composer, draft editor's added
+  // line, approved-PO "add item"), so a switched-off material is not offered.
   const list = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return materials.filter(m => matches(m, norm)).slice(0, 1000);
+    return materials.filter(m => offeredInPicker(m, 'hide') && matches(m, norm)).slice(0, 1000);
   }, [q, materials]);
   /* The greyed half — same search box, so a buyer who types an item name always
      finds it, mapped or not, instead of concluding it does not exist. */
   const offMatches = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return unmapped.filter(m => matches(m, norm));
+    return unmapped.filter(m => offeredInPicker(m, 'hide') && matches(m, norm));
   }, [q, unmapped]);
+  /* Switched-off items the search WOULD have matched — named, never silently
+     dropped, so nobody concludes the item is missing and creates a second one. */
+  const switchedOff = useMemo(() => {
+    const norm = q.toLowerCase().trim();
+    return [...materials, ...unmapped]
+      .filter(m => !offeredInPicker(m, 'hide') && matches(m, norm))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [q, materials, unmapped]);
+  const switchedOffNames = switchedOff.slice(0, 3).map(m => m.name).join(', ')
+    + (switchedOff.length > 3 ? ` +${switchedOff.length - 3} more` : '');
   const offList = useMemo(() => offMatches.slice(0, 200), [offMatches]);
   const computePos = () => {
     const el = ref.current;
@@ -4979,7 +5000,13 @@ function SimpleMaterialPicker({
     <div ref={ref} className="relative">
       <button type="button" disabled={disabled} onClick={() => { setOpen(!open); setQ(''); }}
               className="w-full text-left px-2 py-1 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0] disabled:opacity-60 disabled:cursor-not-allowed">
-        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}</>)
+        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}
+                  {isSwitchedOff(sel) && (
+                    <span title="Switched off in Raw Materials — not offered for new lines"
+                          className="ml-1 text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                      Inactive
+                    </span>
+                  )}</>)
              : <span className="text-[#8B7355]">{disabled ? 'Loading…' : 'Select…'}</span>}
       </button>
       {scopeNote && <div className="text-[9px] text-[#B8A590] mt-0.5">{scopeNote}</div>}
@@ -4995,8 +5022,18 @@ function SimpleMaterialPicker({
           <div className="space-y-0.5">
             {list.length === 0 && (
               <div className="px-2 py-1 text-[11px] text-[#8B7355]">
-                {q.trim() ? <>No mapped item matches &quot;{q}&quot;.</> : <>No materials loaded yet — refresh if this stays empty.</>}
+                {q.trim() ? <>No mapped item matches &quot;{q}&quot;.</>
+                  : switchedOff.length > 0 ? <>No active mapped item to pick.</>
+                  : <>No materials loaded yet — refresh if this stays empty.</>}
                 {unmapped.length > 0 && offList.length > 0 && <> Unmapped matches are listed below.</>}
+              </div>
+            )}
+            {switchedOff.length > 0 && (
+              <div className="px-2 py-0.5 text-[10px] text-gray-500"
+                   title="Switched off in Raw Materials. An admin can switch an item back on there.">
+                {q.trim()
+                  ? <>Switched off in Raw Materials (not offered here): <b className="text-[#6B5744]">{switchedOffNames}</b></>
+                  : <>{notOfferedNote(switchedOff.length, 'hide')}</>}
               </div>
             )}
             {list.map(m => {

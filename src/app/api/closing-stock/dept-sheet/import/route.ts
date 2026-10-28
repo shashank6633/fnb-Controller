@@ -9,6 +9,7 @@ import { rateMap, valueCount, valueSemiCount } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import { CLOSING_DATE_RE, checkClosingDate } from '@/lib/closing-date';
+import { switchedOffStillHeld } from '@/lib/count-list-active';
 
 /**
  * ALL-DEPARTMENTS CLOSING COUNT — ONE FILE, ONE COLUMN PER DEPARTMENT
@@ -362,6 +363,13 @@ export async function GET(request: Request) {
       return Response.json({ error: NO_SCOPE }, { status: 403 });
     }
     const deptIdsJson = JSON.stringify(depts.map(d => d.id));
+    // SWITCHED-OFF ITEMS (owner #6 / ruling 78): a switched-off material keeps
+    // its row while ANY department on this file still holds a non-zero balance
+    // of it on its books — the on-screen sheet's own rule (../route.ts), one row
+    // per item here — and drops off at zero. Every column is a DEPARTMENT, so
+    // central stock is not asked. src/lib/count-list-active.ts. Nothing switched
+    // off → '[]' → the template is exactly what it was.
+    const heldJson = JSON.stringify(switchedOffStillHeld(db, { deptIds: depts.map(d => d.id) }));
 
     // ONE row per item — the union of the included departments' item sets (the
     // house definition: ever issued to, UNION ever counted by). Store-mapped
@@ -408,9 +416,10 @@ export async function GET(request: Request) {
        WHERE ${NOT_STORE_MAPPED}
          AND (COALESCE(rm.is_active,1) = 1
               OR EXISTS (SELECT 1 FROM closing_stock cs2
-                          WHERE cs2.material_id = rm.id AND cs2.date = ?))
+                          WHERE cs2.material_id = rm.id AND cs2.date = ?)
+              OR rm.id IN (SELECT value FROM json_each(?)))
        ORDER BY sort_cat, name
-    `).all(...(wholeCatalogue ? [date] : [deptIdsJson, deptIdsJson, date])) as
+    `).all(...(wholeCatalogue ? [date, heldJson] : [deptIdsJson, deptIdsJson, date, heldJson])) as
       (Pick<MatRow, 'id' | 'name' | 'purchase_unit'> & { sku: string; category: string })[];
 
     // Sub-recipes have no department item set (they are cooked and held

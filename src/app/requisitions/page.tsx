@@ -1962,6 +1962,9 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                               // Every sibling mount (purchases, grn, wastage, transfers)
                               // passes it; /api/inventory carries purchase_unit + pack_size.
                               purchaseBasis
+                              // A switched-off material (ruling #78) is not offered on a
+                              // new line; a draft line already holding one keeps it.
+                              inactive="hide"
                               excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
                               onPick={(id) => { const m = materials.find(x => x.id === id); update(i, { material_id: id, unit: (m?.purchase_unit || m?.unit || '') }); }}
                             />

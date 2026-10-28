@@ -153,12 +153,21 @@ export async function GET(request: Request) {
              COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size,
              rm.current_stock, rm.average_price, rm.reorder_level,
              rm.storage_location, rm.closing_cadence, rm.shelf_life_days`;
+      /* SWITCHED-OFF ITEMS (owner #6 / ruling 78, src/lib/count-list-active.ts):
+         a switched-off material stays on this department's count list — and
+         in the search below — while the department's books (a MAIN one with
+         its subs) still hold a non-zero balance of it, and drops off at zero.
+         Nothing switched off → the first arm is true for every row → both
+         lists are exactly what they were. */
+      const { switchedOffStillHeld } = await import('@/lib/count-list-active');
+      const ACTIVE_OR_HELD = `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?)))`;
+      const heldJson = JSON.stringify(switchedOffStillHeld(db, { deptIds: deptSet }));
       const rows = deptSet.length === 0 ? [] : db.prepare(`
         SELECT ${COLS}
         FROM raw_materials rm
-        WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL}
+        WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL} AND ${ACTIVE_OR_HELD}
         ORDER BY rm.category, rm.name
-      `).all(...deptRequestedParams(deptSet)) as any[];
+      `).all(...deptRequestedParams(deptSet), heldJson) as any[];
 
       /* THE ESCAPE HATCH (requirement 3). The first time a department holds
          something new the list cannot know about it yet, and a counter who
@@ -177,9 +186,10 @@ export async function GET(request: Request) {
           WHERE ${NOT_STORE_MAPPED_SQL}
             AND NOT (${DEPT_REQUESTED_ITEM_SQL})
             AND (rm.name LIKE ? OR COALESCE(rm.sku,'') LIKE ?)
+            AND ${ACTIVE_OR_HELD}
           ORDER BY rm.name
           LIMIT 50
-        `).all(...deptRequestedParams(deptSet), like, like) as any[];
+        `).all(...deptRequestedParams(deptSet), like, like, heldJson) as any[];
       }
       const blind = (r: any) => (isAdmin ? r : { ...r, current_stock: null });
       return Response.json({

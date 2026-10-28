@@ -30,7 +30,7 @@ import {
 // bundle. Never add an import to line-dedupe.ts.
 import { duplicateLineGroups, SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
 import { todayIST, fmtIST } from '@/lib/format-date';
-import MaterialTypeahead from '@/components/MaterialTypeahead';
+import MaterialTypeahead, { isSwitchedOff } from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
 // The house on/off switch. Used for "Paid in cash from petty cash" rather than a
 // bare <input type="checkbox"> so the option reads as the deliberate, stateful
@@ -3048,11 +3048,13 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     );
   }, [filteredMaterials, vendorMaterialIds, vendorShort]);
 
-  /** The vendor's mapped items, alphabetical — the "show these first" list. */
+  /** The vendor's mapped items, alphabetical — the "show these first" list.
+   *  A switched-off material (Raw Materials → Active, ruling #78) is not
+   *  offered for a new bill — same rule as the line picker's inactive="hide". */
   const vendorMappedMaterials = useMemo(() => {
     if (!vendorMaterialIds || vendorMaterialIds.size === 0) return [] as any[];
     return materials
-      .filter((m: any) => vendorMaterialIds.has(String(m.id)))
+      .filter((m: any) => vendorMaterialIds.has(String(m.id)) && !isSwitchedOff(m))
       .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
   }, [vendorMaterialIds, materials]);
 
@@ -4777,6 +4779,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                             missing master row. */}
                         <MaterialTypeahead
                           materials={pickerMaterials as any} purchaseBasis
+                          inactive="hide"
                           value={it.material_id}
                           onPick={(id) => { setMapNote(null); pickMaterial(i, id); }}
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}

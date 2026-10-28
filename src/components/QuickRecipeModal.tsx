@@ -429,6 +429,9 @@ export default function QuickRecipeModal({
               <div className="mb-3">
                 <MaterialTypeahead
                   materials={materials}
+                  // Same rule the suggestion chips already apply
+                  // (recipe-suggest.ts): a switched-off material is not offered.
+                  inactive="hide"
                   value=""
                   onPick={(id) => { addMaterial(id); }}
                   excludeIds={[...chosen]}

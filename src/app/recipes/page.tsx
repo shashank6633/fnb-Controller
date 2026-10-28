@@ -54,6 +54,10 @@ import {
   servedRate, hasBasis, rateSourceLabel, rateTitle, buildRateIndex,
   type ServedRateFields, type ValuedRate,
 } from './sub-recipe-rate';
+// The ONE "is this raw material switched off?" rule every picker shares (Raw
+// Materials → Active, owner ruling #78): a recipe picker is a NEW entry, so a
+// switched-off material is not offered — a line already holding one keeps it.
+import { offeredInPicker, isSwitchedOff, notOfferedNote } from '@/components/MaterialTypeahead';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -5380,6 +5384,17 @@ function DirectItemsPanel({
   const [addMatId, setAddMatId] = useState('');
   const [addMatText, setAddMatText] = useState('');
   const [adding, setAdding] = useState(false);
+  /** What "Add Direct Item" offers: switched-off materials are left out (a new
+   *  link is a new entry, ruling #78). Existing links keep resolving from the
+   *  full `materials` list everywhere else in this panel. */
+  const addOffered = useMemo(() => materials.filter(m => offeredInPicker(m, 'hide')), [materials]);
+  /** The typed text is exactly a switched-off material's name — named on screen
+   *  instead of the bare "pick a material from the list". */
+  const addTypedOff = useMemo(() => {
+    const t = addMatText.trim().toLowerCase();
+    if (!t) return null;
+    return materials.find(m => !offeredInPicker(m, 'hide') && m.name.trim().toLowerCase() === t) || null;
+  }, [materials, addMatText]);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -5548,17 +5563,21 @@ function DirectItemsPanel({
           </label>
           <label className="text-xs text-[#6B5744] flex flex-col gap-1">
             Raw material
+            {/* A new direct item is a NEW entry (ruling #78): the list it picks
+                from — and the typed-name match that fills addMatId — use the
+                OFFERED materials only, so typing a switched-off item's exact
+                name leaves Save disabled and says why. */}
             <input list="di-mat-list" value={addMatText}
                    onChange={e => {
                      const v = e.target.value;
                      setAddMatText(v);
-                     const m = materials.find(x => x.name.toLowerCase() === v.toLowerCase());
+                     const m = addOffered.find(x => x.name.toLowerCase() === v.toLowerCase());
                      setAddMatId(m?.id || '');
                    }}
                    placeholder="type to search materials..."
                    className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm w-64" />
             <datalist id="di-mat-list">
-              {materials.map(m => <option key={m.id} value={m.name} />)}
+              {addOffered.map(m => <option key={m.id} value={m.name} />)}
             </datalist>
           </label>
           <button onClick={addDirectItem} disabled={adding || !addName.trim() || !addMatId}
@@ -5567,7 +5586,11 @@ function DirectItemsPanel({
           </button>
           <button onClick={() => { setShowAdd(false); setAddName(''); setAddMatId(''); setAddMatText(''); }}
                   className="text-sm text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg">Cancel</button>
-          {addMatText && !addMatId && <span className="text-[11px] text-amber-700 self-center">pick a material from the list</span>}
+          {addMatText && !addMatId && (addTypedOff
+            ? <span className="text-[11px] text-amber-800 self-center">
+                <b>{addTypedOff.name}</b> is switched off in Raw Materials — not offered for a new direct item. Pick another material, or ask an admin to switch it back on.
+              </span>
+            : <span className="text-[11px] text-amber-700 self-center">pick a material from the list</span>)}
         </div>
       )}
 
@@ -5724,6 +5747,15 @@ function DirectItemCell({
   // Determine the primary pill: what the user is currently linked to OR the suggestion
   const primaryMat = linkedMat ?? (item.matched ? { id: item.matched.material_id, name: item.matched.material_name } : null);
   const primaryIsSuggestion = primaryMat && item.matched && primaryMat.id === item.matched.material_id;
+  // What a pill click would link to — and whether that is a NEW link to a
+  // material switched off in Raw Materials (ruling #78: not offered for new
+  // entries). Re-saving the link the item already has is not new, so it passes.
+  const linkTarget = primaryMat ? (item.matched?.material_id || primaryMat.id) : '';
+  const targetOff = !!linkTarget && linkTarget !== linkedId
+    && isSwitchedOff(materials.find(m => m.id === linkTarget));
+  const suggestionOffered = !!item.matched
+    && (item.matched.material_id === linkedId
+        || !isSwitchedOff(materials.find(m => m.id === item.matched!.material_id)));
 
   if (!primaryMat) {
     // No suggestion and not linked — show manual link + dismiss options
@@ -5754,7 +5786,8 @@ function DirectItemCell({
             className="text-[10px] bg-white border border-[#E8D5C4] rounded px-1 py-0.5 max-w-[240px]"
           >
             <option value="">— Pick a raw material —</option>
-            {materials.map(m => (
+            {/* A new link is a new entry: switched-off materials are not offered. */}
+            {materials.filter(m => offeredInPicker(m, 'hide')).map(m => (
               <option key={m.id} value={m.id}>{m.name}</option>
             ))}
           </select>
@@ -5768,10 +5801,11 @@ function DirectItemCell({
       {/* ONE big pill — click to link.  When linked, it's green and click does nothing (use unlink). */}
       <button
         type="button"
-        onClick={() => { if (!linkedId || !primaryIsSuggestion) onLink(item.matched?.material_id || primaryMat.id); }}
-        disabled={isSaving || isFinalized}
+        onClick={() => { if (targetOff) return; if (!linkedId || !primaryIsSuggestion) onLink(item.matched?.material_id || primaryMat.id); }}
+        disabled={isSaving || isFinalized || targetOff}
         title={
           isFinalized ? 'Already linked — click unlink below to dismiss' :
+          targetOff ? 'The suggested material is switched off in Raw Materials — not offered for a new link. Use "change" to pick another, or ask an admin to switch it back on.' :
           linkedMat ? 'Click to re-link to the suggested material' :
           'Click to link this sold item to this raw material'
         }
@@ -5787,6 +5821,12 @@ function DirectItemCell({
           isFinalized ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> :
           <Link2 className="w-3.5 h-3.5 shrink-0" />}
         <span className="truncate">{primaryMat.name}</span>
+        {isSwitchedOff(materials.find(m => m.id === primaryMat.id)) && (
+          <span title="Switched off in Raw Materials"
+                className="text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px shrink-0">
+            Inactive
+          </span>
+        )}
       </button>
 
       {/* Meta + action row */}
@@ -5814,7 +5854,9 @@ function DirectItemCell({
           </button>
         ) : (
           <>
-            <span className="text-[#8B7355] italic">Click pill to link</span>
+            {targetOff
+              ? <span className="text-amber-800 italic">Suggestion switched off — use change to pick another</span>
+              : <span className="text-[#8B7355] italic">Click pill to link</span>}
             <span className="text-[#E8D5C4]">·</span>
             <button onClick={onUnlink} disabled={isSaving}
                     className="text-rose-600 hover:text-rose-700 underline disabled:opacity-40"
@@ -5843,12 +5885,18 @@ function DirectItemCell({
           className="text-[10px] bg-white border border-[#E8D5C4] rounded px-1 py-0.5 max-w-[240px]"
         >
           <option value="">— Pick a different raw material —</option>
-          {item.matched && (
+          {/* The suggestion is offered only while it is switched on (or is
+              already this item's link) — same rule as the list below. */}
+          {item.matched && suggestionOffered && (
             <option value={item.matched.material_id}>✓ Suggested: {item.matched.material_name}</option>
           )}
           <optgroup label="All materials">
-            {materials.filter(m => !item.matched || m.id !== item.matched.material_id).map(m => (
-              <option key={m.id} value={m.id}>{m.name}</option>
+            {/* Switched-off materials are not offered for a new link; the one
+                this item is linked to now always stays, so the select never
+                blanks its own value. */}
+            {materials.filter(m => (!item.matched || m.id !== item.matched.material_id)
+                                   && (offeredInPicker(m, 'hide') || m.id === linkedId)).map(m => (
+              <option key={m.id} value={m.id}>{m.name}{isSwitchedOff(m) ? ' (inactive)' : ''}</option>
             ))}
           </optgroup>
         </select>
@@ -5923,7 +5971,7 @@ function MaterialPicker({
 }: {
   value: string;
   materials: Array<{ id: string; name: string; unit: string; average_price: number; sku?: string; category?: string;
-                     purchase_unit?: string; pack_size?: number }>;
+                     purchase_unit?: string; pack_size?: number; is_active?: number | null }>;
   onChange: (id: string) => void;
   /** Sub-recipe rows: list the PURCHASE unit and ₹/purchase-unit, not ₹/g. */
   purchaseBasis?: boolean;
@@ -5969,21 +6017,33 @@ function MaterialPicker({
     };
   }, [open]);
 
+  /** What this picker OFFERS: switched-off materials are left out (a recipe
+   *  line is a new entry). `selected` above still resolves from the full list. */
+  const offered = useMemo(() => materials.filter(m => offeredInPicker(m, 'hide')), [materials]);
+  const tokenHit = (m: { name: string; sku?: string }, raw: string) => {
+    if (!raw) return true;
+    const hay = [
+      m.name, m.sku, (m as any).category, (m as any).unit,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return raw.split(/\s+/).filter(Boolean).every(t => hay.includes(t));
+  };
+  /** Switched-off materials the search would have matched — named in the panel
+   *  so "No matches" is never said about an item that exists but is off. */
+  const offMatches = useMemo(() => {
+    const raw = query.toLowerCase().trim();
+    return materials.filter(m => !offeredInPicker(m, 'hide') && tokenHit(m, raw))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [materials, query]);
   const filtered = useMemo(() => {
-    let list = materials;
+    let list = offered;
     if (onlyPurchased) list = list.filter(m => m.average_price > 0);
     const raw = query.toLowerCase().trim();
     if (raw) {
       // Tokenized substring match — same rules as MaterialTypeahead. Every
       // token (whitespace-separated) must appear somewhere in name/sku/
       // category/unit. Order-independent, so "oil 1l" matches "Sunflower Oil 1L".
-      const tokens = raw.split(/\s+/).filter(Boolean);
-      list = list.filter(m => {
-        const hay = [
-          m.name, m.sku, (m as any).category, (m as any).unit,
-        ].filter(Boolean).join(' ').toLowerCase();
-        return tokens.every(t => hay.includes(t));
-      });
+      list = list.filter(m => tokenHit(m, raw));
     }
     // Sort: bucket by relevance, then alphabetic.
     list = [...list].sort((a, b) => {
@@ -6004,7 +6064,8 @@ function MaterialPicker({
       return an.localeCompare(bn);
     });
     return list;  // no cap — the panel scrolls, search narrows
-  }, [materials, query, onlyPurchased]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offered, query, onlyPurchased]);
 
   return (
     <div className="relative">
@@ -6019,6 +6080,12 @@ function MaterialPicker({
             <>
               <span className="text-[10px] font-mono text-[#8B7355] mr-1">{selected.sku || ''}</span>
               {selected.name}
+              {isSwitchedOff(selected) && (
+                <span title="Switched off in Raw Materials — not offered for new recipe lines"
+                      className="ml-1 text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                  Inactive
+                </span>
+              )}
             </>
           ) : (
             <span className="text-[#8B7355]">Select…</span>
@@ -6049,11 +6116,20 @@ function MaterialPicker({
               Show only materials with purchase history (price &gt; ₹0)
             </label>
             <div className="text-[10px] text-[#8B7355] px-1 mb-1">
-              {filtered.length} of {materials.length} materials
+              {filtered.length} of {offered.length} materials
+              {offMatches.length > 0 && (
+                <span className="text-gray-500" title="Switched off in Raw Materials. An admin can switch an item back on there.">
+                  {' · '}{query.trim()
+                    ? <>switched off, not offered: <b className="text-[#6B5744]">{offMatches.slice(0, 3).map(m => m.name).join(', ')}{offMatches.length > 3 ? ` +${offMatches.length - 3} more` : ''}</b></>
+                    : notOfferedNote(offMatches.length, 'hide')}
+                </span>
+              )}
             </div>
             <div className="space-y-0.5">
               {filtered.length === 0 ? (
-                <div className="text-xs text-[#8B7355] text-center py-4">No matches</div>
+                <div className="text-xs text-[#8B7355] text-center py-4">
+                  {offMatches.length > 0 && query.trim() ? 'No active material matches' : 'No matches'}
+                </div>
               ) : filtered.map(m => {
                 // Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
                 // ₹0.18/g reads as a rounding error), and the closing-valuation

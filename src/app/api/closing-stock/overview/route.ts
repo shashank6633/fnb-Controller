@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { canSeeAllDeptStock, resolveDeptSet } from '@/lib/dept-stock';
 import { todayIST } from '@/lib/format-date';
+import { allDeptIds, switchedOffStillHeld } from '@/lib/count-list-active';
 
 /**
  * CENTRAL closing-stock overview — Grocery Store / Chiller / Kitchen / … × department.
@@ -111,11 +112,17 @@ export async function GET(request: Request) {
 
     // (b) the countable universe per location. Spans active AND inactive
     // materials so counts on a since-deactivated item still register as counted,
-    // but the denominator (total_items) tallies active ones only.
+    // but the denominator (total_items) tallies the items still to be counted:
+    // switched-on ones, plus a switched-OFF one while central or any department
+    // still holds a non-zero balance of it (owner #6 / ruling 78 — the same set
+    // the drill-down's uncounted list keeps; see src/lib/count-list-active.ts).
+    // Nothing switched off → '[]' → exactly the old active-only tally.
+    const heldAnywhere = JSON.stringify(switchedOffStillHeld(db, { central: true, deptIds: allDeptIds(db) }));
     const universeRows = db.prepare(`
       SELECT
         COALESCE(NULLIF(TRIM(rm.storage_location), ''), '${UNASSIGNED}') AS location,
-        COUNT(DISTINCT CASE WHEN rm.is_active = 1 THEN rm.id END)        AS total_items,
+        COUNT(DISTINCT CASE WHEN rm.is_active = 1
+                              OR rm.id IN (SELECT value FROM json_each(?)) THEN rm.id END) AS total_items,
         COUNT(DISTINCT CASE WHEN cs.id IS NOT NULL THEN rm.id END)       AS counted_items
       FROM raw_materials rm
       LEFT JOIN closing_stock cs
@@ -125,7 +132,7 @@ export async function GET(request: Request) {
       WHERE ${NOT_STORE_MAPPED}
       GROUP BY location
       ORDER BY location
-    `).all(date, outletId) as any[];
+    `).all(heldAnywhere, date, outletId) as any[];
 
     const knownKeys = new Set<string>([STORE_KEY, ...mainDepts.map(d => d.id)]);
     const usedKeys = new Set<string>();
@@ -298,12 +305,25 @@ function itemsMode(
     // with a department selected this is that department's still-to-do list, not
     // "nobody has touched it".
     const uw = deptWhere('cs2');
+    // A switched-OFF item stays on the still-to-count list while the place being
+    // counted holds a non-zero balance of it, and drops off at zero (owner #6 /
+    // ruling 78; src/lib/count-list-active.ts): Store/Overall → central stock; a
+    // department → that department's books (a MAIN one with its subs); no
+    // department filter → central or any department. Nothing switched off →
+    // '[]' → exactly the old switched-on-only list.
+    const heldHere = JSON.stringify(
+      deptId == null || deptId === ''
+        ? switchedOffStillHeld(db, { central: true, deptIds: allDeptIds(db) })
+        : deptId === STORE_KEY
+          ? switchedOffStillHeld(db, { central: true })
+          : switchedOffStillHeld(db, { deptIds: deptSet }),
+    );
     const pending = db.prepare(`
       SELECT rm.id AS material_id, rm.name, rm.sku, rm.category, rm.unit, rm.average_price,
              COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
              COALESCE(rm.pack_size, 1) AS pack_size
       FROM raw_materials rm
-      WHERE rm.is_active = 1
+      WHERE (rm.is_active = 1 OR rm.id IN (SELECT value FROM json_each(?)))
         AND ${locSql}
         AND ${NOT_STORE_MAPPED}
         AND NOT EXISTS (
@@ -313,7 +333,7 @@ function itemsMode(
             AND ${uw.sql}
         )
       ORDER BY rm.category, rm.name
-    `).all(...locParams, date, outletId, ...uw.params) as any[];
+    `).all(heldHere, ...locParams, date, outletId, ...uw.params) as any[];
     for (const r of pending) {
       items.push({
         material_id: r.material_id,

@@ -38,6 +38,9 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Loader2, Lock, Minus, Plus, Search, Send, ShoppingCart, X } from 'lucide-react';
 import { api } from '@/lib/api';
 import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+// The ONE "is this raw material switched off?" rule every picker shares (Raw
+// Materials → Active, owner ruling #78). A requisition is a NEW entry.
+import { offeredInPicker, isSwitchedOff } from '@/components/MaterialTypeahead';
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -46,6 +49,9 @@ interface Material {
   reorder_level?: number;
   purchase_unit?: string; pack_size?: number;
   category?: string;
+  /** raw_materials.is_active (GET /api/inventory selects rm.*). 0 = switched
+   *  off: not offered in the catalog for a new line; null/absent = on. */
+  is_active?: number | null;
 }
 interface Department { id: string; name: string; code?: string; }
 /** Minimal /api/department-stock row — what the "With dept" line needs. */
@@ -300,27 +306,47 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
     return map;
   }, [materials, editDraft]);
 
+  /** What the catalog OFFERS: a switched-off material is left out — unless it
+   *  is already in the cart (a draft line holding it), because the rule filters
+   *  what can be ADDED, never a line's current value. */
+  const offered = useMemo(
+    () => materials.filter(m => offeredInPicker(m, 'hide') || (cart[m.id] || 0) > 0),
+    [materials, cart],
+  );
+
   const categories = useMemo(() => {
     const set = new Set<string>();
-    for (const m of materials) if (m.category) set.add(m.category);
+    for (const m of offered) if (m.category) set.add(m.category);
     return ['All', ...Array.from(set).sort((a, b) => a.localeCompare(b))];
-  }, [materials]);
+  }, [offered]);
+
+  const matchesSearch = (m: Material, q: string) => !q
+    // Brand + category alongside name and SKU: "Search Bar should support
+    // Brand Name, SKU, and Material Code". SKU is the material code here
+    // (MAT-00885). brand is unpopulated on all 928 materials today, so it
+    // matches nothing until it is filled in — wired, not yet useful.
+    || m.name.toLowerCase().includes(q)
+    || (m.sku || '').toLowerCase().includes(q)
+    || ((m as any).brand || '').toLowerCase().includes(q)
+    || ((m as any).category || '').toLowerCase().includes(q);
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return materials.filter(m => {
+    return offered.filter(m => {
       if (category !== 'All' && (m.category || '') !== category) return false;
-      if (!q) return true;
-      // Brand + category alongside name and SKU: "Search Bar should support
-      // Brand Name, SKU, and Material Code". SKU is the material code here
-      // (MAT-00885). brand is unpopulated on all 928 materials today, so it
-      // matches nothing until it is filled in — wired, not yet useful.
-      return m.name.toLowerCase().includes(q)
-        || (m.sku || '').toLowerCase().includes(q)
-        || ((m as any).brand || '').toLowerCase().includes(q)
-        || ((m as any).category || '').toLowerCase().includes(q);
+      return matchesSearch(m, q);
     });
-  }, [materials, category, search]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offered, category, search]);
+
+  /** Switched-off items a SEARCH would have matched — named when nothing else
+   *  matches, so a missing item is never mistaken for a missing catalog entry. */
+  const offMatches = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return [] as Material[];
+    return materials.filter(m => !offeredInPicker(m, 'hide') && (cart[m.id] || 0) <= 0 && matchesSearch(m, q));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [materials, cart, search]);
 
   const unitOf = (m: Material) => unitById[m.id] || pu(m);
 
@@ -608,6 +634,11 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
           ) : visible.length === 0 ? (
             <div className="p-8 text-center text-sm text-[#8B7355]">
               No items match{search ? ` “${search}”` : ''}{category !== 'All' ? ` in ${category}` : ''}.
+              {offMatches.length > 0 && (
+                <div className="mt-2 text-xs text-gray-500">
+                  Switched off in Raw Materials (not offered): <b className="text-[#6B5744]">{offMatches.slice(0, 3).map(m => m.name).join(', ')}{offMatches.length > 3 ? ` +${offMatches.length - 3} more` : ''}</b>
+                </div>
+              )}
             </div>
           ) : visible.map(m => {
             const qty = cart[m.id] || 0;
@@ -618,7 +649,17 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
             return (
               <div key={m.id} className="bg-white rounded-lg border border-[#E8D5C4] p-3 flex items-center gap-2">
                 <div className="flex-1 min-w-0">
-                  <div className="text-[13px] font-bold text-[#2D1B0E] uppercase leading-snug break-words">{m.name}</div>
+                  <div className="text-[13px] font-bold text-[#2D1B0E] uppercase leading-snug break-words">
+                    {m.name}
+                    {/* Only reachable for an item already in the cart (a draft
+                        line): say why it will not be offered again once removed. */}
+                    {isSwitchedOff(m) && (
+                      <span title="Switched off in Raw Materials — kept here only because it is already in the cart"
+                            className="ml-1.5 align-middle text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                        Inactive
+                      </span>
+                    )}
+                  </div>
                   {dr && !dr.never_counted && dr.on_hand_est > 0 ? (
                     <div className="text-[11px] text-emerald-600 font-medium mt-0.5">
                       With dept : {inPUq(dr.on_hand_est)} / {pu(m)}

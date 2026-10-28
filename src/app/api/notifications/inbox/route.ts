@@ -338,11 +338,15 @@ export async function GET() {
     // CRITICAL (3★ priority) materials ONLY — with 1000+ materials the bell
     // must mean "act today". 2★/1★ tiers stay visible on /store-dashboard
     // and /crm/reorder, just not counted here.
+    // A SWITCHED-OFF material (is_active = 0, owner #6 / ruling 78) is not
+    // bought any more, so it never asks to be — the same filter Smart Reorder
+    // applies (crm-analyst-data.ts activeMaterials). NULL reads as on.
     if (isAdmin || me.is_head_chef || me.is_store_manager) {
       const n = one(
         `SELECT COUNT(*) AS n FROM raw_materials
          WHERE reorder_level > 0 AND current_stock <= reorder_level
-           AND COALESCE(priority, 2) = 3`,
+           AND COALESCE(priority, 2) = 3
+           AND COALESCE(is_active, 1) = 1`,
         [],
       );
       push('reorder', 'Critical items below reorder level', n, '/crm/reorder');

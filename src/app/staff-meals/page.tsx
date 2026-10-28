@@ -3,6 +3,9 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { packFactor, purchasePrice as ratePerPurchaseUnit, type PackMeta } from '@/lib/pack-units';
+// The ONE "is this raw material switched off?" rule every picker shares (Raw
+// Materials → Active, owner ruling #78).
+import { offeredInPicker, isSwitchedOff, type InactivePickerMode } from '@/components/MaterialTypeahead';
 import {
   Utensils,
   Plus,
@@ -21,6 +24,14 @@ import {
   Link2Off,
   Calendar,
 } from 'lucide-react';
+
+/** What a NEW staff-meal issue offers of a material switched off in Raw
+ *  Materials (ruling #78). ONE setting for BOTH ways in: the "Select from
+ *  inventory" list and the typed "Or enter name" (which the server resolves to
+ *  the same material by exact name, and deducts). 'hide' = never offered. If the
+ *  owner rules a staff-meal issue is consumption like wastage, set this to
+ *  'with-stock' and both paths follow (current_stock = central, /api/inventory). */
+const STAFF_MEAL_PICKER: InactivePickerMode = 'hide';
 
 /* ────────────────────────────────────────────────────────────────────────────
  * THE DIMENSIONAL INVARIANT THIS PAGE MUST NEVER BREAK
@@ -399,6 +410,19 @@ export default function StaffMealsPage() {
     return materials.find(m => m.name.toLowerCase().trim() === typed) || null;
   }, [materials]);
 
+  /**
+   * A row whose TYPED name (nothing picked) is a material this screen does not
+   * offer — switched off in Raw Materials (ruling #78). The select hides it, but
+   * the server resolves the same exact name to that material and deducts it, so
+   * the typed path must obey the same rule: the row says so, its rate is not
+   * auto-filled, and Issue refuses the batch before anything is sent.
+   */
+  const typedOffMaterial = useCallback((row: IssueRowRef | null | undefined): RawMaterial | null => {
+    if (row?.material_id) return null;
+    const mat = materialForRow(row);
+    return mat && !offeredInPicker(mat, STAFF_MEAL_PICKER) ? mat : null;
+  }, [materialForRow]);
+
   const updateRow = (idx: number, field: string, value: any) => {
     setNewRows(prev => {
       const copy = [...prev];
@@ -426,7 +450,9 @@ export default function StaffMealsPage() {
         // Free-text that lands on a real material: adopt its declared basis so
         // the row stops being a kg quantity with an unset (→ recipe) rate.
         const mat = materialForRow(copy[idx]);
-        if (mat && !copy[idx].material_id) {
+        // A switched-off material is not offered here (typedOffMaterial): do not
+        // adopt its rate as if the row were accepted — Issue will refuse it.
+        if (mat && !copy[idx].material_id && offeredInPicker(mat, STAFF_MEAL_PICKER)) {
           const unit = unitOptionsFor(mat)[0] || mat.unit;
           copy[idx].unit = unit;
           copy[idx].purchase_price = rateForUnit(mat, unit);
@@ -459,6 +485,24 @@ export default function StaffMealsPage() {
       // which only recognises the material's OWN two unit strings — anything else
       // is treated as factor 1 and silently mis-books. Refuse the whole batch
       // rather than post part of it: this route runs one transaction per batch.
+      // SWITCHED-OFF GUARD (ruling #78), same whole-batch refusal as the unit
+      // guard below: a typed name that is a switched-off material would be
+      // resolved and deducted by the server, so nothing is sent.
+      const offErrors: string[] = [];
+      for (let i = 0; i < usable.length; i++) {
+        const off = typedOffMaterial(usable[i]);
+        if (off) {
+          offErrors.push(
+            `Row ${i + 1}: ${off.name} is switched off in Raw Materials — not offered for a new staff-meal issue. ` +
+            `Pick another material, or ask an admin to switch it back on. Nothing was issued.`,
+          );
+        }
+      }
+      if (offErrors.length > 0) {
+        setIssueResult({ success: 0, errors: offErrors });
+        return;
+      }
+
       const unitErrors: string[] = [];
       for (let i = 0; i < usable.length; i++) {
         const mat = materialForRow(usable[i]);
@@ -926,6 +970,7 @@ export default function StaffMealsPage() {
                       // Everything below reads ONE resolved material, so the unit
                       // list, the rate and the previewed value cannot disagree.
                       const mat = materialForRow(row);
+                      const typedOff = typedOffMaterial(row);
                       const options = unitOptionsFor(mat);
                       const rowQty = parseFloat(row.quantity);
                       const rowRate = parseFloat(row.purchase_price);
@@ -945,12 +990,20 @@ export default function StaffMealsPage() {
                                 The old label printed the recipe unit beside a bare
                                 average_price ("ALMOND (g) — ₹1.0468"), which reads
                                 like a kilo price for a gram rate. */}
-                            {materials.map(m => {
+                            {/* A new issue is a new entry: a material switched off in
+                                Raw Materials (ruling #78) is not offered — except the
+                                one this row already holds, so the select never blanks. */}
+                            {materials.filter(m => offeredInPicker(m, STAFF_MEAL_PICKER) || m.id === row.material_id).map(m => {
                               const u = unitOptionsFor(m)[0] || m.unit;
-                              return <option key={m.id} value={m.id}>{m.name} — {formatRate(rateForUnit(m, u), u)}</option>;
+                              return <option key={m.id} value={m.id}>{m.name}{isSwitchedOff(m) ? ' (inactive)' : ''} — {formatRate(rateForUnit(m, u), u)}</option>;
                             })}
                           </select>
                           <input type="text" value={row.item_name} onChange={e => updateRow(idx, 'item_name', e.target.value)} placeholder="Or enter name" className="w-full mt-1 px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
+                          {typedOff && (
+                            <div className="mt-0.5 text-[10px] text-amber-800">
+                              <b>{typedOff.name}</b> is switched off in Raw Materials — not offered for a new issue. Pick another material, or ask an admin to switch it back on.
+                            </div>
+                          )}
                         </td>
                         <td className="py-2 px-2">
                           <input type="number" step="0.01" min="0" value={row.quantity} onChange={e => updateRow(idx, 'quantity', e.target.value)} placeholder="0" className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right font-mono focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
