@@ -2,6 +2,11 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { canSeeAllDeptStock, resolveDeptSet } from '@/lib/dept-stock';
 import { todayIST } from '@/lib/format-date';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
+import {
+  addClosingTaxTotals, closingTaxCells, createClosingGstResolver, storedCountValue, sumClosingTax,
+  type ClosingTaxTotals,
+} from '@/lib/closing-tax';
 
 /**
  * CENTRAL closing-stock overview — Grocery Store / Chiller / Kitchen / … × department.
@@ -19,6 +24,25 @@ import { todayIST } from '@/lib/format-date';
  *   ?department_id=<id>         items mode. '__store__' = the NULL/'' bucket; a MAIN
  *                               department id expands to itself + its sub-departments.
  *   ?include_uncounted=1        items mode — append this location's not-yet-counted materials.
+ *
+ * ESTIMATED GST (owner #4, rulings #77/#78/#81 — src/lib/closing-tax.ts).
+ * Every board cell, row total and the grand totals carry `closing_tax`
+ * ({ tax, total_incl_tax, value_taxed, rated, taxed, items }); every counted
+ * drill-down item carries value_at_count / gst_pct / gst_source / gst_note /
+ * gst_title / tax / total_incl_tax.
+ * The rate is resolved at the board's COUNT DATE, and the tax is applied to
+ * the value SAVED WITH EACH COUNT (closing_stock.total_value, read through
+ * closing-tax.ts storedCountValue) — the same figure, and so the same tax, the
+ * Closing Stock History and Closing History & Compare show for that count.
+ * It is NOT applied to this board's own physical_value (physical_stock ×
+ * TODAY's average_price — the existing formula, untouched): that figure moves
+ * when a later bill moves the average price, and the brief forbids a later
+ * bill re-pricing an older count. So `value_taxed` (Σ value at count of the
+ * taxed rows) and `value_at_count` are shipped beside the tax, and the page
+ * prints them, so "value at count + GST = Total incl. GST" foots on screen.
+ * Only rows with a rate AND a value at count are summed. Same visibility as
+ * physical_value (everyone past the gate); the stored total_value is cost
+ * data GET /api/closing-stock already ships to every caller.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -43,6 +67,13 @@ const OUTLET_SCOPE = (alias: string) => `(${alias}.outlet_id = ? OR COALESCE(${a
 /** ₹ to paise. Null passes through so blind-count nulls survive the rounding. */
 const paise = (n: number | null | undefined): number | null =>
   n == null ? null : Math.round(n * 100) / 100;
+
+/** The liquor lock for the GST resolver — the store-issued-log precedent. */
+const gstResolverFor = (db: ReturnType<typeof getDb>, materialIds: string[]) =>
+  createClosingGstResolver(db, {
+    isStoreMapped: (category) => isStoreMappedMaterial(db, category),
+    materialIds,
+  });
 
 export async function GET(request: Request) {
   try {
@@ -109,6 +140,30 @@ export async function GET(request: Request) {
       GROUP BY location, dept_key
     `).all(date, outletId) as any[];
 
+    // (a') the same counts, ONE ROW PER COUNT, for the estimated GST. Same
+    // filters as (a). Each row's GST basis is the value SAVED with the count
+    // (storedCountValue) — exactly what the drill-down prints as "Value at
+    // count" — so a cell's tax is the sum of the taxes its item list prints.
+    const taxRows = db.prepare(`
+      SELECT
+        COALESCE(NULLIF(TRIM(rm.storage_location), ''), '${UNASSIGNED}') AS location,
+        CASE WHEN d.id IS NULL THEN '${STORE_KEY}'
+             ELSE COALESCE(NULLIF(TRIM(d.parent_id), ''), d.id) END      AS dept_key,
+        cs.material_id                                   AS material_id,
+        cs.rate_per_purchase_unit                        AS rate_per_purchase_unit,
+        cs.rate_source                                   AS rate_source,
+        cs.total_value                                   AS total_value
+      FROM closing_stock cs
+      JOIN raw_materials rm ON rm.id = cs.material_id
+      LEFT JOIN departments d ON d.id = cs.department_id
+      WHERE cs.date = ?
+        AND ${OUTLET_SCOPE('cs')}
+        AND ${NOT_STORE_MAPPED}
+    `).all(date, outletId) as {
+      location: string; dept_key: string; material_id: string;
+      rate_per_purchase_unit: number | null; rate_source: string | null; total_value: number | null;
+    }[];
+
     // (b) the countable universe per location. Spans active AND inactive
     // materials so counts on a since-deactivated item still register as counted,
     // but the denominator (total_items) tallies active ones only.
@@ -129,6 +184,20 @@ export async function GET(request: Request) {
 
     const knownKeys = new Set<string>([STORE_KEY, ...mainDepts.map(d => d.id)]);
     const usedKeys = new Set<string>();
+
+    // Estimated GST per (location, department) cell, folded exactly like (a).
+    const gst = taxRows.length ? gstResolverFor(db, taxRows.map(r => String(r.material_id))) : null;
+    const taxCellRows = new Map<string, { gst_pct: number | null; tax: number | null; total_incl_tax: number | null }[]>();
+    for (const r of taxRows) {
+      const key = knownKeys.has(r.dept_key) ? r.dept_key : STORE_KEY;
+      const g = gst!.forMaterial(String(r.material_id), date);
+      const cellKey = `${r.location}\u0000${key}`;
+      let list = taxCellRows.get(cellKey);
+      if (!list) { list = []; taxCellRows.set(cellKey, list); }
+      list.push({ gst_pct: g.gst_pct, ...closingTaxCells(storedCountValue(r), g) });
+    }
+    const taxFor = (location: string, key: string): ClosingTaxTotals =>
+      sumClosingTax(taxCellRows.get(`${location}\u0000${key}`) || []);
 
     interface Cell {
       counted: number; physical_value: number;
@@ -171,8 +240,11 @@ export async function GET(request: Request) {
       const cells = byLocation.get(location);
       const by_dept: Record<string, any> = {};
       const tot = { counted: 0, physical_value: 0, system_value: 0, variance_value: 0 };
+      const rowTax: ClosingTaxTotals[] = [];
       if (cells) {
         for (const [key, c] of cells) {
+          const cellTax = taxFor(location, key);
+          rowTax.push(cellTax);
           tot.counted += c.counted;
           tot.physical_value += c.physical_value;
           tot.system_value += c.system_value;
@@ -184,6 +256,9 @@ export async function GET(request: Request) {
             variance_value: isAdmin ? paise(c.variance_value) : null,
             shortage: isAdmin ? c.shortage : null,
             excess: isAdmin ? c.excess : null,
+            // On each count's value at count (value_taxed says how much);
+            // shown to the same readers as physical_value.
+            closing_tax: cellTax,
           };
         }
       }
@@ -199,6 +274,7 @@ export async function GET(request: Request) {
           physical_value: paise(tot.physical_value),
           system_value: isAdmin ? paise(tot.system_value) : null,
           variance_value: isAdmin ? paise(tot.variance_value) : null,
+          closing_tax: addClosingTaxTotals(rowTax),
         },
       };
     }).filter(r => r.total_items > 0 || r.total.counted > 0);
@@ -209,6 +285,7 @@ export async function GET(request: Request) {
       counted: rows.reduce((s, r) => s + r.counted_items, 0),
       physical_value: paise(rows.reduce((s, r) => s + (r.total.physical_value || 0), 0)),
       variance_value: isAdmin ? paise(rows.reduce((s, r) => s + (r.total.variance_value || 0), 0)) : null,
+      closing_tax: addClosingTaxTotals(rows.map(r => r.total.closing_tax)),
     };
 
     return Response.json({ date, departments, rows, totals, generated_at: new Date().toISOString() });
@@ -251,6 +328,7 @@ function itemsMode(
   const counted = db.prepare(`
     SELECT cs.material_id, cs.department_id,
            cs.physical_stock, cs.system_stock, cs.variance, cs.variance_value,
+           cs.rate_per_purchase_unit, cs.rate_source, cs.total_value,
            cs.notes, cs.recorded_by,
            cs.created_at AS last_counted_at, cs.date AS last_counted_date,
            rm.name, rm.sku, rm.category, rm.unit, rm.average_price,
@@ -268,30 +346,48 @@ function itemsMode(
     ORDER BY rm.category, rm.name
   `).all(date, outletId, ...locParams, ...dw.params) as any[];
 
-  const items: any[] = counted.map(r => ({
-    material_id: r.material_id,
-    name: r.name,
-    sku: r.sku || '',
-    category: r.category || '',
-    unit: r.unit || '',
-    purchase_unit: r.purchase_unit || '',
-    pack_size: Number(r.pack_size) || 1,
-    average_price: r.average_price,
-    department_id: r.department_id || '',
-    department_name: r.department_name || STORE_NAME,
-    counted: true,
-    physical_stock: r.physical_stock,
-    // physical_stock is in RECIPE units and average_price is ₹/RECIPE unit —
-    // multiply straight through, do NOT divide by pack_size.
-    value: paise(r.physical_stock * r.average_price),
-    system_stock: isAdmin ? r.system_stock : null,
-    variance: isAdmin ? r.variance : null,
-    variance_value: isAdmin ? paise(r.variance_value) : null,
-    notes: r.notes || '',
-    recorded_by: r.recorded_by || '',
-    last_counted_at: r.last_counted_at,
-    last_counted_date: r.last_counted_date,
-  }));
+  // Estimated GST for each COUNTED row, at this board's count date, on the
+  // value SAVED with the count (value_at_count) — not on `value` below, which
+  // is today's average price × qty and moves when a later bill lands.
+  const gst = counted.length ? gstResolverFor(db, counted.map(r => String(r.material_id))) : null;
+
+  const items: any[] = counted.map(r => {
+    const value = paise(r.physical_stock * r.average_price);
+    const valueAtCount = storedCountValue(r);
+    const g = gst!.forMaterial(String(r.material_id), date);
+    return {
+      material_id: r.material_id,
+      name: r.name,
+      sku: r.sku || '',
+      category: r.category || '',
+      unit: r.unit || '',
+      purchase_unit: r.purchase_unit || '',
+      pack_size: Number(r.pack_size) || 1,
+      average_price: r.average_price,
+      department_id: r.department_id || '',
+      department_name: r.department_name || STORE_NAME,
+      counted: true,
+      physical_stock: r.physical_stock,
+      // physical_stock is in RECIPE units and average_price is ₹/RECIPE unit —
+      // multiply straight through, do NOT divide by pack_size.
+      value,
+      system_stock: isAdmin ? r.system_stock : null,
+      variance: isAdmin ? r.variance : null,
+      variance_value: isAdmin ? paise(r.variance_value) : null,
+      notes: r.notes || '',
+      recorded_by: r.recorded_by || '',
+      last_counted_at: r.last_counted_at,
+      last_counted_date: r.last_counted_date,
+      // The GST basis, printed beside the tax as "Value at count"; null when
+      // no value was saved with the count (then no tax either).
+      value_at_count: valueAtCount,
+      gst_pct: g.gst_pct,
+      gst_source: g.gst_source,
+      gst_note: g.gst_note,
+      gst_title: g.gst_title,
+      ...closingTaxCells(valueAtCount, g),
+    };
+  });
 
   if (url.searchParams.get('include_uncounted') === '1') {
     // "Uncounted" is scoped to the SAME department filter as the counted list —
@@ -336,6 +432,14 @@ function itemsMode(
         recorded_by: '',
         last_counted_at: null,
         last_counted_date: null,
+        // Not counted → nothing to tax. Blank, never 0.
+        value_at_count: null,
+        gst_pct: null,
+        gst_source: null,
+        gst_note: '',
+        gst_title: '',
+        tax: null,
+        total_incl_tax: null,
       });
     }
   }
@@ -346,6 +450,9 @@ function itemsMode(
     physical_value: paise(counted.reduce((s, r) => s + r.physical_stock * r.average_price, 0)),
     system_value: isAdmin ? paise(counted.reduce((s, r) => s + r.system_stock * r.average_price, 0)) : null,
     variance_value: isAdmin ? paise(counted.reduce((s, r) => s + (r.variance_value || 0), 0)) : null,
+    // Counted rows only (uncounted fillers have no value); rows with a rate
+    // AND a value at count summed (value_taxed = Σ their value at count).
+    closing_tax: sumClosingTax(items.filter(i => i.counted)),
   };
 
   return Response.json({

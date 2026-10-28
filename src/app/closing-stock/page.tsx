@@ -39,6 +39,12 @@ import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState, { countKind } from '@/components/CountState';
+import {
+  CLOSING_GST_PCT_CSV, CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
+  CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_INCL_LABEL, CLOSING_INCL_TITLE,
+  CLOSING_TAX_CSV, CLOSING_TAX_LABEL, CLOSING_TAX_TITLE, SEMI_GST,
+  closingTaxCsv, closingTaxNotes, fmtClosingGstPct, sumClosingTax,
+} from '@/lib/closing-tax';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -149,6 +155,43 @@ function ValueCell({ value, source, rate }: { value?: number | null; source?: st
   if (noBasis(source, rate) || value == null) return <NoBasisDash />;
   return <span className="font-mono">{fmtMoney(Number(value))}</span>;
 }
+
+/* ── HISTORY TAB ONLY: estimated GST beside Total Value (owner #4, rulings
+ * #77/#78/#81). The server resolves the rate and the rupees
+ * (src/lib/closing-tax.ts) — these cells only print them. Blank is an
+ * em-dash, never 0 / 0%: a 0 would claim the item is GST-free. Every rate
+ * prints where it came from ("last bill with GST 12 Oct 2026" / "Master GST %"). */
+function GstPctCell({ pct, note, title }: { pct?: number | null; note?: string | null; title?: string | null }) {
+  return (
+    <span title={title || undefined}>
+      {pct == null
+        ? <span className="text-[#B8A590]">—</span>
+        : <span className="font-mono">{fmtClosingGstPct(pct)}</span>}
+      {note && <span className="block text-[9px] font-sans text-[#B8A590]">{note}</span>}
+    </span>
+  );
+}
+
+function TaxMoneyCell({ value, why }: { value?: number | null; why?: string | null }) {
+  if (value == null) {
+    return <span className="text-[#B8A590]" title={why || 'No GST rate (or no value saved at count) for this row — left blank, never ₹0.'}>—</span>;
+  }
+  return <span className="font-mono">{fmtMoney(Number(value))}</span>;
+}
+
+/** Why a raw row's Tax / Total incl. cell is blank — the hover text. */
+const gstBlankWhy = (item: any): string | undefined => {
+  if (item?.gst_pct == null) return item?.gst_title || undefined;
+  // A rate is known but this count has no value saved with it: counted before
+  // values were stored with counts (its Total Value is worked out at TODAY's
+  // price, marked "est."), or nothing to value it on that day. A later bill
+  // must never move an old count's tax, so none is estimated.
+  if (item?.rate_is_stored === false && !noBasis(item?.rate_source, item?.rate_per_purchase_unit)) {
+    return 'No value was saved with this count (it was counted before values were stored with counts) — '
+      + 'the Total Value shown is worked out at today\'s price, so no GST is estimated on it.';
+  }
+  return 'No value was saved with this count — nothing to apply the GST rate to.';
+};
 
 /** The row's rate whichever sheet it came from: raw materials are priced per
  *  PURCHASE unit, sub-recipes per YIELD unit. */
@@ -1056,6 +1099,12 @@ export default function ClosingStockByLocationPage() {
       if (isAdmin) r['Variance'] = csvQty(toPurchaseQty(Number(item.variance) || 0, hm));
       if (isAdmin) r['Variance (Rs)'] = item.variance_value == null ? '' : Number(item.variance_value);
       r['Notes'] = item.notes || '';
+      // Estimated GST — APPENDED after the last existing column so every column
+      // above keeps its position. Blank (never 0) where there is no rate.
+      r[CLOSING_GST_PCT_CSV] = closingTaxCsv(item.gst_pct);
+      r[CLOSING_GST_SOURCE_CSV] = item.gst_note || '';
+      r[CLOSING_TAX_CSV] = closingTaxCsv(item.tax);
+      r[CLOSING_INCL_CSV] = closingTaxCsv(item.total_incl_tax);
       rows.push(r);
     }
 
@@ -1075,6 +1124,10 @@ export default function ClosingStockByLocationPage() {
       if (isAdmin) r['Variance'] = '';
       if (isAdmin) r['Variance (Rs)'] = '';
       r['Notes'] = s.notes || '';
+      r[CLOSING_GST_PCT_CSV] = '';
+      r[CLOSING_GST_SOURCE_CSV] = SEMI_GST.gst_note;
+      r[CLOSING_TAX_CSV] = '';
+      r[CLOSING_INCL_CSV] = '';
       rows.push(r);
     }
 
@@ -1584,6 +1637,17 @@ export default function ClosingStockByLocationPage() {
   const historyPriced = historyItems.some((i: any) => i.total_value != null || i.rate_source != null)
     || historySemi.some((s: any) => s.total_value != null || s.rate_per_unit != null);
   const historyUnvalued = unvaluedCount([...historyItems, ...historySemi]);
+  /** Estimated-GST footer: only rows WITH a rate are summed (raw rows carry the
+   *  server's figures; semi-finished rows are always blank), and M counts every
+   *  row on the sheet so "rate known for N of M" describes the whole table. */
+  const historyTax = sumClosingTax([
+    ...historyItems,
+    ...historySemi.map(() => ({ gst_pct: null, tax: null, total_incl_tax: null })),
+  ]);
+  /** Every note printed with those totals (chip, footer lines, hover) — from
+   *  the ONE helper, so each states the true case: no rate / rates but no
+   *  value saved at count / some taxed. */
+  const historyTaxNotes = closingTaxNotes(historyTax, 'items', fmtMoney);
 
   const reloadLocations = async () => {
     setLoading(true);
@@ -2380,6 +2444,12 @@ export default function ClosingStockByLocationPage() {
                           {historyPriced && (
                             <span className="text-[#2D1B0E]">Closing value: <span className="font-bold font-mono">{fmtMoney(historyValueTotal)}</span></span>
                           )}
+                          {historyPriced && historyTax.taxed > 0 && (
+                            <span className="text-[#2D1B0E]" title={`${CLOSING_TAX_TITLE} ${historyTaxNotes.title}`}>
+                              {CLOSING_TAX_LABEL}: <span className="font-bold font-mono">{fmtMoney(historyTax.tax)}</span>
+                              <span className="ml-1 text-[10px] text-[#8B7355]">({historyTaxNotes.rate})</span>
+                            </span>
+                          )}
                           {isAdmin && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
                           {isAdmin && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
                           {isAdmin && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
@@ -2404,6 +2474,15 @@ export default function ClosingStockByLocationPage() {
                               <span className="block font-normal text-[9px] text-[#8B7355]">at count time, per purchase unit</span>
                             </th>
                             <th className="text-right py-2.5 px-3 font-medium">Total Value</th>
+                            {/* Estimated GST (rulings #77/#78/#81). Derived only
+                                from Total Value, so it has Total Value's
+                                visibility — every tier. */}
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_GST_PCT_TITLE}>
+                              {CLOSING_GST_PCT_LABEL}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{CLOSING_GST_PCT_SUB}</span>
+                            </th>
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_TAX_TITLE}>{CLOSING_TAX_LABEL}</th>
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_INCL_TITLE}>{CLOSING_INCL_LABEL}</th>
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>}
                             <th className="text-left py-2.5 px-3 font-medium">Notes</th>
@@ -2448,6 +2527,15 @@ export default function ClosingStockByLocationPage() {
                                 <td className="py-2 px-3 text-right text-xs">
                                   <ValueCell value={item.total_value} source={item.rate_source} rate={item.rate_per_purchase_unit} />
                                 </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <GstPctCell pct={item.gst_pct} note={item.gst_note} title={item.gst_title} />
+                                </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <TaxMoneyCell value={item.tax} why={gstBlankWhy(item)} />
+                                </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <TaxMoneyCell value={item.total_incl_tax} why={gstBlankWhy(item)} />
+                                </td>
                                 {isAdmin && (
                                   <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
                                     {item.variance > 0 ? '+' : ''}{hq(item.variance)} {hu}
@@ -2469,7 +2557,7 @@ export default function ClosingStockByLocationPage() {
                               yield unit — no purchase unit, no pack factor. */}
                           {historySemi.length > 0 && (
                             <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
-                              <td colSpan={isAdmin ? 9 : 6} className="py-2 px-3">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3">
                                 <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-[#6B5744]">
                                   <Layers className="w-3.5 h-3.5" /> Semi-finished / sub-recipes
                                   <span className="font-normal normal-case text-[10px] text-[#8B7355]">— counted and costed per yield unit</span>
@@ -2494,6 +2582,11 @@ export default function ClosingStockByLocationPage() {
                               <td className="py-2 px-3 text-right text-xs">
                                 <ValueCell value={s.total_value} source={s.rate_source} rate={s.rate_per_unit} />
                               </td>
+                              <td className="py-2 px-3 text-right text-xs">
+                                <GstPctCell pct={null} note={SEMI_GST.gst_note} title={SEMI_GST.gst_title} />
+                              </td>
+                              <td className="py-2 px-3 text-right text-xs"><TaxMoneyCell value={null} why={SEMI_GST.gst_title} /></td>
+                              <td className="py-2 px-3 text-right text-xs"><TaxMoneyCell value={null} why={SEMI_GST.gst_title} /></td>
                               {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
                               {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
                               <td className="py-2 px-3 text-xs text-[#8B7355]">{s.notes || '-'}</td>
@@ -2517,6 +2610,18 @@ export default function ClosingStockByLocationPage() {
                             <td className="py-2 px-3 text-right"><CrossDash what="rate total" /></td>
                             <td className="py-2 px-3 text-right font-mono">
                               {historyPriced ? fmtMoney(historyValueTotal) : <NoBasisDash />}
+                            </td>
+                            {/* A GST % does not add up across materials. Tax and
+                                Total incl. sum ONLY the rows with a rate, and say
+                                how many — so this footer foots its own column. */}
+                            <td className="py-2 px-3 text-right"><CrossDash what="GST % total" /></td>
+                            <td className="py-2 px-3 text-right" title={`${CLOSING_TAX_TITLE} ${historyTaxNotes.title}`}>
+                              {historyTax.taxed > 0 ? <span className="font-mono">{fmtMoney(historyTax.tax)}</span> : <span className="text-[#B8A590]">—</span>}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{historyTaxNotes.rate}</span>
+                            </td>
+                            <td className="py-2 px-3 text-right" title={historyTaxNotes.title}>
+                              {historyTax.taxed > 0 ? <span className="font-mono">{fmtMoney(historyTax.total_incl_tax)}</span> : <span className="text-[#B8A590]">—</span>}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{historyTaxNotes.incl}</span>
                             </td>
                             {isAdmin && <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>}
                             {isAdmin && (
