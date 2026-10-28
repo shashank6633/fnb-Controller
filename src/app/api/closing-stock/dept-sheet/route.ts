@@ -12,6 +12,7 @@ import { checkClosingDate } from '@/lib/closing-date';
 import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
 import { cutoverAt, deptKey } from '@/lib/dept-ledger';
 import { readDepartmentAreas, areaLabelMap, areaLabelFor } from '@/lib/department-areas';
+import { heldInDepts } from '@/lib/count-list-active';
 
 /**
  * DEPARTMENT CLOSING SHEET — one sheet spanning every ACTIVE department, for
@@ -346,6 +347,13 @@ export async function GET(request: Request) {
     }
 
     const deptIdsJson = JSON.stringify(depts.map(d => d.id));
+    // SWITCHED-OFF ITEMS (owner #6 / ruling 78): a (department, material) pair
+    // whose material is switched off stays on this sheet while THAT department's
+    // books still hold a non-zero balance of it, and drops off at zero — see
+    // src/lib/count-list-active.ts. deptKey() keys, matched in the query below
+    // as dept_id || '|' || material_id. Nothing switched off → '[]' → the
+    // sheet is exactly what it was.
+    const heldPairsJson = JSON.stringify([...heldInDepts(db, depts.map(d => d.id)).pairs]);
 
     // ONE query for every (department, material) pair on the sheet. The pair set
     // is the house DEPT_ITEM_SET definition, expanded across all departments at
@@ -438,9 +446,10 @@ export async function GET(request: Request) {
               OR EXISTS (SELECT 1 FROM closing_stock cs2
                           WHERE cs2.material_id = rm.id
                             AND cs2.date = ?
-                            AND COALESCE(cs2.department_id,'') = pairs.dept_id))
+                            AND COALESCE(cs2.department_id,'') = pairs.dept_id)
+              OR (pairs.dept_id || '|' || rm.id) IN (SELECT value FROM json_each(?)))
        ORDER BY COALESCE(NULLIF(TRIM(rm.category),''), 'zz') , rm.name
-    `).all(deptIdsJson, deptIdsJson, deptIdsJson, date) as MatRow[];
+    `).all(deptIdsJson, deptIdsJson, deptIdsJson, date, heldPairsJson) as MatRow[];
 
     // Counts already recorded for this date, keyed by department+material.
     const countRows = db.prepare(`

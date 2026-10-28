@@ -16,13 +16,14 @@ import { getCurrentUser } from '@/lib/auth';
  *     dryRun → { targeted, changed, skipped, skipped_ids, would_change }  (NOTHING written)
  *     apply  → { updated, changed, skipped, skipped_ids, field, value }
  *
- * ── THE FOUR WRITABLE COLUMNS, AND WHY IT CANNOT TOUCH A FIFTH ──────────────
+ * ── THE FIVE WRITABLE COLUMNS, AND WHY IT CANNOT TOUCH A SIXTH ─────────────
  * `WRITES` below is a frozen map from an allowlisted field name to a COMPLETE,
  * HARDCODED UPDATE statement. The column name is never interpolated from the
  * request, there is no generic `SET ${col} = ?` anywhere in this file, and an
  * unrecognised field name is a 400 before a statement is ever prepared. So the
  * set of columns this route can write is fixed at author time:
- *     tax_percent, cess_percent, is_butchering_source, is_butchering_output
+ *     tax_percent, cess_percent, is_butchering_source, is_butchering_output,
+ *     is_active
  * (+ updated_at, as every write path in this app does). average_price,
  * current_stock, last_purchase_price, unit, pack_size and every other column are
  * unreachable from here — no shared upsert helper, no SELECT-then-rewrite
@@ -39,6 +40,14 @@ import { getCurrentUser } from '@/lib/auth';
  * adds a capped, previewable, audited path to a capability that tier already
  * holds. Note this route does NOT copy the neighbouring /api/inventory POST/PUT,
  * which have no handler-level auth at all; matching them would be a regression.
+ *
+ * is_active (Active on/off — owner #6, ruling 78) IS THE ONE EXCEPTION: ADMIN
+ * ONLY (owner, 2026-10-28). A store manager asking for that field — dry-run
+ * included — gets 403 before the value or ids are even read; store managers
+ * keep every other field above exactly as before. Switching off writes only
+ * is_active: no stock, costing or valuation path reads it; the pickers hide the
+ * item on NEW entries. The warning an admin sees first (stock + open documents)
+ * comes from GET/POST /api/inventory/active-impact.
  *
  * CSRF is enforced without a proxy.ts change: '/api/inventory' is a
  * CSRF_REQUIRED_PREFIXES entry (src/proxy.ts) and the match is
@@ -62,7 +71,12 @@ const MAX_IDS = 2000;
 /** Ids echoed back in the response / audit row, so a 2,000-id call can't bloat either. */
 const ID_ECHO_CAP = 200;
 
-type FieldKey = 'tax_percent' | 'cess_percent' | 'is_butchering_source' | 'is_butchering_output';
+type FieldKey = 'tax_percent' | 'cess_percent' | 'is_butchering_source' | 'is_butchering_output' | 'is_active';
+
+/** Fields only an admin may set here (owner, 2026-10-28: "WHO may switch a raw
+ *  material on/off = ADMIN ONLY"). Every other field keeps the admin || store
+ *  manager tier. */
+const ADMIN_ONLY_FIELDS: ReadonlySet<FieldKey> = new Set<FieldKey>(['is_active']);
 
 /**
  * The complete, hardcoded write for each allowlisted field. Nothing here is
@@ -89,6 +103,11 @@ const WRITES: Readonly<Record<FieldKey, { sql: string; label: string; coerce: (r
     label: 'Butchering output (cut)',
     coerce: flag,
   },
+  is_active: {
+    sql: `UPDATE raw_materials SET is_active = ?, updated_at = datetime('now') WHERE id = ?`,
+    label: 'Active',
+    coerce: activeFlag,
+  },
 });
 
 /** Reading the current value of one allowlisted field — also hardcoded per field. */
@@ -97,6 +116,9 @@ const READS: Readonly<Record<FieldKey, string>> = Object.freeze({
   cess_percent: `SELECT id, name, COALESCE(cess_percent, 0) AS v FROM raw_materials WHERE id = ?`,
   is_butchering_source: `SELECT id, name, COALESCE(is_butchering_source, 0) AS v FROM raw_materials WHERE id = ?`,
   is_butchering_output: `SELECT id, name, COALESCE(is_butchering_output, 0) AS v FROM raw_materials WHERE id = ?`,
+  // NULL reads as ON — the column default, and the reading every is_active
+  // filter in this app uses (COALESCE(is_active, 1) = 1).
+  is_active: `SELECT id, name, COALESCE(is_active, 1) AS v FROM raw_materials WHERE id = ?`,
 });
 
 /** A percent: REFUSED outside 0..100, never clamped — a clamp turns a fat-finger
@@ -127,6 +149,13 @@ function flag(raw: unknown): number {
   throw new Error('value must be 0 or 1 for a butchering flag');
 }
 
+/** Active on/off: strictly 1 (on) or 0 (off), same spellings as flag(). */
+function activeFlag(raw: unknown): number {
+  if (raw === true || raw === 1 || raw === '1') return 1;
+  if (raw === false || raw === 0 || raw === '0') return 0;
+  throw new Error('value must be 1 (on) or 0 (off) for Active');
+}
+
 export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
@@ -145,6 +174,16 @@ export async function POST(request: Request) {
       }, { status: 400 });
     }
     const spec = WRITES[field];
+
+    /* ── admin-only fields: refused for anyone else, dry-run included, before
+       the value or the ids are read ──────────────────────────────────────── */
+    if (ADMIN_ONLY_FIELDS.has(field) && me.role !== 'admin') {
+      return Response.json({
+        error: 'Only an admin can switch raw materials on or off. Nothing was changed.',
+        code: 'admin_only_is_active',
+        field,
+      }, { status: 403 });
+    }
 
     /* ── value: refused, never clamped ───────────────────────────────────── */
     let value: number;
@@ -240,7 +279,9 @@ export async function POST(request: Request) {
           changed: changedRows.length,
           skipped: skippedIds.length,
         },
-        note: `Bulk set ${spec.label} = ${value} on ${before.length} material(s)`
+        note: (field === 'is_active'
+          ? `Bulk switched ${value ? 'ON' : 'OFF'} ${before.length} material(s)`
+          : `Bulk set ${spec.label} = ${value} on ${before.length} material(s)`)
           + ` (${changedRows.length} actually changed, ${skippedIds.length} id(s) matched nothing)`,
       });
     })();

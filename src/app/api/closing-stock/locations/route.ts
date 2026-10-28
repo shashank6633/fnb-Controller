@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { DEPT_REQUESTED_ITEM_SQL, deptRequestedParams, selectedDeptSet } from '@/lib/dept-requested-items';
+import { switchedOffStillHeld } from '@/lib/count-list-active';
 
 /**
  * Storage-location summary for the EOD count workflow.
@@ -59,6 +60,16 @@ export async function GET(request: Request) {
         params.push(...deptRequestedParams(selSet));
       }
     }
+
+    /* SWITCHED-OFF ITEMS (owner #6 / ruling 78): the identical clause
+       ../by-location appends, so a card's "x of y" counts the same rows its
+       count screen lists — see the note there and src/lib/count-list-active.ts.
+       Nothing switched off → the first arm is true for every row → the cards
+       are exactly what they were. */
+    deptScopeSql += ` AND (COALESCE(rm.is_active, 1) = 1 OR cs.id IS NOT NULL OR rm.id IN (SELECT value FROM json_each(?)))`;
+    params.push(JSON.stringify(deptMatch
+      ? switchedOffStillHeld(db, { deptIds: selectedDeptSet(db, deptMatch) })
+      : switchedOffStillHeld(db, { central: true })));
 
     const rows = db.prepare(`
       SELECT

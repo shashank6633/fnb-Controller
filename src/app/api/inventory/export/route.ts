@@ -12,9 +12,12 @@ import { cutoverAt } from '@/lib/dept-ledger';
  * GET /api/inventory/export
  *   → 200 text/csv with Content-Disposition attachment
  *
- * NOTE: includes inactive rows too so a user can re-activate by editing
- * `is_active` from 0 → 1 in the spreadsheet. Excluding them would silently
- * drop them on the round-trip.
+ * NOTE: includes inactive rows too, and carries an `is_active` column (1 = on,
+ * 0 = switched off — owner #6 / ruling 78), so an ADMIN can switch items on or
+ * off by editing that cell and re-uploading. Excluding inactive rows would
+ * silently drop them on the round-trip. (Before 2026-10-28 this comment
+ * promised an is_active column the sheet did not have.) A store manager's
+ * re-upload never changes is_active — see round-trip-import.
  *
  * LAYOUT (deliberate, see HEADER_ALIASES and the `_note` block below):
  *   line 1 = headers, `_note` first
@@ -54,6 +57,11 @@ const COLUMNS = [
   'is_butchering_output',     // CAN be produced by breaking down a carcass (may also be bought)
   'storage_location',
   'shelf_life_days',
+  // 1 = on, 0 = switched off. Written as a literal 1/0 on EVERY row — NOT in
+  // BLANK_WHEN_ZERO: here 0 is a real setting ("off"), not "not set", and a
+  // blank would read as "unknown" to whoever opens the sheet. Writable on the
+  // way back in by an ADMIN only (round-trip-import).
+  'is_active',
 ];
 
 /**
@@ -135,7 +143,10 @@ function centralStockNote(db: ReturnType<typeof getDb>): string {
       + ' with earlier exports until the cutover count is taken.';
   return base + boundary
     + ' This column, and every column ending "_purchase_unit", are informational: re-uploading this'
-    + ' file never writes them.';
+    + ' file never writes them.'
+    + ' "is_active" is 1 for an item that is on and 0 for one that is switched off (hidden when making'
+    + ' new entries; its stock, history and reports are unchanged, and the count sheets keep listing it'
+    + ' while it still holds stock); only an admin\'s re-upload changes it.';
 }
 
 function csvEscape(v: any): string {
@@ -174,6 +185,9 @@ const BLANK_WHEN_ZERO = new Set([
 ]);
 
 function csvCell(col: string, v: any): string {
+  // Always a literal 1 or 0, read the way every is_active filter reads it
+  // (COALESCE(is_active, 1) = 1): only a stored 0 is "off".
+  if (col === 'is_active') return v != null && Number(v) === 0 ? '0' : '1';
   if (BLANK_WHEN_ZERO.has(col) && (v == null || Number(v) === 0)) return '';
   return csvEscape(v);
 }

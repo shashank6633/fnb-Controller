@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { DEPT_REQUESTED_ITEM_SQL, deptRequestedParams, selectedDeptSet } from '@/lib/dept-requested-items';
+import { switchedOffStillHeld } from '@/lib/count-list-active';
 
 /**
  * Materials in a specific storage location, with their current system stock
@@ -78,6 +79,20 @@ export async function GET(request: Request) {
         params.push(...deptRequestedParams(selSet));
       }
     }
+
+    /* SWITCHED-OFF ITEMS (owner #6 / ruling 78, src/lib/count-list-active.ts):
+       a switched-off material stays on this count screen while the place being
+       counted still holds a non-zero balance of it — Store / Overall: central
+       stock; a selected department: that department's books (a MAIN one with
+       its subs) — or while it already has a count here on this date, and drops
+       off at zero. ../locations carries the identical clause so its cards keep
+       matching this list. Nothing switched off → the first arm is true for
+       every row → the list is exactly what it was. Appended LAST, after every
+       other WHERE param. */
+    deptScopeSql += ` AND (COALESCE(rm.is_active, 1) = 1 OR cs.id IS NOT NULL OR rm.id IN (SELECT value FROM json_each(?)))`;
+    params.push(JSON.stringify(deptMatch
+      ? switchedOffStillHeld(db, { deptIds: selectedDeptSet(db, deptMatch) })
+      : switchedOffStillHeld(db, { central: true })));
 
     const rows = db.prepare(`
       SELECT rm.id, rm.sku, rm.name, rm.unit, rm.purchase_unit, rm.pack_size,

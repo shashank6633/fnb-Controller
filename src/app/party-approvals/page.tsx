@@ -1067,6 +1067,7 @@ function ChefEditModal({ reqId, onClose, onSaved }: {
                     // /api/inventory feeds this list, so purchase_unit + pack_size
                     // are both present.
                     purchaseBasis
+                    inactive="hide"
                     value={it.material_id}
                     onPick={(id: string) => {
                       // New / swapped material → house convention: request in the

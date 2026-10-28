@@ -1,4 +1,4 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 import { lockedUnitFields } from '@/lib/unit-audit-lock';
@@ -139,6 +139,11 @@ export async function GET(request: Request) {
       query += ' AND rm.reorder_level > 0 AND rm.current_stock < rm.reorder_level';
     }
 
+    // NO is_active FILTER HERE, ON PURPOSE (owner #6 / ruling 78). Every row
+    // carries is_active (rm.*); the pickers hide switched-off items from their
+    // SEARCH RESULTS only. Filtering this shared list would blank the line of
+    // every open PO / requisition / recipe that already uses a switched-off
+    // item, and stop counting, wastage and transfers finding stock it still has.
     query += ' ORDER BY rm.name ASC';
 
     const materials = db.prepare(query).all(...params) as any[];
@@ -227,6 +232,15 @@ function isDuplicateName(db: ReturnType<typeof getDb>, name: string, excludeId?:
   return all.some(r => canonNameInput(r.name).toLowerCase() === wanted);
 }
 
+/** A strict on/off for raw_materials.is_active: true/1/'1' → 1, false/0/'0' → 0,
+ *  anything else → null (the caller answers 400). Same accepted spellings as
+ *  bulk-update's flag fields; never Number(x), which reads [] as 0. */
+function activeFlag(raw: unknown): 0 | 1 | null {
+  if (raw === true || raw === 1 || raw === '1') return 1;
+  if (raw === false || raw === 0 || raw === '0') return 0;
+  return null;
+}
+
 // Helper: enforce duplicate-SKU rule (Phase 1 §1).
 function isDuplicateSku(db: ReturnType<typeof getDb>, sku: string, excludeId?: string): boolean {
   if (!sku) return false;
@@ -278,6 +292,28 @@ export async function POST(request: Request) {
     if (priority != null && ![1, 2, 3].includes(Number(priority))) {
       return Response.json({ error: 'priority must be 1, 2 or 3' }, { status: 400 });
     }
+    // is_active on CREATE — same rule as the PUT below. Absent / null / 1 → the
+    // item starts ON (the column default, every existing caller). 0 = create it
+    // already switched off: ADMIN ONLY (owner, 2026-10-28), 403 for anyone else
+    // with nothing created, so a form showing "Off" can never quietly save "On".
+    let createActive: 0 | 1 = 1;
+    let createActor = '';
+    if (body.is_active !== undefined && body.is_active !== null) {
+      const a = activeFlag(body.is_active);
+      if (a === null) return Response.json({ error: 'is_active must be 1 (on) or 0 (off)' }, { status: 400 });
+      if (a === 0) {
+        const me = await getCurrentUser();
+        if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+        if (me.role !== 'admin') {
+          return Response.json({
+            error: 'Only an admin can switch raw materials on or off. Nothing was created.',
+            code: 'admin_only_is_active',
+          }, { status: 403 });
+        }
+        createActor = me.email;
+      }
+      createActive = a;
+    }
     if (isDuplicateName(db, name)) {
       return Response.json({ error: `Duplicate material name: "${name}" already exists. Phase 1 SOP: no duplicates.` }, { status: 409 });
     }
@@ -306,8 +342,9 @@ export async function POST(request: Request) {
         super_category, brand, yield_percent, tax_percent, cess_percent,
         standard_purchase_rate, closing_cadence, is_recipe_item, is_direct_sell, is_semifinished,
         storage_location, shelf_life_days, priority, average_price,
+        is_active,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
       id, sku, name, category || 'other', newUnit,
       newPurchaseUnit,
@@ -328,7 +365,21 @@ export async function POST(request: Request) {
       // the PUT has always honored this; the POST dropped it, so every new
       // material landed at ₹0 until edited a second time.
       (average_price != null && Number.isFinite(Number(average_price))) ? Number(average_price) : 0,
+      // is_active — last positional value, matching the column list above.
+      createActive,
     );
+
+    if (createActive === 0) {
+      logAuditEvent(db, {
+        event_type: 'raw_material.active_set',
+        entity_type: 'raw_material',
+        entity_id: id,
+        actor_email: createActor,
+        before: null,
+        after: { is_active: 0 },
+        note: `${name}: created switched OFF`,
+      });
+    }
 
     const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id);
     return Response.json({ material }, { status: 201 });
@@ -364,6 +415,40 @@ export async function PUT(request: Request) {
     }
     const existing = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id) as any;
     if (!existing) return Response.json({ error: 'Material not found' }, { status: 404 });
+
+    /* ── ACTIVE ON / OFF — ADMIN ONLY (owner #6, ruling 78; WHO = admin, owner
+     * 2026-10-28) ─────────────────────────────────────────────────────────────
+     * is_active absent or null → left exactly as it is (every existing caller,
+     * which never sent it). Present → it must be a plain on/off; anything else is
+     * a 400, never a guess. A NON-ADMIN who tries to CHANGE it is refused with a
+     * 403 BEFORE anything is written — not even the other fields of the same
+     * edit — so a half-applied save cannot happen. A non-admin echoing back the
+     * value already stored is not a change and passes untouched.
+     * Switching off writes ONLY this column: stock, costing, valuation, open
+     * documents and reports never read it (pickers hide the item on NEW entries;
+     * counting / wastage / transfers keep it while it holds stock — the count
+     * lists by src/lib/count-list-active.ts). */
+    let activeWanted: 0 | 1 | null = null;
+    if (body.is_active !== undefined && body.is_active !== null) {
+      activeWanted = activeFlag(body.is_active);
+      if (activeWanted === null) {
+        return Response.json({ error: 'is_active must be 1 (on) or 0 (off)' }, { status: 400 });
+      }
+    }
+    const activeNow: 0 | 1 = Number(existing.is_active) === 0 ? 0 : 1;
+    const activeChanging = activeWanted !== null && activeWanted !== activeNow;
+    let activeActor = '';
+    if (activeChanging) {
+      const me = await getCurrentUser();
+      if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+      if (me.role !== 'admin') {
+        return Response.json({
+          error: 'Only an admin can switch raw materials on or off. Nothing was saved.',
+          code: 'admin_only_is_active',
+        }, { status: 403 });
+      }
+      activeActor = me.email;
+    }
 
     /* ── "IS THIS A RENAME?" IS JUDGED IN CANONICAL SPACE, ON BOTH SIDES ─────
      * canonNameInput is NOT identity on every stored name: it collapses plain
@@ -428,6 +513,7 @@ export async function PUT(request: Request) {
           is_recipe_item = ?, is_direct_sell = ?, is_semifinished = ?,
           storage_location = ?, shelf_life_days = ?, priority = ?,
           average_price = CASE WHEN ? IS NOT NULL THEN ? ELSE average_price END,
+          is_active = CASE WHEN ? IS NOT NULL THEN ? ELSE is_active END,
           updated_at = datetime('now')
       WHERE id = ?
     `).run(
@@ -454,8 +540,27 @@ export async function PUT(request: Request) {
       priority != null ? Number(priority) : (existing.priority ?? 2),
       // Two placeholders for the CASE expression on average_price
       overrideAvgPrice, overrideAvgPrice,
+      // Two for is_active: NULL (= leave it) unless an admin is changing it.
+      activeChanging ? activeWanted : null, activeChanging ? activeWanted : null,
       id
     );
+
+    if (activeChanging) {
+      // History: who switched it, from what, to what. Best-effort, as every
+      // logAuditEvent call is (it swallows its own failure).
+      logAuditEvent(db, {
+        event_type: 'raw_material.active_set',
+        entity_type: 'raw_material',
+        entity_id: String(id),
+        actor_email: activeActor,
+        before: { is_active: activeNow },
+        after: { is_active: activeWanted },
+        // Only what is true of every switch: the stock figure is not touched,
+        // and the count lists keep the item while it holds stock.
+        note: `${nameToStore}: switched ${activeWanted ? 'ON' : 'OFF'}`
+          + (activeWanted ? '' : ' (hidden when making new entries; stock and reports unchanged; counted while it still holds stock)'),
+      });
+    }
 
     // Cascade recipe + sub-recipe cost recalc if the price OR the unit/pack
     // conversion basis changed (pack_size also feeds pcs↔ml conversions inside
