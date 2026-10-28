@@ -175,16 +175,10 @@ const navTree: NavEntry[] = [
   // once every item is denied). That filter reads `me.role_name`; see the note
   // on the `me` state below before changing its type.
   //
-  // ⚠️ P4: THESE ROWS NOW APPEAR FOR A MANAGEMENT ROLE WHOSE `page_access` LIST
-  // PREDATES THE MODULE. `canAccessPage` gained one line —
-  // `isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)` — so
-  // for `/feedback*` the module's own gate decides and a role's list can only
-  // NARROW it, never widen it. Before that, a Floor Manager (whose list is
-  // explicit and has no `/feedback` entry) got a 403 PAGE while
-  // `GET /api/feedback/floor` answered 200, and the sidebar correctly hid a row
-  // that would have bounced them. Nothing here had to change for that to work —
-  // this list and the catalog were already twins — but if you ever hand-roll a
-  // role test in this file you will re-create exactly that split.
+  // Since 2026-10-28 (owner): these rows follow the role's page ticks exactly like
+  // every other page — the old rule that let the module open its own door for a
+  // role whose list never mentioned /feedback is gone (it showed Guest Feedback to
+  // every manager-level role). Tick the pages in Settings → Roles to grant them.
   {
     kind: "section",
     label: "Guest Feedback",
