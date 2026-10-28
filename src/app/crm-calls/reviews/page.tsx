@@ -466,6 +466,39 @@ export default function ReviewsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshResult, setRefreshResult] = useState<RefreshOutcome | null>(null);
 
+  /* AI REPLY DRAFTS ON / OFF (owner, 2026-10-28). The reply box's "AI draft"
+   * button only works while the settings flag reviews_ai_reply_draft is '1'
+   * (src/lib/reviews/reply-draft.ts REVIEWS_REPLY_AI_FLAG); until now no screen
+   * could set it. Admin only — the settings route's KEY_POLICY already refuses
+   * anyone else (api/settings/route.ts, write: 'admin'). null = not loaded yet. */
+  const [aiDraftOn, setAiDraftOn] = useState<boolean | null>(null);
+  const [aiDraftSaving, setAiDraftSaving] = useState(false);
+  const canReply = !!data?.can_reply;
+  useEffect(() => {
+    if (!canReply) return;
+    let gone = false;
+    fetch('/api/settings?key=reviews_ai_reply_draft')
+      .then(r => r.json())
+      .then(j => { if (!gone) setAiDraftOn(j?.value === '1'); })
+      .catch(() => { /* leave it unknown; the switch shows "…" */ });
+    return () => { gone = true; };
+  }, [canReply]);
+  const toggleAiDraft = async () => {
+    if (aiDraftOn === null || aiDraftSaving) return;
+    const next = !aiDraftOn;
+    setAiDraftSaving(true);
+    try {
+      const res = await api('/api/settings', { method: 'PUT', body: { key: 'reviews_ai_reply_draft', value: next ? '1' : '0' } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j?.error || `Could not save (${res.status})`);
+      setAiDraftOn(next);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not change AI reply drafts');
+    } finally {
+      setAiDraftSaving(false);
+    }
+  };
+
   const fetchSeq = useRef(0);
 
   const load = useCallback(async () => {
@@ -856,6 +889,24 @@ export default function ReviewsPage() {
               >
                 <Upload className="w-3.5 h-3.5" />
                 Import a file
+              </button>
+            )}
+
+            {canReply && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={aiDraftOn === true}
+                onClick={toggleAiDraft}
+                disabled={aiDraftOn === null || aiDraftSaving}
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-60 ${
+                  aiDraftOn ? 'bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100'
+                            : 'bg-white border-[#E0D0BE] text-[#6B5744] hover:bg-[#FFF1E3]'
+                }`}
+                title="Turns the AI draft button in the reply box on or off. Drafts use the AI provider set in AI Training → CRM Settings, and a draft is never sent by itself — you edit and send it."
+              >
+                {aiDraftSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                AI reply drafts: {aiDraftOn === null ? '…' : aiDraftOn ? 'On' : 'Off'}
               </button>
             )}
           </div>
