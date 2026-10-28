@@ -7,10 +7,11 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { Building, Plus, Edit, Save, X, Loader2 } from 'lucide-react';
+import { Building, Plus, Edit, Save, X, Loader2, Layers } from 'lucide-react';
 import { api, apiJson } from '@/lib/api';
 import Toggle from '@/components/Toggle';
 import DeviationRoutingReadiness from '@/components/DeviationRoutingReadiness';
+import ManageAreasPanel, { type AreasPayload } from './ManageAreasPanel';
 
 interface User { id: string; name: string; email: string; role: string; is_active?: number; is_head_chef?: number; }
 interface CategoryCount { category: string; count: number }
@@ -22,7 +23,7 @@ interface Department {
   member_count?: number; open_requisition_count?: number;
   submission_windows?: string;        // CSV of HH:MM e.g. "11:00,18:30"
   submission_grace_minutes?: number;  // default 30
-  area?: string;                       // kitchen | bar | store | service | other | '' (unset)
+  area?: string;                       // an area KEY from Manage Areas (/api/departments/areas) | '' (unset)
   material_categories?: string | null; // JSON array of allowed raw_materials.category values
   // Main-department hierarchy. parent_id === null → this IS a main department.
   parent_id?: string | null;          // main dept this sub-dept belongs to
@@ -99,15 +100,9 @@ function DeductReach({ d }: { d: Department }) {
   );
 }
 
-// Coarse areas used for closing-stock rollups. A department belongs to exactly one.
-const AREA_OPTIONS: { value: string; label: string }[] = [
-  { value: '', label: '— Unassigned —' },
-  { value: 'kitchen', label: 'Kitchen' },
-  { value: 'bar', label: 'Bar' },
-  { value: 'store', label: 'Store' },
-  { value: 'service', label: 'Service / Operations' },
-  { value: 'other', label: 'Other' },
-];
+// Coarse areas used for closing-stock rollups. A department belongs to at most
+// one. The list is the owner's (Manage Areas, admin only) — read from
+// /api/departments/areas, never hard-coded here.
 
 // Count categories in a department's material_categories JSON string.
 const catCount = (mc?: string | null): number => {
@@ -123,6 +118,8 @@ export default function DepartmentsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [catalogCategories, setCatalogCategories] = useState<CategoryCount[]>([]);
+  const [areas, setAreas] = useState<AreasPayload | null>(null);
+  const [showAreas, setShowAreas] = useState(false);
   // Parsed allowed-categories for the currently-edited dept (Set for fast toggling).
   const editingCats: Set<string> = (() => {
     if (!editing?.material_categories) return new Set();
@@ -141,12 +138,14 @@ export default function DepartmentsPage() {
 
   const reload = async () => {
     setLoading(true);
-    const [d, u, m] = await Promise.all([
+    const [d, u, m, a] = await Promise.all([
       fetch('/api/departments').then(r => r.json()),
       fetch('/api/auth/users').then(r => r.json()).catch(() => ({ users: [] })),
       fetch('/api/auth/me').then(r => r.json()).catch(() => ({ user: null })),
+      fetch('/api/departments/areas').then(r => (r.ok ? r.json() : null)).catch(() => null),
     ]);
     setDepts(d.departments || []);
+    setAreas(Array.isArray(a?.areas) ? a : null);
     setUsers((u.users || []).filter((x: User) => x.is_active !== 0));
     setMe(m.user);
     setLoading(false);
@@ -249,6 +248,27 @@ export default function DepartmentsPage() {
   // Parent row for the dept currently being edited (used for inheritance display).
   const editingParent = editing?.parent_id ? depts.find(d => d.id === editing.parent_id) : null;
 
+  // ── Area dropdown ─────────────────────────────────────────────────────────
+  // Switched-ON areas from Manage Areas, in the owner's order. The department
+  // being edited also keeps the area it ALREADY has — even one since switched
+  // off, or a value from before the list existed — shown for what it is, so
+  // re-saving the form never silently changes or refuses it.
+  const savedArea = editing?.id ? (depts.find(d => d.id === editing.id)?.area || '').trim() : '';
+  const areaOptions: { value: string; label: string }[] = (() => {
+    const list = areas?.areas || [];
+    const opts = list.filter(a => a.active).map(a => ({ value: a.key, label: a.label }));
+    if (savedArea && !opts.some(o => o.value === savedArea)) {
+      const hit = list.find(a => a.key === savedArea);
+      opts.push({
+        value: savedArea,
+        label: hit ? `${hit.label} (switched off)` : areas ? `${savedArea} (not in the list)` : savedArea,
+      });
+    }
+    return [{ value: '', label: '— Unassigned —' }, ...opts];
+  })();
+  const pickedArea = (editing?.area || '').trim();
+  const pickedAreaRow = areas?.areas.find(a => a.key === pickedArea);
+
   // ── Recipe deduction, at a glance ─────────────────────────────────────────
   // With 29 departments across 13 groups this list is 42 rows; without a total
   // the only way to answer "which of my kitchens deduct?" is to read every one.
@@ -278,6 +298,10 @@ export default function DepartmentsPage() {
             }}
                     className="px-3 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm">
               + Seed Kitchen Sub-Depts
+            </button>
+            <button onClick={() => setShowAreas(v => !v)} aria-expanded={showAreas}
+                    className="px-3 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm flex items-center gap-2">
+              <Layers className="w-4 h-4" /> Manage Areas
             </button>
             <button onClick={() => setEditing(empty())}
                     className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
@@ -314,6 +338,12 @@ export default function DepartmentsPage() {
           while the alert still routes through the Head Chef flag, so a panel
           built on them would report the opposite of what happens. */}
       {!loading && isAdmin && <DeviationRoutingReadiness />}
+
+      {/* Manage Areas — ADMIN ONLY (owner ruling #82). The API re-checks admin
+          on every write and 403s anyone else; this is a mirror, not the gate. */}
+      {isAdmin && showAreas && (
+        <ManageAreasPanel data={areas} onChanged={setAreas} onClose={() => setShowAreas(false)} />
+      )}
 
       <div className="bg-white border border-[#E8D5C4] rounded-xl">
         {loading ? (
@@ -527,13 +557,19 @@ export default function DepartmentsPage() {
                   departments can share an area (all kitchen sub-depts → Kitchen). */}
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                 Area
-                <select value={editing.area || ''}
+                <select value={pickedArea}
                         onChange={e => setEditing(p => p ? { ...p, area: e.target.value } : p)}
                         className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
-                  {AREA_OPTIONS.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                  {areaOptions.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
                 </select>
                 <span className="text-[10px] text-[#8B7355]">
-                  Groups departments for closing-stock rollups (Kitchen / Bar / Store / Service).
+                  Groups departments for the area totals on Closing Stock. Add, rename or switch off areas under Manage Areas.
+                  {pickedArea && pickedAreaRow && !pickedAreaRow.active && (
+                    <> <b className="font-medium text-[#8a5a06]">{pickedAreaRow.label} is switched off:</b> this department keeps it, but it can’t be given to another department.</>
+                  )}
+                  {pickedArea && areas && !pickedAreaRow && (
+                    <> <b className="font-medium text-[#8a5a06]">“{pickedArea}” is not in the Manage Areas list.</b> This department keeps it until you pick an area from the list.</>
+                  )}
                 </span>
               </label>
 

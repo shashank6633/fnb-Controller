@@ -599,9 +599,16 @@ export default function ClosingStockByLocationPage() {
   // Per-area rollup (admin/HOD only) — each area's overall physical closing value
   // for the selected date. Sourced from summary.by_area on /api/closing-stock.
   const [byArea, setByArea] = useState<any[]>([]);
-  const AREA_LABELS: Record<string, string> = {
-    kitchen: 'Kitchen', bar: 'Bar', store: 'Store', service: 'Service / Ops', other: 'Other', __store__: 'Store / Overall',
-  };
+  // Area names come from Settings → Departments → Manage Areas (the owner's
+  // list); a key the list has no entry for shows as itself. '__store__' is
+  // this page's own bucket for counts with no department area.
+  const [areaNames, setAreaNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    fetch('/api/departments/areas').then(r => (r.ok ? r.json() : null)).then(j => {
+      if (Array.isArray(j?.areas)) setAreaNames(Object.fromEntries(j.areas.map((a: any) => [a.key, a.label])));
+    }).catch(() => {});
+  }, []);
+  const AREA_LABELS: Record<string, string> = { ...areaNames, __store__: 'Store / Overall' };
 
   // Name of the department a pinned user records for ('Store/Overall' when none).
   const ownDeptName = departments.find((d: any) => d.id === ownDeptId)?.name
@@ -2179,7 +2186,7 @@ export default function ClosingStockByLocationPage() {
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             {byArea.map((a: any) => (
               <div key={a.area} className="border border-[#E8D5C4] rounded-lg p-3 bg-[#FFF8F0]">
-                <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{AREA_LABELS[a.area] || a.area}</div>
+                <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{a.label || AREA_LABELS[a.area] || a.area}</div>
                 <div className="text-lg font-semibold text-[#2D1B0E] mt-1">{fmt(a.physical_value)}</div>
                 <div className="text-[10px] text-[#8B7355] mt-0.5">{a.item_count} item{a.item_count === 1 ? '' : 's'}</div>
               </div>

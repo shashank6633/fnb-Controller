@@ -61,6 +61,13 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
   ['department_recipe_deduction_v1',      { owner: '/api/departments' }],
   ['department_recipe_deduction_seed_v1', { owner: '/api/departments' }],
   ['department_recipe_deduction_auto_v1', { owner: '/api/departments' }],
+  // THE LIST OF DEPARTMENT AREAS (Manage Areas, ruling #82). Owned by
+  // /api/departments/areas: admin-only, audited, and refuses deleting an area a
+  // department still uses. Without this row a MANAGER could PUT '[]' or junk
+  // here (measured: 200, list wiped, every used key turned "unlisted", Closing
+  // Stock fell back to raw keys) and an admin could drop an in-use area with no
+  // audit row. READ stays open — the list is names, not a secret.
+  ['department_areas', { owner: '/api/departments/areas' }],
   // The crash-alert WhatsApp number decides WHO gets production error alerts.
   // Admin-only to read (don't hand a personal number to every signed-in staff
   // session) and to write — the /api/error-report console is admin-only, so a

@@ -11,6 +11,7 @@ import { todayIST } from '@/lib/format-date';
 import { checkClosingDate } from '@/lib/closing-date';
 import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
 import { cutoverAt, deptKey } from '@/lib/dept-ledger';
+import { readDepartmentAreas, areaLabelMap, areaLabelFor } from '@/lib/department-areas';
 
 /**
  * DEPARTMENT CLOSING SHEET — one sheet spanning every ACTIVE department, for
@@ -480,6 +481,8 @@ export async function GET(request: Request) {
     }
 
     let gItems = 0, gCounted = 0, gValue = 0, gUnpriced = 0, gVariance = 0;
+    // Area names (Settings → Departments → Manage Areas), read once per sheet.
+    const areaNames = areaLabelMap(readDepartmentAreas(db).areas);
 
     const departments = depts.map(d => {
       const mats = byDept.get(d.id) || [];
@@ -598,6 +601,9 @@ export async function GET(request: Request) {
         /** The heading this department files under (its parent, or itself). */
         group: d.parent_name || d.name,
         area: d.area,
+        /** The area's name from Manage Areas ('' when none; the key itself
+         *  when the list has no entry for it). */
+        area_label: areaLabelFor(areaNames, d.area),
         is_active: d.is_active === 1,
         items: rows,
         totals: {

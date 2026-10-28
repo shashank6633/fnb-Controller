@@ -10,6 +10,7 @@ import {
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { checkClosingDate } from '@/lib/closing-date';
+import { readDepartmentAreas, areaLabelMap, areaLabelFor } from '@/lib/department-areas';
 
 /**
  * VALUATION ON THE CLOSING SHEET (2026-07-30)
@@ -326,8 +327,12 @@ export async function GET(request: Request) {
       closingValueByArea.set(r.area, r2((closingValueByArea.get(r.area) || 0) + v.total_value));
     }
 
+    // Names from Manage Areas (Settings → Departments); a key with no entry in
+    // the list is shown as itself, '__store__' as "Store / Overall".
+    const areaNames = areaLabelMap(readDepartmentAreas(db).areas);
     const by_area = areaRows.map(r => ({
       area: r.area,
+      label: areaLabelFor(areaNames, r.area),
       physical_value: r.physical_value || 0,
       system_value: r.system_value || 0,
       variance_value: r.variance_value || 0,

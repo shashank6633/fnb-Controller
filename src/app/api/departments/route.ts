@@ -9,6 +9,7 @@ import {
 } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { canonNameInput } from '@/lib/name-canon';
+import { readDepartmentAreas, checkDepartmentArea } from '@/lib/department-areas';
 
 /* ════════════════════════════════════════════════════════════════════════════
  * RECIPE DEDUCTION PER DEPARTMENT — the seed and the only writer
@@ -318,13 +319,18 @@ export async function POST(request: Request) {
     if (!b.name || !String(b.name).trim()) {
       return Response.json({ error: 'name required' }, { status: 400 });
     }
+    // Area: '' or an area that is switched ON in Manage Areas
+    // (src/lib/department-areas.ts). An unknown or switched-off value is refused
+    // in plain words rather than stored as free text nothing can name.
+    const areaCheck = checkDepartmentArea(readDepartmentAreas(db).areas, b.area, null);
+    if (!areaCheck.ok) return Response.json({ error: areaCheck.error }, { status: 400 });
     const id = generateId();
     db.prepare(`
       INSERT INTO departments (id, name, code, description, head_chef_user_id, head_user_id, parent_id, area, is_active, submission_windows, submission_grace_minutes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     `).run(id, String(b.name).trim(), b.code || '', b.description || '', b.head_chef_user_id || null,
             b.head_user_id || null, b.parent_id || null,
-            String(b.area || '').trim(),
+            areaCheck.value,
             String(b.submission_windows || '').trim(),
             b.submission_grace_minutes != null ? Number(b.submission_grace_minutes) : 30);
     const row = db.prepare('SELECT * FROM departments WHERE id = ?').get(id);
@@ -341,6 +347,18 @@ export async function PUT(request: Request) {
     const db = getDb();
     const b = await request.json();
     if (!b.id) return Response.json({ error: 'id required' }, { status: 400 });
+    // Area (Manage Areas, src/lib/department-areas.ts): absent/null keeps the
+    // stored value (COALESCE below). Otherwise '' or a switched-ON area — and a
+    // department may always keep the area it already has, even one since
+    // switched off, because the edit modal re-sends the whole row on every save.
+    let areaValue: string | null = null;
+    if (b.area !== undefined && b.area !== null) {
+      const cur = db.prepare('SELECT area FROM departments WHERE id = ?').get(String(b.id)) as
+        { area: string | null } | undefined;
+      const areaCheck = checkDepartmentArea(readDepartmentAreas(db).areas, b.area, cur?.area ?? null);
+      if (!areaCheck.ok) return Response.json({ error: areaCheck.error }, { status: 400 });
+      areaValue = areaCheck.value;
+    }
     // RECIPE DEDUCTION IS DELIBERATELY NOT WRITABLE HERE — PATCH below is its
     // only writer. The edit modal sends `{ ...fetchedRow }`, so this body WILL
     // usually carry recipe_deduction_enabled; honouring it would let a form
@@ -431,7 +449,7 @@ export async function PUT(request: Request) {
       WHERE id = ?
     `).run(
       b.name ?? null, b.code ?? null, b.description ?? null,
-      b.area ?? null,
+      areaValue,
       b.head_chef_user_id !== undefined ? b.head_chef_user_id : null,
       b.is_active != null ? (b.is_active ? 1 : 0) : null,
       b.submission_windows ?? null,

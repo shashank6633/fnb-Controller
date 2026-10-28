@@ -123,6 +123,8 @@ interface SheetDept {
   parent_name: string;
   group: string;
   area: string;
+  /** The area's name from Settings → Departments → Manage Areas ('' = none). */
+  area_label?: string;
   is_active: boolean;
   items: SheetItem[];
   totals: {
@@ -968,6 +970,12 @@ export default function ClosingSheetPage() {
                 <div className="text-sm font-semibold text-[#2D1B0E]">
                   {dept.name}
                   {dept.parent_name && <span className="text-[#B9A896] font-normal"> · {dept.parent_name}</span>}
+                  {dept.area && (
+                    <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded bg-[#EFE1D0] text-[#6B5744]"
+                          title="This department's area, from Settings → Departments → Manage Areas">
+                      Area: {dept.area_label || dept.area}
+                    </span>
+                  )}
                   {!dept.is_active && <span className="ml-1.5 text-[9px] uppercase px-1 rounded bg-red-100 text-red-700">inactive</span>}
                 </div>
                 <div className="text-[11px] text-[#8B7355]">
