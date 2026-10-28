@@ -3297,8 +3297,10 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: 
   return (
     <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
       {rc && <ReapprovalChangesPanel rc={rc} approvalNote={po.approval_note} />}
-      <div className="flex items-start gap-6">
-        <div className="text-xs text-[#6B5744] space-y-1">
+      {/* Details on ONE compact strip above the lines (owner, 2026-10-28): side by
+          side they took half the width and pushed the line table into a scroll. */}
+      <div className="flex flex-col gap-2">
+        <div className="text-xs text-[#6B5744] flex flex-wrap items-baseline gap-x-5 gap-y-1 pb-2 border-b border-[#E8D5C4]">
           {/* The two dates that bracket the order, side by side: when we raised
               it, and when the vendor said it would land. An overdue promise is
               called out here too — the detail panel is where a buyer chasing a
@@ -3313,18 +3315,19 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: 
               </span>
             ) : <span className="text-[#8B7355]">—</span>}
           </div>
-          {po.notes && <div><span className="font-semibold">Notes:</span> {po.notes}</div>}
           {po.submitted_at && <div><span className="font-semibold">Submitted:</span> {dateLabel(po.submitted_at)}</div>}
           {po.approved_at  && <div><span className="font-semibold">Approved:</span>  {dateLabel(po.approved_at)} by {po.approved_by}</div>}
           {po.received_at  && <div><span className="font-semibold">Received:</span>  {dateLabel(po.received_at)}</div>}
-          {po.rejected_reason && <div className="text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
+          {po.rejected_reason && <div className="basis-full text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
+          {/* Notes on their own full-width line, at most two lines; the whole text on hover. */}
+          {po.notes && <div className="basis-full line-clamp-2" title={po.notes}><span className="font-semibold">Notes:</span> {po.notes}</div>}
           {/* WHY THE RECEIVED COLUMN LOOKS THE WAY IT DOES, NAMED ONCE at the
               top rather than only inferred from chips down the table — a
               storekeeper who reads "Received 0" concludes the delivery failed.
               Blue, not amber or red, matching /grn: the desk did nothing wrong;
               the receipt is waiting on somebody else. */}
           {heldLines.length > 0 && (
-            <div className="text-blue-800 max-w-[22rem]">
+            <div className="basis-full text-blue-800">
               <Clock className="w-3 h-3 inline-block align-[-2px] mr-1" />
               <span className="font-semibold">{heldGrns.join(', ') || 'This receipt'}</span>{' '}
               {heldLines.length === 1 ? 'has 1 line' : `has ${heldLines.length} lines`} held for a quality check —
@@ -3344,7 +3347,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: 
             </div>
           ))}
           {grouped && (view?.closures || []).length > 0 && (
-            <div className="text-red-800 max-w-[22rem] pt-1">
+            <div className="basis-full text-red-800">
               {(view?.closures || []).map(c => (
                 <div key={c.vendor_id + c.closed_at}>
                   <span className="font-semibold">{c.vendor_name || 'A vendor'} closed</span>
@@ -3356,7 +3359,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: 
             </div>
           )}
         </div>
-        <div className="flex-1 min-w-0 overflow-x-auto">
+        <div className="min-w-0 overflow-x-auto">
         <table className="text-xs w-full min-w-[640px]">
           <thead className="text-[#8B7355]">
             <tr>
