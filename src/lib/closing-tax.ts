@@ -469,12 +469,20 @@ export function closingTaxNotes(
       ? `the 1 ${one} with a GST rate has no value saved at count`
       : `none of the ${rated} ${noun} with a GST rate has a value saved at count`;
     const noRate = items - rated;
+    // The compact board-footer form names WHICH rows have no value, like
+    // `which` above: when some rows have no rate, one of THOSE may well have a
+    // value at count, so a bare "none with a value at count" would be untrue.
+    const shortWhich = rated === items
+      ? 'none with a value at count'
+      : rated === 1
+        ? 'the 1 with a GST rate has no value at count'
+        : `none of the ${rated} with a GST rate has a value at count`;
     return {
       situation,
       rate: `${known}, but ${which} saved at count, so no tax is shown`,
       incl: withRate,
       covers: withRate,
-      short: `${known} · none with a value at count · no tax`,
+      short: `${known} · ${shortWhich} · no tax`,
       title: `GST rate known for ${rated} of ${of(items)}, but ${which} saved with the count, so no tax is `
         + 'estimated and both totals are blank. Tax is applied only to the value saved with the count — never to '
         + 'a value worked out today, which a later bill could move.'
