@@ -39,6 +39,7 @@ import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState, { countKind } from '@/components/CountState';
+import { isSwitchedOff } from '@/components/MaterialTypeahead';
 import {
   CLOSING_GST_PCT_CSV, CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
   CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_INCL_LABEL, CLOSING_INCL_TITLE,
@@ -268,6 +269,25 @@ interface Item {
   current_stock: number | null; average_price: number; reorder_level?: number;   // system stock — null for non-admins (blind count)
   super_category?: string; category?: string; closing_cadence?: string; shelf_life_days?: number;
   today_count: number | null; today_variance: number | null; today_by?: string;
+  /** raw_materials.is_active (0 = switched off) — for the Inactive tag only. */
+  is_active?: number | null;
+}
+
+/**
+ * Small grey "Inactive" tag on a count row whose material is switched off in
+ * Raw Materials (owner #6 / ruling 78). Grey, not red: a switched-off item is
+ * not an alert — it is hidden on NEW entries only, and while it is still on a
+ * count list (it holds stock, or already has a count that day) counting it is
+ * exactly right. The same tag on the Record Closing Stock sheet and on an
+ * area's count screen, so the two read alike.
+ */
+function InactiveTag() {
+  return (
+    <span title="Switched off in Raw Materials — not offered on new entries. Its stock still counts: if you hold some, count it as usual."
+          className="ml-1.5 align-middle text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+      Inactive
+    </span>
+  );
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -364,7 +384,10 @@ function AddOffListItem({ deptId, deptName, existingIds, onAdd, compact }: {
               {shown.map(r => (
                 <li key={r.id} className="flex items-center gap-2 px-3 py-1.5">
                   <span className="flex-1 min-w-0">
-                    <span className="block text-xs font-medium text-[#2D1B0E] truncate">{r.name}</span>
+                    <span className="block text-xs font-medium text-[#2D1B0E] truncate">
+                      {r.name}
+                      {isSwitchedOff(r) && <InactiveTag />}
+                    </span>
                     <span className="block text-[10px] text-[#8B7355]">
                       {categoryLabel(r.category || 'other')}
                       {r.sku ? ` · ${r.sku}` : ''} · counted in {r.purchase_unit || r.unit}
@@ -671,6 +694,40 @@ export default function ClosingStockByLocationPage() {
     </div>
   ) : null;
 
+  /* SWITCHED-OFF ITEMS ON THE STORE / OVERALL SHEET (owner #6 / ruling 78).
+     /api/inventory lists every material, switched-off ones included (it is the
+     shared list and is deliberately never filtered by is_active). On the
+     Store / Overall sheet — and the CSV template / upload built from the same
+     rows — a switched-off item stays only while the central store still holds
+     a non-zero balance of it, or a Store / Overall count is already saved for
+     it on the sheet's date; at zero it drops off. That is the rule a
+     Store / Overall area count screen (/api/closing-stock/by-location)
+     applies, answered by the server per date (GET /api/closing-stock?
+     store_keep=1 → src/lib/count-list-active.ts storeOverallKeepIds).
+     Until the answer for THIS date is in, switched-off rows are held back, so
+     none can be typed into and then vanish; if the call fails they are all
+     shown (tagged Inactive) rather than hiding something countable. A
+     department's sheet is untouched: its own list (dept_items) applies the
+     rule on the server, and its fail-open fallback promises the full list. */
+  const [storeKeepByDate, setStoreKeepByDate] = useState<Record<string, Set<string> | 'error'>>({});
+  const loadStoreKeep = async (d: string): Promise<Set<string> | 'error'> => {
+    let ids: Set<string> | 'error' = 'error';
+    try {
+      const r = await fetch(`/api/closing-stock?${new URLSearchParams({ store_keep: '1', date: d })}`);
+      const j = r.ok ? await r.json() : null;
+      if (Array.isArray(j?.keep_ids)) ids = new Set<string>(j.keep_ids.map((x: unknown) => String(x)));
+    } catch { /* 'error' → show every row, tagged */ }
+    setStoreKeepByDate(prev => ({ ...prev, [d]: ids }));
+    return ids;
+  };
+  useEffect(() => {
+    if (!closingStockOpen || activeDeptId) return;
+    loadStoreKeep(closingDate);
+  }, [closingStockOpen, activeDeptId, closingDate]);
+  /** Is this row on the Store / Overall sheet? Switched-ON rows always are. */
+  const storeSheetKeeps = (m: { id?: unknown; is_active?: unknown }, keep: Set<string> | 'error' | undefined) =>
+    !isSwitchedOff(m) || keep === 'error' || (keep instanceof Set && keep.has(String(m.id)));
+
   /* Modal item list scoped to the ACTIVE department's category whitelist.
      Staff (no dept choice) fetch WITHOUT scope=all, so the server whitelist
      already returns exactly their main dept's items. Privileged viewers keep
@@ -708,8 +765,14 @@ export default function ClosingStockByLocationPage() {
     if (!canSeeAllDepts && deptItemIds) {
       list = list.filter((m: any) => deptItemIds.has(String(m.id)));
     }
+    // Store / Overall only: a switched-off item stays while central holds it
+    // or a Store / Overall count is saved for this date (see storeKeepByDate).
+    if (!activeDeptId) {
+      const keep = storeKeepByDate[closingDate];
+      list = list.filter((m) => storeSheetKeeps(m, keep));
+    }
     return list;
-  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds, deptScopeActive, deptRequested, extraRows]);
+  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds, deptScopeActive, deptRequested, extraRows, activeDeptId, storeKeepByDate, closingDate]);
   /** Ids on the sheet — the escape hatch must not offer a duplicate. */
   const sheetIds = useMemo(() => new Set(deptScopedMaterials.map((m: any) => String(m.id))), [deptScopedMaterials]);
   // Is a real category whitelist in effect for the active dept? Gates the base
@@ -755,7 +818,9 @@ export default function ClosingStockByLocationPage() {
         <div className="flex items-start gap-2 rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-4 py-2.5 text-xs text-[#6B5744]">
           <ListChecks className="w-4 h-4 flex-shrink-0 mt-0.5 text-[#8B7355]" />
           <span>
-            <strong>Store / Overall</strong> — the full central list, not scoped to any department.
+            <strong>Store / Overall</strong> — the full central list, not scoped to any department
+            (an item switched off in Raw Materials stays on it only while its central balance is not
+            zero, or once it has a Store / Overall count that day).
             Pick a department above to count only the items that department actually uses.
           </span>
         </div>
@@ -789,7 +854,8 @@ export default function ClosingStockByLocationPage() {
           <span>
             <strong>{activeDeptName} uses {ever} item{ever === 1 ? '' : 's'}</strong> — every material this
             department has ever requisitioned, with no time limit, so something it asked for months ago
-            stays on the list. Items it has never requested (or only ever had rejected) are not shown.
+            stays on the list. Items it has never requested (or only ever had rejected) are not shown,
+            nor is an item switched off in Raw Materials once this department&apos;s balance of it is zero.
             {extraRows.length > 0 && (
               <> {' '}<span className="text-[#af4408] font-medium">+{extraRows.length} added by hand this session.</span></>
             )}
@@ -1352,14 +1418,20 @@ export default function ClosingStockByLocationPage() {
    * sheet never needs it — those rows come from the server, not /api/inventory.
    * ────────────────────────────────────────────────────────────────────────── */
   const closingSheetRows = async (): Promise<any[]> => {
-    if (deptScopeActive || materials.length) return deptScopedMaterials;
-    const all = await fetchMaterials();
+    if (deptScopeActive || (activeDeptId && materials.length)) return deptScopedMaterials;
+    const all = materials.length ? materials : await fetchMaterials();
     let list = (hasDeptChoice && deptCategorySet)
       ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
       : all;
     // Same dept item-set intersection as deptScopedMaterials.
     if (!canSeeAllDepts && deptItemIds) {
       list = list.filter((m: any) => deptItemIds.has(String(m.id)));
+    }
+    // Store / Overall: the same switched-off rule as the sheet, for THIS date —
+    // awaited here, so a template or an upload never runs ahead of it.
+    if (!activeDeptId) {
+      const keep = storeKeepByDate[closingDate] ?? await loadStoreKeep(closingDate);
+      list = list.filter((m: any) => storeSheetKeeps(m, keep));
     }
     return list;
   };
@@ -1412,6 +1484,14 @@ export default function ClosingStockByLocationPage() {
       const byName = new Map(mats.map(m => [String(m.name).trim().toLowerCase(), m]));
       const subById = new Map(subs.map(s => [String(s.id), s]));
       const subByName = new Map(subs.map(s => [s.name.trim().toLowerCase(), s]));
+      /* A row for a SWITCHED-OFF item the Store / Overall sheet does not list
+         (zero central stock, no Store / Overall count saved that date) is not
+         "material not found" — it exists. Say what is actually true. */
+      const offList = activeDeptId ? [] : (materials.length ? materials : await fetchMaterials())
+        .filter((m: any) => isSwitchedOff(m) && !byId.has(String(m.id)));
+      const offById = new Map(offList.map((m: any) => [String(m.id), m]));
+      const offBySku = new Map(offList.filter((m: any) => m.sku).map((m: any) => [String(m.sku).trim().toLowerCase(), m]));
+      const offByName = new Map(offList.map((m: any) => [String(m.name).trim().toLowerCase(), m]));
       const text = await file.text();
       const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
       if (parsed.errors?.length) {
@@ -1480,7 +1560,13 @@ export default function ClosingStockByLocationPage() {
         const skuKey = get(row, 'SKU', 'sku').toLowerCase();
         const nameKey = get(row, 'Name', 'name').toLowerCase();
         const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
-        if (!m) { errors.push(notOnSheet(label)); continue; }
+        if (!m) {
+          const off = (idKey && offById.get(idKey)) || (skuKey && offBySku.get(skuKey)) || (nameKey && offByName.get(nameKey));
+          errors.push(off
+            ? `${label}: switched off in Raw Materials, with no central stock and no Store / Overall count saved for ${closingDate}, so it is not on this sheet and was not counted. An admin can switch it back on in Raw Materials.`
+            : notOnSheet(label));
+          continue;
+        }
         // Basis comes from the row's own Unit cell: new templates declare the
         // purchase unit (count ×pack → recipe), old files declare the recipe
         // unit (raw). Anything else is ambiguous — reject the row rather than
@@ -2005,7 +2091,10 @@ export default function ClosingStockByLocationPage() {
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isLow ? 'bg-red-50/30' : ''}`}>
                         <td className="py-1.5 px-3">
-                          <div className="font-medium text-[#2D1B0E]">{it.name}</div>
+                          <div className="font-medium text-[#2D1B0E]">
+                            {it.name}
+                            {isSwitchedOff(it) && <InactiveTag />}
+                          </div>
                           <div className="flex gap-1.5 mt-0.5 items-center">
                             <span className="text-[10px] font-mono text-[#8B7355]">{it.sku || '·'}</span>
                             {cadenceTag && (
@@ -2827,7 +2916,10 @@ export default function ClosingStockByLocationPage() {
                         const isExcess = variance !== null && variance > 0;
                         return (
                           <tr key={m.id} className={`border-t border-[#E8D5C4]/50 ${isShortage ? 'bg-red-50/30' : isExcess ? 'bg-blue-50/30' : ''}`}>
-                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">{m.name}</td>
+                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">
+                              {m.name}
+                              {isSwitchedOff(m) && <InactiveTag />}
+                            </td>
                             <td className="py-1.5 px-3">
                               <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${CATEGORY_COLORS[m.category]?.bg || ''} ${CATEGORY_COLORS[m.category]?.text || ''}`}>
                                 {categoryLabel(m.category)}

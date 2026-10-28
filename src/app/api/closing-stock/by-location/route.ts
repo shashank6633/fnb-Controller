@@ -99,6 +99,9 @@ export async function GET(request: Request) {
              COALESCE(rm.case_size, 1) AS case_size,
              rm.current_stock, rm.average_price, rm.reorder_level,
              rm.super_category, rm.category, rm.closing_cadence, rm.shelf_life_days,
+             -- For the grey "Inactive" tag on a switched-off row the clause
+             -- above keeps (same tag as the Record Closing Stock sheet).
+             COALESCE(rm.is_active, 1) AS is_active,
              cs.physical_stock AS today_count,
              cs.variance       AS today_variance,
              cs.recorded_by    AS today_by

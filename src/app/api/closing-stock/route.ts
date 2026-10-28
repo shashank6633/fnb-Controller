@@ -133,6 +133,33 @@ export async function GET(request: Request) {
      * computed or returned on this path at all. average_price is COST data
      * (same treatment as the rest of this route) and ships to everyone.
      * ────────────────────────────────────────────────────────────────────── */
+    /* ══════════════════════════════════════════════════════════════════════
+     * store_keep=1&date= — SWITCHED-OFF ITEMS ON THE STORE / OVERALL SHEET
+     * ══════════════════════════════════════════════════════════════════════
+     * The Record Closing Stock sheet with no department chosen lists the
+     * central catalogue (GET /api/inventory, which carries is_active but is
+     * deliberately never filtered by it). Owner #6 / ruling 78: a switched-off
+     * item stays on a count list only while it still holds stock. This answers
+     * which switched-off ids the Store / Overall sheet keeps on `date` —
+     * central balance non-zero, or a Store / Overall count already saved that
+     * day (storeOverallKeepIds, src/lib/count-list-active.ts: the same two arms
+     * ../by-location applies to a Store / Overall area screen). The page drops
+     * every other switched-off row from the sheet, its CSV template and its
+     * upload. Purely additive; nothing here writes; ids only (no stock figure
+     * leaves the server, so blind counts are untouched).
+     * ────────────────────────────────────────────────────────────────────── */
+    if (url.searchParams.get('store_keep') === '1') {
+      if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+      const d = String(date || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return Response.json({ error: 'date (YYYY-MM-DD) is required' }, { status: 400 });
+      const { storeOverallKeepIds, switchedOffIds } = await import('@/lib/count-list-active');
+      return Response.json({
+        date: d,
+        switched_off: switchedOffIds(db).length,
+        keep_ids: storeOverallKeepIds(db, d),
+      });
+    }
+
     if (url.searchParams.get('dept_items') === '1') {
       if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
       const wanted = (departmentId || '').trim();
@@ -150,11 +177,15 @@ export async function GET(request: Request) {
         return Response.json({ error: 'Not allowed for this department' }, { status: 403 });
       }
       const deptSet = selectedDeptSet(db, dept.id);
+      // is_active rides along so the sheet can tag a switched-off row
+      // "Inactive" (it is listed only while held — see below); the GET
+      // /api/inventory rows the Store / Overall sheet uses already carry it.
       const COLS = `rm.id, rm.sku, rm.name, rm.category, rm.super_category, rm.unit,
              COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
              COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size,
              rm.current_stock, rm.average_price, rm.reorder_level,
-             rm.storage_location, rm.closing_cadence, rm.shelf_life_days`;
+             rm.storage_location, rm.closing_cadence, rm.shelf_life_days,
+             COALESCE(rm.is_active, 1) AS is_active`;
       /* SWITCHED-OFF ITEMS (owner #6 / ruling 78, src/lib/count-list-active.ts):
          a switched-off material stays on this department's count list — and
          in the search below — while the department's books (a MAIN one with

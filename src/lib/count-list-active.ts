@@ -14,6 +14,9 @@ import { deptKey, deptOnHandBulk } from './dept-ledger';
  *   closing-stock/by-location   an area's count screen (+ ../locations, its
  *                               progress cards — kept identical to it)
  *   closing-stock?dept_items=1  a department's own count list (+ its search)
+ *   closing-stock?store_keep=1  the Store / Overall "Record Closing Stock"
+ *                               sheet on /closing-stock (+ its CSV template and
+ *                               upload) — storeOverallKeepIds below
  *   lib/central-cutover.ts      the Central Store Cutover count sheet
  *
  * THE RULE. A switched-ON item is listed exactly as before. A switched-OFF item
@@ -140,6 +143,34 @@ export function switchedOffStillHeld(
     for (const m of heldInDepts(db, where.deptIds, off).materials) keep.add(m);
   }
   return [...keep];
+}
+
+/**
+ * The switched-off material ids the STORE / OVERALL count sheet keeps on
+ * `date` — the /closing-stock "Record Closing Stock" sheet with no department
+ * chosen, and the CSV template / upload built from the same rows. A
+ * switched-off item stays while EITHER
+ *   · the central store still holds a non-zero balance of it (centralHeldSql —
+ *     the same arm switchedOffStillHeld({ central: true }) reads), OR
+ *   · a Store / Overall count (department_id NULL or '') is already saved for
+ *     it on `date`, so a saved count never silently vanishes,
+ * and drops off otherwise. These are exactly the two arms
+ * closing-stock/by-location applies to a Store / Overall area count screen
+ * (its `cs.id IS NOT NULL` on the Store / Overall join + switchedOffStillHeld
+ * ({ central: true })), so the area screen and the sheet list the same
+ * switched-off items. Returns [] at once when nothing is switched off.
+ */
+export function storeOverallKeepIds(db: Database.Database, date: string): string[] {
+  if (switchedOffIds(db).length === 0) return [];
+  return (db.prepare(`
+    SELECT rm.id FROM raw_materials rm
+     WHERE COALESCE(rm.is_active, 1) = 0
+       AND (${centralHeldSql('rm')}
+            OR EXISTS (SELECT 1 FROM closing_stock cs
+                        WHERE cs.material_id = rm.id
+                          AND cs.date = ?
+                          AND COALESCE(cs.department_id, '') = ''))
+  `).all(date) as Array<{ id: string }>).map((r) => String(r.id));
 }
 
 /** Every department id (active or not) — for a list that spans the house. */
