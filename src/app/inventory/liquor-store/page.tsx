@@ -7,8 +7,12 @@
  * store_category_map + store_user_access): a future Wine Cellar shows up here
  * automatically via the store picker (hidden while only one store is active).
  *
- * Sections: STOCK (search + category chips + totals), NEW PURCHASE
- * (can_procure), ADJUSTMENT incl. one-time OPENING (can_adjust), LEDGER tab
+ * Sections: STOCK (search + category chips + totals), a link to enter a bill
+ * on Goods Receipt (GRN) → TGBCL Liquor Bill (can_procure — since the
+ * liquor-on-GRN switch-over, owner rulings #83/#84, liquor bills are entered
+ * there and post straight into this store's ledger; the old New Bill / Upload
+ * CSV (Bill) doors here are retired, their routes answer 410), ADJUSTMENT incl.
+ * one-time OPENING (can_adjust), LEDGER tab
  * (type chips / material search / date range), CLOSING STOCK tab
  * (can_close_stock — independent daily physical counts, Phase C) and REPORTS
  * tab (11 store-scoped reports + CSV download, Phase D). Store closing is
@@ -39,7 +43,13 @@ import {
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
-interface StoreLite { id: string; name: string; code: string; is_active: number; }
+interface StoreLite {
+  id: string; name: string; code: string; is_active: number;
+  /** Mapped categories (GET /api/stores). A store that owns ≥ 1 category is
+   *  where a Goods Receipt TGBCL Liquor Bill posts its bottles (materialStoreId);
+   *  a FLOOR bar owns none and is filled by transfers. */
+  categories?: { id: string; category: string }[];
+}
 interface Access { can_view: boolean; can_procure: boolean; can_adjust: boolean; can_close_stock: boolean; }
 interface StockRow {
   material_id: string; material_name: string; category: string; unit: string;
@@ -64,7 +74,6 @@ interface LedgerRow {
   /** Synthetic closing-count register rows (ledger ?counts=1) — never move stock. */
   is_count?: boolean; system_qty?: number; variance?: number; saved_at?: string;
 }
-interface VendorLite { id: string; name: string; }
 /** Ledger render item: a plain row, or a bill-subtotal marker after a group
  *  of consecutive 'purchase' rows sharing one non-empty invoice ref. */
 /** Bill-level charges on a liquor invoice (TGBCL): recorded on top of the line
@@ -76,7 +85,12 @@ interface BillChargeRow {
 }
 type LedgerItem =
   | { kind: 'row'; row: LedgerRow }
-  | { kind: 'bill'; ref: string; count: number; total: number; supplier: string; charges?: BillChargeRow | null };
+  | { kind: 'bill'; ref: string; count: number; total: number; supplier: string; charges?: BillChargeRow | null;
+      /** The bill's Goods Receipt stamp ('Goods Receipt GRN-yyyy-#### · PINV-yyyy-L####'),
+       *  when every line of the group carries the same one — a TGBCL bill entered
+       *  on Goods Receipt writes it as each ledger row's notes. '' for bills
+       *  recorded here before the switch-over. */
+      grn: string };
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
@@ -129,24 +143,6 @@ const today = () => todayIST();
 const numOr0 = (s?: string) => {
   const n = Number(s);
   return s != null && s !== '' && Number.isFinite(n) ? n : 0;
-};
-/** Normalise a CSV date cell to YYYY-MM-DD. Accepts YYYY-MM-DD as-is, or a
- *  day-first DD-MM-YYYY / DD/MM/YYYY / DD.MM.YYYY (2- or 4-digit year, the
- *  Indian convention). Anything else → '' so the server falls back to the
- *  bill's default date from the modal. */
-const normDate = (raw: string): string => {
-  const s = String(raw || '').trim();
-  if (!s) return '';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  let m = s.match(/^(\d{4})[/.](\d{1,2})[/.](\d{1,2})$/);      // year-first
-  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
-  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);       // day-first
-  if (m) {
-    const d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0');
-    let y = m[3]; if (y.length === 2) y = '20' + y;
-    if (Number(d) >= 1 && Number(d) <= 31 && Number(mo) >= 1 && Number(mo) <= 12) return `${y}-${mo}-${d}`;
-  }
-  return '';
 };
 
 /* One quantity: '2 cs + 9 btl + 450 ml' (bold) with '· 25,200 ml' alongside.
@@ -281,9 +277,6 @@ export default function LiquorStorePage() {
   // response predates this field.
   const [catalog, setCatalog] = useState<StockRow[]>([]);
   const [materials, setMaterials] = useState<MatRow[]>([]);
-  const [suppliers, setSuppliers] = useState<string[]>([]);
-  const [vendors, setVendors] = useState<VendorLite[]>([]);
-  const [storeVendors, setStoreVendors] = useState<VendorLite[]>([]);
   const [stockLoading, setStockLoading] = useState(false);
 
   const [ledger, setLedger] = useState<LedgerRow[]>([]);
@@ -324,14 +317,22 @@ export default function LiquorStorePage() {
   // Modals
   const [showAdjust, setShowAdjust] = useState(false);
   const [showBulkAdjust, setShowBulkAdjust] = useState(false);
-  const [showBill, setShowBill] = useState(false);
-  const [showUpload, setShowUpload] = useState(false);
   // Migration modal target: material_ids to preview, or 'all'
   const [migrateTarget, setMigrateTarget] = useState<string[] | 'all' | null>(null);
 
   const access: Access = accessByStore[storeId] ||
     { can_view: false, can_procure: false, can_adjust: false, can_close_stock: false };
   const store = stores.find(s => s.id === storeId) || null;
+  // Where liquor bills land: the active stores that own ≥ 1 category. The
+  // Goods Receipt TGBCL Liquor Bill posts each line into its material's
+  // category-owning store, never into a floor bar (floors fill by transfer).
+  const ownerStores = stores.filter(s => (s.categories?.length || 0) > 0);
+  const ownsCategories = !!store && ownerStores.some(s => s.id === store.id);
+  const ownerNames = ownerStores.map(s => s.name).join(', ');
+  // The Goods Receipt liquor modal is offered to users with 'procure' on a
+  // category-owning store (GET /api/grn?liquor_option=1) — same test here, so
+  // the link never leads to a screen without the button.
+  const canEnterLiquorBill = ownerStores.some(s => accessByStore[s.id]?.can_procure);
 
   // Closing tab is gated on can_close_stock — bounce off it after a store switch.
   useEffect(() => {
@@ -382,9 +383,6 @@ export default function LiquorStorePage() {
       setStock(j.stock || []);
       setCatalog(j.catalog || j.stock || []);
       setMaterials(j.materials || []);
-      setSuppliers(j.recent_suppliers || []);
-      setVendors(j.vendors || []);
-      setStoreVendors(j.store_vendors || []);
       setStockLoadedFor(storeId);
     } catch (e: any) { setError(e.message); }
     finally { setStockLoading(false); }
@@ -529,16 +527,22 @@ export default function LiquorStorePage() {
           // BOTH halves are store_stock_ledger columns, and that table is
           // recipe-basis on both: `quantity` is signed RECIPE units and
           // `unit_cost` is ₹ per RECIPE unit (src/lib/store-engine.ts:68,80).
-          // The writer proves it: /api/stores/[id]/procure-bill converts the
-          // cases/bottles/loose entry to a recipe quantity and divides the
-          // per-bottle price by the pack factor before storing, then books its
-          // own line_total as recipe_qty × unit_cost. This subtotal reproduces that
+          // The writers prove it: the Goods Receipt TGBCL Liquor Bill (and the
+          // retired /api/stores/[id]/procure-bill before it) convert the
+          // cases/bottles/loose entry to a recipe quantity and divide the
+          // per-bottle price by the pack factor before storing, then book the
+          // line_total as recipe_qty × unit_cost. This subtotal reproduces that
           // sum, so it equals the invoice line total. NOTE: `unit_cost` is
           // purchase-basis in the PURCHASE tables — it is recipe-basis only here.
           // rate-basis: recipe (store_stock_ledger.quantity × .unit_cost)
           total: Math.round(group.reduce((s, g) => s + (Number(g.quantity) || 0) * (Number(g.unit_cost) || 0), 0) * 100) / 100,
           supplier: group[0].supplier || '',
           charges: billCharges[ref.toLowerCase()] || null,
+          grn: (() => {
+            const n0 = String(group[0].notes || '').trim();
+            return /^Goods Receipt /.test(n0) && group.every(g => String(g.notes || '').trim() === n0)
+              ? n0 : '';
+          })(),
         });
       }
       i = j;
@@ -596,8 +600,14 @@ export default function LiquorStorePage() {
             <Wine className="w-6 h-6 text-[#af4408]" /> Liquor Store
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
-            {store?.name} — separate stock on its own ledger. Liquor purchases are recorded HERE,
-            never on Central Store purchases.
+            {store?.name} — separate stock on its own ledger.
+            {ownsCategories ? (
+              <> Liquor bills are entered on Goods Receipt (GRN) → TGBCL Liquor Bill and post straight into this
+                store; bills recorded here earlier stay on these reports.</>
+            ) : ownerStores.length > 0 ? (
+              <> Liquor bills are entered on Goods Receipt (GRN) → TGBCL Liquor Bill and post straight into
+                {' '}{ownerNames}; this store&apos;s bottles arrive by transfer from there.</>
+            ) : null}
           </p>
         </div>
         {stores.length > 1 && (
@@ -624,23 +634,19 @@ export default function LiquorStorePage() {
             <Upload className="w-4 h-4" /> Bulk Adjust
           </button>
         )}
-        {/* The single-line "New Purchase" button was removed on the owner's
-            call — it recorded the same inward by a second route, so a one-item
-            purchase is now simply a bill with one line and the TGBCL invoice
-            number, vendor and bill charges are never optional. New Bill and
-            Upload CSV (Bill) are the two remaining ways in. */}
-        {access.can_procure && (
-          <button onClick={() => setShowUpload(true)}
-                  title="Upload a full liquor invoice (govt / TGBCL) from a CSV — many lines + bill charges in one go"
-                  className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5">
-            <Upload className="w-4 h-4" /> Upload CSV (Bill)
-          </button>
-        )}
-        {access.can_procure && (
-          <button onClick={() => setShowBill(true)}
-                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
-            <ReceiptText className="w-4 h-4" /> New Bill
-          </button>
+        {/* ONE DOOR PER INDENT (owner rulings #83/#84). New Bill and Upload CSV
+            (Bill) are retired: a TGBCL bill — typed or uploaded as the TGBCL
+            CSV — is entered on Goods Receipt (GRN) → TGBCL Liquor Bill, which
+            records the GRN + PINV and posts the bottles straight into this
+            store's ledger with the TGBCL charges and Net Indent. Their routes
+            (procure / procure-bill / procure-bulk) answer 410. Bills recorded
+            here before the switch-over stay on every tab and report below. */}
+        {canEnterLiquorBill && (
+          <a href="/grn?liquor=1"
+             title={`Liquor bills are entered on Goods Receipt (GRN) → TGBCL Liquor Bill (cases / bottles / loose, the TGBCL charges, or the TGBCL CSV) — the bottles post straight into ${ownerNames}`}
+             className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5">
+            <ReceiptText className="w-4 h-4" /> Enter bill on Goods Receipt
+          </a>
         )}
         {access.can_view && (
           <button onClick={downloadInwardRegister} disabled={regBusy}
@@ -773,7 +779,11 @@ export default function LiquorStorePage() {
           ) : filtered.length === 0 ? (
             <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl">
               {stock.length === 0
-                ? `No stock yet. ${access.can_procure ? 'Record your first invoice with “New Bill”' : 'Purchases will appear here'} — or set opening stock via Adjustment.`
+                ? (ownsCategories
+                  ? 'No stock yet. Liquor bills are entered on Goods Receipt → TGBCL Liquor Bill — or set opening stock via Adjustment.'
+                  : ownerStores.length > 0
+                    ? `No stock yet. Bottles reach ${store?.name || 'this store'} by transfer from ${ownerNames} (Inventory → Store Transfers) — or set opening stock via Adjustment.`
+                    : 'No stock yet. Set opening stock via Adjustment.')
                 : 'Nothing matches the current filters.'}
             </div>
           ) : (
@@ -1020,7 +1030,8 @@ export default function LiquorStorePage() {
                               <td colSpan={10} className="px-3 py-1.5 text-[11px] text-[#6B5744]">
                                 <ReceiptText className="w-3.5 h-3.5 inline mr-1 text-[#af4408]" />
                                 Bill <span className="font-mono">{item.ref}</span>
-                                {item.supplier ? ` · ${item.supplier}` : ''} — {item.count} lines,
+                                {item.supplier ? ` · ${item.supplier}` : ''}
+                                {item.grn && <> · <span className="font-mono">{item.grn}</span></>} — {item.count} lines,
                                 subtotal <b className="text-[#2D1B0E]">{inr(item.total)}</b>
                                 {item.charges && <BillChargesLine c={item.charges} />}
                               </td>
@@ -1088,7 +1099,8 @@ export default function LiquorStorePage() {
                            className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl px-3 py-2 text-[11px] text-[#6B5744]">
                         <ReceiptText className="w-3.5 h-3.5 inline mr-1 text-[#af4408]" />
                         Bill <span className="font-mono">{item.ref}</span>
-                        {item.supplier ? ` · ${item.supplier}` : ''} — {item.count} lines,
+                        {item.supplier ? ` · ${item.supplier}` : ''}
+                        {item.grn && <> · <span className="font-mono">{item.grn}</span></>} — {item.count} lines,
                         subtotal <b className="text-[#2D1B0E]">{inr(item.total)}</b>
                         {item.charges && <div className="mt-1"><BillChargesLine c={item.charges} /></div>}
                       </div>
@@ -1158,23 +1170,6 @@ export default function LiquorStorePage() {
           stock={catalog} materials={materials}
           onClose={() => setShowBulkAdjust(false)}
           onSaved={msg => { setShowBulkAdjust(false); afterWrite(msg); }}
-        />
-      )}
-      {showBill && store && (
-        <BillModal
-          storeId={store.id} storeName={store.name}
-          materials={materials} suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
-          onClose={() => setShowBill(false)}
-          onSaved={msg => { setShowBill(false); afterWrite(msg); }}
-        />
-      )}
-      {showUpload && store && (
-        <UploadBillModal
-          storeId={store.id} storeName={store.name}
-          suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
-          onClose={() => setShowUpload(false)}
-          onSaved={msg => { setShowUpload(false); afterWrite(msg); }}
-          onRefresh={() => { loadStock(); loadLedger(); }}
         />
       )}
       {migrateTarget && store && (
@@ -1333,852 +1328,13 @@ function AdjustModal({ storeId, storeName, materials, hasHistory, onClose, onSav
   );
 }
 
-/* ── Bulk Bill modal (one invoice, many lines → /procure-bill) ─────────── */
-
-interface BillLine {
-  key: number; material_id: string; cbl: CBLValue;
-  price: string; perCase: boolean; batch: string; expiry: string;
-  discount: string; cgst: string; sgst: string; delivery: string;
-}
-const newBillLine = (key: number): BillLine =>
-  ({ key, material_id: '', cbl: CBL_EMPTY, price: '', perCase: false, batch: '', expiry: '',
-     discount: '', cgst: '', sgst: '', delivery: '' });
-
-/* ── Bill charges (TGBCL invoice overhead) — shared by New Bill + Upload CSV ── */
-interface ChargesState { mrp: string; excise: string; cess: string; tcs: string; }
-const CHARGES_EMPTY: ChargesState = { mrp: '', excise: '', cess: '', tcs: '' };
-const chargesTotal = (c: ChargesState) => numOr0(c.mrp) + numOr0(c.excise) + numOr0(c.cess) + numOr0(c.tcs);
-const chargesBody = (c: ChargesState) => ({
-  mrp_rounding: numOr0(c.mrp), excise_turnover_tax: numOr0(c.excise),
-  special_excise_cess: numOr0(c.cess), tcs: numOr0(c.tcs),
-});
-function ChargeInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <div>
-      <L>{label}</L>
-      <input type="number" min={0} step="any" inputMode="decimal" value={value}
-             onChange={e => onChange(e.target.value)} placeholder="0" className={inputCls} />
-    </div>
-  );
-}
-/** The 4 manual invoice charges + auto Invoice/Net Indent totals. `invoiceValue`
- *  is the running Σ of line amounts; Net Indent = Invoice Value + the 4 charges. */
-function ChargesSection({ c, onChange, invoiceValue }: {
-  c: ChargesState; onChange: (patch: Partial<ChargesState>) => void; invoiceValue: number;
-}) {
-  const net = Math.round((invoiceValue + chargesTotal(c)) * 100) / 100;
-  return (
-    <div className="border border-[#E8D5C4] rounded-lg p-3 bg-[#FFF8F0] space-y-2">
-      <div className="text-[11px] font-semibold text-[#6B5744] flex items-center gap-1.5">
-        <ReceiptText className="w-3.5 h-3.5 text-[#af4408]" />
-        Bill charges — enter from the invoice (each varies bill-to-bill, no calculation)
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        <ChargeInput label="MRP Rounding Off" value={c.mrp} onChange={v => onChange({ mrp: v })} />
-        <ChargeInput label="Bar Excise Turnover Tax" value={c.excise} onChange={v => onChange({ excise: v })} />
-        <ChargeInput label="Special Excise Cess" value={c.cess} onChange={v => onChange({ cess: v })} />
-        <ChargeInput label="TCS" value={c.tcs} onChange={v => onChange({ tcs: v })} />
-      </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs pt-1.5 border-t border-[#F0E4D6]">
-        <span className="text-[#6B5744]">Invoice Value (Σ lines) <b className="text-[#2D1B0E]">{inr(invoiceValue)}</b></span>
-        <span className="text-[#6B5744]">Net Indent Value <b className="text-[#af4408] text-sm">{inr(net)}</b></span>
-      </div>
-    </div>
-  );
-}
-
-/** Vendor picker with auto-learn: shows vendors already used for THIS store
- *  (`used`) first, with a "show all" toggle to the full master (`all`). When no
- *  vendor has been used here yet, it shows the full list so the first bill isn't
- *  blocked. A selected vendor not in `used` forces the full list so it stays
- *  visible. Self-populates: saving a bill with a vendor adds it to `used`. */
-function VendorSelect({ used, all, value, onChange }: {
-  used: VendorLite[]; all: VendorLite[]; value: string; onChange: (id: string) => void;
-}) {
-  const [showAll, setShowAll] = useState(false);
-  const hasUsed = used.length > 0;
-  const selectedNotInUsed = !!value && !used.some(v => v.id === value);
-  const list = (showAll || !hasUsed || selectedNotInUsed) ? all : used;
-  return (
-    <div>
-      <div className="flex items-center justify-between">
-        <L>Vendor (optional)</L>
-        {hasUsed && (
-          <button type="button" onClick={() => setShowAll(s => !s)}
-                  className="text-[10px] text-[#af4408] hover:underline">
-            {(showAll || selectedNotInUsed) ? 'used here only' : 'show all'}
-          </button>
-        )}
-      </div>
-      <select value={value} onChange={e => onChange(e.target.value)} className={inputCls}>
-        <option value="">—</option>
-        {list.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-      </select>
-      {!hasUsed && <div className="text-[10px] text-[#8B7355] mt-0.5">All vendors — none used for this store yet</div>}
-    </div>
-  );
-}
-
-function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved }: {
-  storeId: string; storeName: string;
-  materials: MatRow[]; suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
-  onClose: () => void; onSaved: (msg: string) => void;
-}) {
-  const [supplier, setSupplier] = useState('');
-  const [invoiceRef, setInvoiceRef] = useState('');
-  const [date, setDate] = useState(today());
-  const [vendorId, setVendorId] = useState('');
-  const [lines, setLines] = useState<BillLine[]>([newBillLine(1)]);
-  const [charges, setCharges] = useState<ChargesState>(CHARGES_EMPTY);
-  const [openLineChg, setOpenLineChg] = useState<Set<number>>(new Set());
-  const toggleLineChg = (key: number) => setOpenLineChg(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const matById = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
-  const setLine = (key: number, patch: Partial<BillLine>) =>
-    setLines(ls => ls.map(l => l.key === key ? { ...l, ...patch } : l));
-  const addLine = () => setLines(ls => [...ls, newBillLine(Math.max(0, ...ls.map(l => l.key)) + 1)]);
-  const removeLine = (key: number) => setLines(ls => ls.length > 1 ? ls.filter(l => l.key !== key) : ls);
-
-  /** Line economics: recipe qty + ₹ line total (price ÷ case when perCase). */
-  const lineCalc = (l: BillLine) => {
-    const mat = matById.get(l.material_id) || null;
-    if (!mat) return { mat: null, recipe: 0, total: 0 };
-    const recipe = cblRecipe(mat, l.cbl);
-    const cf = caseFactor(mat), pf = packFactor(mat);
-    const perBottle = l.perCase ? (Number(l.price) || 0) / cf : (Number(l.price) || 0);
-    const perRecipe = pf > 1 ? perBottle / pf : perBottle;
-    return { mat, recipe, total: recipe * perRecipe };
-  };
-  const billTotal = lines.reduce((s, l) => s + lineCalc(l).total, 0);
-  const filledLines = lines.filter(l => l.material_id || l.cbl.cases || l.cbl.bottles || l.cbl.loose || l.price);
-
-  const save = async () => {
-    setErr(null);
-    if (!invoiceRef.trim()) { setErr('Enter the invoice number'); return; }
-    if (!supplier.trim() && !vendorId) { setErr('Enter the supplier'); return; }
-    if (filledLines.length === 0) { setErr('Add at least one bill line'); return; }
-    for (let i = 0; i < filledLines.length; i++) {
-      const l = filledLines[i];
-      const { mat, recipe } = lineCalc(l);
-      if (!mat) { setErr(`Line ${i + 1}: pick a material`); return; }
-      if (!(recipe > 0)) { setErr(`Line ${i + 1} (${mat.name}): enter a quantity`); return; }
-      if (l.price === '' || !(Number(l.price) >= 0)) { setErr(`Line ${i + 1} (${mat.name}): enter the price`); return; }
-    }
-    setBusy(true);
-    try {
-      const r = await api(`/api/stores/${storeId}/procure-bill`, {
-        method: 'POST',
-        body: {
-          supplier: supplier.trim(), invoice_ref: invoiceRef.trim(),
-          vendor_id: vendorId || undefined, date,
-          charges: chargesBody(charges),
-          lines: filledLines.map(l => ({
-            material_id: l.material_id,
-            cases: numOr0(l.cbl.cases), bottles: numOr0(l.cbl.bottles), loose: numOr0(l.cbl.loose),
-            unit_price: Number(l.price) || 0, per_case: l.perCase || undefined,
-            batch_no: l.batch.trim() || undefined, expiry_date: l.expiry || undefined,
-            discount: numOr0(l.discount) || undefined, cgst: numOr0(l.cgst) || undefined,
-            sgst: numOr0(l.sgst) || undefined, delivery_charges: numOr0(l.delivery) || undefined,
-          })),
-        },
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      const net = j.bill_charges?.net_indent_value;
-      onSaved(`Bill ${invoiceRef.trim()} saved — ${j.posted} line${j.posted === 1 ? '' : 's'}, ${inr(j.total_value)}`
-        + (net && net !== j.total_value ? ` · Net Indent ${inr(net)}` : ''));
-    } catch (e: any) { setErr(e.message); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <ModalShell wide title="New Bill (bulk entry)" icon={<ReceiptText className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
-      footer={<>
-        <span className="mr-auto text-sm text-[#6B5744]">Bill total <b className="text-[#2D1B0E]">{inr(billTotal)}</b></span>
-        <button onClick={onClose} disabled={busy}
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Cancel</button>
-        <button onClick={save} disabled={busy}
-                className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-          Save Bill
-        </button>
-      </>}>
-      <p className="text-[11px] text-[#8B7355] -mt-1">
-        One supplier invoice, many items — every line posts to the {storeName} ledger under the
-        same invoice ref, in one save. Central Store stays untouched.
-      </p>
-      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
-
-      {/* Bill header */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div>
-          <L>Supplier</L>
-          <input value={supplier} onChange={e => setSupplier(e.target.value)} list="liq-bill-suppliers"
-                 placeholder="Type a supplier…" className={inputCls} />
-          <datalist id="liq-bill-suppliers">
-            {suppliers.map(s => <option key={s} value={s} />)}
-          </datalist>
-        </div>
-        <div>
-          <L>Invoice no.</L>
-          <input value={invoiceRef} onChange={e => setInvoiceRef(e.target.value)} placeholder="INV-…" className={inputCls} />
-        </div>
-        <div>
-          <L>Date</L>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
-        </div>
-        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
-      </div>
-
-      {/* Lines */}
-      <div className="space-y-2">
-        {lines.map((l, i) => {
-          const { mat, recipe, total } = lineCalc(l);
-          const cf = mat ? caseFactor(mat) : 1;
-          return (
-            <div key={l.key} className="border border-[#E8D5C4] rounded-lg p-2.5 space-y-2 bg-[#FFFDF9]">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-semibold text-[#8B7355] shrink-0">#{i + 1}</span>
-                <div className="flex-1 min-w-0">
-                  <MaterialTypeahead materials={materials as MaterialLite[]} value={l.material_id}
-                                     onPick={id => setLine(l.key, { material_id: id, cbl: CBL_EMPTY })}
-                                     showStock={false} compact
-                                     placeholder="Material — name, SKU or category…" />
-                </div>
-                <button onClick={() => removeLine(l.key)} disabled={lines.length === 1}
-                        className="shrink-0 text-[#8B7355] hover:text-red-700 disabled:opacity-30" title="Remove line">
-                  <Trash2 className="w-4 h-4" />
-                </button>
-              </div>
-              <CBLEntry mat={mat} value={l.cbl} onChange={v => setLine(l.key, { cbl: v })} />
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
-                <div>
-                  <L>₹ / {l.perCase ? 'case' : (mat?.purchase_unit || mat?.unit || 'btl')}</L>
-                  <div className="flex gap-1">
-                    <input type="number" min={0} step="any" inputMode="decimal" value={l.price}
-                           onChange={e => setLine(l.key, { price: e.target.value })}
-                           placeholder="0" className={inputCls} />
-                    {cf > 1 && (
-                      <button type="button" onClick={() => setLine(l.key, { perCase: !l.perCase })}
-                              title="Toggle price per bottle / per case"
-                              className={`shrink-0 px-1.5 rounded border text-[10px] font-medium ${l.perCase
-                                ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
-                        /cs
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div>
-                  <L>Batch no.</L>
-                  <input value={l.batch} onChange={e => setLine(l.key, { batch: e.target.value })}
-                         placeholder="optional" className={inputCls} />
-                </div>
-                <div>
-                  <L>Expiry</L>
-                  <input type="date" value={l.expiry} onChange={e => setLine(l.key, { expiry: e.target.value })} className={inputCls} />
-                </div>
-                <div className="text-right">
-                  <L>Line total</L>
-                  <div className="px-2 py-1.5 text-sm font-semibold text-[#2D1B0E]">
-                    {recipe > 0 && l.price !== '' ? inr(total) : '—'}
-                  </div>
-                </div>
-              </div>
-              {/* Per-line inward charges (recorded only). Bill-level charges
-                  (MRP round-off / excise turnover / cess / TCS) are entered once
-                  below in Bill charges. */}
-              <button type="button" onClick={() => toggleLineChg(l.key)}
-                      className="text-[10px] text-[#af4408] hover:underline">
-                {openLineChg.has(l.key) ? '− Hide line charges' : '+ Line charges (discount / CGST / SGST / delivery)'}
-              </button>
-              {openLineChg.has(l.key) && (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-[#F0E4D6]">
-                  {([['discount', 'Discount'], ['cgst', 'CGST'], ['sgst', 'SGST'], ['delivery', 'Delivery']] as const).map(([k, label]) => (
-                    <div key={k}>
-                      <L>{label} ₹</L>
-                      <input type="number" min={0} step="any" inputMode="decimal" value={(l as any)[k]}
-                             onChange={e => setLine(l.key, { [k]: e.target.value } as Partial<BillLine>)}
-                             placeholder="0" className={inputCls} />
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
-        <button onClick={addLine}
-                className="w-full px-3 py-2 border border-dashed border-[#D4B896] hover:border-[#af4408] hover:text-[#af4408] text-[#6B5744] rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
-          <Plus className="w-4 h-4" /> Add line
-        </button>
-      </div>
-
-      {/* Bill-level charges (TGBCL invoice overhead) */}
-      <ChargesSection c={charges} onChange={p => setCharges(prev => ({ ...prev, ...p }))} invoiceValue={billTotal} />
-    </ModalShell>
-  );
-}
-
-/* ── Upload CSV Bill modal (full govt / TGBCL invoice → /procure-bulk) ─────── */
-
-interface UploadRow {
-  item_name: string; sku: string;
-  cases: string; bottles: string; loose: string;
-  unit_price: string; amount: string; per_case: boolean;
-  batch_no: string; expiry_date: string; date: string;
-  discount: string; cgst: string; sgst: string; delivery_charges: string;
-  /** BILL-level charges (one set per invoice) may also be supplied in the sheet.
-   *  They are read off the first row that carries them and pre-fill the modal's
-   *  Bill charges inputs, so the user always sees what was picked up. */
-  mrp_round_off: string; excise_turnover_tax: string; special_excise_cess: string; tcs: string;
-  /** PER-ROW inward/invoice number. A register CSV holds MANY inward bills —
-   *  each line posts to the ledger under ITS OWN number (dup-guard included).
-   *  The first row's value still pre-fills the modal's Invoice No., which
-   *  covers rows without one and carries the bill-level charges. */
-  inward_no: string;
-  /** Carried so the sheet mirrors the Inward Register export. REFERENCE ONLY —
-   *  the item is resolved by sku then item_name, and raw_materials.category is
-   *  authoritative, so this never decides which material a row lands on. */
-  category_name: string;
-  /** Bill-level: pre-fills the modal's Supplier when it is still blank. The
-   *  vendor dropdown there stays authoritative. */
-  supplier_name: string;
-  /** Register parity only — the liquor store has no PO stage, so this is never read. */
-  po_qty: string;
-  /** Routes inward_qty onto cases / bottles / loose (see the parser). */
-  purchase_unit: string;
-  /** Line total INCLUDING this line's charges. Cross-check only — NOT the price
-   *  basis, or the charges would be counted into unit cost twice. */
-  total_inward_amount: string;
-  /** Set when inward_qty had a blank/unrecognised purchase_unit and was read as
-   *  bottles, so the preview can say so instead of silently assuming. */
-  unit_note: string;
-}
-interface UploadSkipped {
-  row: number; item_name: string; sku: string;
-  cases: any; bottles: any; loose: any; unit_price: any; amount: any;
-  batch_no: string; expiry_date: string; date: string; kind: string; reason: string;
-}
-
-/** Parse a CSV (header row required) into normalized UploadRows via papaparse.
- *  Flexible, case-insensitive header names map onto our canonical keys
- *  (govt-invoice friendly). Blank rows are dropped. Throws on a parse error. */
-function parseBillCsv(text: string): UploadRow[] {
-  const parsed = Papa.parse(text, {
-    header: true, skipEmptyLines: true,
-    transformHeader: (h: string) => h.toLowerCase().trim(),
-  });
-  // Ignore NON-fatal FieldMismatch errors (a ragged footer/totals row, a title
-  // line, or an item description with an unescaped comma) — PapaParse still
-  // parses the data, and our per-row skip-and-report handles those rows. Only a
-  // genuinely fatal parse error (unusable file) should abort the whole upload.
-  const fatal = (parsed.errors || []).filter(
-    (e: any) => e.type !== 'FieldMismatch' && e.code !== 'TooFewFields' && e.code !== 'TooManyFields',
-  );
-  if (fatal.length) throw new Error('CSV parse error: ' + fatal[0].message);
-  const get = (row: any, ...keys: string[]) => {
-    for (const k of keys) if (row[k] != null && String(row[k]).trim() !== '') return String(row[k]).trim();
-    return '';
-  };
-  const out: UploadRow[] = [];
-  for (const row of parsed.data as any[]) {
-    const item_name = get(row, 'item_name', 'name', 'item', 'product', 'product description', 'product_description', 'description', 'brand');
-    const sku = get(row, 'sku', 'brand_code', 'brand code', 'code');
-    const cases = get(row, 'cases', 'quantity cases', 'quantity_cases', 'qty cases', 'case', 'cs');
-    const bottles = get(row, 'bottles', 'quantity bottles', 'quantity_bottles', 'qty bottles', 'bottle', 'btl');
-    const loose = get(row, 'loose', 'pegs', 'units');
-    const unit_price = get(row, 'unit_price', 'unit price', 'price', 'rate', 'price_per_bottle');
-    // 'subtotal' is the register's name for this: qty x rate, BEFORE charges.
-    const amount = get(row, 'amount', 'subtotal', 'sub total', 'total', 'line_total', 'line total', 'value');
-    const pc = get(row, 'per_case', 'per case', 'rate_per_case').toLowerCase();
-    const batch_no = get(row, 'batch_no', 'batch', 'batch no', 'lot');
-    const expiry_date = get(row, 'expiry_date', 'expiry', 'exp', 'best_before');
-    const date = normDate(get(row, 'date', 'inward_date', 'inward date', 'purchase_date', 'purchase date', 'invoice_date', 'invoice date', 'bill_date', 'bill date'));
-    const discount = get(row, 'discount', 'disc');
-    const cgst = get(row, 'cgst');
-    const sgst = get(row, 'sgst');
-    const delivery_charges = get(row, 'delivery_charges', 'delivery', 'delivery charges', 'delivery_charge');
-    // BILL-level charges, optionally supplied in the sheet (TGBCL indent names too).
-    const mrp_round_off = get(row, 'mrp_round_off', 'mrp round off', 'mrp_rounding', 'mrp rounding off');
-    const excise_turnover_tax = get(row, 'excise_turnover_tax', 'bar excise turnover tax', 'excise turnover tax', 'turnover_tax');
-    const special_excise_cess = get(row, 'special_excise_cess', 'special excise cess', 'cess');
-    const tcs = get(row, 'tcs');
-    // Inward/invoice number and category, so the upload sheet mirrors the Inward
-    // Register export (INVOICE ID · INWARD DATE · SUPPLIER NAME · CATEGORY NAME · …)
-    // and a downloaded register can be filled in and sent straight back.
-    // inward_no is a BILL-level value: one invoice per upload, so it pre-fills the
-    // modal's Invoice number (same treatment as the bill-level charges below).
-    const inward_no = get(row, 'inward_no', 'inward no', 'invoice_id', 'invoice id', 'invoice_ref',
-                          'invoice_no', 'invoice no', 'indent_no', 'indent no');
-    // Reference only — the item is resolved by SKU then name on the server, and
-    // raw_materials.category is authoritative. Carried so the sheet reads like the
-    // register; it never decides which material a row lands on.
-    const category_name = get(row, 'category_name', 'category name', 'category');
-    const supplier_name = get(row, 'supplier_name', 'supplier name', 'supplier', 'vendor', 'vendor_name', 'vendor name');
-    // Accepted for register parity and IGNORED on purpose: the liquor store has no
-    // PO stage (bills are booked straight onto the store ledger), so there is no
-    // ordered quantity to compare against. Carried so a register round-trips.
-    const po_qty = get(row, 'po_qty', 'po qty', 'ordered_qty', 'ordered qty');
-    // Generic qty + unit, the shape the Inward Register exports. Mapped onto
-    // cases/bottles/loose below — /procure-bill speaks CBL, not qty+unit.
-    const inward_qty = get(row, 'inward_qty', 'inward qty', 'qty', 'quantity');
-    const purchase_unit = get(row, 'purchase_unit', 'purchase unit', 'unit', 'uom');
-    // The line TOTAL INCLUDING this line's charges. Parsed for a cross-check only —
-    // never used as the price basis. Feeding it in as the subtotal is exactly how
-    // the Central purchases template once double-counted CGST/SGST into unit cost.
-    const total_inward_amount = get(row, 'total_inward_amount', 'total inward amount', 'net_amount', 'net amount');
-    // Skip a fully-blank line (all key fields empty).
-    if (!item_name && !sku && !cases && !bottles && !loose && !inward_qty && !unit_price && !amount) continue;
-
-    // ── inward_qty + purchase_unit -> cases / bottles / loose ────────────────
-    // Explicit cases/bottles/loose ALWAYS win: they are the native liquor shape and
-    // an existing sheet must keep behaving exactly as before. Only fill from the
-    // generic pair when none of the three was given.
-    let qCases = cases, qBottles = bottles, qLoose = loose;
-    let unitNote = '';
-    if (!cases && !bottles && !loose && inward_qty) {
-      const u = purchase_unit.toLowerCase().replace(/[^a-z]/g, '');
-      if (['case', 'cases', 'cs', 'box', 'boxes', 'carton', 'cartons'].includes(u)) qCases = inward_qty;
-      else if (['bottle', 'bottles', 'btl', 'btls', 'pc', 'pcs', 'piece', 'pieces', 'nos', 'no', 'each', 'ea', 'unit', 'units'].includes(u)) qBottles = inward_qty;
-      else if (['ml', 'l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'peg', 'pegs', 'loose', 'g', 'kg'].includes(u)) {
-        qLoose = inward_qty;
-        // Loose is the RECIPE-unit slot (usually ml/g). 'L'/'kg' are 1000× the
-        // usual recipe unit and CANNOT be scaled here (material resolves
-        // server-side) — flag so the operator fixes the sheet before posting.
-        if (['l', 'ltr', 'litre', 'litres', 'liter', 'liters', 'kg'].includes(u)) {
-          unitNote = `"${purchase_unit}" routed to LOOSE, which is read in the recipe unit (ml/g) — a ${inward_qty} ${purchase_unit} line would post ~1000× small. Use ml/g or the cases/bottles columns.`;
-        }
-      }
-      else {
-        // Blank or unrecognised unit. Default to BOTTLES, never cases: a case is
-        // ~12 bottles, so guessing "case" would inflate the receipt an order of
-        // magnitude, and unit_price is per bottle unless per_case says otherwise.
-        // Flagged so the preview shows what was assumed rather than hiding it.
-        qBottles = inward_qty;
-        unitNote = purchase_unit ? `read "${purchase_unit}" as bottles` : 'no purchase_unit — read as bottles';
-      }
-    }
-    out.push({
-      item_name, sku, cases: qCases, bottles: qBottles, loose: qLoose, unit_price, amount,
-      per_case: pc === '1' || pc === 'true' || pc === 'yes' || pc === 'y',
-      batch_no, expiry_date, date, discount, cgst, sgst, delivery_charges,
-      mrp_round_off, excise_turnover_tax, special_excise_cess, tcs,
-      inward_no, category_name, supplier_name, po_qty, purchase_unit,
-      total_inward_amount, unit_note: unitNote,
-    });
-  }
-  return out;
-}
-
-function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors, onClose, onSaved, onRefresh }: {
-  storeId: string; storeName: string;
-  suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
-  onClose: () => void; onSaved: (msg: string) => void; onRefresh: () => void;
-}) {
-  const [supplier, setSupplier] = useState('');
-  const [invoiceRef, setInvoiceRef] = useState('');
-  const [date, setDate] = useState(today());
-  const [vendorId, setVendorId] = useState('');
-  const [charges, setCharges] = useState<ChargesState>(CHARGES_EMPTY);
-  const [rows, setRows] = useState<UploadRow[]>([]);
-  const [fileName, setFileName] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [result, setResult] = useState<{ posted: number; skipped: number; duplicates: number; total_value: number;
-    net_indent_value?: number; skipped_rows: UploadSkipped[] } | null>(null);
-
-  // Invoice Value preview from parsed rows (best-effort — the exact figure is
-  // computed on the server with each material's pack/case factors). When a row
-  // carries `amount` (the line total, as on the govt indent) it's exact; a
-  // unit_price-only row is a rough estimate since case size isn't known here.
-  // total_inward_amount is NEVER used as a price. It is only checked against
-  // subtotal + this line's own charges, because a sheet where those disagree means
-  // the operator's arithmetic and ours differ — worth saying before posting, and
-  // far safer than adopting their figure (which would fold charges into unit cost).
-  const inwardMismatches = useMemo(() => rows.filter(r => {
-    const stated = numOr0(r.total_inward_amount);
-    if (!(stated > 0)) return false;
-    const sub = numOr0(r.amount);
-    if (!(sub > 0)) return false;                       // no subtotal to compare against
-    const calc = sub - numOr0(r.discount) + numOr0(r.cgst) + numOr0(r.sgst) + numOr0(r.delivery_charges);
-    return Math.abs(calc - stated) > 1;                 // ₹1 tolerance for rounding
-  }).length, [rows]);
-
-  const [previewInvoice, previewExcluded] = useMemo(() => {
-    let sum = 0, excluded = 0;
-    for (const r of rows) {
-      const amt = numOr0(r.amount);
-      if (amt > 0) { sum += amt; continue; }
-      const up = numOr0(r.unit_price);
-      const cs = numOr0(r.cases), bt = numOr0(r.bottles);
-      if (r.per_case) { sum += up * cs; continue; }
-      // Per-bottle price with cases present: the case's bottle count is only
-      // known server-side, so estimating cs×1 bottle would undershoot ~12×.
-      if (cs > 0) { excluded++; sum += up * bt; continue; }
-      sum += up * bt;
-    }
-    return [sum, excluded];
-  }, [rows]);
-
-  const onFile = async (f: File | null) => {
-    if (!f) return;
-    setErr(null); setResult(null);
-    try {
-      const text = await f.text();
-      const parsed = parseBillCsv(text);
-      if (parsed.length === 0) { setErr('No data rows found — check the CSV has a header row and at least one line.'); return; }
-      setRows(parsed); setFileName(f.name);
-      // Bill-level charges are ONE set per invoice. If the sheet carries them,
-      // take the first row that has a value for each and pre-fill the Bill
-      // charges inputs below, so what was picked up is visible + editable.
-      const firstOf = (k: 'mrp_round_off' | 'excise_turnover_tax' | 'special_excise_cess' | 'tcs') => {
-        const hit = parsed.find(r => String(r[k] || '').trim() !== '' && numOr0(r[k]) !== 0);
-        return hit ? String(hit[k]).trim() : '';
-      };
-      const fromSheet = {
-        mrp: firstOf('mrp_round_off'), excise: firstOf('excise_turnover_tax'),
-        cess: firstOf('special_excise_cess'), tcs: firstOf('tcs'),
-      };
-      if (fromSheet.mrp || fromSheet.excise || fromSheet.cess || fromSheet.tcs) {
-        setCharges(prev => ({
-          mrp: fromSheet.mrp || prev.mrp, excise: fromSheet.excise || prev.excise,
-          cess: fromSheet.cess || prev.cess, tcs: fromSheet.tcs || prev.tcs,
-        }));
-      }
-      // Same treatment for the inward/invoice number — one per bill. Only fill a
-      // BLANK field: whatever the user already typed is a deliberate choice and
-      // must win over the sheet.
-      const sheetInward = parsed.find(r => String(r.inward_no || '').trim() !== '');
-      if (sheetInward) setInvoiceRef(prev => prev.trim() || String(sheetInward.inward_no).trim());
-      // Supplier likewise. The vendor dropdown below stays authoritative — this only
-      // saves re-typing a name the sheet already carries, and never overwrites a
-      // supplier the user picked.
-      const sheetSupplier = parsed.find(r => String(r.supplier_name || '').trim() !== '');
-      if (sheetSupplier) setSupplier(prev => prev.trim() || String(sheetSupplier.supplier_name).trim());
-      // A per-row date is already supported; if the sheet carries one, adopt it for
-      // the bill header too so the register round-trips without re-typing.
-      const sheetDate = parsed.find(r => String(r.date || '').trim() !== '');
-      if (sheetDate) setDate(prev => (prev === today() ? String(sheetDate.date).trim() : prev));
-    } catch (e: any) { setErr(`Could not read file: ${e.message}`); }
-  };
-
-  const downloadTemplate = () => {
-    const d = today();
-    // Columns 9-12 are PER-LINE charges (usually blank for TGBCL liquor).
-    // Columns 13-16 are the BILL-level charges — ONE set per invoice, so put
-    // them on the FIRST row only; they pre-fill the Bill charges box in the
-    // modal (which stays editable). Sample below mirrors a TGBCL indent.
-    // inward_no is BILL-level like columns 13-16: one invoice per upload, so put
-    // it on the FIRST row only — it pre-fills the modal's Invoice number field.
-    // category_name is reference only (the item is matched by sku, then name), and
-    // leads the item columns so the sheet reads in Inward Register order.
-    // Full Inward Register column set, in register order, so a downloaded register
-    // can be filled in and sent straight back. inward_no / supplier_name and the 4
-    // bill-level charges are ONE-PER-INVOICE: first row only.
-    // inward_qty + purchase_unit is the register's way of stating quantity; cases /
-    // bottles / loose still work and WIN when present (the native liquor shape).
-    const sample =
-      'inward_no,inward_date,supplier_name,category_name,item_name,sku,'
-      + 'po_qty,inward_qty,purchase_unit,rate,subtotal,'
-      + 'discount,cgst,sgst,special_excise_cess,tcs,delivery_charges,mrp_round_off,total_inward_amount,'
-      + 'cases,bottles,loose,per_case,batch_no,expiry_date\n'
-      // case-quantity line, priced by line total, carrying the bill-level charges
-      + `TGBCL-001,${d},GOVERNMENT OF TELANGANA,beer,HEINEKEN LAGER BEER,6561,,5,case,,15010,,,,22617,5491,,7214.40,50332.40,,,,,,\n`
-      // same, no charges of its own
-      + `,${d},,beer,KINGFISHER ULTRA LAGER BEER,5029,,12,case,,28824,,,,,,,,28824,,,,,,\n`
-      // per-line discount, and a bottle quantity
-      + `,${d},,vodka,GREY GOOSE VODKA,9004,,6,bottle,,20101,500,,,,,,,19601,,,,,,\n`
-      // priced per CASE instead of per bottle -> per_case=1
-      + `,${d},,vodka,ABSOLUT VODKA,8006,,1,case,3900,,,,,,,,,3900,,,,1,,\n`
-      // the older cases/bottles style still works and takes precedence
-      + `,${d},,rum,CAMIKARA RUM 750ML,7001,,,,2425.08,2425.08,,,,,,,,2425.08,0,1,,,,\n`;
-    const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'liquor-bill-template.csv';
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  };
-
-  const downloadBalance = () => {
-    // Only the fixable rows (unknown item, wrong store, bad qty/price) belong in
-    // the balance file — 'duplicate' rows are already in the system, so exclude
-    // them (re-uploading them would just skip again).
-    const balance = (result?.skipped_rows || []).filter(s => s.kind !== 'duplicate');
-    if (!balance.length) return;
-    const clean = (v: any) => {
-      let s = String(v ?? '');
-      // Formula-injection guard — skip genuinely-numeric cells so signed numbers
-      // stay summable in Excel (not coerced to text).
-      if (/^[=+\-@]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s;
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const header = ['item_name', 'sku', 'cases', 'bottles', 'loose', 'unit_price', 'amount', 'date', 'batch_no', 'expiry_date', 'reason'];
-    const lines = [header.join(',')];
-    for (const s of balance) {
-      lines.push([s.item_name, s.sku, s.cases, s.bottles, s.loose, s.unit_price, s.amount, s.date, s.batch_no, s.expiry_date, s.reason].map(clean).join(','));
-    }
-    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `unuploaded-rows-${invoiceRef.trim() || 'bill'}.csv`;
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  };
-
-  const save = async () => {
-    setErr(null);
-    if (!invoiceRef.trim()) { setErr('Enter the invoice number'); return; }
-    if (!supplier.trim() && !vendorId) { setErr('Enter the supplier'); return; }
-    if (rows.length === 0) { setErr('Upload a CSV first'); return; }
-    setBusy(true);
-    try {
-      const r = await api(`/api/stores/${storeId}/procure-bulk`, {
-        method: 'POST',
-        body: {
-          supplier: supplier.trim(), invoice_ref: invoiceRef.trim(),
-          vendor_id: vendorId || undefined, date,
-          charges: chargesBody(charges),
-          rows: rows.map(r => ({
-            item_name: r.item_name, sku: r.sku || undefined,
-            cases: r.cases || undefined, bottles: r.bottles || undefined, loose: r.loose || undefined,
-            unit_price: r.unit_price || undefined, amount: r.amount || undefined,
-            per_case: r.per_case || undefined, date: r.date || undefined,
-            batch_no: r.batch_no || undefined, expiry_date: r.expiry_date || undefined,
-            discount: r.discount || undefined, cgst: r.cgst || undefined,
-            sgst: r.sgst || undefined, delivery_charges: r.delivery_charges || undefined,
-            inward_no: r.inward_no || undefined,
-          })),
-        },
-      });
-      const j = await r.json();
-      if (r.status === 409 && j.duplicate) { setErr(j.error); setBusy(false); return; }
-      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setResult({
-        posted: j.posted, skipped: j.skipped, duplicates: j.duplicates || 0, total_value: j.total_value,
-        net_indent_value: j.bill_charges?.net_indent_value, skipped_rows: j.skipped_rows || [],
-      });
-      // If everything posted, close out with a flash (onSaved refreshes the
-      // parent). If some rows were skipped, keep the modal open for review — but
-      // still refresh the parent so the posted lines/stock show behind it.
-      if ((j.skipped || 0) === 0) {
-        const net = j.bill_charges?.net_indent_value;
-        onSaved(`Bill ${invoiceRef.trim()} uploaded — ${j.posted} line${j.posted === 1 ? '' : 's'}, ${inr(j.total_value)}`
-          + (net && net !== j.total_value ? ` · Net Indent ${inr(net)}` : ''));
-      } else if ((j.posted || 0) > 0) {
-        onRefresh();
-      }
-    } catch (e: any) { setErr(e.message); }
-    finally { setBusy(false); }
-  };
-
-  const skipColor = (kind: string) =>
-    kind === 'wrong_store' ? 'text-blue-700'
-      : kind === 'duplicate' ? 'text-amber-700'
-      : 'text-red-700';
-
-  return (
-    <ModalShell wide title="Upload CSV Bill (govt invoice)" icon={<Upload className="w-5 h-5 text-[#af4408]" />} onClose={onClose}
-      footer={<>
-        <span className="mr-auto text-sm text-[#6B5744]">
-          {rows.length > 0 ? <>{rows.length} row{rows.length === 1 ? '' : 's'} · Invoice ≈ <b className="text-[#2D1B0E]">{inr(previewInvoice)}</b>{previewExcluded > 0 && <span className="text-amber-700"> ({previewExcluded} row{previewExcluded === 1 ? '' : 's'} with cases at a per-bottle price counted bottles only — case contents added on the server)</span>}</> : 'No file yet'}
-        </span>
-        <button onClick={onClose} disabled={busy}
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
-          {result ? 'Close' : 'Cancel'}
-        </button>
-        {!result && (
-          <button onClick={save} disabled={busy || rows.length === 0}
-                  className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-            Upload Bill
-          </button>
-        )}
-      </>}>
-      <p className="text-[11px] text-[#8B7355] -mt-1">
-        Upload one supplier invoice or a multi-bill inward register as a CSV — each matched line posts to the
-        {' '}{storeName} ledger under its row&apos;s own <b>inward_no</b> (this invoice number covers rows
-        without one, and the bill charges). Already-posted lines are skipped so nothing doubles. Central Store stays untouched.
-      </p>
-      {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{err}</div>}
-
-      {/* Bill header */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div>
-          <L>Supplier</L>
-          <input value={supplier} onChange={e => setSupplier(e.target.value)} list="liq-upload-suppliers"
-                 placeholder="Type a supplier…" className={inputCls} />
-          <datalist id="liq-upload-suppliers">{suppliers.map(s => <option key={s} value={s} />)}</datalist>
-        </div>
-        <div>
-          <L>Invoice no.</L>
-          <input value={invoiceRef} onChange={e => setInvoiceRef(e.target.value)} placeholder="INV-…" className={inputCls} />
-        </div>
-        <div>
-          <L>Date (default)</L>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
-          <div className="text-[10px] text-[#8B7355] mt-0.5">Used for rows without a date column</div>
-        </div>
-        <VendorSelect used={storeVendors} all={vendors} value={vendorId} onChange={setVendorId} />
-      </div>
-
-      {/* File + template */}
-      {!result && (
-        <div className="flex flex-wrap items-center gap-2">
-          <label className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 cursor-pointer">
-            <Upload className="w-4 h-4" /> {fileName || 'Choose CSV file'}
-            <input type="file" accept=".csv,text/csv" className="hidden"
-                   onChange={e => onFile(e.target.files?.[0] || null)} />
-          </label>
-          <button onClick={downloadTemplate} type="button"
-                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm font-medium flex items-center gap-1.5">
-            <Download className="w-4 h-4" /> Sample template
-          </button>
-          {rows.length > 0 && (
-            <button onClick={() => { setRows([]); setFileName(''); }} type="button"
-                    className="text-xs text-[#8B7355] hover:text-red-700 underline">clear</button>
-          )}
-        </div>
-      )}
-
-      {/* Column help */}
-      {!result && rows.length === 0 && (
-        <div className="text-[11px] text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 leading-relaxed">
-          <b>CSV columns</b> (header row required; extra columns ignored): <code>item_name</code> or <code>sku</code>/<code>brand_code</code> (matched to a Raw Material),
-          {' '}<code>cases</code>, <code>bottles</code>, optional <code>loose</code>, and a price — either <code>amount</code> (line total ₹, as printed on the indent)
-          {' '}<i>or</i> <code>unit_price</code> (₹ per bottle; add <code>per_case=1</code> for a per-case rate). Optional <code>date</code> (YYYY-MM-DD or DD-MM-YYYY; blank rows use the Date field above), <code>batch_no</code>, <code>expiry_date</code>.
-          Optional per-line ₹ charges: <code>discount</code>, <code>cgst</code>, <code>sgst</code>, <code>delivery_charges</code>.
-          The 4 bill-level charges — <code>mrp_round_off</code>, <code>excise_turnover_tax</code>, <code>special_excise_cess</code>, <code>tcs</code> —
-          can go in the CSV too: put them on the <b>first row only</b> (one set per invoice) and they pre-fill the Bill charges box below, which stays editable.
-          {' '}<code>inward_no</code> (the invoice / indent number) is bill-level the same way — first row only, and it pre-fills Invoice number above.
-          {' '}<code>supplier_name</code> is bill-level too and pre-fills Supplier.
-          {' '}<code>category_name</code> is accepted so the sheet matches the Inward Register export, but it is <b>reference only</b> — the item is always resolved by <code>sku</code> first, then <code>item_name</code>.
-          {' '}Quantity may be given the register&apos;s way as <code>inward_qty</code> + <code>purchase_unit</code> (<code>case</code> / <code>bottle</code> / <code>ml</code>); <code>cases</code>/<code>bottles</code>/<code>loose</code> still work and take precedence.
-          {' '}<code>subtotal</code> is the same as <code>amount</code>. <code>total_inward_amount</code> is only cross-checked — the bill posts from subtotal + charges, never from that column.
-          {' '}<code>po_qty</code> is accepted for register parity and ignored: liquor bills have no PO stage.
-        </div>
-      )}
-
-      {/* Parsed preview */}
-      {!result && rows.length > 0 && (
-        <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
-          <div className="px-3 py-1.5 bg-[#FFF1E3] text-[11px] font-semibold text-[#6B5744]">{rows.length} rows parsed from {fileName}</div>
-          {(() => {
-            const inwards = new Set(rows.map(r => String(r.inward_no || '').trim()).filter(Boolean));
-            return inwards.size > 1 ? (
-              <div className="px-3 py-1.5 bg-sky-50 border-t border-sky-200 text-[11px] text-sky-800">
-                {inwards.size} distinct inward numbers in this file — each line posts under <b>its own</b> number.
-                The Invoice No. above is used only for rows without one, and for the bill-level charges.
-              </div>
-            ) : null;
-          })()}
-          {/* Say what was assumed / what disagrees BEFORE the bill is posted. */}
-          {rows.some(r => r.unit_note && !/LOOSE/.test(r.unit_note)) && (
-            <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">
-              {rows.filter(r => r.unit_note && !/LOOSE/.test(r.unit_note)).length} row(s) gave a quantity without a usable <code>purchase_unit</code> — read as <b>bottles</b>.
-              {' '}Add <code>purchase_unit</code> (<code>case</code> or <code>bottle</code>), or use the <code>cases</code>/<code>bottles</code> columns, if that is wrong.
-            </div>
-          )}
-          {rows.some(r => r.unit_note && /LOOSE/.test(r.unit_note)) && (
-            <div className="px-3 py-1.5 bg-red-50 border-t border-red-200 text-[11px] text-red-800 font-medium">
-              ⚠ {rows.filter(r => r.unit_note && /LOOSE/.test(r.unit_note)).length} row(s) would post ~1000× small:
-              {' '}{rows.filter(r => r.unit_note && /LOOSE/.test(r.unit_note)).slice(0, 3).map(r => `${r.item_name || r.sku}: ${r.unit_note}`).join(' · ')}
-            </div>
-          )}
-          {inwardMismatches > 0 && (
-            <div className="px-3 py-1.5 bg-amber-50 border-t border-amber-200 text-[11px] text-amber-800">
-              {inwardMismatches} row(s) where <code>total_inward_amount</code> ≠ subtotal − discount + CGST + SGST + delivery.
-              {' '}The bill is posted from <b>subtotal + charges</b>, not from that column — worth re-checking the sheet.
-            </div>
-          )}
-          <div className="max-h-52 overflow-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-[#FBF6EF] text-[#8B7355] sticky top-0">
-                <tr><th className="text-left px-2 py-1">Item</th><th className="text-left px-2 py-1">SKU</th>
-                  <th className="text-right px-2 py-1">Cases</th><th className="text-right px-2 py-1">Bottles</th>
-                  {/* Cases + Bottles are PURCHASE units; Loose is the recipe-unit
-                      remainder (ml/g) — say so, it is the column that misreads. */}
-                  <th className="text-right px-2 py-1">Loose (recipe)</th>
-                  <th className="text-right px-2 py-1">Unit ₹</th><th className="text-right px-2 py-1">Amount ₹</th>
-                  <th className="text-left px-2 py-1">Date</th></tr>
-              </thead>
-              <tbody className="divide-y divide-[#F0E4D6]">
-                {rows.slice(0, 100).map((r, i) => (
-                  <tr key={i}>
-                    <td className="px-2 py-1 text-[#2D1B0E]">{r.item_name || <span className="text-red-600">—</span>}</td>
-                    <td className="px-2 py-1 text-[#6B5744]">{r.sku || '—'}</td>
-                    <td className="px-2 py-1 text-right">{r.cases || '—'}</td>
-                    <td className="px-2 py-1 text-right">{r.bottles || '—'}</td>
-                    <td className={`px-2 py-1 text-right ${r.unit_note ? 'text-amber-700 font-semibold' : ''}`}>{r.loose || '—'}</td>
-                    <td className="px-2 py-1 text-right">{r.unit_price || '—'}{r.per_case ? '/cs' : ''}</td>
-                    <td className="px-2 py-1 text-right">{r.amount || '—'}</td>
-                    <td className="px-2 py-1 text-[#6B5744] whitespace-nowrap">{r.date || <span className="text-[#8B7355]">(Date above)</span>}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {rows.length > 100 && <div className="px-3 py-1 text-[10px] text-[#8B7355]">…showing first 100 of {rows.length}</div>}
-        </div>
-      )}
-
-      {/* Charges (always visible so they're entered before upload) */}
-      {!result && <ChargesSection c={charges} onChange={p => setCharges(prev => ({ ...prev, ...p }))} invoiceValue={previewInvoice} />}
-
-      {/* Result: posted / skipped + downloads */}
-      {result && (
-        <div className="space-y-3">
-          <div className="flex flex-wrap gap-3 text-sm">
-            <span className="px-2.5 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg">
-              <b>{result.posted}</b> uploaded · {inr(result.total_value)}
-              {result.net_indent_value && result.net_indent_value !== result.total_value
-                ? <> · Net Indent <b>{inr(result.net_indent_value)}</b></> : null}
-            </span>
-            {result.skipped > 0 && (
-              <span className="px-2.5 py-1 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg">
-                <b>{result.skipped}</b> NOT uploaded
-                {result.duplicates > 0 ? ` (incl. ${result.duplicates} already-uploaded)` : ''}
-              </span>
-            )}
-          </div>
-          {result.skipped > 0 && (
-            <>
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-xs font-semibold text-[#6B5744]">Rows not uploaded — fix and re-upload just these:</div>
-                {result.skipped_rows.some(s => s.kind !== 'duplicate') && (
-                  <button onClick={downloadBalance} type="button"
-                          className="px-3 py-1.5 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs font-medium flex items-center gap-1.5">
-                    <Download className="w-3.5 h-3.5" /> Download un-uploaded rows
-                  </button>
-                )}
-              </div>
-              <div className="border border-[#E8D5C4] rounded-lg max-h-64 overflow-auto divide-y divide-[#F0E4D6]">
-                {result.skipped_rows.map((s, i) => (
-                  <div key={i} className="px-3 py-1.5 text-xs">
-                    <span className="text-[#8B7355]">Row {s.row}:</span>{' '}
-                    <span className="font-medium text-[#2D1B0E]">{s.item_name || s.sku || '(no name)'}</span>{' — '}
-                    <span className={skipColor(s.kind)}>{s.reason}</span>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-          {result.skipped === 0 && (
-            <div className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4" /> Every row uploaded. You can close this window.
-            </div>
-          )}
-        </div>
-      )}
-    </ModalShell>
-  );
-}
-
 /* ── Bulk Adjustment / Opening Stock modal (CSV + manual lines) ────────────
    Set / correct many materials' stock for this store in ONE save. Each line
    carries a TARGET quantity (what's physically there now); the server posts
    'opening' for a brand-new material or an 'adjustment' delta for one that
-   already has stock, so the ledger becomes that target. Mirrors BillModal's
-   multi-line entry + ClosingSection's Template / Upload-CSV convention. */
+   already has stock, so the ledger becomes that target. Multi-line entry in
+   the layout the retired New Bill modal used + ClosingSection's Template /
+   Upload-CSV convention. */
 
 interface BulkLine { key: number; material_id: string; cbl: CBLValue; cost: string; }
 const newBulkLine = (key: number): BulkLine => ({ key, material_id: '', cbl: CBL_EMPTY, cost: '' });
@@ -3577,7 +2733,9 @@ const REPORT_DEFS: ReportDef[] = [
     { k: 'unit_cost', l: '₹/recipe unit', fmt: 'inr4' },
     { k: 'balance_purchase', l: 'Balance', fmt: 'qty' },
     { k: 'balance_cbl', l: 'Balance (cs/btl)' }, { k: 'running_balance', l: 'Balance (recipe)', fmt: 'qty' },
-    { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'by', l: 'By' },
+    // Notes carries the Goods Receipt stamp ('Goods Receipt GRN-… · PINV-…L…') on
+    // the purchase rows of a TGBCL bill entered on Goods Receipt.
+    { k: 'supplier', l: 'Supplier' }, { k: 'ref', l: 'Ref' }, { k: 'notes', l: 'Notes' }, { k: 'by', l: 'By' },
   ] },
   { key: 'purchases', label: 'Purchase Register', dated: true, cols: [
     { k: 'date', l: 'Date' }, { k: 'material', l: 'Material' },

@@ -139,6 +139,18 @@ const redactEmail = (v: unknown): string =>
  * answered them (inside the txn, its own sentence) — so a repeat on the same
  * order reads exactly as it did. One PO line can be received only once, so a
  * repeat inside one order can never book the same goods twice anyway.
+ *
+ * A TGBCL LIQUOR GRN (goods_receipt_notes.store_dest_id set) IS NOT IN THIS
+ * GUARD — the same exclusion as the ad-hoc route's dupBill. Its bottles went
+ * into the store location's ledger, never to central stock, and this route
+ * refuses store-mapped lines outright, so a PO receipt can never be the same
+ * goods as a liquor bill. One paper bill that carried both is saved as two
+ * receipts under ONE vendor bill number (the liquor half on TGBCL Liquor Bill,
+ * the Central half here, received on its PO), exactly as the Liquor Store's
+ * New Bill left it before the switch-over (it wrote no GRN header at all). The
+ * liquor half keeps its own hard, cross-rail indent guard in
+ * src/lib/liquor-grn.ts. Without this line the outcome depended on which half
+ * was keyed first, and a match named the liquor GRN as "the same goods".
  * ══════════════════════════════════════════════════════════════════════════ */
 interface PriorVendorBill {
   source: 'grn' | 'po_bill' | 'purchases';
@@ -166,6 +178,7 @@ function findPriorVendorBill(
        AND COALESCE(g.outlet_id, '') = COALESCE(?, '')
        AND ${liveClaimSql('g')}
        AND COALESCE(g.po_id, '') <> ?
+       AND COALESCE(g.store_dest_id, '') = ''
      ORDER BY CASE WHEN g.date = ? THEN 0 ELSE 1 END, g.created_at ASC
      LIMIT 1
   `).get(bill, q.vendorKey, q.outletId, q.poId, q.receivedAt) as any;

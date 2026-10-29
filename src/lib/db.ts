@@ -3501,6 +3501,28 @@ function initializeSchema(db: Database.Database) {
     if (!hasG('voided_by'))   db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN voided_by TEXT DEFAULT ''`);
     if (!hasG('void_reason')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN void_reason TEXT DEFAULT ''`);
 
+    // ── TGBCL LIQUOR BILLS ON THE GRN SCREEN (owner rulings #83 / #84) ──────
+    // A liquor bill typed on Goods Receipt keeps THIS header — its GRN number,
+    // the duplicate guard and the document — but writes NO goods_receipt_note_
+    // items and NO purchases rows: its lines post straight into the store's
+    // own ledger (store_stock_ledger 'purchase' rows) with the TGBCL charges on
+    // store_bill_charges, exactly as Liquor Store → New Bill did. These three
+    // columns say so (src/lib/liquor-grn.ts is their only writer):
+    //   store_dest_id    — the store_locations.id the bottles went into; '' on
+    //                      every central receipt, which is how every reader
+    //                      tells the two apart.
+    //   store_invoice_id — OUR invoice number for the liquor bill, its own
+    //                      series PINV-yyyy-L#### (the central PINV mints read
+    //                      MAX over `purchases`, which liquor never writes).
+    //   store_bill_json  — the bill document frozen at save (lines, rates,
+    //                      charges, totals). A void keeps it, struck through,
+    //                      the way a central void keeps its line items.
+    // Schema only: no UPDATE, no backfill — every existing row reads '' (a
+    // central receipt), which is the truth about it.
+    if (!hasG('store_dest_id'))    db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN store_dest_id TEXT NOT NULL DEFAULT ''`);
+    if (!hasG('store_invoice_id')) db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN store_invoice_id TEXT NOT NULL DEFAULT ''`);
+    if (!hasG('store_bill_json'))  db.exec(`ALTER TABLE goods_receipt_notes ADD COLUMN store_bill_json TEXT NOT NULL DEFAULT ''`);
+
     // GRN Inward financial columns (TGBCL-style inward register) — per LINE ₹
     // amounts captured at receive time. SUBTOTAL = inward qty × rate (computed),
     // TOTAL INWARD AMOUNT = subtotal − discount + cgst + sgst + compensation
