@@ -193,14 +193,24 @@ export async function GET(request: Request) {
          Nothing switched off → the first arm is true for every row → both
          lists are exactly what they were. */
       const { switchedOffStillHeld } = await import('@/lib/count-list-active');
-      const ACTIVE_OR_HELD = `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?)))`;
+      /* …or while it already has a count saved for THIS department on the
+         sheet's date (?date=YYYY-MM-DD, sent by the Record sheet), so a count to
+         zero does not drop it off the sheet it was counted on — the same rule
+         the area count screen (by-location) applies. No date → no such arm. */
+      const keepDate = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('date') || '') ? url.searchParams.get('date') as string : '';
+      const ACTIVE_OR_HELD = keepDate
+        ? `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?))
+            OR rm.id IN (SELECT kc.material_id FROM closing_stock kc
+                         WHERE kc.date = ? AND kc.department_id IN (SELECT value FROM json_each(?))))`
+        : `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?)))`;
       const heldJson = JSON.stringify(switchedOffStillHeld(db, { deptIds: deptSet }));
+      const keepParams: unknown[] = keepDate ? [heldJson, keepDate, JSON.stringify(deptSet)] : [heldJson];
       const rows = deptSet.length === 0 ? [] : db.prepare(`
         SELECT ${COLS}
         FROM raw_materials rm
         WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL} AND ${ACTIVE_OR_HELD}
         ORDER BY rm.category, rm.name
-      `).all(...deptRequestedParams(deptSet), heldJson) as any[];
+      `).all(...deptRequestedParams(deptSet), ...keepParams) as any[];
 
       /* THE ESCAPE HATCH (requirement 3). The first time a department holds
          something new the list cannot know about it yet, and a counter who
@@ -222,7 +232,7 @@ export async function GET(request: Request) {
             AND ${ACTIVE_OR_HELD}
           ORDER BY rm.name
           LIMIT 50
-        `).all(...deptRequestedParams(deptSet), like, like, heldJson) as any[];
+        `).all(...deptRequestedParams(deptSet), like, like, ...keepParams) as any[];
       }
       const blind = (r: any) => (isAdmin ? r : { ...r, current_stock: null });
       return Response.json({

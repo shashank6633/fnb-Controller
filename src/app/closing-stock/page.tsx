@@ -514,13 +514,16 @@ export default function ClosingStockByLocationPage() {
      switching departments never carries one dept's addition onto another's
      sheet. Session-only: saving a count is what makes an addition permanent. */
   const [extraByDept, setExtraByDept] = useState<Record<string, any[]>>({});
+  // The Record sheet's date. Declared here, before the department-list effect
+  // below, because that effect sends it (?date=) and refetches when it changes.
+  const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
   useEffect(() => {
     if (!me) return;
     if (!activeDeptId) { setDeptRequested(null); setDeptScopeError(false); setDeptScopeLoading(false); return; }
     let live = true;
     setDeptScopeLoading(true);
     setDeptScopeError(false);
-    const qs = new URLSearchParams({ dept_items: '1', department_id: activeDeptId });
+    const qs = new URLSearchParams({ dept_items: '1', department_id: activeDeptId, date: closingDate });
     fetch(`/api/closing-stock?${qs}`)
       .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(j => {
@@ -531,7 +534,7 @@ export default function ClosingStockByLocationPage() {
       .catch(() => { if (live) { setDeptRequested(null); setDeptScopeError(true); } })
       .finally(() => { if (live) setDeptScopeLoading(false); });
     return () => { live = false; };
-  }, [me, activeDeptId]);
+  }, [me, activeDeptId, closingDate]);
 
   /** Is the ever-requested scope in force right now (loaded, for THIS dept)? */
   const deptScopeActive = !!activeDeptId && !!deptRequested && deptRequested.deptId === activeDeptId;
@@ -598,7 +601,7 @@ export default function ClosingStockByLocationPage() {
   // location-count workflow above stays lightweight.
   const [materials, setMaterials] = useState<any[]>([]);
   const [closingStockOpen, setClosingStockOpen] = useState(false);
-  const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
+  // closingDate is declared above (it feeds the department list's fetch).
   /* DEEP LINK from the Closing Overview board: /closing-stock?date=&location=&department_id=
      Seeded once on mount — without this every "Record" link on that board landed
      on today's page with no area or department selected, which reads as a dead

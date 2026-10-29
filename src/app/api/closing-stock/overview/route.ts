@@ -171,12 +171,17 @@ export async function GET(request: Request) {
     // switched-on ones, plus a switched-OFF one while central or any department
     // still holds a non-zero balance of it (owner #6 / ruling 78 — the same set
     // the drill-down's uncounted list keeps; see src/lib/count-list-active.ts).
+    // A switched-off item COUNTED on this date stays in the denominator too
+    // (`cs.id IS NOT NULL`), as locations / by-location keep it — otherwise a
+    // count to zero drops it from total_items while counted_items keeps it and
+    // the board reads e.g. "4 / 3 counted" (green) with an item still uncounted.
     // Nothing switched off → '[]' → exactly the old active-only tally.
     const heldAnywhere = JSON.stringify(switchedOffStillHeld(db, { central: true, deptIds: allDeptIds(db) }));
     const universeRows = db.prepare(`
       SELECT
         COALESCE(NULLIF(TRIM(rm.storage_location), ''), '${UNASSIGNED}') AS location,
         COUNT(DISTINCT CASE WHEN rm.is_active = 1
+                              OR cs.id IS NOT NULL
                               OR rm.id IN (SELECT value FROM json_each(?)) THEN rm.id END) AS total_items,
         COUNT(DISTINCT CASE WHEN cs.id IS NOT NULL THEN rm.id END)       AS counted_items
       FROM raw_materials rm
