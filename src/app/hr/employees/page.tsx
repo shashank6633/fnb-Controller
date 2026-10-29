@@ -415,6 +415,11 @@ export default function HrEmployeesPage() {
   const [bulkCreateDesig, setBulkCreateDesig] = useState(false);
   const bulkFileRef = useRef<HTMLInputElement>(null);
 
+  // ── Export CSV (GET /api/hr/employees/export — owner ruling 92) ────────
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   // Race guard: a stale response must never overwrite a newer one
   // (pattern copied from src/app/crm-calls/log/page.tsx).
   const fetchSeq = useRef(0);
@@ -789,6 +794,37 @@ export default function HrEmployeesPage() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  /** Server-built export (template columns + status; BOM, formula guard and
+   *  row cap live in the API) — fetched as a blob so the download stays
+   *  same-origin and cookie-authed, the HR Reports page pattern. */
+  const exportEmployees = async (which: 'active' | 'all') => {
+    setExportOpen(false);
+    setExporting(true);
+    setExportError(null);
+    try {
+      const res = await fetch(`/api/hr/employees/export?status=${which}`, { cache: 'no-store' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        setExportError(j?.error || 'Could not export the employees CSV');
+        return;
+      }
+      const name = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '')?.[1]
+        || `employees-${which}.csv`;
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch {
+      setExportError('Network error — could not export the employees CSV');
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const onBulkPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     e.target.value = ''; // allow re-picking the same file
@@ -1026,7 +1062,36 @@ export default function HrEmployeesPage() {
               Employee master{loading ? '' : ` — ${total} employee${total === 1 ? '' : 's'}`}. Profiles, departments and designations.
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <button onClick={() => setExportOpen(o => !o)} disabled={exporting}
+                      aria-haspopup="menu" aria-expanded={exportOpen}
+                      className="inline-flex items-center gap-2 px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-medium disabled:opacity-50">
+                {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Export employees (CSV)
+              </button>
+              {exportOpen && (
+                <>
+                  <button aria-label="Close export menu" onClick={() => setExportOpen(false)}
+                          className="fixed inset-0 z-10 cursor-default" />
+                  <div role="menu"
+                       className="absolute left-0 top-full mt-1 z-20 w-64 bg-white border border-[#E8D5C4] rounded-lg shadow-lg p-1 text-sm">
+                    <button role="menuitem" onClick={() => exportEmployees('active')}
+                            className="w-full text-left px-3 py-2 rounded-md hover:bg-[#FFF1E3]">
+                      <div className="font-medium text-[#2D1B0E]">Active only</div>
+                      <div className="text-[11px] text-[#8B7355]">Status Active</div>
+                    </button>
+                    <button role="menuitem" onClick={() => exportEmployees('all')}
+                            className="w-full text-left px-3 py-2 rounded-md hover:bg-[#FFF1E3]">
+                      <div className="font-medium text-[#2D1B0E]">All</div>
+                      <div className="text-[11px] text-[#8B7355]">Every status, incl. resigned and former</div>
+                    </button>
+                    <div className="px-3 pt-1.5 pb-1 mt-1 border-t border-[#E8D5C4] text-[11px] text-[#8B7355]">
+                      Same columns as the bulk-upload template, plus status. No salary, bank, PAN/Aadhaar, documents or photos.
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
             <button onClick={openBulk}
                     className="inline-flex items-center gap-2 px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-medium">
               <Upload className="w-4 h-4" /> Bulk upload
@@ -1037,6 +1102,15 @@ export default function HrEmployeesPage() {
             </button>
           </div>
         </div>
+
+        {exportError && (
+          <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm flex items-center justify-between gap-3">
+            <span>{exportError}</span>
+            <button onClick={() => setExportError(null)} aria-label="Dismiss" className="shrink-0">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
 
         {/* Filters */}
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-3 space-y-3">
