@@ -68,6 +68,13 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
   // Stock fell back to raw keys) and an admin could drop an in-use area with no
   // audit row. READ stays open — the list is names, not a secret.
   ['department_areas', { owner: '/api/departments/areas' }],
+  // THE LIST OF PARENT CATEGORIES (Manage Parents, ruling #87). Owned by
+  // /api/categories/parents: admin-only, audited, refuses deleting a parent an
+  // item or placeholder still uses, and renames the items with the parent in
+  // one transaction. Without this row a manager could PUT '[]' here and empty
+  // every parent picker, or an admin could drop an in-use parent unaudited.
+  // READ stays open — the list is names, not a secret.
+  ['category_parents', { owner: '/api/categories/parents' }],
   // The crash-alert WhatsApp number decides WHO gets production error alerts.
   // Admin-only to read (don't hand a personal number to every signed-in staff
   // session) and to write — the /api/error-report console is admin-only, so a

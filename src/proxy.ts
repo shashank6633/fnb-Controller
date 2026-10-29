@@ -75,6 +75,10 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/butchering',          // carcass breakdown batches + seed
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/department-materials', // dept on-hand transfer view + post-party reconcile
+  // Inventory → Categories: sub-category assign/rename/create, and Manage
+  // Parents (ruling #87), whose rename rewrites the parent on every item. The
+  // only caller (src/app/settings/categories) posts through src/lib/api.ts.
+  '/api/categories',
   // Department → department transfers: send / receive / cancel. Receive MOVES
   // STOCK between two department ledgers, so a forged POST from a cross-site
   // page driving a signed-in cook's browser is exactly the threat. Its own line
