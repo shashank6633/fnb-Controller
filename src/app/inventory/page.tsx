@@ -26,6 +26,7 @@ import Papa from 'papaparse';
 import { api } from '@/lib/api';
 import { usePurchaseUnitOptions } from '@/lib/use-units';
 import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
+import { canonNameInput } from '@/lib/name-canon';
 import Toggle from '@/components/Toggle';
 
 /* ------------------------------------------------------------------ */
@@ -263,7 +264,25 @@ function mergeStorageLocations(values: (string | undefined)[]): string[] {
   return [...CANONICAL_STORAGE_LOCATIONS, ...Array.from(seen.values()).sort((a, b) => a.localeCompare(b))];
 }
 
-const SUPER_CATEGORIES = ['', 'Meat', 'Seafood', 'Dairy', 'Vegetables', 'Fruits', 'Liquor', 'Beverages', 'Grocery', 'Housekeeping', 'Stationery', 'Fuel', 'Other'] as const;
+/** Super Category choices for the item form: none, every switched-ON parent of
+ *  Inventory → Categories → Manage Parents (GET /api/categories/parents, the
+ *  ONE list — ruling #87), and the item's own saved value even when that is
+ *  switched off or not in the list, so saving an item never drops its parent. */
+function superCategoryOptions(list: { label: string; active: boolean }[] | null, keep: string[]) {
+  const out: { value: string; label: string }[] = [{ value: '', label: '— None —' }];
+  const seen = new Set<string>(['']);
+  for (const p of list || []) {
+    if (p.active && !seen.has(p.label)) { seen.add(p.label); out.push({ value: p.label, label: p.label }); }
+  }
+  for (const v of keep) {
+    if (seen.has(v)) continue;
+    seen.add(v);
+    const hit = (list || []).find(p => canonNameInput(p.label).toLowerCase() === canonNameInput(v).toLowerCase());
+    const note = !list ? '' : !hit ? ' (not in the list)' : hit.active ? ' (as saved)' : ' (switched off)';
+    out.push({ value: v, label: v + note });
+  }
+  return out;
+}
 const CLOSING_CADENCES = [
   { v: 'none',    label: 'None (only on demand)' },
   { v: 'daily',   label: 'Daily — counted every day' },
@@ -370,6 +389,16 @@ export default function InventoryPage() {
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error('unavailable'))))
       .then((j) => setDirectDept(j?.targets && typeof j.targets === 'object' ? j.targets : {}))
       .catch(() => setDirectDept({}));
+  }, []);
+
+  // Parent categories for the item form's Super Category (see superCategoryOptions).
+  // null until loaded / on failure: the form then offers only "None" and the item's own value.
+  const [parentChoices, setParentChoices] = useState<{ label: string; active: boolean }[] | null>(null);
+  useEffect(() => {
+    fetch('/api/categories/parents')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('unavailable'))))
+      .then((j) => setParentChoices(Array.isArray(j?.parents) ? j.parents : null))
+      .catch(() => setParentChoices(null));
   }, []);
 
   // Inline per-row priority setter — same apply path as the bulk tool, so a
@@ -1812,7 +1841,10 @@ export default function InventoryPage() {
                     <select value={formData.super_category || ''}
                             onChange={e => setFormData(f => ({ ...f, super_category: e.target.value }))}
                             className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
-                      {SUPER_CATEGORIES.map(s => <option key={s} value={s}>{s || '— None —'}</option>)}
+                      {superCategoryOptions(parentChoices, [
+                        ((formData.id && (materials.find(m => m.id === formData.id) as any)?.super_category) || ''),
+                        formData.super_category || '',
+                      ]).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                     </select>
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1">

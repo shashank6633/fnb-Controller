@@ -16,13 +16,20 @@
  *
  * The dropdowns on /inventory and /unit-audit pick up these mappings via
  * super_category and render with <optgroup> grouping.
+ *
+ * The PARENTS themselves are managed under "Manage Parents" (owner ruling #87,
+ * ManageParentsPanel.tsx → /api/categories/parents). "Under parent" and
+ * "Move to parent" offer the switched-ON parents; a leaf already under a
+ * switched-off or unlisted parent shows that parent as its current choice.
  */
 
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Layers, Loader2, Plus, Save, Search, AlertCircle, AlertTriangle, CheckCircle2, Edit2,
+  Layers, Loader2, Plus, Save, Search, AlertCircle, AlertTriangle, CheckCircle2, Edit2, FolderTree,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { canonNameInput } from '@/lib/name-canon';
+import ManageParentsPanel, { type ParentsPayload } from './ManageParentsPanel';
 
 interface Leaf { category: string; super_category: string; count: number; }
 interface Group { super_category: string; super_category_raw: string; leaves: Leaf[]; }
@@ -30,6 +37,11 @@ interface Group { super_category: string; super_category_raw: string; leaves: Le
 export default function CategoryManagerPage() {
   const [groups, setGroups] = useState<Group[]>([]);
   const [allSupers, setAllSupers] = useState<string[]>([]);
+  // The whole managed list (switched-off parents too), to name a leaf's
+  // current parent truthfully when it is not one of the offered choices.
+  const [parentList, setParentList] = useState<{ label: string; active: boolean }[]>([]);
+  const [showParents, setShowParents] = useState(false);
+  const [parentsData, setParentsData] = useState<ParentsPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [pendingAssign, setPendingAssign] = useState<Record<string, string>>({});
@@ -58,14 +70,44 @@ export default function CategoryManagerPage() {
         if (cancelled) return;
         if (j.error) { setError(j.error); return; }
         setGroups(j.groups || []);
-        setAllSupers(j.all_super_categories || []);
-        if (!newParent && (j.all_super_categories || []).length > 0) setNewParent(j.all_super_categories[0]);
+        const supers: string[] = j.all_super_categories || [];
+        setAllSupers(supers);
+        setParentList(Array.isArray(j.parents) ? j.parents : []);
+        // Keep the picked parent only while it is still offered (it may have
+        // been switched off, renamed or deleted in Manage Parents).
+        setNewParent(prev => (supers.includes(prev) ? prev : supers[0] || ''));
       })
       .catch(e => !cancelled && setError(e.message))
       .finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
+
+  // Manage Parents: loaded when the panel is open, and again after any save
+  // on this page (counts of sub-categories / items change).
+  useEffect(() => {
+    if (!showParents) return;
+    let cancelled = false;
+    fetch('/api/categories/parents')
+      .then(r => (r.ok ? r.json() : null))
+      .then(j => { if (!cancelled && Array.isArray(j?.parents)) setParentsData(j); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [showParents, refreshKey]);
+
+  /** Why a parent name is not one of the offered choices ('' when it is):
+   *  switched off in Manage Parents, not in the list at all, or saved in a
+   *  different spelling from the list's (e.g. "bar" vs "Bar"). */
+  const parentStatus = (v: string): '' | 'off' | 'unlisted' | 'spelling' => {
+    if (!v || allSupers.includes(v)) return '';
+    const hit = parentList.find(p => canonNameInput(p.label).toLowerCase() === canonNameInput(v).toLowerCase());
+    if (!hit) return 'unlisted';
+    return hit.active ? 'spelling' : 'off';
+  };
+  const parentNote = (v: string) =>
+    ({ '': '', off: ' (switched off)', unlisted: ' (not in the list)', spelling: ' (as saved)' })[parentStatus(v)];
+  const parentBadge = (v: string) =>
+    ({ '': '', off: 'Switched off', unlisted: 'In use, not in the list', spelling: 'Spelled differently from the list' })[parentStatus(v)];
 
   const filtered = useMemo(() => {
     if (!search.trim()) return groups;
@@ -144,16 +186,30 @@ export default function CategoryManagerPage() {
 
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-4">
-      <div>
-        <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
-          <Layers className="w-6 h-6 text-[#af4408]" /> Category Manager
-        </h1>
-        <p className="text-xs text-[#6B5744] mt-0.5">
-          Assign every leaf category (Beers, Whisky, Mutton…) to a parent super-category
-          (Bar, Meat…). This grouping drives the optgroup display on Raw Materials, Unit Audit,
-          and requisition material pickers.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
+            <Layers className="w-6 h-6 text-[#af4408]" /> Category Manager
+          </h1>
+          <p className="text-xs text-[#6B5744] mt-0.5">
+            Assign every leaf category (Beers, Whisky, Mutton…) to a parent super-category
+            (Bar, Meat…). This grouping drives the optgroup display on Raw Materials, Unit Audit,
+            and requisition material pickers.
+          </p>
+        </div>
+        {meRole === 'admin' && (
+          <button onClick={() => setShowParents(v => !v)} aria-expanded={showParents}
+                  className="px-3 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm flex items-center gap-2">
+            <FolderTree className="w-4 h-4" /> Manage Parents
+          </button>
+        )}
       </div>
+
+      {meRole === 'admin' && showParents && (
+        <ManageParentsPanel data={parentsData}
+                            onChanged={next => { setParentsData(next); setRefreshKey(k => k + 1); }}
+                            onClose={() => setShowParents(false)} />
+      )}
 
       {/* Summary */}
       <div className="grid grid-cols-3 gap-3">
@@ -174,6 +230,7 @@ export default function CategoryManagerPage() {
           <label className="text-[10px] uppercase tracking-wide text-[#8B7355]">Under parent</label>
           <select value={newParent} onChange={e => setNewParent(e.target.value)}
                   className="mt-0.5 px-2 py-1.5 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0] min-w-[140px]">
+            {allSupers.length === 0 && <option value="">(Ungrouped)</option>}
             {allSupers.map(s => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
@@ -240,6 +297,11 @@ export default function CategoryManagerPage() {
               <div className="px-4 py-2 bg-[#FFF1E3] border-b border-[#E8D5C4] flex items-center justify-between">
                 <div className="font-semibold text-[#2D1B0E]">
                   {g.super_category}
+                  {parentBadge(g.super_category_raw) && (
+                    <span className="ml-1.5 text-[10px] font-normal px-1.5 py-0.5 rounded bg-[#E8D5C4] text-[#6B5744]">
+                      {parentBadge(g.super_category_raw)}
+                    </span>
+                  )}
                   <span className="ml-2 text-[10px] text-[#8B7355] font-normal">
                     {g.leaves.length} sub-categor{g.leaves.length === 1 ? 'y' : 'ies'}
                   </span>
@@ -277,6 +339,12 @@ export default function CategoryManagerPage() {
                                     className="px-1 py-0.5 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0]">
                               <option value="">(Ungrouped)</option>
                               {allSupers.map(s => <option key={s} value={s}>{s}</option>)}
+                              {/* Its current (or staged) parent when that is not an offered
+                                  choice — switched off or not in the list — so the box never
+                                  shows a parent the leaf is not under. */}
+                              {[...new Set([g.super_category_raw, queuedParent ?? ''])]
+                                .filter(v => v && !allSupers.includes(v))
+                                .map(v => <option key={`cur-${v}`} value={v}>{v}{parentNote(v)}</option>)}
                             </select>
                           </td>
                           <td className="py-1.5 px-3">

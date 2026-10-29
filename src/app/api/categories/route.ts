@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { readCategoryParents, checkParentChoice } from '@/lib/category-parents';
 
 /**
  * Category management — drives the parent/child hierarchy on raw_materials.
@@ -12,7 +13,8 @@ import { getCurrentUser } from '@/lib/auth';
  *
  * GET  /api/categories
  *   → { groups: [{ super_category, leaves: [{ category, count, super_category }] }],
- *       all_super_categories: [...],
+ *       all_super_categories: [...],   // the SWITCHED-ON parents of Manage Parents
+ *       parents: [{ label, active }],  // the whole managed list (switched-off too)
  *       ungrouped_count }
  *
  * POST /api/categories                                            admin only
@@ -22,16 +24,18 @@ import { getCurrentUser } from '@/lib/auth';
  *     create?:    [{ category, super_category }]     // seed an empty leaf (no
  *                                                       material yet — placeholder)
  *   }
+ *   A parent given in assign / create must be a switched-ON parent of Manage
+ *   Parents, blank (ungrouped), or the parent the leaf already has — otherwise
+ *   the whole request is refused (400) and nothing is saved.
+ *
+ * The parents themselves (add / rename / switch off / delete) are managed by
+ * /api/categories/parents (owner ruling #87); the list used to be a hard-coded
+ * KNOWN_SUPERS here and now lives in src/lib/category-parents.ts.
  */
 export const dynamic = 'force-dynamic';
 
-const KNOWN_SUPERS = [
-  'Bar', 'Beverages',
-  'Meat', 'Seafood',
-  'Dairy', 'Produce', 'Vegetables', 'Fruits',
-  'Grocery', 'Bakery', 'Spices', 'Frozen',
-  'Housekeeping', 'Stationery', 'Fuel', 'Other',
-];
+/** Thrown inside the POST transaction to roll it back with a plain message. */
+class ParentRefused extends Error {}
 
 export async function GET() {
   try {
@@ -74,9 +78,12 @@ export async function GET() {
       byParent.get(p)!.push(r);
     }
 
-    // Include every KNOWN_SUPERS bucket even if empty, so the UI lets the
-    // admin assign categories under them.
-    for (const s of KNOWN_SUPERS) {
+    // Include every switched-ON managed parent's bucket even if empty, so the
+    // UI lets the admin assign categories under them. (Switched-off parents
+    // appear only when something still sits under them.)
+    const managed = readCategoryParents(db).parents;
+    const activeSupers = managed.filter(p => p.active).map(p => p.label);
+    for (const s of activeSupers) {
       if (!byParent.has(s)) byParent.set(s, []);
     }
 
@@ -90,7 +97,8 @@ export async function GET() {
 
     return Response.json({
       groups,
-      all_super_categories: KNOWN_SUPERS,
+      all_super_categories: activeSupers,
+      parents: managed.map(p => ({ label: p.label, active: p.active })),
       ungrouped_count: rows.filter(r => !r.super_category).length,
     });
   } catch (e: any) {
@@ -109,6 +117,27 @@ export async function POST(request: Request) {
 
     let assigned = 0, renamed = 0, created = 0;
 
+    // The parent a leaf is put under must be a switched-ON parent of Manage
+    // Parents, blank, or one the leaf already has (so a leaf under a
+    // switched-off / unlisted parent can stay there).
+    const parents = readCategoryParents(db).parents;
+    const hasPlaceholders = () => !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'category_placeholders'`).get();
+    const currentParents = (cat: string): Set<string> => {
+      const s = new Set((db.prepare(`SELECT DISTINCT COALESCE(super_category, '') AS sup FROM raw_materials WHERE category = ?`)
+        .all(cat) as { sup: string }[]).map(r => r.sup));
+      if (hasPlaceholders()) {
+        const p = db.prepare(`SELECT super_category AS sup FROM category_placeholders WHERE category = ?`).get(cat) as { sup: string } | undefined;
+        if (p) s.add(p.sup);
+      }
+      return s;
+    };
+    const parentFor = (cat: string, sup: unknown): string => {
+      const chk = checkParentChoice(parents, sup, currentParents(cat));
+      if (!chk.ok) throw new ParentRefused(chk.error);
+      return chk.value;
+    };
+
     const txn = db.transaction(() => {
       // Assign parent (super_category) to all materials in a given leaf
       if (Array.isArray(b.assign)) {
@@ -118,8 +147,8 @@ export async function POST(request: Request) {
         `);
         for (const a of b.assign) {
           const cat = String(a.category || '').trim();
-          const sup = String(a.super_category || '').trim();
           if (!cat) continue;
+          const sup = parentFor(cat, String(a.super_category || '').trim());
           const r = upd.run(sup, cat);
           assigned += r.changes;
         }
@@ -158,8 +187,8 @@ export async function POST(request: Request) {
         `);
         for (const c of b.create) {
           const cat = String(c.category || '').trim();
-          const sup = String(c.super_category || '').trim();
           if (!cat) continue;
+          const sup = parentFor(cat, String(c.super_category || '').trim());
           ins.run(cat, sup);
           created += 1;
         }
@@ -169,6 +198,7 @@ export async function POST(request: Request) {
 
     return Response.json({ ok: true, assigned, renamed, created });
   } catch (e: any) {
+    if (e instanceof ParentRefused) return Response.json({ error: e.message }, { status: 400 });
     console.error('[/api/categories]', e);
     return Response.json({ error: e.message }, { status: 500 });
   }
