@@ -523,7 +523,7 @@ export default function PageAccessSettingsPage() {
                                 Roles, and until it is assigned the page stays shut no matter what
                                 is ticked. */}
                             {matchPages.map(p => (
-                              <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : p.financeCap ? 'Admins, Managers and HODs — plus any role holding “View finance & purchase reports” (Settings → Roles). For other roles this grant is ignored.' : p.mgmtOnly ? 'Only Admins, Managers and HODs can open this page — this grant is ignored for other roles' : p.greOnly ? 'Only the GRE role (create it in Settings → Roles, then ASSIGN it to the user below) plus Managers, HODs and Admins can open this page. Until the role is assigned to this user, ticking this box grants nothing.' : undefined}
+                              <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : p.hrFullCap ? 'Admins only by default — plus a Manager-tier or HOD user whose role has “Full HR access” (Settings → Roles), WITH this tick. For anyone else this grant is ignored.' : p.financeCap ? 'Admins, Managers and HODs — plus any role holding “View finance & purchase reports” (Settings → Roles). For other roles this grant is ignored.' : p.mgmtOnly ? 'Only Admins, Managers and HODs can open this page — this grant is ignored for other roles' : p.greOnly ? 'Only the GRE role (create it in Settings → Roles, then ASSIGN it to the user below) plus Managers, HODs and Admins can open this page. Until the role is assigned to this user, ticking this box grants nothing.' : undefined}
                                      className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 py-0.5 rounded min-w-0">
                                 <input type="checkbox" checked={cur.has(p.path)}
                                        onChange={() => togglePath(u.id, p.path)} />
@@ -536,6 +536,8 @@ export default function PageAccessSettingsPage() {
                                   ? <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium">Finance</span>
                                   : p.mgmtOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">Mgmt</span>}
                                 {p.greOnly && <span className="text-[9px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full font-medium">GRE</span>}
+                                {/* Ruling #90: the five admin-only HR pages "Full HR access" can open. */}
+                                {p.hrFullCap && <span className="text-[9px] bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded-full font-medium">HR</span>}
                                 <span className="text-[9px] font-mono text-[#8B7355] ml-auto truncate max-w-full">{p.path}</span>
                               </label>
                             ))}

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canManageHr, canAdminHr, isHrLeaveStatus } from '@/lib/hr';
+import { canManageHr, canHrFull, HR_FULL_DENIED, isHrLeaveStatus } from '@/lib/hr';
 import {
   validateRequest,
   applyApprovedLeave,
@@ -51,7 +51,8 @@ import { reportServerError } from '@/lib/error-alerts';
  *      db.transaction(): a failure anywhere rolls the whole decision back and
  *      the row stays pending. The response includes the updated balance.
  *
- * Gates: GET/POST canManageHr, PATCH canAdminHr. The proxy does NOT protect
+ * Gates: GET/POST canManageHr, PATCH canHrFull (admin, or a management role
+ * holding "Full HR access" — owner ruling #90). The proxy does NOT protect
  * API GETs — these handlers are the security boundary (§2.1). Errors are
  * GENERIC on the wire except hr-leave's caller-safe validation messages;
  * e.message otherwise never leaves the server.
@@ -270,10 +271,10 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // Decisions are ADMIN acts (variance pattern: requesting is management,
+  // Decisions are canHrFull acts (admin or "Full HR access") (variance pattern: requesting is management,
   // deciding is not).
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

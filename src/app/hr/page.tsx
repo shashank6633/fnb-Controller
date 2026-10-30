@@ -19,8 +19,14 @@
  *    read `total` from their list endpoints with pageSize=1; corrections has
  *    no pagination, so ?status=pending returns the (small) queue itself.
  *    A 403 on any of these HIDES that row (the documents AND advances queues
- *    are admin-only; a manager-tier caller simply doesn't get them) — never
- *    an error banner.
+ *    are canHrFull — admin, or a "Full HR access" role, owner ruling #90; any
+ *    other manager-tier caller simply doesn't get them) — never an error
+ *    banner. Those two rows link to adminOnly + hrFullCap pages, so when the
+ *    API answered (canHrFull) they are ALSO hidden unless canAccessPage opens
+ *    the linked page for this viewer (one /api/auth/me read, made only then) —
+ *    a capability holder whose map does not tick /hr/payroll or /hr/documents
+ *    is never deep-linked into a redirect (same rule as the bell, inbox
+ *    route). Admins: canAccessPage is always true, so nothing changes.
  *
  * NO 14-day attendance trend chart, ON PURPOSE: there is no trend endpoint,
  * and building the series client-side would mean 14 separate
@@ -49,6 +55,7 @@ import {
   Wallet,
 } from 'lucide-react';
 import { employeeStatusMeta, type HrEmployeeListRow } from '@/lib/hr';
+import { canAccessPage, type CatalogUser } from '@/lib/page-catalog';
 import { fmtISTDate, todayIST } from '@/lib/format-date';
 
 /* ── date arithmetic (pure, IST-day strings in / out) ── */
@@ -203,9 +210,10 @@ export default function HrDashboardPage() {
       }
     })();
 
-    // Action queues — count-only; a 403 hides the row (docs is admin-only).
+    // Action queues — count-only; a 403 hides the row (advances + docs are
+    // canHrFull, and also need the linked page openable — header note).
     const counts = (async () => {
-      const [leave, corrections, advances, docs] = await Promise.all([
+      const [leave, corrections, advancesRaw, docsRaw] = await Promise.all([
         fetchTotal('/api/hr/leave/requests?status=pending&pageSize=1'),
         (async (): Promise<number | null> => {
           try {
@@ -220,6 +228,25 @@ export default function HrDashboardPage() {
         fetchTotal('/api/hr/advances?status=pending&pageSize=1'),
         fetchTotal('/api/hr/documents?expiring_days=60&pageSize=1'),
       ]);
+      // Only when one of the two canHrFull queues answered: is its linked
+      // page openable for this viewer? If /api/auth/me itself fails, keep the
+      // rows — the API has already proved canHrFull, which is exactly how
+      // this page behaved before ruling #90.
+      let advances = advancesRaw;
+      let docs = docsRaw;
+      if (advances !== null || docs !== null) {
+        try {
+          const r = await fetch('/api/auth/me');
+          const j = r.ok ? await r.json().catch(() => null) : null;
+          const me = (j?.user ?? null) as CatalogUser | null;
+          if (me) {
+            if (advances !== null && !canAccessPage('/hr/payroll', me)) advances = null;
+            if (docs !== null && !canAccessPage('/hr/documents', me)) docs = null;
+          }
+        } catch {
+          /* keep the rows — see above */
+        }
+      }
       setQueues({ leave, corrections, advances, docs });
     })();
 

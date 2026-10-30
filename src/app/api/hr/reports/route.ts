@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canManageHr, canAdminHr } from '@/lib/hr';
+import { canManageHr, canHrFull } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -21,7 +21,8 @@ import { reportServerError } from '@/lib/error-alerts';
  *
  * Gates (the proxy does NOT protect API GETs — §2.1, this handler is the
  * boundary): every caller needs canManageHr (/hr/reports is mgmtOnly);
- * payroll-register additionally needs canAdminHr — it carries gross/net
+ * payroll-register additionally needs canHrFull (admin, or a management role
+ * holding "Full HR access" — owner ruling #90) — it carries gross/net
  * salary figures, an adminOnly surface per §2.2. Errors return GENERIC
  * messages only (e.message can leak schema/PII for HR data).
  */
@@ -77,8 +78,10 @@ export async function GET(request: Request) {
     const type = String(sp.get('type') || '');
     const def = Object.prototype.hasOwnProperty.call(REPORTS, type) ? REPORTS[type] : null;
     if (!def) return Response.json({ error: 'Unknown report type' }, { status: 400 });
-    if (def.adminOnly && !canAdminHr(me)) {
-      return Response.json({ error: 'Payroll Register is admin-only' }, { status: 403 });
+    if (def.adminOnly && !canHrFull(me)) {
+      // The refusal must keep the word "admin": hr/reports/page.tsx matches
+      // /admin/i to show the lock card instead of an error.
+      return Response.json({ error: 'Payroll Register needs an admin or "Full HR access" role' }, { status: 403 });
     }
 
     const from = sp.get('from');

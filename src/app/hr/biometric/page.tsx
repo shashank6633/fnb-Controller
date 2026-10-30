@@ -2,7 +2,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 /**
- * HR — Biometric & Import (Phase 2 + Phase 8 connector, adminOnly).
+ * HR — Biometric & Import (Phase 2 + Phase 8 connector). adminOnly in the
+ * page catalog, and also opened by a Manager-tier/HOD role with "Full HR
+ * access" ticked on Settings → Roles (owner ruling #90) — such a user gets
+ * EVERYTHING here, the SmartOffice connection and device commands included.
  *
  * Contract: docs/HRMS_DECISIONS.md §8.1/§8.5. Three cards:
  *   1. Device identity mapping (hr_biometric_map) — SmartOffice punches (and
@@ -21,11 +24,16 @@
  *      is DATA (settings keys hr_smartoffice_base_url / _api_key / _serials /
  *      _last_sync), never hardcoded. When the link is down, the CSV import
  *      below stays the guaranteed offline path — same engine, same rules.
- *      Client contract with /api/hr/biometric/smartoffice (canAdminHr):
- *        GET  → { configured, base_url, serials[], last_sync, api_key_set }
- *               (the API key itself is NEVER echoed — SECRET_KEY_RE masks it)
+ *      Client contract with /api/hr/biometric/smartoffice (canHrFull):
+ *        GET  → { configured, base_url, serials[], last_sync, api_key_set,
+ *                 auto_sync }
+ *               (the API key itself is NEVER echoed — SECRET_KEY_RE masks it;
+ *               auto_sync is the 30-minute background pull's last result —
+ *               shown under the Sync row, truthfully, including "never ran",
+ *               "failing since" and "scheduler not running on this server")
  *        POST { action: 'save_config', base_url, api_key, serials }
- *               (blank api_key = keep the stored key, house secret rule)
+ *               (blank api_key = keep the stored key, house secret rule —
+ *               but a NEW base_url needs the key typed again: 400 otherwise)
  *        POST { action: 'test' } → { ok, message, users? } (verbatim reply)
  *        POST { action: 'sync', from, to } → syncSmartOfficePunches() report
  *        POST { action: 'push_user', employee_id, with_photo }
@@ -35,25 +43,28 @@
  *      User commands are addressed by employee_id — the route resolves the
  *      employee's active mapping itself ('' any-device wildcard wins).
  *      Responses are parsed tolerantly (soft key aliases) and the device's
- *      reply is surfaced VERBATIM — never rewritten into fake success copy.
+ *      own message is surfaced as sent (its JSON message, one line, clipped —
+ *      the server never echoes a raw/non-JSON reply) — never rewritten into
+ *      fake success copy.
  *   3. CSV punch import — the guaranteed offline path (owner ruling: go-live
  *      is biometric-gated). Preview (?commit=0) is mandatory before Import
  *      (?commit=1); unmatched rows are surfaced with line numbers, never
  *      silently dropped. Editing the CSV after a preview disarms the Import
  *      button until the next preview.
  *
- * All endpoints gate on canAdminHr server-side — this page just renders the
- * 401/403 honestly. Structure copied from src/app/hr/employees/page.tsx.
+ * Every write endpoint gates on canHrFull server-side (admin, or a role with
+ * "Full HR access") — this page just renders the 401/403 honestly. Structure
+ * copied from src/app/hr/employees/page.tsx.
  */
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Fingerprint, Plus, X, Loader2, Save, Upload, FileText, AlertTriangle,
   CheckCircle2, Ban, RefreshCw, Info, Eye, Cable, Wifi, Send, Lock, Unlock,
-  CalendarClock,
+  CalendarClock, Clock,
 } from 'lucide-react';
 import { api, apiJson } from '@/lib/api';
-import { todayIST } from '@/lib/format-date';
+import { todayIST, fmtIST } from '@/lib/format-date';
 import Combobox, { type ComboOption } from '@/components/Combobox';
 
 /** A hr_biometric_map row joined to its employee (GET /api/hr/biometric). */
@@ -87,6 +98,8 @@ interface PreviewResult {
 
 interface CommitResult {
   recorded: number;
+  /** Punches already stored before this import — skipped (never re-recorded). */
+  already: number;
   ignored: number;
   unmatched: number;
   unmatchedRows: CsvEchoRow[];
@@ -142,9 +155,10 @@ function normalizeCommit(json: any): CommitResult {
     ? json.unmatched_rows
     : Array.isArray(json?.unmatched) ? json.unmatched : [];
   const recorded = toCount(json?.recorded) ?? toCount(json?.recorded_count) ?? toCount(json?.imported) ?? 0;
-  const ignored = toCount(json?.ignored) ?? toCount(json?.ignored_count) ?? toCount(json?.duplicates) ?? 0;
+  const already = toCount(json?.already_recorded) ?? 0;
+  const ignored = toCount(json?.ignored_duplicates) ?? toCount(json?.ignored) ?? toCount(json?.ignored_count) ?? toCount(json?.duplicates) ?? 0;
   const unmatched = toCount(json?.unmatched) ?? toCount(json?.unmatched_count) ?? unmatchedRows.length;
-  return { recorded, ignored, unmatched, unmatchedRows };
+  return { recorded, already, ignored, unmatched, unmatchedRows };
 }
 
 /** Beyond this the server-side body buffer becomes the risk — refuse client-side. */
@@ -162,6 +176,34 @@ interface SoConfigView {
   last_sync: string;
   /** Base URL + API key both stored — the minimum for any device call. */
   configured: boolean;
+  /** Who last saved these settings, and when (DB UTC time); null = never. */
+  config_saved: { by: string; at: string } | null;
+  /** The 30-minute background pull's status; null when the server sent none. */
+  auto_sync: SoAutoSyncView | null;
+}
+
+/** GET …/smartoffice → auto_sync (readSmartOfficeAutoSyncStatus + context). */
+interface SoAutoSyncView {
+  configured: boolean;
+  interval_min: number;
+  /** THIS server process's background scheduler tick is armed. */
+  scheduler_armed: boolean;
+  /** ISO instants ('' = never). */
+  last_attempt_at: string;
+  last_run_at: string;
+  /** null = no automatic run has finished yet. */
+  last_ok: boolean | null;
+  /** The failure reason VERBATIM (or a note on success, usually ''). */
+  last_message: string;
+  last_from: string;
+  last_to: string;
+  counts: {
+    fetched: number; recorded: number; already: number;
+    ignored: number; refused: number; unmatched: number;
+  } | null;
+  last_success_at: string;
+  failing_since: string;
+  consecutive_failures: number;
 }
 
 interface SoTestResult { ok: boolean; message: string; enrolled: number | null }
@@ -171,6 +213,8 @@ interface SoSyncReport {
   message: string;
   fetched: number;
   recorded: number;
+  /** Punches already stored before this sync — skipped (never re-recorded). */
+  already: number;
   ignored: number;
   refused: { code: string; reason: string }[];
   unmatched: { code: string; punches: number }[];
@@ -188,7 +232,45 @@ function normalizeSoConfig(json: any): SoConfigView {
   const configured = typeof src?.configured === 'boolean'
     ? src.configured
     : base_url !== '' && api_key_set;
-  return { base_url, api_key_set, serials, last_sync, configured };
+  const cs = src?.config_saved;
+  const config_saved = cs && typeof cs === 'object' && typeof cs.at === 'string' && cs.at
+    ? { by: typeof cs.by === 'string' ? cs.by : '', at: cs.at }
+    : null;
+  return {
+    base_url, api_key_set, serials, last_sync, configured, config_saved,
+    auto_sync: normalizeSoAutoSync(src?.auto_sync, configured),
+  };
+}
+
+/** Tolerant reader for the auto-sync status; null when absent. */
+function normalizeSoAutoSync(a: any, configuredFallback: boolean): SoAutoSyncView | null {
+  if (!a || typeof a !== 'object') return null;
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const c = a.last_counts && typeof a.last_counts === 'object' ? a.last_counts : null;
+  return {
+    configured: typeof a.configured === 'boolean' ? a.configured : configuredFallback,
+    interval_min: toCount(a.interval_min) ?? 30,
+    scheduler_armed: a.scheduler_armed === true,
+    last_attempt_at: str(a.last_attempt_at),
+    last_run_at: str(a.last_run_at),
+    last_ok: typeof a.last_ok === 'boolean' ? a.last_ok : null,
+    last_message: str(a.last_message),
+    last_from: str(a.last_from),
+    last_to: str(a.last_to),
+    counts: c
+      ? {
+          fetched: toCount(c.fetched) ?? 0,
+          recorded: toCount(c.recorded) ?? 0,
+          already: toCount(c.already_recorded) ?? 0,
+          ignored: toCount(c.ignored_duplicates) ?? 0,
+          refused: toCount(c.refused) ?? 0,
+          unmatched: toCount(c.unmatched) ?? 0,
+        }
+      : null,
+    last_success_at: str(a.last_success_at),
+    failing_since: str(a.failing_since),
+    consecutive_failures: toCount(a.consecutive_failures) ?? 0,
+  };
 }
 
 /** Enrolled-user count from any of the plausible test-reply shapes. */
@@ -218,6 +300,7 @@ function normalizeSoSync(json: any): SoSyncReport {
     message: String(json?.message ?? ''),
     fetched: toCount(json?.fetched) ?? 0,
     recorded: toCount(json?.recorded) ?? 0,
+    already: toCount(json?.already_recorded) ?? 0,
     ignored: toCount(json?.ignored_duplicates) ?? toCount(json?.ignored) ?? 0,
     refused: refusedRaw.map(r => ({
       code: String(r?.code ?? r?.employeeCode ?? '') || '—',
@@ -288,7 +371,7 @@ export default function HrBiometricPage() {
       const res = await fetch('/api/hr/biometric');
       if (!res.ok) {
         setMapError(res.status === 401 || res.status === 403
-          ? 'You need admin access for biometric setup.'
+          ? 'Biometric setup needs an admin, or a role with "Full HR access".'
           : "Couldn't load device mappings");
         return;
       }
@@ -375,7 +458,7 @@ export default function HrBiometricPage() {
       const json = await res.json().catch(() => null);
       if (!res.ok) {
         setSoCfgError(res.status === 401 || res.status === 403
-          ? 'You need admin access for the SmartOffice connector.'
+          ? 'The SmartOffice connector needs an admin, or a role with "Full HR access".'
           : "Couldn't load the SmartOffice settings");
         return;
       }
@@ -418,7 +501,7 @@ export default function HrBiometricPage() {
           ok: false,
           text: json?.error
             || (res.status === 401 || res.status === 403
-              ? 'You need admin access to change the connector settings.'
+              ? 'Changing the connector settings needs an admin, or a role with "Full HR access".'
               : 'Could not save the connection settings'),
         });
         return;
@@ -476,7 +559,7 @@ export default function HrBiometricPage() {
         setSyncError(
           json?.error || json?.message
             || (res.status === 401 || res.status === 403
-              ? 'You need admin access to sync punches.'
+              ? 'Syncing punches needs an admin, or a role with "Full HR access".'
               : 'Sync failed — nothing was recorded.'),
         );
         return;
@@ -640,7 +723,7 @@ export default function HrBiometricPage() {
         setCsvError(
           json?.error
             || (res.status === 401 || res.status === 403
-              ? 'You need admin access to import punches.'
+              ? 'Importing punches needs an admin, or a role with "Full HR access".'
               : 'Preview failed — nothing was imported.'),
         );
         return;
@@ -671,14 +754,15 @@ export default function HrBiometricPage() {
         setCsvError(
           json?.error
             || (res.status === 401 || res.status === 403
-              ? 'You need admin access to import punches.'
+              ? 'Importing punches needs an admin, or a role with "Full HR access".'
               : 'Import failed — check the attendance register before retrying, some rows may have been recorded.'),
         );
         return;
       }
       setImportResult(normalizeCommit(json));
-      // Disarm: importing the same text twice would only mint ignored dupes,
-      // but there is no reason to leave the trigger loaded.
+      // Disarm: importing the same text twice would only report every punch
+      // as already on file (the server skips them), but there is no reason to
+      // leave the trigger loaded.
       setPreview(null);
       setPreviewedCsv(null);
     } catch {
@@ -923,7 +1007,7 @@ export default function HrBiometricPage() {
                        className={`${inputCls} font-mono`} />
                 <p className="text-[11px] text-[#8B7355] mt-1">
                   As reachable from THIS app&apos;s server — usually the venue&apos;s port-forward or
-                  VPN address, not the LAN one.
+                  VPN address, not the LAN one. Changing it needs the API key typed again.
                 </p>
               </div>
               <div>
@@ -936,7 +1020,7 @@ export default function HrBiometricPage() {
                        className={`${inputCls} font-mono`} />
                 <p className="text-[11px] text-[#8B7355] mt-1">
                   {soCfg?.api_key_set
-                    ? 'A key is stored — leave blank to keep it.'
+                    ? 'A key is stored — leave blank to keep it (only when the base URL stays the same; a new address needs the key typed again).'
                     : 'From the SmartOffice web app’s API settings.'}
                 </p>
               </div>
@@ -975,8 +1059,15 @@ export default function HrBiometricPage() {
                 </span>
               )}
             </div>
+            {/* Who last saved the connection — admins and "Full HR access"
+                holders can both change it, so a re-pointed address is visible. */}
+            {soCfg?.config_saved && (
+              <p className="-mt-2 text-[11px] text-[#8B7355]">
+                Connection settings last saved by {soCfg.config_saved.by || 'an unknown user'} on {fmtIST(soCfg.config_saved.at)}.
+              </p>
+            )}
 
-            {/* Test verdict — the device's reply VERBATIM */}
+            {/* Test verdict — the device's own message (or why it could not be asked) */}
             {soTest && (
               <div className={`rounded-xl border px-4 py-3 text-sm flex items-start gap-2 ${
                 soTest.ok
@@ -987,7 +1078,9 @@ export default function HrBiometricPage() {
                   ? <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
                   : <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />}
                 <div>
-                  <div>SmartOffice replied: &ldquo;{soTest.message}&rdquo;</div>
+                  {/* Only an answer FROM SmartOffice is "SmartOffice replied" — an
+                      unreachable/refused address is this app's own finding. */}
+                  <div>{soTest.ok ? 'SmartOffice replied' : 'Connection test failed'}: &ldquo;{soTest.message}&rdquo;</div>
                   {soTest.enrolled !== null && (
                     <div className="text-xs mt-0.5">
                       {soTest.enrolled} user{soTest.enrolled === 1 ? '' : 's'} enrolled on the device{soCfg && soCfg.serials.includes(',') ? 's' : ''}.
@@ -1020,11 +1113,17 @@ export default function HrBiometricPage() {
                   Sync punches
                 </button>
                 <span className="text-[11px] text-[#8B7355] pb-2">
+                  {/* The cursor is the last day a SUCCESSFUL sync reached. When that is
+                      today, today is only covered up to the moment of that sync. */}
                   {soCfg?.last_sync
-                    ? <>Last fully-synced day: <span className="font-mono">{soCfg.last_sync}</span></>
+                    ? soCfg.last_sync >= todayIST()
+                      ? <>Last successful sync reached today (<span className="font-mono">{soCfg.last_sync}</span>) — later punches are picked up by the next sync, which re-checks today.</>
+                      : <>Last successful sync reached <span className="font-mono">{soCfg.last_sync}</span> — the next sync starts from that day.</>
                     : 'Never synced yet.'}
                 </span>
               </div>
+
+              {soCfg?.auto_sync && <AutoSyncStatusLine a={soCfg.auto_sync} />}
 
               <p className="text-[11px] text-[#8B7355]">
                 The venue&apos;s SmartOffice server must be reachable from this app (port-forward or
@@ -1056,6 +1155,10 @@ export default function HrBiometricPage() {
                         </span>
                         <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-green-100 text-green-700 border-green-200">
                           <CheckCircle2 className="w-3.5 h-3.5" /> {syncReport.recorded} recorded
+                        </span>
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-gray-100 text-gray-600 border-gray-200"
+                              title="These punches were already stored (an earlier sync, a CSV import, or a punch within the duplicate window) — skipped, not recorded again">
+                          {syncReport.already} already on file
                         </span>
                         <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border bg-amber-100 text-amber-800 border-amber-200">
                           {syncReport.ignored} ignored duplicate{syncReport.ignored === 1 ? '' : 's'}
@@ -1107,8 +1210,8 @@ export default function HrBiometricPage() {
                         <div className="rounded-xl border border-red-200 overflow-hidden">
                           <div className="bg-red-50 text-red-700 px-3 py-2 text-xs font-semibold">
                             Unmatched device ids — no active mapping, so their punches were NOT
-                            recorded. Map them, then sync the range again (safe: already-recorded
-                            punches just count as ignored duplicates).
+                            recorded. Map them, then sync the range again (safe: punches already
+                            stored are skipped and counted as already on file).
                           </div>
                           <div className="overflow-x-auto">
                             <table className="w-full text-sm">
@@ -1354,6 +1457,10 @@ export default function HrBiometricPage() {
                   <span className="inline-flex px-3 py-1.5 rounded-full text-xs font-medium border bg-green-100 text-green-700 border-green-200">
                     {importResult.recorded} punch{importResult.recorded === 1 ? '' : 'es'} recorded
                   </span>
+                  <span className="inline-flex px-3 py-1.5 rounded-full text-xs font-medium border bg-gray-100 text-gray-600 border-gray-200"
+                        title="These punches were already stored (an earlier import, the SmartOffice sync, or a punch within the duplicate window) — skipped, not recorded again">
+                    {importResult.already} already on file
+                  </span>
                   <span className="inline-flex px-3 py-1.5 rounded-full text-xs font-medium border bg-amber-100 text-amber-800 border-amber-200">
                     {importResult.ignored} ignored duplicate{importResult.ignored === 1 ? '' : 's'}
                   </span>
@@ -1519,6 +1626,79 @@ export default function HrBiometricPage() {
         )}
 
       </div>
+    </div>
+  );
+}
+
+/**
+ * The 30-minute background pull's last result, under the Sync row. Every state
+ * is said plainly — off, never ran, in flight, OK with counts, or FAILED with
+ * the server's reason verbatim — and a server whose background scheduler is
+ * not armed says so instead of implying runs that will never happen.
+ */
+function AutoSyncStatusLine({ a }: { a: SoAutoSyncView }) {
+  const every = `Auto-sync every ${a.interval_min} min`;
+  const noScheduler = !a.scheduler_armed
+    ? ' (background scheduler not running on this server — no automatic runs will happen here)'
+    : '';
+
+  if (!a.configured) {
+    return (
+      <p className="text-[11px] text-[#8B7355] flex items-start gap-1.5">
+        <Clock className="w-3.5 h-3.5 mt-px shrink-0" />
+        <span>Auto-sync off: save the base URL and API key above to turn it on (it then runs every {a.interval_min} min).</span>
+      </p>
+    );
+  }
+
+  // A claimed attempt newer than the last finished run: in flight, or the
+  // server stopped mid-run. We cannot tell which, so say only what is known.
+  const inFlight = a.last_attempt_at !== '' && a.last_attempt_at > a.last_run_at;
+  const inFlightNote = inFlight
+    ? ` · a run started ${fmtIST(a.last_attempt_at)} has not reported a result yet`
+    : '';
+
+  if (a.last_ok === null) {
+    return (
+      <p className="text-[11px] text-[#8B7355] flex items-start gap-1.5">
+        <Clock className="w-3.5 h-3.5 mt-px shrink-0" />
+        <span>
+          {every}; no automatic run recorded yet{inFlightNote}{noScheduler}.
+        </span>
+      </p>
+    );
+  }
+
+  const c = a.counts;
+  const range = a.last_from && a.last_to
+    ? (a.last_from === a.last_to ? a.last_from : `${a.last_from} → ${a.last_to}`)
+    : '';
+
+  if (a.last_ok) {
+    return (
+      <p className="text-[11px] text-green-800 flex items-start gap-1.5">
+        <Clock className="w-3.5 h-3.5 mt-px shrink-0" />
+        <span>
+          {every} · last run {fmtIST(a.last_run_at)} · OK{range ? ` (${range})` : ''}
+          {c && <> · {c.fetched} fetched · {c.recorded} recorded · {c.already} already on file · {c.refused} refused · {c.unmatched} unmatched id{c.unmatched === 1 ? '' : 's'}</>}
+          {a.last_message && <> · {a.last_message}</>}
+          {inFlightNote}{noScheduler}
+        </span>
+      </p>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-red-200 bg-red-50 text-red-700 px-3 py-2 text-[11px] flex items-start gap-1.5">
+      <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" />
+      <span>
+        {every} · last run {fmtIST(a.last_run_at)} FAILED: &ldquo;{a.last_message || 'no reason was given'}&rdquo;
+        {a.failing_since && <> · failing since {fmtIST(a.failing_since)}</>}
+        {' '}· {a.consecutive_failures} failed run{a.consecutive_failures === 1 ? '' : 's'} in a row
+        {' '}· last success: {a.last_success_at ? fmtIST(a.last_success_at) : 'never'}
+        {c && c.recorded > 0 && <> · {c.recorded} punch{c.recorded === 1 ? '' : 'es'} recorded before it stopped</>}
+        {inFlightNote}{noScheduler}
+      </span>
     </div>
   );
 }

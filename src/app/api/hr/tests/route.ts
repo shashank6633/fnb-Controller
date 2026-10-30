@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canManageHr, canAdminHr } from '@/lib/hr';
+import { canManageHr, canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { EXITED_STATUSES } from '@/lib/hr-attendance';
 import { reportServerError } from '@/lib/error-alerts';
 
@@ -28,7 +28,7 @@ import { reportServerError } from '@/lib/error-alerts';
  *      canManageHr. References validated at CREATE (400 named message);
  *      duplicate active name → 409.
  * POST { action:'question', test_id, kind?, question, options?, correct,
- *        sort_order? } → { question }                            canAdminHr
+ *        sort_order? } → { question }                            canHrFull
  *      kind 'mcq' (default) | 'true_false' (options default True/False).
  *      correct MUST be one of the options. Any question mutation bumps
  *      hr_tests.version — attempts freeze the version they ran against.
@@ -45,8 +45,10 @@ import { reportServerError } from '@/lib/error-alerts';
  *      IMMUTABLE — re-submitting is a 409. Audit: hr.test.attempt.
  *
  * PUT  { id, ...test fields } → { test }                          canManageHr
- * PUT  { question_id, ...question fields } → { question }         canAdminHr
- * DELETE ?id= (test, canManageHr) | ?question_id= (question, canAdminHr)
+ * PUT  { question_id, ...question fields } → { question }         canHrFull
+ * DELETE ?id= (test, canManageHr) | ?question_id= (question, canHrFull)
+ *        (canHrFull = admin, or a management role holding "Full HR access"
+ *        — owner ruling #90.)
  *        → { ok: true }             (soft: is_active = 0 — rows never removed)
  *
  * Every verb gates through getCurrentUser (the proxy does NOT protect API
@@ -258,12 +260,12 @@ export async function POST(request: Request) {
     try { body = await request.json(); } catch { /* handled by field checks below */ }
     const action = s(body?.action);
 
-    // ================= question authoring (canAdminHr) =================
+    // ================= question authoring (canHrFull) =================
     if (action === 'question') {
-      // Question mutations are ADMIN acts — the answer key is the whole value
+      // Question mutations are canHrFull acts (admin or "Full HR access") — the answer key is the whole value
       // of the test.
-      if (!canAdminHr(me)) {
-        return Response.json({ error: 'Admin access required' }, { status: 403 });
+      if (!canHrFull(me)) {
+        return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
       }
       const test_id = s(body?.test_id);
       if (!test_id) return Response.json({ error: 'Test is required' }, { status: 400 });
@@ -624,11 +626,11 @@ export async function PUT(request: Request) {
     let body: any = {};
     try { body = await request.json(); } catch { /* handled below */ }
 
-    // ================= update a question (canAdminHr) =================
+    // ================= update a question (canHrFull) =================
     const question_id = s(body?.question_id);
     if (question_id) {
-      if (!canAdminHr(me)) {
-        return Response.json({ error: 'Admin access required' }, { status: 403 });
+      if (!canHrFull(me)) {
+        return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
       }
       const db = getDb();
       const existing = db
@@ -807,11 +809,11 @@ export async function DELETE(request: Request) {
   try {
     const url = new URL(request.url);
 
-    // ================= deactivate a question (canAdminHr) =================
+    // ================= deactivate a question (canHrFull) =================
     const question_id = s(url.searchParams.get('question_id'));
     if (question_id) {
-      if (!canAdminHr(me)) {
-        return Response.json({ error: 'Admin access required' }, { status: 403 });
+      if (!canHrFull(me)) {
+        return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
       }
       const db = getDb();
       const existing = db

@@ -86,10 +86,12 @@ interface UserRow {
   is_head_chef: number; page_access: string | null; role_id: string | null;
   role_name: string | null; role_base: string | null;
   role_page_access: string | null; role_head_chef: number | null; role_is_active: number | null;
+  role_can_hr_full: number | null;
 }
 interface RoleRow {
   id: string; name: string; base_role: string; page_access: string | null;
   is_head_chef: number; is_active: number; sort_order: number;
+  can_full_hr_access: number;
 }
 
 interface Diff {
@@ -210,7 +212,7 @@ export async function GET() {
     SELECT u.id, u.email, u.name, u.role, u.is_head_chef, u.page_access, u.role_id,
            r.name AS role_name, r.base_role AS role_base,
            r.page_access AS role_page_access, r.is_head_chef AS role_head_chef,
-           r.is_active AS role_is_active
+           r.is_active AS role_is_active, r.can_full_hr_access AS role_can_hr_full
     FROM users u
     LEFT JOIN roles r ON r.id = u.role_id
     WHERE u.is_active = 1
@@ -220,7 +222,7 @@ export async function GET() {
   // ONE query for roles. Inactive roles are INCLUDED (and flagged) for the same
   // reason as above — they are still governing whoever is assigned to them.
   const roleRows = db.prepare(`
-    SELECT id, name, base_role, page_access, is_head_chef, is_active, sort_order
+    SELECT id, name, base_role, page_access, is_head_chef, is_active, sort_order, can_full_hr_access
     FROM roles
     ORDER BY sort_order, name COLLATE NOCASE
   `).all() as RoleRow[];
@@ -241,6 +243,10 @@ export async function GET() {
       // have silently understated a GRE's reach in the "now" column.
       role_name: row.role_name || null,
       role_is_active: row.role_id ? !!row.role_is_active : null,
+      // "Full HR access" (ruling #90), resolved EXACTLY as getCurrentUser does:
+      // role-only, and only while the role is active. Without it the report
+      // would count the five HR-capability pages as closed for the HR role.
+      can_full_hr_access: hasRole && !!row.role_is_active && !!row.role_can_hr_full,
     };
     const source: Diff['effective_map_source'] =
       row.page_access != null ? 'user'
@@ -272,6 +278,8 @@ export async function GET() {
       role: row.base_role || 'staff',
       is_head_chef: !!row.is_head_chef,
       page_access: row.page_access ?? null,
+      // Same rule as the user subject above: an inactive role holds nothing.
+      can_full_hr_access: !!row.is_active && !!row.can_full_hr_access,
     };
     return {
       id: row.id,

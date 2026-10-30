@@ -1,12 +1,13 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import {
   recordAttendanceEvent,
   BLOCKED_STATUSES,
   SUSPENDED_PUNCH_MESSAGE,
 } from '@/lib/hr-attendance';
 import { reportServerError } from '@/lib/error-alerts';
+import { createAlreadyOnFileGuard } from '@/lib/smartoffice';
 
 /**
  * HR Biometric CSV import (/api/hr/biometric/import) — Phase 2 biometric
@@ -45,8 +46,13 @@ import { reportServerError } from '@/lib/error-alerts';
  *   CHRONOLOGICAL order (the file may be unsorted; the single-gate
  *   alternation engine depends on punch order). Duplicate punches inside the
  *   debounce window are INSERTED with ignored=1 by the engine (append-only)
- *   and counted here.
- *   → { commit: true, matched, recorded, ignored_duplicates, unmatched }
+ *   and counted here. Punches ALREADY ON FILE before this import (a re-import
+ *   of the same export, or a day the SmartOffice sync already pulled) are
+ *   skipped and counted as already_recorded — see createAlreadyOnFileGuard in
+ *   src/lib/smartoffice.ts for why the engine's debounce alone would record
+ *   them again.
+ *   → { commit: true, matched, recorded, already_recorded, ignored_duplicates,
+ *       unmatched }
  *
  * TIMEZONE: device exports carry IST wall time; storage is UTC
  * ('YYYY-MM-DD HH:MM:SS', the datetime('now') shape). Conversion is
@@ -59,8 +65,9 @@ import { reportServerError } from '@/lib/error-alerts';
  * synchronous better-sqlite3 on the shared POS box, so an unbounded commit
  * loop would stall live billing.
  *
- * Gate: canAdminHr (§2.1 — the proxy does NOT protect API routes). Errors
- * return GENERIC messages only.
+ * Gate: canHrFull — admin, or a Manager-tier/HOD user whose role carries
+ * "Full HR access" (owner ruling #90; §2.1 — the proxy does NOT protect API
+ * routes). Errors return GENERIC messages only.
  */
 export const dynamic = 'force-dynamic';
 
@@ -276,8 +283,8 @@ interface MappingRow {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -437,6 +444,13 @@ export async function POST(request: Request) {
     // above has resolved.
     let recorded = 0;
     let ignoredDuplicates = 0;
+    // Punches ALREADY ON FILE (a re-import of the same export, or a day the
+    // SmartOffice sync already pulled) are skipped, not re-fed: the engine
+    // debounces only against the employee's LATEST punch, so re-feeding a
+    // stored day would record every earlier punch again as a live event.
+    // Shared rule with the SmartOffice sync — see createAlreadyOnFileGuard.
+    let alreadyRecorded = 0;
+    const onFile = createAlreadyOnFileGuard(db);
     const batchId = generateId();
 
     // Only the engine's documented caller-safe messages may reach the wire as
@@ -459,6 +473,10 @@ export async function POST(request: Request) {
     const run = db.transaction(() => {
       for (const row of matched) {
         try {
+          if (onFile.isOnFile(row.employee_id, row.at_utc)) {
+            alreadyRecorded++;
+            continue;
+          }
           const { event } = recordAttendanceEvent(db, {
             employee_id: row.employee_id,
             source: 'import',
@@ -469,6 +487,7 @@ export async function POST(request: Request) {
             reason: '',
             created_by: me.email, // the uploading admin is the human actor
           });
+          onFile.noteInserted(event.id);
           if (event.ignored) ignoredDuplicates++;
           else recorded++;
         } catch (rowErr) {
@@ -493,6 +512,7 @@ export async function POST(request: Request) {
         after: {
           rows: rows.length,
           recorded,
+          already_recorded: alreadyRecorded,
           ignored_duplicates: ignoredDuplicates,
           unmatched: unmatched.length,
         },
@@ -504,6 +524,7 @@ export async function POST(request: Request) {
       commit: true,
       matched: matched.length,
       recorded,
+      already_recorded: alreadyRecorded,
       ignored_duplicates: ignoredDuplicates,
       unmatched,
     });

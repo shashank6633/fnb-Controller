@@ -1,10 +1,14 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 import { todayIST } from '@/lib/format-date';
 import {
+  checkSmartOfficeBaseUrl,
+  smartOfficeBaseUrlKey,
   getSmartOfficeConfig,
+  readSmartOfficeAutoSyncStatus,
+  SO_AUTO_SYNC_INTERVAL_MIN,
   type SmartOfficeConfig,
   soAddDevice,
   soDeleteDevice,
@@ -40,23 +44,39 @@ import type Database from 'better-sqlite3';
  *   · hr_smartoffice_base_url   e.g. http://203.0.113.7:8080
  *   · hr_smartoffice_api_key    the SmartOffice APIKey (never echoed back)
  *   · hr_smartoffice_serials    comma-separated device serial numbers
- *   · hr_smartoffice_last_sync  'YYYY-MM-DD' cursor of the last fully-synced
- *                               IST day (advanced by the sync itself)
+ *   · hr_smartoffice_last_sync  'YYYY-MM-DD' cursor — the last IST day a
+ *                               successful sync covered (advanced by the sync
+ *                               itself, forward-only; the next sync re-checks it)
+ *   · hr_smartoffice_auto_sync  JSON status of the 30-minute auto-sync
+ *                               (written only by runSmartOfficeAutoSync)
  *
- * GET → { configured, base_url, serials, last_sync, api_key_set }
+ * GET → { configured, base_url, serials, last_sync, api_key_set, config_saved,
+ *         auto_sync }
  *   api_key_set is a BOOLEAN — the key value itself is never returned.
+ *   config_saved = { by, at } of the last save_config (audit row), or null.
+ *   auto_sync = readSmartOfficeAutoSyncStatus() + { interval_min, configured,
+ *   scheduler_armed } — scheduler_armed is THIS process's
+ *   globalThis.__fnbScheduler__.started (the boot-armed tick that drives the
+ *   auto-sync; read from globalThis so this route never imports scheduler.ts
+ *   and can never arm it). The status never contains the API key.
  *
  * POST { action, ... } — one action per request:
- *   · save_config { base_url, api_key?, serials } — base_url must be http(s)
- *     ('' clears it); api_key is written ONLY when provided non-empty, so
- *     saving the other fields never wipes a stored key. Audited with the key
- *     MASKED ('set'/'unset').
+ *   · save_config { base_url, api_key?, serials } — base_url passes
+ *     checkSmartOfficeBaseUrl (http(s), no ?/#/credentials, never loopback /
+ *     link-local / cloud metadata; '' clears it) and is stored canonical;
+ *     api_key is written ONLY when provided non-empty, so saving the other
+ *     fields never wipes a stored key — BUT a CHANGED address with a stored
+ *     key and no new key is a 400: the stored key only ever goes to the
+ *     address it was saved with (admins included). Audited with the key
+ *     MASKED ('set'/'unset' before; 'replaced'/'kept'/'unset' after).
  *   · test — soFetchLiveUsers against the first serial (or GetDeviceCommands
  *     for today when no serials are stored) → { ok, message, users? }.
  *   · sync { from?, to? } — defaults from = last_sync ∥ today−7 (IST),
  *     to = today; feeds punches through syncSmartOfficePunches (which funnels
  *     into recordAttendanceEvent — THE only punch write path) and returns the
- *     full report. Re-running a range is safe (engine debounce = idempotent).
+ *     full report. Re-running a range is safe: punches already on file are
+ *     skipped and counted as already_recorded (the engine's debounce alone is
+ *     NOT enough — see syncSmartOfficePunches).
  *   · push_user { employee_id, with_photo? } — UploadUser with the mapped
  *     biometric id; with_photo also sends PhotoUploadInBiometric when the
  *     employee has a stored photo (raw base64 — the data: prefix is stripped
@@ -69,12 +89,16 @@ import type Database from 'better-sqlite3';
  *     (= all devices, vendor convention) unless the mapping pins one device.
  *   · add_device { name, serial } / delete_device { serial }.
  *
- * Every action returns the DEVICE'S OWN message so the admin sees exactly
+ * Every action returns the DEVICE'S OWN message (its JSON message, one line,
+ * clipped — soFetch never echoes a raw or non-JSON reply) so the user sees
  * what SmartOffice said. Every command is audited with actor me.email.
  *
- * Gates (§2.1 — the proxy does NOT protect API routes): canAdminHr on EVERY
- * verb, GET included. Errors return GENERIC messages only. Client mutations
- * must go through api()/apiJson (CSRF on '/api/hr').
+ * Gates (§2.1 — the proxy does NOT protect API routes): canHrFull on EVERY
+ * verb, GET included — admin, or a Manager-tier/HOD user whose role carries
+ * "Full HR access" (owner ruling #90: the whole Biometric page, connection
+ * settings and device commands included; the API key is still write-only).
+ * Errors return GENERIC messages only. Client mutations must go through
+ * api()/apiJson (CSRF on '/api/hr').
  */
 export const dynamic = 'force-dynamic';
 
@@ -161,25 +185,65 @@ function targetSerials(mapping: MapRow, cfg: SmartOfficeConfig): string[] {
   return mapping.device_id ? [mapping.device_id] : cfg.serials;
 }
 
+/** True when THIS process's background scheduler tick is armed — the tick
+ *  that drives the auto-sync. Read from globalThis (set by
+ *  src/lib/scheduler.ts startSchedulerOnce) so this route never imports the
+ *  scheduler and can never arm it as a side effect. */
+function schedulerArmed(): boolean {
+  const g = globalThis as { __fnbScheduler__?: { started?: boolean } };
+  return g.__fnbScheduler__?.started === true;
+}
+
+/**
+ * Who last saved the connection settings, and when (UTC 'YYYY-MM-DD HH:MM:SS'),
+ * from the save_config audit row — shown on the Biometric page so a changed
+ * address is visible to the owner. null when never saved through this route
+ * (or the audit table cannot be read — the status must still load).
+ */
+function lastConfigSave(db: Database.Database): { by: string; at: string } | null {
+  try {
+    const row = db
+      .prepare(
+        `SELECT actor_email, created_at FROM audit_events
+          WHERE entity_type = 'hr_smartoffice_config' AND entity_id = 'smartoffice'
+            AND event_type = 'hr.biometric.config'
+          ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get() as { actor_email: string; created_at: string } | undefined;
+    return row ? { by: row.actor_email || '', at: row.created_at || '' } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The GET status shape (also returned after save_config). NEVER the key. */
-function statusShape(cfg: SmartOfficeConfig) {
+function statusShape(cfg: SmartOfficeConfig, db: Database.Database) {
+  const configured = cfg.baseUrl !== '' && cfg.apiKey !== '';
   return {
-    configured: cfg.baseUrl !== '' && cfg.apiKey !== '',
+    configured,
     base_url: cfg.baseUrl,
     serials: cfg.serials,
     last_sync: cfg.lastSync,
     api_key_set: cfg.apiKey !== '',
+    config_saved: lastConfigSave(db),
+    auto_sync: {
+      ...readSmartOfficeAutoSyncStatus(db),
+      interval_min: SO_AUTO_SYNC_INTERVAL_MIN,
+      configured,
+      scheduler_armed: schedulerArmed(),
+    },
   };
 }
 
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
   try {
-    return Response.json(statusShape(getSmartOfficeConfig(getDb())));
+    const db = getDb();
+    return Response.json(statusShape(getSmartOfficeConfig(db), db));
   } catch (e) {
     console.error('GET /api/hr/biometric/smartoffice failed:', e);
     reportServerError(e, { url: request.url });
@@ -190,8 +254,8 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: Record<string, unknown> = {};
@@ -204,14 +268,37 @@ export async function POST(request: Request) {
 
     /* ---------------- save_config ---------------- */
     if (action === 'save_config') {
-      const base_url = s(body?.base_url).replace(/\/+$/, '');
-      if (base_url && !/^https?:\/\//i.test(base_url)) {
+      // Address guard (smartoffice.ts checkSmartOfficeBaseUrl): http(s) only,
+      // no "?"/"#"/credentials, never loopback / link-local / cloud-metadata.
+      // What is stored is the canonical form — the exact address soFetch calls.
+      const checked = checkSmartOfficeBaseUrl(s(body?.base_url));
+      if (!checked.ok) {
+        return Response.json({ error: checked.error }, { status: 400 });
+      }
+      const base_url = checked.url;
+      const api_key = s(body?.api_key);
+
+      // THE STORED KEY ONLY EVER GOES TO THE ADDRESS IT WAS SAVED WITH.
+      // Every call carries it in the query string, so re-pointing the address
+      // while keeping the stored key would hand the key to whoever runs the new
+      // address — measured 2026-10-29 before this rule: a "Full HR access"
+      // holder re-pointed base_url with no key, pressed Test, and the admin's
+      // key arrived at their host; the 30-minute auto-sync kept sending it
+      // there even after the tick was revoked. So a NEW address needs the key
+      // typed again — for admins too. Clearing the address ('') needs nothing
+      // (no call can be made), and saving the same address (e.g. only the
+      // serials changed) keeps the stored key exactly as before.
+      const addressChanged =
+        base_url !== '' && smartOfficeBaseUrlKey(cfg.baseUrl) !== base_url;
+      if (addressChanged && cfg.apiKey && !api_key) {
         return Response.json(
-          { error: 'Base URL must start with http:// or https://' },
+          {
+            error:
+              'Re-enter the API key to change the SmartOffice address — the saved key is only ever sent to the address it was saved with. Nothing was saved.',
+          },
           { status: 400 },
         );
       }
-      const api_key = s(body?.api_key);
       const serialsInput = Array.isArray(body?.serials)
         ? (body.serials as unknown[]).map((x) => String(x ?? '').trim()).filter(Boolean).join(',')
         : s(body?.serials);
@@ -242,7 +329,9 @@ export async function POST(request: Request) {
           after: {
             base_url,
             serials,
-            api_key: (api_key || cfg.apiKey) ? 'set' : 'unset',
+            // 'replaced' when a new key was typed in this save, 'kept' when the
+            // stored one stays — never the value.
+            api_key: api_key ? 'replaced' : cfg.apiKey ? 'kept' : 'unset',
           },
         });
       });
@@ -251,7 +340,7 @@ export async function POST(request: Request) {
       return Response.json({
         ok: true,
         message: 'SmartOffice configuration saved',
-        ...statusShape(getSmartOfficeConfig(db)),
+        ...statusShape(getSmartOfficeConfig(db), db),
       });
     }
 
@@ -314,6 +403,7 @@ export async function POST(request: Request) {
             to,
             fetched: report.fetched,
             recorded: report.recorded,
+            already_recorded: report.already_recorded,
             ignored_duplicates: report.ignored_duplicates,
             refused: report.refused.length,
             unmatched: report.unmatched.length,

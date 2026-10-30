@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, type HrRosterCoverage, type HrRosterShiftMap } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, type HrRosterCoverage, type HrRosterShiftMap } from '@/lib/hr';
 import { getHrDayCutoff } from '@/lib/hr-attendance';
 import { splitShiftInvariantProblem } from '@/lib/hr-roster-generate';
 import { reportServerError } from '@/lib/error-alerts';
@@ -20,10 +20,10 @@ import { reportServerError } from '@/lib/error-alerts';
  *          department_id='' scope are returned with inherited:true and are
  *          read-only here — they are a default, not this department's row.
  * PUT    { department_id, coverage?: [...], shift_map?: [...] } → { ok, counts }
- *          Admin only. UPSERT of the rows given, all in ONE transaction. It is
+ *          Admin or "Full HR access" (canHrFull). UPSERT of the rows given, all in ONE transaction. It is
  *          never a replace: a row this call does not mention is left alone, so a
  *          half-filled form cannot wipe a configured week.
- * DELETE ?kind=coverage|shift_map&id=   → { ok: true }. Admin only.
+ * DELETE ?kind=coverage|shift_map&id=   → { ok: true }. Admin or "Full HR access" (canHrFull).
  *
  * COVERAGE IS A FLOOR (owner rule 3, verbatim: "minimum present per group per
  * day"). There is deliberately NO max-offs field in this route's vocabulary, and
@@ -42,8 +42,10 @@ import { reportServerError } from '@/lib/error-alerts';
  * departments.id or it is refused; the stale local database still carries a
  * legacy "Akan Service" department production does not have.
  *
- * Writes are ADMIN (canAdminHr), matching /api/hr/settings and the shifts and
- * designations masters; reads are management (canManageHr), matching the grid.
+ * Writes are canHrFull (admin, or a management role holding "Full HR access"
+ * — owner ruling #90), matching the shifts master; /api/hr/settings and the
+ * designations master stay admin-only (canAdminHr). Reads are management
+ * (canManageHr), matching the grid.
  * Both verbs re-authenticate: the proxy does NOT guard API routes (HRMS §2.1).
  */
 export const dynamic = 'force-dynamic';
@@ -169,7 +171,7 @@ export async function GET(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by the field checks below */ }
@@ -351,7 +353,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, hr/designations); a JSON body is accepted too.
   const url = new URL(request.url);

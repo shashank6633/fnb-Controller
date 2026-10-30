@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import type { HrStatutoryConfig } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
@@ -12,7 +12,8 @@ import { reportServerError } from '@/lib/error-alerts';
  * scoped by state/employee_category, effective-dated, and read by the payroll
  * compute (src/lib/hr-payroll.ts) as "the row effective on day D".
  *
- * THIS IS MONEY CONFIG. Every verb (GET included) gates on canAdminHr — the
+ * THIS IS MONEY CONFIG. Every verb (GET included) gates on canHrFull (admin,
+ * or a management role holding "Full HR access" — owner ruling #90) — the
  * proxy does NOT protect API GETs (HRMS_DECISIONS §2.1); this handler is the
  * security boundary.
  *
@@ -124,7 +125,7 @@ function parseConfigJson(v: unknown): string | null {
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   try {
     const sp = new URL(request.url).searchParams;
@@ -191,7 +192,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -323,7 +324,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -396,7 +397,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, tasks/*); accept a { id } body too so
   // neither caller shape breaks (the designations-route convention).

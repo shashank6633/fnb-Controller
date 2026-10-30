@@ -32,8 +32,9 @@
  *    days in ONE all-or-nothing transaction. Department filter matches the
  *    employee's MAIN department OR sub-department (the employee-list rule).
  *  · Shift Requests — pending queue with Approve / Reject + review note.
- *    Decisions are ADMIN-only (canAdminHr — hidden here for UX, re-checked
- *    by PATCH server-side); approval writes the roster row in the same
+ *    Decisions belong to admins and roles with "Full HR access" (canHrFull
+ *    — owner ruling #90; hidden here for UX, re-checked by PATCH
+ *    server-side); approval writes the roster row in the same
  *    transaction, so the grid refetches after a decision. Management can
  *    also log a request on an employee's behalf (no self-service yet, §8.3).
  *
@@ -69,7 +70,7 @@ import { fmtISTDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import Combobox, { type ComboOption } from '@/components/Combobox';
 import TabScroller from '@/components/TabScroller';
 import {
-  canAdminHr,
+  canHrFull,
   shiftRequestStatusMeta,
   type HrRoster,
   type HrShift,
@@ -199,8 +200,9 @@ const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF
 export default function HrRosterPage() {
   const [tab, setTab] = useState<TabKey>('grid');
 
-  // Who am I — request Approve/Reject render only for admins (the PATCH
-  // re-checks server-side; hiding is UX, not the boundary).
+  // Who am I — request Approve/Reject (and roster-config edits) render only
+  // for canHrFull (admin, or a "Full HR access" role); the PATCH/PUT re-check
+  // server-side — hiding is UX, not the boundary.
   const [me, setMe] = useState<SessionUser | null>(null);
   useEffect(() => {
     fetch('/api/auth/me')
@@ -208,7 +210,7 @@ export default function HrRosterPage() {
       .then(j => setMe(j?.user || null))
       .catch(() => {});
   }, []);
-  const isAdmin = canAdminHr(me);
+  const hrFull = canHrFull(me);
 
   /* ── Shared picker data ────────────────────────────────────────────── */
   const [departments, setDepartments] = useState<DeptRow[]>([]);
@@ -621,7 +623,7 @@ export default function HrRosterPage() {
     if (tab === 'requests') fetchRequests();
   }, [tab, fetchRequests]);
 
-  /* ── Decision modal (admin) ────────────────────────────────────────── */
+  /* ── Decision modal (canHrFull) ────────────────────────────────────── */
   const [decideReq, setDecideReq] = useState<RequestRow | null>(null);
   const [decideNote, setDecideNote] = useState('');
   const [deciding, setDeciding] = useState<'approve' | 'reject' | null>(null);
@@ -1074,13 +1076,13 @@ export default function HrRosterPage() {
                             </td>
                             <td className="px-3 py-2 text-right">
                               {r.status === 'pending' ? (
-                                isAdmin ? (
+                                hrFull ? (
                                   <button onClick={() => openDecide(r)}
                                           className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-[#E8D5C4] hover:bg-[#FFF1E3] rounded-lg text-xs text-[#6B5744]">
                                     <ClipboardList className="w-3.5 h-3.5" /> Review
                                   </button>
                                 ) : (
-                                  <span className="text-[11px] text-[#8B7355]">Admin decides</span>
+                                  <span className="text-[11px] text-[#8B7355]" title="Decided by an admin or a role with Full HR access">Admin / Full HR decides</span>
                                 )
                               ) : (
                                 <span className="text-[#C9B8A5]">—</span>
@@ -1179,7 +1181,7 @@ export default function HrRosterPage() {
           </div>
         )}
 
-        {/* ── Decision modal (admin) ──────────────────────────────────── */}
+        {/* ── Decision modal (canHrFull) ──────────────────────────────── */}
         {decideReq && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
             <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
@@ -1308,8 +1310,8 @@ export default function HrRosterPage() {
                             className={inputCls} />
                 </div>
                 <p className="text-[11px] text-[#8B7355]">
-                  One pending request per employee per day. Approval (admin) applies the shift to the
-                  roster automatically.
+                  One pending request per employee per day. Approval (an admin or a role with Full HR
+                  access) applies the shift to the roster automatically.
                 </p>
               </div>
               <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
@@ -1332,7 +1334,7 @@ export default function HrRosterPage() {
             departmentId={configFor.deptId}
             departmentLabel={deptById.get(configFor.deptId)?.name || configFor.deptId}
             initialTab={configFor.tab}
-            canWrite={isAdmin}
+            canWrite={hrFull}
             onClose={() => setConfigFor(null)}
             onSaved={bumpReadiness}
           />

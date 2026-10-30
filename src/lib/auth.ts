@@ -49,6 +49,15 @@ export interface SessionUser {
    *  every production label). Granted per ROLE only, like the two capabilities
    *  above; an admin always holds it (owner's call, 2026-10-22). */
   can_manage_label_printer: boolean;
+  /** "Full HR access (all HR pages except HR Settings)" — owner ruling #90,
+   *  2026-10-29. Granted per ROLE only (roles.can_full_hr_access), and only
+   *  while that role is ACTIVE: deactivating the role revokes it, exactly as the
+   *  proxy resolves it. NECESSARY BUT NOT SUFFICIENT, like the finance
+   *  capability: it lifts the adminOnly tier on the five `hrFullCap` HR pages
+   *  (page-catalog.ts) for a Manager-tier or HOD user who ALSO has the page
+   *  ticked, and the canHrFull() API gates (src/lib/hr.ts). HR Settings and
+   *  every non-HR admin surface stay admin-only. */
+  can_full_hr_access: boolean;
   /** JSON-stringified array of allowed page paths. null = full access (backward compat). */
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
@@ -112,6 +121,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
            r.can_void_bill_handover AS role_can_void_bh,
            r.can_view_finance_reports AS role_can_view_fin,
            r.can_manage_label_printer AS role_can_label_printer,
+           r.can_full_hr_access AS role_can_hr_full, r.is_active AS role_active_for_caps,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
@@ -152,6 +162,13 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     // user on the old users.role tier from picking the capability up by accident.
     can_view_finance_reports: hasRole && !!row.role_can_view_fin,
     can_manage_label_printer: hasRole && !!row.role_can_label_printer,
+    // ROLE-ONLY like the two above, AND revoked by a deactivated role. The JOIN
+    // above deliberately has no is_active filter (tier + pages must keep
+    // resolving from a deactivated role, see the NOTE above), so the filter is
+    // applied HERE for this capability — matching proxy.ts, whose capability
+    // query reads `AND is_active = 1`. Without it the API gates (canHrFull)
+    // would answer 200 to a user the proxy bounces off the page.
+    can_full_hr_access: hasRole && !!row.role_active_for_caps && !!row.role_can_hr_full,
     // Pages: a per-user page_access overrides; else inherit the role's set; else
     // null = full access (backward compat for users without a role or override).
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
@@ -241,6 +258,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
            r.can_void_bill_handover AS role_can_void_bh,
            r.can_view_finance_reports AS role_can_view_fin,
            r.can_manage_label_printer AS role_can_label_printer,
+           r.can_full_hr_access AS role_can_hr_full,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
     FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE lower(u.email) = lower(?) AND u.is_active = 1
@@ -263,6 +281,9 @@ export async function verifyApprover(email: string, password: string): Promise<S
     // user on the old users.role tier from picking the capability up by accident.
     can_view_finance_reports: hasRole && !!row.role_can_view_fin,
     can_manage_label_printer: hasRole && !!row.role_can_label_printer,
+    // This JOIN already filters r.is_active = 1, so hasRole is false for a
+    // deactivated role and the capability is revoked with it.
+    can_full_hr_access: hasRole && !!row.role_can_hr_full,
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,

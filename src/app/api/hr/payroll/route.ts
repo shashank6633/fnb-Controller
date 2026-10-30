@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { computePayrollItem, finalizeRunGuard, payrollPeriodBounds, statutoryDriftSinceCompute } from '@/lib/hr-payroll';
 import { getHrOrgState } from '@/lib/hr-attendance';
 import { reportServerError } from '@/lib/error-alerts';
@@ -14,7 +14,8 @@ import { reportServerError } from '@/lib/error-alerts';
  * (ledgers append; state lives in status columns; employee_id is ALWAYS
  * hr_employees.id, actors are ALWAYS me.email).
  *
- * THIS IS MONEY. Every verb (GET included) gates on canAdminHr — the proxy
+ * THIS IS MONEY. Every verb (GET included) gates on canHrFull (admin, or a
+ * management role holding "Full HR access" — owner ruling #90) — the proxy
  * does NOT protect API GETs (HRMS_DECISIONS §2.1); this handler is the
  * security boundary. Errors are GENERIC on the wire: e.message never leaves
  * the server (payroll internals are PII).
@@ -144,7 +145,7 @@ const ITEM_ORDER = `ORDER BY employee_name COLLATE NOCASE, i.id`;
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   try {
     const sp = new URL(request.url).searchParams;
@@ -223,7 +224,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }

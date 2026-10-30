@@ -14,8 +14,9 @@
  *    debounce-ignored rows (greyed, with their reason): the audit-trail view
  *    for disputes. Corrections are REQUESTED here (variance_approvals
  *    pattern), never written directly — approval appends manual events.
- *  · Corrections — the pending queue; Approve/Reject are admin-only
- *    (canAdminHr) with a required review note.
+ *  · Corrections — the pending queue; Approve/Reject belong to admins and
+ *    roles with "Full HR access" (canHrFull — owner ruling #90) with a
+ *    required review note.
  *
  * Structure copied from the Phase 1 list page (src/app/hr/employees/page.tsx):
  * race-guarded fetches, house filter card, house safe-modal shell, portaled
@@ -47,7 +48,7 @@ import TabScroller from '@/components/TabScroller';
 import {
   attendanceStatusMeta,
   eventSourceMeta,
-  canAdminHr,
+  canHrFull,
   type HrAttendanceEvent,
   type HrAttendanceSummary,
   type HrAttendanceCorrection,
@@ -180,8 +181,9 @@ const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF
 export default function HrAttendancePage() {
   const [tab, setTab] = useState<TabKey>('register');
 
-  // Who am I — corrections Approve/Reject render only for admins (the PATCH
-  // re-checks server-side; hiding is UX, not the boundary).
+  // Who am I — corrections Approve/Reject render only for canHrFull (admin,
+  // or a "Full HR access" role); the PATCH re-checks server-side — hiding is
+  // UX, not the boundary.
   const [me, setMe] = useState<SessionUser | null>(null);
   useEffect(() => {
     fetch('/api/auth/me')
@@ -189,7 +191,7 @@ export default function HrAttendancePage() {
       .then(j => setMe(j?.user || null))
       .catch(() => {});
   }, []);
-  const isAdmin = canAdminHr(me);
+  const hrFull = canHrFull(me);
 
   /* ── Register state ────────────────────────────────────────────────── */
   const [rows, setRows] = useState<RegisterRow[]>([]);
@@ -399,7 +401,7 @@ export default function HrAttendancePage() {
         },
       });
       setShowCorrModal(false);
-      setCorrNotice('Correction request submitted — it appears in the Corrections tab until an admin decides it.');
+      setCorrNotice('Correction request submitted — it appears in the Corrections tab until an admin or a role with Full HR access decides it.');
       setTimeout(() => setCorrNotice(null), 6000);
       if (corrStatusFilter === 'pending' || corrStatusFilter === '') fetchCorrections();
     } catch (e) {
@@ -489,7 +491,7 @@ export default function HrAttendancePage() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
       setDecisionError(/403|forbidden/i.test(msg)
-        ? 'Only admins can approve or reject correction requests.'
+        ? 'Only admins and roles with Full HR access can approve or reject correction requests.'
         : niceErr(e, 'Could not record the decision'));
     } finally {
       setDecisionSaving(false);
@@ -902,9 +904,9 @@ export default function HrAttendancePage() {
               </div>
             ) : (
               <div className={`space-y-3 ${corrLoading ? 'opacity-60' : ''}`}>
-                {!isAdmin && corrStatusFilter === 'pending' && corrections.length > 0 && (
+                {!hrFull && corrStatusFilter === 'pending' && corrections.length > 0 && (
                   <div className="rounded-xl border border-amber-200 bg-amber-50 text-amber-800 px-4 py-3 text-sm">
-                    Only admins can approve or reject correction requests — you can review them here.
+                    Only admins and roles with Full HR access can approve or reject correction requests — you can review them here.
                   </div>
                 )}
                 {corrections.map(c => {
@@ -953,7 +955,7 @@ export default function HrAttendancePage() {
                       {c.status !== 'pending' && c.review_reason && (
                         <div className="text-xs text-[#6B5744]">Review note: {c.review_reason}</div>
                       )}
-                      {c.status === 'pending' && isAdmin && (
+                      {c.status === 'pending' && hrFull && (
                         <div className="flex items-center gap-2 pt-1">
                           <button onClick={() => { setDecision({ corr: c, action: 'approve' }); setDecisionNote(''); setDecisionError(null); }}
                                   className="inline-flex items-center gap-1 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs font-medium">

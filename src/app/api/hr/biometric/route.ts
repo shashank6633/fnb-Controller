@@ -1,6 +1,6 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canManageHr, canAdminHr } from '@/lib/hr';
+import { canManageHr, canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -25,7 +25,8 @@ import { reportServerError } from '@/lib/error-alerts';
  *        (hr_attendance_events is append-only).
  *
  * Gates (§2.1 — the proxy does NOT protect API routes): GET canManageHr,
- * mutations canAdminHr. Errors return GENERIC messages only.
+ * mutations canHrFull — admin, or a Manager-tier/HOD user whose role carries
+ * "Full HR access" (owner ruling #90). Errors return GENERIC messages only.
  */
 export const dynamic = 'force-dynamic';
 
@@ -76,8 +77,8 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: Record<string, unknown> = {};
@@ -188,8 +189,8 @@ export async function POST(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: Record<string, unknown> = {};

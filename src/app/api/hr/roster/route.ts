@@ -2,7 +2,8 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import {
-  canAdminHr,
+  canHrFull,
+  HR_FULL_DENIED,
   canManageHr,
   isHrShiftRequestStatus,
   type HrRoster,
@@ -41,7 +42,7 @@ import { reportServerError } from '@/lib/error-alerts';
  *          swap_with_employee_id?, reason? } → { request }
  *          (management tier) One PENDING request per employee-day (409).
  * PATCH  { id, action: 'approve' | 'reject', review_reason? } → { request }
- *          ADMIN ONLY. Refuses non-pending (409). Approval writes the roster
+ *          canHrFull (admin or "Full HR access"). Refuses non-pending (409). Approval writes the roster
  *          row IN THE SAME TRANSACTION as the decision; a swap request also
  *          hands the requester's previous shift (when one was rostered) to the
  *          swap partner atomically.
@@ -530,7 +531,7 @@ export async function DELETE(request: Request) {
 }
 
 /**
- * PATCH — decide a shift request (ADMIN ONLY). Approval writes the roster row
+ * PATCH — decide a shift request (canHrFull: admin or "Full HR access"). Approval writes the roster row
  * in the SAME transaction as the status flip: the decision and its effect can
  * never disagree. Swap semantics: the requester always receives the requested
  * shift; when a swap partner is named AND the requester already had a roster
@@ -540,7 +541,7 @@ export async function DELETE(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }
