@@ -3773,7 +3773,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         .map(ln => ({ ln, why: mappingWarning(ln) }))
         .filter(x => !!x.why)
         .map(x => (isRailBuy(x.ln)
-          ? { ...x, why: `${x.ln.material_name} is a Liquor Store item — never a Central Store purchase, so this line is DROPPED from the PO whatever vendor is picked; buy it through Inventory → Liquor Store.` }
+          ? { ...x, why: `${x.ln.material_name} is a Liquor Store item — never a Central Store purchase, so this line is DROPPED from the PO whatever vendor is picked; its bill is entered on Goods Receipt (GRN) → TGBCL Liquor Bill.` }
           : x));
       if (willDrop.length > 0) {
         const railN = willDrop.filter(x => isRailBuy(x.ln)).length;
@@ -3784,8 +3784,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           (railN === 0
             ? `so the dropped quantity would have to be ordered by hand on Purchase Orders.\n\n`
             : railN === willDrop.length
-              ? `so the dropped quantity would have to be bought through Inventory → Liquor Store.\n\n`
-              : `so the dropped quantities would have to be ordered by hand on Purchase Orders (the Liquor Store items through Inventory → Liquor Store).\n\n`) +
+              ? `so the dropped quantity's bill would have to be entered on Goods Receipt (GRN) → TGBCL Liquor Bill.\n\n`
+              : `so the dropped quantities would have to be ordered by hand on Purchase Orders (the Liquor Store items' bills entered on Goods Receipt (GRN) → TGBCL Liquor Bill).\n\n`) +
           `Continue anyway?`,
         );
         if (!ok) return;
@@ -3993,8 +3993,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const stillOwed = skipped.filter(s => s.code === 'unmapped_vendor' || s.code === 'store_mapped');
     // Their remedies are NOT the same: an unmapped pair is fixed on Vendor Items
     // and then raised on Purchase Orders, while a store-mapped (liquor / TGBCL)
-    // material can never go on a Central PO at all and has to be bought through
-    // the Liquor Store. Sending a bar item to Vendor Items would be a dead end.
+    // material can never go on a Central PO at all — its TGBCL bill is entered on
+    // Goods Receipt (GRN) → TGBCL Liquor Bill, which posts straight into the
+    // store location. Sending a bar item to Vendor Items would be a dead end.
     const owedMappingOnly = stillOwed.length > 0 && stillOwed.every(s => s.code === 'unmapped_vendor');
     const unitReview: string[] = Array.isArray(result.issue_unit_review) ? result.issue_unit_review : [];
     /* THE LINES THE CENTRAL STORE HELD BACK. store-process issues every line
@@ -4169,8 +4170,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       <>Each line above says where to raise it: a vendor-mapping gap is fixed on{' '}
                         <a href="/vendors/materials" className="underline font-medium">Vendor Items</a> and then ordered on{' '}
                         <a href="/purchase-orders" className="underline font-medium">Purchase Orders</a>, while a Liquor Store
-                        item is bought on{' '}
-                        <a href="/inventory/liquor-store" className="underline font-medium">Inventory → Liquor Store</a>.</>
+                        item&apos;s bill is entered on{' '}
+                        <a href="/grn?liquor=1" className="underline font-medium">Goods Receipt (GRN) → TGBCL Liquor Bill</a>.</>
                     )}
                   </div>
                 )}
@@ -4559,7 +4560,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   Buy box sat greyed out — which reads as "this row is dead". */}
               <div className="text-[10px] text-blue-800 mt-0.5">
                 {raisePo
-                  ? 'Buy / Unit ₹ / Vendor appear on every line. A short line shows a grey suggestion in the Buy box — its Shortfall rounded up, to a whole pack where the item is bought by the BTL, PKT or CASE (or, where the line says so, requested minus the figure typed); picking a vendor fills it in as the quantity to order, and you can type over it or clear it. Nothing is ordered while the box is empty, so an untouched grid still submits. Each Buy line needs a price and a vendor mapped to that item, and the lot goes onto ONE purchase order, pending admin approval — except a Liquor Store item\'s Buy line, which is dropped (buy it through Inventory → Liquor Store).'
+                  ? 'Buy / Unit ₹ / Vendor appear on every line. A short line shows a grey suggestion in the Buy box — its Shortfall rounded up, to a whole pack where the item is bought by the BTL, PKT or CASE (or, where the line says so, requested minus the figure typed); picking a vendor fills it in as the quantity to order, and you can type over it or clear it. Nothing is ordered while the box is empty, so an untouched grid still submits. Each Buy line needs a price and a vendor mapped to that item, and the lot goes onto ONE purchase order, pending admin approval — except a Liquor Store item\'s Buy line, which is dropped (its bill is entered on Goods Receipt (GRN) → TGBCL Liquor Bill).'
                   : 'Default OFF. Issuance only — store manager raises POs separately on /purchase-orders.'}
               </div>
               {raisePo && vmError && (
@@ -5218,7 +5219,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                         update(i, { vendor_id: vid, vendor: v?.name || '' });
                                       }}
                                       title={isRailBuy(ln)
-                                        ? 'A Liquor Store item — never a Central Store purchase. A Buy line on it is dropped from this PO whatever vendor is picked; buy it through Inventory → Liquor Store.'
+                                        ? 'A Liquor Store item — never a Central Store purchase. A Buy line on it is dropped from this PO whatever vendor is picked; its bill is entered on Goods Receipt (GRN) → TGBCL Liquor Bill.'
                                         : !vmReady
                                         ? 'The vendor → item mapping has not loaded, so this list is not filtered. The server still enforces it.'
                                         : mapped.length > 0
@@ -5248,8 +5249,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           {railWarn && (
                             <div className="text-[9px] text-amber-800 mt-0.5 max-w-[9rem]">
                               ⚠ {ln.material_name} is a Liquor Store item — never a Central Store purchase, so this Buy line
-                              is DROPPED from the PO whatever vendor is picked. Buy it through{' '}
-                              <a href="/inventory/liquor-store" target="_blank" rel="noopener noreferrer" className="underline">Inventory → Liquor Store</a>.
+                              is DROPPED from the PO whatever vendor is picked. Its bill is entered on{' '}
+                              <a href="/grn?liquor=1" target="_blank" rel="noopener noreferrer" className="underline">Goods Receipt → TGBCL Liquor Bill</a>.
                             </div>
                           )}
                           {mapWarn && (
@@ -5464,7 +5465,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             // problem and the footer's blocked-reason owns it.
             // A liquor / store-mapped Buy line is dropped too (round 10,
             // isRailBuy — the route's rail guard runs before the mapping rule),
-            // and it has its own remedy: the Liquor Store, never Vendor Items.
+            // and it has its own remedy: Goods Receipt → TGBCL Liquor Bill, never Vendor Items.
             // EVERY PURPOSE (final pass, owner-ratified). On a party requisition
             // the drop also decides whether the party transfer runs
             // (transferRuns / isDroppedBuy). On an internal one production's
@@ -5483,8 +5484,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             const railSentence = railLines.length === 0 ? null : (
               <span className="text-amber-800 font-semibold">
                 {railNames} {railOne ? 'is a Liquor Store item' : 'are Liquor Store items'} — never a Central Store
-                purchase, so {railOne ? 'its Buy line is' : 'their Buy lines are'} DROPPED from the PO; buy{' '}
-                {railOne ? 'it' : 'them'} through Inventory → Liquor Store.
+                purchase, so {railOne ? 'its Buy line is' : 'their Buy lines are'} DROPPED from the PO; {railOne ? 'its bill is' : 'their bills are'}
+                {' '}entered on Goods Receipt (GRN) → TGBCL Liquor Bill.
               </span>
             );
             return (

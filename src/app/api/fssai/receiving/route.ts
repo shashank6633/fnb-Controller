@@ -302,12 +302,24 @@ export async function GET(request: Request) {
       const grn = db.prepare(
         `SELECT g.id, g.grn_number, g.date, g.time, g.po_id, g.vendor_id, g.vendor,
                 g.invoice_number, g.invoice_date, g.received_by, g.status,
+                IFNULL(g.store_dest_id,'') AS store_dest_id,
+                IFNULL(sl.name,'') AS store_dest_name,
                 IFNULL(v.name,'') AS vendor_name_now, IFNULL(v.gstin,'') AS vendor_gstin
            FROM goods_receipt_notes g
            LEFT JOIN vendors v ON v.id = g.vendor_id
+           LEFT JOIN store_locations sl ON sl.id = g.store_dest_id
           WHERE g.id = ?`,
       ).get(grnId) as any;
       if (!grn) return Response.json({ error: 'That delivery is not in the goods-receipt register.' }, { status: 404 });
+      /* A TGBCL LIQUOR GRN posts its bottles straight to a store location's own
+       * ledger and has no goods-receipt lines, so there is nothing here to check
+       * off. Same scope as the open list below: Central Store deliveries only. */
+      if (str(grn.store_dest_id)) {
+        return Response.json(
+          { error: `This is a liquor bill posted to ${str(grn.store_dest_name) || 'a store location'}; the receiving-inspection list covers Central Store deliveries only.`, code: 'liquor_bill' },
+          { status: 400 },
+        );
+      }
 
       const existing = db.prepare(
         `SELECT id, check_no, status FROM fssai_receiving_checks WHERE grn_id = ? AND status <> 'void'
@@ -392,6 +404,9 @@ export async function GET(request: Request) {
            FROM goods_receipt_notes g
           WHERE IFNULL(g.date,'') >= ?
             AND IFNULL(g.voided_at,'') = ''
+            -- TGBCL liquor GRNs post to a store location's ledger, not Central:
+            -- they are not deliveries this inspection list covers.
+            AND IFNULL(g.store_dest_id,'') = ''
             AND NOT EXISTS (
               SELECT 1 FROM fssai_receiving_checks c
                WHERE c.grn_id = g.id AND c.status <> 'void'
@@ -631,10 +646,21 @@ export async function POST(request: Request) {
       let grn: any = null;
       if (grnId) {
         grn = db.prepare(
-          `SELECT id, grn_number, po_id, vendor_id, vendor, invoice_number, date, time
-             FROM goods_receipt_notes WHERE id = ?`,
+          `SELECT g.id, g.grn_number, g.po_id, g.vendor_id, g.vendor, g.invoice_number, g.date, g.time,
+                  IFNULL(g.store_dest_id,'') AS store_dest_id, IFNULL(sl.name,'') AS store_dest_name
+             FROM goods_receipt_notes g
+             LEFT JOIN store_locations sl ON sl.id = g.store_dest_id
+            WHERE g.id = ?`,
         ).get(grnId) as any;
         if (!grn) return Response.json({ error: 'That delivery is not in the goods-receipt register.' }, { status: 400 });
+        /* Same scope as the prefill and the open list: a TGBCL liquor GRN is not a
+         * Central Store delivery, so an inspection is never attached to one. */
+        if (str(grn.store_dest_id)) {
+          return Response.json(
+            { error: `This is a liquor bill posted to ${str(grn.store_dest_name) || 'a store location'}; the receiving-inspection list covers Central Store deliveries only.`, code: 'liquor_bill' },
+            { status: 400 },
+          );
+        }
         /* ONE LIVE INSPECTION PER DELIVERY. Two of them is how a file stops making
          * sense, and the refusal hands back the id so the screen can offer "open
          * it" instead of a dead end — the pattern the run-open 409 already uses. */

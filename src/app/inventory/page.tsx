@@ -448,6 +448,30 @@ export default function InventoryPage() {
       .catch(() => setParentChoices(null));
   }, []);
 
+  // Every sub-category on Inventory → Categories, INCLUDING ones added there that
+  // no item uses yet (category_placeholders) — GET /api/categories, the same list
+  // that page shows. Without it the Category dropdown only knew categories some
+  // item already carried, so a newly added sub-category never appeared here.
+  // null until loaded / on failure: the dropdown then falls back to the old list.
+  const [catalogLeaves, setCatalogLeaves] = useState<{ category: string; parent: string }[] | null>(null);
+  useEffect(() => {
+    fetch('/api/categories')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('unavailable'))))
+      .then((j) => {
+        if (!Array.isArray(j?.groups)) { setCatalogLeaves(null); return; }
+        const leaves: { category: string; parent: string }[] = [];
+        for (const g of j.groups) {
+          const parent = String(g?.super_category_raw ?? '').trim();
+          for (const l of Array.isArray(g?.leaves) ? g.leaves : []) {
+            const category = String(l?.category ?? '').trim();
+            if (category) leaves.push({ category, parent });
+          }
+        }
+        setCatalogLeaves(leaves);
+      })
+      .catch(() => setCatalogLeaves(null));
+  }, []);
+
   // Inline per-row priority setter — same apply path as the bulk tool, so a
   // single item's level can be set straight from the list (optimistic; reverts
   // on failure). Gated to the same roles as the bulk tool via canBulkPriority.
@@ -562,9 +586,11 @@ export default function InventoryPage() {
      dropdown stays consistent on an empty DB). */
   const availableCategories = useMemo(() => {
     const live = new Set(materials.map(m => (m.category || '').trim()).filter(Boolean));
-    const all = new Set<string>([...CATEGORIES, ...live]);
+    // + sub-categories added on Inventory → Categories that no item uses yet.
+    const catalog = (catalogLeaves || []).map(l => l.category);
+    const all = new Set<string>([...CATEGORIES, ...live, ...catalog]);
     return Array.from(all).sort((a, b) => a.localeCompare(b));
-  }, [materials]);
+  }, [materials, catalogLeaves]);
 
   /** Storage-location vocabulary: canonical areas + whatever is actually stored
    *  on a material today. Feeds both the edit-modal datalist and the bulk tool,
@@ -587,18 +613,22 @@ export default function InventoryPage() {
       map.get(sup)!.add(cat);
     }
     // Ensure every category in `availableCategories` is represented even if
-    // no material in the current list uses it (e.g. placeholder leaves).
+    // no material in the current list uses it (e.g. placeholder leaves) — under
+    // the parent it was added under on Inventory → Categories, else "(Other)".
+    const catalogParent = new Map<string, string>();
+    for (const l of catalogLeaves || []) if (l.parent && !catalogParent.has(l.category)) catalogParent.set(l.category, l.parent);
     for (const c of availableCategories) {
       const found = Array.from(map.values()).some(set => set.has(c));
       if (!found) {
-        if (!map.has('(Other)')) map.set('(Other)', new Set());
-        map.get('(Other)')!.add(c);
+        const sup = catalogParent.get(c) || '(Other)';
+        if (!map.has(sup)) map.set(sup, new Set());
+        map.get(sup)!.add(c);
       }
     }
     return Array.from(map.entries())
       .sort(([a], [b]) => (a === '(Other)' ? 1 : b === '(Other)' ? -1 : a.localeCompare(b)))
       .map(([sup, set]) => ({ sup, cats: Array.from(set).sort((a, b) => a.localeCompare(b)) }));
-  }, [materials, availableCategories]);
+  }, [materials, availableCategories, catalogLeaves]);
 
   /* ---- Low-stock items ---- */
 

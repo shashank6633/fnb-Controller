@@ -202,12 +202,18 @@ export function isStoreMappedMaterial(db: Database, materialIdOrCategory: string
  * null (= Central material, proceed). Accepts a raw_materials.id OR a raw
  * category string, like isStoreMappedMaterial.
  *
- * Wired into: /api/purchases POST, /api/grn POST (per-line skip+report),
- * /api/purchase-orders POST+PUT (draft compose), /api/purchase-orders/[id]/
- * receive (per-line skip+report, so HISTORICAL liquor POs never pollute
- * central stock), /api/inward-import/commit (per-row skip+report).
- * Store procurement lives ONLY in store_stock_ledger via /api/stores/[id]/
- * procure — central purchases / average_price / current_stock stay untouched.
+ * Wired into: /api/purchases POST, /api/purchase-orders POST+PUT (draft
+ * compose), /api/purchase-orders/[id]/receive (per-line skip+report, so
+ * HISTORICAL liquor POs never pollute central stock), /api/inward-import/
+ * commit (per-row skip+report), and the other central writers that quote it.
+ * /api/grn POST no longer calls it: a bill with store-mapped lines is routed
+ * whole to src/lib/liquor-grn.ts (classifyGrnLines / receiveLiquorGrn).
+ * Store procurement lives ONLY in store_stock_ledger. Since owner rulings #83 /
+ * #84 the one door for a new liquor bill is Goods Receipt (GRN) → TGBCL Liquor
+ * Bill, which posts the bottles straight into the store's ledger (with the
+ * TGBCL charges on store_bill_charges); the old /api/stores/[id]/procure*
+ * routes no longer take new bills. Central purchases / average_price /
+ * current_stock stay untouched either way.
  */
 export function centralFlowBlock(db: Database, materialIdOrCategory: string): string | null {
   const key = String(materialIdOrCategory || '').trim();
@@ -218,7 +224,7 @@ export function centralFlowBlock(db: Database, materialIdOrCategory: string): st
   if (!storeId) return null;
   const store = getStoreById(db, storeId);
   const label = mat ? `"${mat.name}"` : `Category "${category}"`;
-  return `${label} is a ${store?.name || 'store location'} material — use Inventory → Liquor Store → New Purchase. Store-mapped materials never enter Central Store purchases.`;
+  return `${label} is a ${store?.name || 'store location'} material — it never enters Central Store stock or purchases. Its bill is entered on Goods Receipt (GRN) → TGBCL Liquor Bill, which posts the bottles straight into ${store?.name || 'that store'}.`;
 }
 
 /**
