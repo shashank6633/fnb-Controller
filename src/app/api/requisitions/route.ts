@@ -5,6 +5,8 @@ import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow }
 import { duplicateLineError, requisitionLinePoState } from '@/lib/po-helpers';
 import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
 import { centralFlowBlock } from '@/lib/store-engine';
+// Ruling #86a "Show": what other open party requisitions hold of central.
+import { partyPromisedForRequisition } from '@/lib/party-pending';
 // ROUTED REQUISITION LINES (owner rulings #45 + #74) — the readers only. The
 // state of a routed line (who sends it, what was sent on which transfer, THE
 // RULE's verdict, the one sentence) is built ONCE, there, for every screen.
@@ -257,6 +259,40 @@ export async function GET(request: Request) {
         `).all(id) as any[]) movedPool.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
       }
       for (const it of items) it.party_moved_recipe = movedPool.get(String(it.material_id)) || 0;
+      // PROMISED TO OTHER PARTIES (owner ruling #86a "Show", 2026-10-28 — the
+      // FUEL incident). ADDITIVE — no field above changes; current_stock stays
+      // the raw central figure. A party line's goods leave the central books
+      // only when its requisition's store part is done (party-fulfillment.ts),
+      // so what other OPEN party requisitions were handed over and has not yet
+      // moved is still inside current_stock (src/lib/party-pending.ts says
+      // exactly what counts: routed lines, store-mapped materials and
+      // unit-review lines never do). Per line, by material:
+      //   promised_elsewhere_purchase / _recipe  held by OTHER open party requisitions
+      //   promised_elsewhere_reqs                [{ req_number, event_name, qty_purchase, ... }], oldest first
+      //   free_purchase / free_recipe            central − promised elsewhere, SIGNED
+      //                                          (below 0 = the books are already short by that much)
+      //   own_pending_purchase / _recipe         THIS requisition's own handed-over, not-yet-moved quantity
+      //   own_claim_short_purchase / _recipe     of that, what the books cannot cover once the OLDER
+      //                                          parties' claims are honoured (ruling #80) — 0 when covered
+      // Purchase figures are 6-dp (÷ packFactor); the desk formats them.
+      try {
+        const promised = partyPromisedForRequisition(db, String(id), items.map(it => String(it.material_id)));
+        for (const it of items) {
+          const v = promised.get(String(it.material_id));
+          if (!v) continue;
+          it.promised_elsewhere_purchase = v.promised_elsewhere_purchase;
+          it.promised_elsewhere_recipe = v.promised_elsewhere_recipe;
+          it.promised_elsewhere_reqs = v.promised_elsewhere_reqs;
+          it.free_purchase = v.free_purchase;
+          it.free_recipe = v.free_recipe;
+          it.own_pending_purchase = v.own_pending_purchase;
+          it.own_pending_recipe = v.own_pending_recipe;
+          it.own_claim_short_purchase = v.own_claim_short_purchase;
+          it.own_claim_short_recipe = v.own_claim_short_recipe;
+        }
+      } catch (pErr) {
+        console.error('[/api/requisitions GET] party promised figures failed:', pErr);
+      }
       // MERGED PO STATE, per line (owner rulings #63-#70). ADDITIVE — no field
       // above changes. One batched read (po-helpers.ts requisitionLinePoState):
       //   on_po            { po_id, po_number, vendor_name, vendor_id, status,
