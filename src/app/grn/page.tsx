@@ -36,7 +36,12 @@ import Combobox from '@/components/Combobox';
 // bare <input type="checkbox"> so the option reads as the deliberate, stateful
 // choice it is — and so it matches every other toggle in the app.
 import Toggle from '@/components/Toggle';
-import { packFactor, fmtQtyNum } from '@/lib/pack-units';
+import { packFactor, fmtQtyNum, fmtBreakdown } from '@/lib/pack-units';
+/* THE TGBCL LIQUOR BILL DOOR (owner rulings #83/#84). A liquor indent is a GRN
+   too — its own modal, because its lines are cases / bottles / loose at a rate
+   per bottle with four bill-level TGBCL charges, and it posts into the store
+   location's ledger instead of Central stock. See the component's header. */
+import LiquorGrnBillModal, { type LiquorBillPrefill } from '@/components/LiquorGrnBillModal';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand } from '@/lib/use-stock-on-hand';
 /* ── THE BILL HANDOVER QUESTION, ASKED IN THE STORE'S OWN QUALITY CHECK ──────
@@ -411,7 +416,45 @@ interface GRN {
   edited_at?: string | null;
   edited_by?: string | null;
   edit_count?: number;
+  /* ── A TGBCL LIQUOR BILL (owner rulings #83/#84) ──────────────────────────
+     Set by GET /api/grn on a row whose header carries store_dest_id: its lines
+     posted into a store location's ledger, not into goods_receipt_note_items,
+     so line_count / accepted_value / inward_value are 0 / null for it by
+     construction and THIS is where its figures come from. null on every
+     Central bill. */
+  store_dest_id?: string;
+  store_invoice_id?: string;
+  liquor?: LiquorSummary | null;
 }
+/** The list row's summary of a liquor bill (GET /api/grn summariseStoreBill). */
+interface LiquorSummary {
+  store_id: string; store_name: string; pinv: string;
+  line_count: number; invoice_value: number; net_indent_value: number;
+}
+/** One line of a liquor bill's frozen document (store_bill_json v1). */
+interface LiquorBillLine {
+  ledger_id?: string; material_id: string; material_name: string; category?: string;
+  unit?: string; purchase_unit?: string; pack_factor?: number; case_factor?: number;
+  cases?: number; bottles?: number; loose?: number; recipe_qty?: number; purchase_qty?: number;
+  rate_basis?: string; rate_entered?: number; rate_per_bottle?: number; unit_cost?: number;
+  line_total?: number; discount?: number; delivery_charges?: number;
+  batch_no?: string; expiry_date?: string;
+}
+/** A liquor bill's frozen document, as GET /api/grn?id= serves it (grn.liquor). */
+interface LiquorBillDoc {
+  /** Set by readStoreBill when the stored document could not be parsed. */
+  unreadable?: boolean;
+  v?: number; store_id?: string; store_name?: string; pinv?: string; indent_no?: string;
+  supplier?: string; vendor_id?: string; date?: string; posted_at?: string; posted_by?: string;
+  lines: LiquorBillLine[];
+  charges?: { mrp_rounding?: number; excise_turnover_tax?: number; special_excise_cess?: number; tcs?: number };
+  invoice_value?: number; net_indent_value?: number;
+}
+/** Is this row a liquor bill posted to a store location? Keyed on the payload
+ *  the server attached, falling back to the header column. */
+const isLiquor = (g: { liquor?: unknown; store_dest_id?: string | null }) =>
+  !!g?.liquor || String(g?.store_dest_id ?? '').trim() !== '';
+const liquorStoreName = (g: { liquor?: LiquorSummary | null }) => g?.liquor?.store_name || 'the Liquor Store';
 
 const STATUS_TONE: Record<string, string> = {
   received: 'bg-emerald-100 text-emerald-700 border-emerald-200',
@@ -511,6 +554,23 @@ function SourceChip({ poSourced, muted = false, className = '' }:
   );
 }
 
+/** The liquor bill's chip, in place of DIRECT / AGAINST PO. Same outline family
+ *  as SourceChip (a "what kind of document" label, not a status), its own icon
+ *  and the store's own name — a TGBCL bill is direct by construction, and what
+ *  the reader needs is WHERE its bottles went. Muted, never struck, on a void,
+ *  for the same reasons SourceChip gives. */
+function LiquorChip({ storeName, muted = false }: { storeName: string; muted?: boolean }) {
+  return (
+    <span
+      title={`TGBCL liquor bill — its bottles posted straight into ${storeName}'s own ledger, not into Central Store stock. Its lines, Net Indent and reports are on Inventory → Liquor Store.`}
+      className={`inline-flex items-center gap-1 shrink-0 whitespace-nowrap rounded-sm border px-1.5 py-px text-[9px] font-sans font-semibold uppercase tracking-[0.08em] ${
+        muted ? 'border-[#C9B9A5] bg-white/70 text-[#8B7355]' : 'border-[#7a3e8f] bg-white text-[#6b2f80]'}`}>
+      <Wine className="w-2.5 h-2.5" />
+      → {storeName}
+    </span>
+  );
+}
+
 /** Is this receipt still holding its goods at the bay? */
 const isHeld = (g: { status: string }) => g.status === 'awaiting_qc';
 /** Was this receipt EVER put through the gate — including after it cleared?
@@ -587,6 +647,52 @@ export default function GrnPage() {
     }, 0);
     return () => clearTimeout(t);
   }, []);
+
+  /* ── THE TGBCL LIQUOR BILL DOOR ─────────────────────────────────────────────
+   * `liquorOpen` mounts the liquor modal; `liquorPrefill` carries the liquor
+   * lines of a mixed paper bill over from Enter Vendor Bill (which stays open
+   * underneath, so its Central lines are not lost).
+   *
+   * /grn?liquor=1 opens it on mount — the link Inventory → Liquor Store and the
+   * requisition screens send people to — with the SAME one-tick strip as ?new=1
+   * above, for the same reason. */
+  const [liquorOpen, setLiquorOpen] = useState(false);
+  const [liquorPrefill, setLiquorPrefill] = useState<LiquorBillPrefill | null>(null);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('liquor') !== '1') return;
+    setLiquorOpen(true);
+    const t = setTimeout(() => {
+      const q = new URLSearchParams(window.location.search);
+      q.delete('liquor');
+      const qs = q.toString();
+      window.history.replaceState(null, '', window.location.pathname + (qs ? `?${qs}` : ''));
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
+  /** The store locations this user may receive a liquor bill into. The header
+   *  button shows only when there is at least one; the modal re-reads the same
+   *  endpoint and the POST re-checks access, so this is a courtesy, not the gate.
+   *  null = not answered (button hidden, and the header sentence names no store). */
+  const [liquorStores, setLiquorStores] = useState<Array<{ id: string; name: string; can_procure: boolean }> | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/grn?liquor_option=1', { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (!alive) return;
+        type Opt = { id?: unknown; name?: unknown; can_procure?: unknown };
+        const list = ((Array.isArray(d?.stores) ? d.stores : []) as Opt[])
+          .filter(s => s && s.id)
+          .map(s => ({ id: String(s.id), name: String(s.name || ''), can_procure: s.can_procure === true }));
+        setLiquorStores(list);
+      })
+      .catch(() => { if (alive) setLiquorStores(null); });
+    return () => { alive = false; };
+  }, []);
+  const canLiquor = (liquorStores || []).some(s => s.can_procure);
+  const liquorName = liquorStores?.length === 1 && liquorStores[0].name ? liquorStores[0].name : 'the Liquor Store';
   /**
    * Is the signed-in user an admin? THREE-STATE, and null (= "not answered
    * yet / the answer did not arrive") is NOT the same as false for anything but
@@ -877,9 +983,20 @@ export default function GrnPage() {
     // total_rejected_qty accumulator used to sit here — removed so nobody
     // "helpfully" prints it later.)
     const c = { received: 0, awaiting_qc: 0, partial: 0, rejected: 0, void: 0,
-                accepted_value: 0, awaiting_value: 0 };
+                accepted_value: 0, awaiting_value: 0,
+                liquor_bills: 0, liquor_net: 0, liquor_store: '' };
     for (const g of list) {
       c[g.status] = (c[g.status] || 0) + 1;
+      // A TGBCL LIQUOR BILL IS COUNTED ON ITS OWN, NEVER INTO Σ ACCEPTED. Its
+      // bottles went to the store location's ledger, so it already adds ₹0 to
+      // accepted_value (no goods_receipt_note_items rows) — and folding its Net
+      // Indent in would put liquor into a Central figure. Its own counter beside
+      // the Σ, for the non-void bills only (a void took its bottles back out).
+      if (isLiquor(g) && g.status !== 'void') {
+        c.liquor_bills += 1;
+        c.liquor_net += Number(g.liquor?.net_indent_value) || 0;
+        c.liquor_store = c.liquor_store && c.liquor_store !== liquorStoreName(g) ? 'store locations' : liquorStoreName(g);
+      }
       // A VOIDED bill's stock and cost rows have been reversed — its value is no
       // longer money this kitchen received. Counting it here would restate the
       // period's inward total upwards for ever. It keeps its own counter instead,
@@ -958,14 +1075,26 @@ export default function GrnPage() {
             (a full printed invoice, a cash buy, a sample, a donation, a vendor return). Receiving a PO creates a GRN
             automatically. Each line records ordered / received / accepted / rejected with a reason, and perishables are
             held for a kitchen check before any stock appears.
+            {/* THE LIQUOR DOOR, in one sentence. A storekeeper who used to enter
+                TGBCL bills on Inventory → Liquor Store arrives here looking for
+                it; the sentence names the button and where the bottles go. */}
+            {' '}TGBCL liquor bills go on <em>TGBCL Liquor Bill</em> — their bottles post straight into {liquorName}, never into Central stock.
+            {liquorStores !== null && !canLiquor && <> (That button shows for staff allowed to receive into {liquorName}.)</>}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <button onClick={downloadRegister} disabled={exporting}
-                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO), then Tax Value (GST), Tax % Applied (GST) and the PO No. (blank on a direct bill) as its last three columns. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
+                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO), then Tax Value (GST), Tax % Applied (GST) and the PO No. (blank on a direct bill) as its last three columns. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own. Liquor bills are not in this file — download them from Inventory → Liquor Store → Inward Register."
                   className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
             {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
+          {canLiquor && (
+            <button onClick={() => { setLiquorPrefill(null); setLiquorOpen(true); }}
+                    title={`Record a TGBCL liquor indent — cases / bottles / loose at the rate per bottle, with the TGBCL charges and Net Indent. The bottles post straight into ${liquorName}; Central Store stock and costs are not touched.`}
+                    className="px-3 py-2 bg-white border border-[#6b2f80] text-[#6b2f80] hover:bg-[#6b2f80]/10 rounded-lg text-sm flex items-center gap-2">
+              <Wine className="w-4 h-4" /> TGBCL Liquor Bill
+            </button>
+          )}
           <button onClick={() => setCreating(true)}
                   title="Record a vendor bill that has no purchase order behind it — the full printed invoice, a cash buy, a sample, a donation or a return."
                   className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
@@ -988,7 +1117,16 @@ export default function GrnPage() {
           picker still composes freely while the user is driving it. Direct and
           All are left exactly as the user set them. */}
       {creating && <AdHocGrnModal onClose={() => setCreating(false)}
-                                  onCreated={() => { setCreating(false); setSourceFilter(s => (s === 'po' ? '' : s)); afterWrite(); }} />}
+                                  onCreated={() => { setCreating(false); setSourceFilter(s => (s === 'po' ? '' : s)); afterWrite(); }}
+                                  onOpenLiquor={canLiquor ? (pre) => { setLiquorPrefill(pre); setLiquorOpen(true); } : undefined} />}
+      {/* MOUNTED AFTER Enter Vendor Bill and one layer above it (z-[60]): when a
+          mixed paper bill's liquor lines are moved here, the Central half stays
+          open underneath, so nothing typed there is lost. A liquor bill is
+          DIRECT by construction (po_id NULL), so the same Source widening as
+          above applies on save. */}
+      {liquorOpen && <LiquorGrnBillModal prefill={liquorPrefill}
+                                         onClose={() => { setLiquorOpen(false); setLiquorPrefill(null); }}
+                                         onSaved={() => { setLiquorOpen(false); setLiquorPrefill(null); setSourceFilter(s => (s === 'po' ? '' : s)); afterWrite(); }} />}
       {/* Mounted at PAGE level, not inside the row: the row lives in a table with
           `overflow-x-auto` on its wrapper, and a fixed overlay rendered inside a
           scroll container is clipped by it on some browsers. */}
@@ -997,8 +1135,16 @@ export default function GrnPage() {
           answer: it gates the LINE editor inside the modal, because PATCH
           /api/grn/[id] is requireRole('admin'). Narrowing the mount instead
           would take the bill-level edit away from the store manager. */}
-      {editing && canAmend === true && <EditBillModal g={editing} isAdmin={isAdmin} onClose={() => setEditing(null)}
-                                 onSaved={() => { setEditing(null); afterWrite(); }} />}
+      {/* A LIQUOR BILL GETS ITS OWN, NARROWER AMEND FORM: its indent number and
+          supplier are also its record on the store ledger and the TGBCL
+          charges, so PUT refuses to move them (code liquor_identity), and it has
+          no goods_receipt_note_items for the line editor to correct. Notes and
+          the invoice date are all that is amendable. */}
+      {editing && canAmend === true && (isLiquor(editing)
+        ? <LiquorEditBillModal g={editing} onClose={() => setEditing(null)}
+                               onSaved={() => { setEditing(null); afterWrite(); }} />
+        : <EditBillModal g={editing} isAdmin={isAdmin} onClose={() => setEditing(null)}
+                         onSaved={() => { setEditing(null); afterWrite(); }} />)}
       {voiding && isAdmin === true && (
         <VoidBillModal g={voiding} onClose={() => setVoiding(null)}
                        onVoided={() => { setVoiding(null); afterWrite(); }} />
@@ -1164,7 +1310,15 @@ export default function GrnPage() {
           <span className="text-amber-700">⚠ {counts.partial}</span>
           <span className="text-red-700">✗ {counts.rejected}</span>
           {counts.void > 0 && <span className="text-[#8B7355]" title={"Voided bills — their stock and cost rows were reversed, so they are excluded from the Σ beside this AND from the Inward Register download. Pick the 'void' filter to list them, or use a row's own Download to get one." + sliceNote}>⊘ {counts.void} void</span>}
-          <span title={'Accepted value of the NON-VOID bills in this range.' + sliceNote}>Σ accepted: <b className="font-mono">{fmt(counts.accepted_value)}</b></span>
+          <span title={'Accepted value of the NON-VOID bills in this range.' + (counts.liquor_bills > 0 ? ' Liquor bills are not in it — their bottles went to the store location, not Central stock.' : '') + sliceNote}>Σ accepted: <b className="font-mono">{fmt(counts.accepted_value)}</b></span>
+          {/* SEPARATE, AND NEVER ADDED INTO THE Σ BESIDE IT — see counts. */}
+          {counts.liquor_bills > 0 && (
+            <span className="text-[#6b2f80]"
+                  title={`TGBCL liquor bills in this range (not void). Their bottles posted into ${counts.liquor_store || 'the store location'}, not Central stock, so they are kept out of Σ accepted. Net Indent = Invoice Value + the four TGBCL charges.` + sliceNote}>
+              <Wine className="w-3 h-3 inline-block align-[-2px] mr-0.5" />
+              Liquor: {counts.liquor_bills} bill{counts.liquor_bills === 1 ? '' : 's'} · Net Indent <b className="font-mono">{fmt(counts.liquor_net)}</b> (in {counts.liquor_store || 'the store location'})
+            </span>
+          )}
         </div>
       </div>
 
@@ -1295,10 +1449,13 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
     danger?: boolean; href?: string; newTab?: boolean; onClick?: () => void;
     disabled?: boolean;
   };
+  const liquor = isLiquor(g);
   const acts: ActionDef[] = [
     {
       key: 'view', label: expanded ? 'Hide' : 'View',
-      title: expanded ? 'Hide the line items' : 'View this bill — line items, charges and QC checklist',
+      title: expanded ? 'Hide the line items'
+        : liquor ? 'View this liquor bill — its lines, TGBCL charges and Net Indent'
+        : 'View this bill — line items, charges and QC checklist',
       icon: <Eye className={sz} />, onClick: onToggle,
     },
   ];
@@ -1318,7 +1475,9 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
   // looser, so an unanswered load promises the narrower thing.
   if (!isVoid && canAmend === true) acts.push({
     key: 'edit', label: 'Edit',
-    title: isAdmin === true
+    title: liquor
+      ? `Amend the notes and invoice date of this liquor bill. Its indent number and supplier are also its record in ${liquorStoreName(g)}, so they are not amendable here — void it and enter it again.`
+      : isAdmin === true
       ? 'Amend the bill details (invoice no., invoice date, vendor, QC, notes) and correct its line items — quantity, rate or remove a line. A correction to a received bill unwinds and reapplies its stock and cost rows; the amendment is recorded.'
       : 'Amend the bill details (invoice no., invoice date, vendor, QC, notes). Quantities and rates are corrected by an admin — the amendment is recorded.',
     icon: <Pencil className={sz} />, onClick: onEdit,
@@ -1347,12 +1506,17 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
   // state of the ORDER, which this row does not carry.
   if (!isVoid && isAdmin === true) acts.push({
     key: 'void', label: 'Delete',
-    title: g.po_id
+    title: liquor
+      ? `Delete this liquor bill — takes its bottles back out of ${liquorStoreName(g)} and removes its TGBCL charges, then marks it void (admin only). Refused if any of the bottles have since moved or been counted.`
+      : g.po_id
       ? `Delete this bill — reverses the stock it added, marks it void, and reopens ${g.po_number || 'the purchase order'} so the delivery can be received again (admin only)`
       : 'Delete this bill — reverses the stock it added and marks it void (admin only)',
     icon: <Trash2 className={sz} />, danger: true, onClick: onVoid,
   });
-  acts.push({
+  // NOT OFFERED ON A LIQUOR BILL: the central register has no rows for it (its
+  // lines are on the store ledger), so the download would be an empty file
+  // under a GRN number that plainly exists. Its register is the store's own.
+  if (!liquor) acts.push({
     key: 'download', label: 'Download',
     title: 'Download this entry as CSV, in the Inward Register column order',
     icon: <Download className={sz} />,
@@ -1456,6 +1620,9 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
   const strike = isVoid ? 'line-through decoration-[#8B7355]' : '';
   const editCount = Number(g.edit_count) || 0;
   const held = isHeld(g);
+  /** A TGBCL liquor bill: its lines are on the store ledger, so its row figures
+   *  come from g.liquor and its detail from detail.liquor. */
+  const liquor = isLiquor(g);
   /* ── THE OFF-PO ALERTS ON THIS RECEIPT ───────────────────────────────────
      The row caption and its tooltip describe the RECEIPT, rolled up across
      every alert on it — not the newest alert alone. The newest is often the
@@ -1569,7 +1736,9 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             brightest thing in it. */}
         <td className="py-2 px-3">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <SourceChip poSourced={isPoSourced(g)} muted={isVoid} />
+            {liquor
+              ? <LiquorChip storeName={liquorStoreName(g)} muted={isVoid} />
+              : <SourceChip poSourced={isPoSourced(g)} muted={isVoid} />}
             {/* Shown only when the order could be resolved. A PO-sourced row
                 whose order row has gone still reads "Against PO" — the chip is
                 keyed off po_id, so it never quietly downgrades to "Direct". */}
@@ -1603,7 +1772,7 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             )}
           </div>
         </td>
-        <td className={`py-2 px-3 text-right font-mono ${strike}`}>{g.line_count}</td>
+        <td className={`py-2 px-3 text-right font-mono ${strike}`}>{liquor ? (Number(g.liquor?.line_count) || 0) : g.line_count}</td>
         {/* Rejected qty is a SUM ACROSS MATERIALS and GRN qtys are PURCHASE units,
             so it can only be printed as a quantity when every rejected line shares
             one purchase unit (kg + kg). A mixed GRN (2 kg + 3 BTL) has no honest
@@ -1642,12 +1811,22 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             truth. An em-dash with the reason in its tooltip is the honest cell;
             the stored figure is still 0 and Σ accepted still excludes it. */}
         <td className={`py-2 px-3 text-right font-mono font-semibold ${strike}`}>
-          {held
+          {liquor
+            ? <span className="text-[#B8A590] font-sans font-normal"
+                    title={`bottles go to ${liquorStoreName(g)}, not central stock`}>—</span>
+            : held
             ? <span className="text-[#B8A590] font-sans font-normal"
                     title={`Not decided yet. ${checkerName} records the accepted quantity when they sign off — until then it is stored as 0, which means "no decision", not "all rejected".`}>not decided</span>
             : fmt(g.accepted_value || 0)}
         </td>
-        <td className={`py-2 px-3 text-right font-mono font-semibold ${isVoid ? 'text-[#8B7355]' : 'text-[#af4408]'} ${strike}`}>{g.inward_value ? fmt(g.inward_value) : '—'}</td>
+        {/* A liquor bill's Inward ₹ is its NET INDENT (Invoice Value + the four
+            TGBCL charges) — the figure the TGBCL bill itself is totalled to. */}
+        <td className={`py-2 px-3 text-right font-mono font-semibold ${isVoid ? 'text-[#8B7355]' : 'text-[#af4408]'} ${strike}`}
+            title={liquor ? `Net Indent — Invoice ${fmt(Number(g.liquor?.invoice_value) || 0)} + TGBCL charges` : undefined}>
+          {liquor
+            ? (g.liquor ? fmt(Number(g.liquor.net_indent_value) || 0) : '—')
+            : (g.inward_value ? fmt(g.inward_value) : '—')}
+        </td>
         <td className="py-2 px-3">
           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${STATUS_TONE[g.status] || 'bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]'}`}
                 title={isVoid ? `${voidedBadgeText(g)}. The stock this bill added was reversed; the document is kept.`
@@ -1684,7 +1863,9 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
               <span>
                 <b>{voidedBadgeText(g)}.</b>{' '}
-                The stock this bill added was reversed and its cost rows deleted. The document below is kept as the record of what arrived, and it no longer counts towards inward value.
+                {liquor
+                  ? <>Its bottles were taken back out of {liquorStoreName(g)} and its TGBCL charges removed. The bill document below is kept, struck through, as the record of what arrived; the indent number can be entered again.</>
+                  : <>The stock this bill added was reversed and its cost rows deleted. The document below is kept as the record of what arrived, and it no longer counts towards inward value.</>}
                 {g.void_reason ? <> Reason: <i>{g.void_reason}</i></> : null}
               </span>
             </div>
@@ -1782,6 +1963,15 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             </div>
           ) : !detail ? (
             <div className="text-xs text-[#8B7355]"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading line items…</div>
+          ) : (liquor || detail.liquor || String(detail.store_dest_id || '').trim()) ? (
+            /* A TGBCL LIQUOR BILL — its lines are the frozen bill document
+               (store_bill_json), not goods_receipt_note_items, and it has no
+               receiving checklist (the liquor form asks none). */
+            <>
+              <LiquorBillDetail grn={detail} voided={isVoid} />
+              {(history.length > 0 || editCount > 0) &&
+                <GrnHistory history={history} editCount={editCount} capped={historyCapped} />}
+            </>
           ) : (
             <>
               <div className="text-xs text-[#6B5744] mb-2 flex flex-wrap gap-x-3 gap-y-1">
@@ -2049,6 +2239,154 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
         </td></tr>
       )}
     </>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   A TGBCL LIQUOR BILL, OPENED UP (owner rulings #83/#84).
+
+   THE LINES ARE THE FROZEN BILL DOCUMENT — goods_receipt_notes.store_bill_json,
+   written once at save and kept (struck through) by a void — served by
+   GET /api/grn?id= as `grn.liquor`. There are no goods_receipt_note_items for a
+   liquor bill: its bottles posted to the store location's ledger, which is
+   where every Liquor Store report reads them.
+
+   QUANTITIES LEAD WITH THE PURCHASE UNIT (owner rule): the cases / bottles
+   breakdown and the bottle total, with the exact recipe figure as the declared
+   "=" hint. Discount and delivery are recorded-only — outside the Net Indent,
+   exactly as Liquor Store New Bill recorded them — and the table says so.
+   ══════════════════════════════════════════════════════════════════════════ */
+/** PackMeta off a frozen bill line. pack_factor / case_factor are the factors
+ *  the server resolved at save; handing them back as pack_size / case_size lets
+ *  the shared helpers re-apply the same both-halves rule. */
+const liquorLineMeta = (ln: LiquorBillLine) => ({
+  unit: String(ln?.unit || ''), purchase_unit: String(ln?.purchase_unit || ln?.unit || ''),
+  pack_size: Number(ln?.pack_factor) || 1, case_size: Number(ln?.case_factor) || 1,
+});
+function LiquorBillDetail({ grn, voided }: {
+  grn: { grn_number?: string; invoice_number?: string; date?: string; vendor?: string;
+         invoice_date?: string; notes?: string; liquor?: LiquorBillDoc | null };
+  voided: boolean;
+}) {
+  const bill = grn?.liquor || null;
+  const strike = voided ? 'line-through decoration-[#8B7355]' : '';
+  if (!bill || bill.unreadable || !Array.isArray(bill.lines) || bill.lines.length === 0) {
+    return (
+      <div className="text-xs text-amber-900 bg-amber-50 border border-amber-300 rounded p-2">
+        This is a TGBCL liquor bill, but its bill document could not be read here. Its lines are on
+        {' '}<b>Inventory → Liquor Store</b> (ledger, purchase and inward registers) under indent <b>{grn?.invoice_number || '—'}</b>.
+      </div>
+    );
+  }
+  const ch = bill.charges || {};
+  const chargeRows: Array<[string, number]> = [
+    ['MRP Rounding Off', Number(ch.mrp_rounding) || 0],
+    ['Bar Excise Turnover Tax', Number(ch.excise_turnover_tax) || 0],
+    ['Special Excise Cess', Number(ch.special_excise_cess) || 0],
+    ['TCS', Number(ch.tcs) || 0],
+  ];
+  const discTotal = r2(bill.lines.reduce((s, ln) => s + (Number(ln.discount) || 0), 0));
+  const delivTotal = r2(bill.lines.reduce((s, ln) => s + (Number(ln.delivery_charges) || 0), 0));
+  const storeName = bill.store_name || 'the Liquor Store';
+  return (
+    <div className="space-y-2">
+      <div className="text-xs text-[#6B5744] flex flex-wrap gap-x-3 gap-y-1">
+        <span><b>GRN #:</b> {grn.grn_number}</span>
+        {bill.pinv && <span><b>Invoice ID:</b> <span className="font-mono">{bill.pinv}</span></span>}
+        <span><b>Indent no.:</b> <span className="font-mono">{bill.indent_no || grn.invoice_number || '—'}</span></span>
+        <span><b>Inward date:</b> {bill.date || grn.date}</span>
+        <span><b>Supplier:</b> {bill.supplier || grn.vendor || '—'}</span>
+        <span><b>Posted to:</b> {storeName}</span>
+        {grn.invoice_date && <span><b>Invoice date:</b> {grn.invoice_date}</span>}
+        {(bill.posted_by || bill.posted_at) && (
+          <span><b>Posted by:</b> {bill.posted_by || '—'}{bill.posted_at ? ` · ${fmtIST(bill.posted_at)}` : ''}</span>
+        )}
+        {grn.notes && <span><b>Notes:</b> {grn.notes}</span>}
+      </div>
+      <div className="text-[11px] text-[#6b2f80] bg-[#f6eef9] border border-[#e2cdea] rounded px-2 py-1 flex items-start gap-1.5">
+        <Wine className="w-3.5 h-3.5 shrink-0 mt-px" />
+        <span>
+          {voided
+            ? <>This bill’s bottles were taken back out of <b>{storeName}</b>{' '}when it was voided. The document is kept as the record of what arrived.</>
+            : <>These bottles are in <b>{storeName}</b>’s own ledger at the rate paid — not in Central Store stock, and no average price moved. Its ledger, purchase and inward registers are on <b>Inventory → Liquor Store</b>.</>}
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className={`w-full text-xs min-w-[860px] ${voided ? 'text-[#8B7355]' : ''}`}>
+          <thead className="text-[#8B7355] bg-[#FFF1E3]/50">
+            <tr>
+              <th className="text-left  py-1 px-2 font-medium">Item</th>
+              <th className="text-left  py-1 px-2 font-medium">Category</th>
+              <th className="text-right py-1 px-2 font-medium">Received (cs / btl / loose)</th>
+              <th className="text-right py-1 px-2 font-medium">Rate / bottle</th>
+              <th className="text-right py-1 px-2 font-medium text-[#af4408]">Line total</th>
+              <th className="text-right py-1 px-2 font-medium" title="Recorded on the store ledger row only — not taken off the rate, the line total or the Net Indent.">Discount</th>
+              <th className="text-right py-1 px-2 font-medium" title="Recorded on the store ledger row only — not in the Net Indent.">Delivery</th>
+              <th className="text-left  py-1 px-2 font-medium">Batch</th>
+              <th className="text-left  py-1 px-2 font-medium">Expiry</th>
+            </tr>
+          </thead>
+          <tbody>
+            {bill.lines.map((ln, i) => {
+              const meta = liquorLineMeta(ln);
+              const pu = meta.purchase_unit || 'units';
+              const pq = Number(ln.purchase_qty) || 0;
+              const breakdown = fmtBreakdown(Number(ln.recipe_qty) || 0, meta);
+              const pf = packFactor(meta);
+              return (
+                <tr key={String(ln.ledger_id || i)} className={`border-t border-[#E8D5C4]/50 ${strike}`}>
+                  <td className="py-1 px-2 text-[#2D1B0E]">{ln.material_name}</td>
+                  <td className="py-1 px-2 text-[#6B5744]">{ln.category || '—'}</td>
+                  <td className="py-1 px-2 text-right font-mono">
+                    {breakdown && <>{breakdown} = </>}<b>{fmtQtyNum(pq)} {pu}</b>
+                    {pf > 1 && <div className="text-[9px] font-normal text-[#B8A590]">= {fmtQtyNum(Number(ln.recipe_qty) || 0)} {meta.unit}</div>}
+                  </td>
+                  <td className="py-1 px-2 text-right font-mono">
+                    {m2(ln.rate_per_bottle)} <span className="text-[9px] text-[#B8A590]">/ {pu}</span>
+                    {ln.rate_basis === 'amount' && <div className="text-[9px] text-[#B8A590]">from the line amount</div>}
+                    {ln.rate_basis === 'case' && <div className="text-[9px] text-[#B8A590]">entered as {m2(ln.rate_entered)} per case</div>}
+                  </td>
+                  <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(ln.line_total)}</td>
+                  <td className={`py-1 px-2 text-right font-mono ${Number(ln.discount) ? '' : 'text-[#B8A590]'}`}>{q2(ln.discount)}</td>
+                  <td className={`py-1 px-2 text-right font-mono ${Number(ln.delivery_charges) ? '' : 'text-[#B8A590]'}`}>{q2(ln.delivery_charges)}</td>
+                  <td className="py-1 px-2 text-[#6B5744]">{ln.batch_no || '—'}</td>
+                  <td className="py-1 px-2 text-[#6B5744]">{ln.expiry_date || '—'}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+          <tfoot className={`bg-[#FFF1E3]/60 font-semibold text-[#2D1B0E] border-t border-[#E8D5C4] ${strike}`}>
+            <tr>
+              {/* No quantity total: lines are different brands, and bottles of
+                  one brand plus bottles of another is not a figure. ₹ only. */}
+              <td className="py-1.5 px-2" colSpan={4}>{bill.lines.length} line(s) · Invoice Value</td>
+              <td className="py-1.5 px-2 text-right font-mono text-[#af4408]">{m2(bill.invoice_value)}</td>
+              <td className="py-1.5 px-2 text-right font-mono">{q2(discTotal)}</td>
+              <td className="py-1.5 px-2 text-right font-mono">{q2(delivTotal)}</td>
+              <td colSpan={2}></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      <div className={`border border-[#E8D5C4] rounded bg-white px-2.5 py-2 text-[11px] text-[#6B5744] max-w-md ${strike}`}>
+        <div className="font-semibold text-[#2D1B0E] mb-1">TGBCL charges</div>
+        <div className="flex justify-between gap-2"><span>Invoice Value (Σ lines)</span><b className="font-mono">{m2(bill.invoice_value)}</b></div>
+        {chargeRows.map(([label, v]) => (
+          <div key={label} className="flex justify-between gap-2">
+            <span>{label}</span><span className={`font-mono ${v ? 'text-[#2D1B0E]' : 'text-[#B8A590]'}`}>{v < 0 ? '− ' : '+ '}{m2(Math.abs(v))}</span>
+          </div>
+        ))}
+        <div className="flex justify-between gap-2 border-t border-[#E8D5C4] mt-1 pt-1 text-[12px]">
+          <span className="font-semibold">Net Indent Value</span><b className="font-mono text-[#af4408]">{m2(bill.net_indent_value)}</b>
+        </div>
+        {(discTotal > 0 || delivTotal > 0) && (
+          <div className="text-[10px] text-[#8B7355] mt-1">
+            Discount and delivery above are recorded on the lines only and are not in the Net Indent.
+          </div>
+        )}
+        <div className="text-[10px] text-[#8B7355] mt-0.5">No GST on liquor — none is recorded on these lines.</div>
+      </div>
+    </div>
   );
 }
 
@@ -2420,7 +2758,13 @@ function GrnHistory({ history, editCount, capped }: { history: any[]; editCount:
 /* Ad-hoc GRN modal — creates a GRN + purchases for a non-PO   */
 /* receipt (cash buy, sample, donation, return).                */
 /* ============================================================ */
-function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+function AdHocGrnModal({ onClose, onCreated, onOpenLiquor }: {
+  onClose: () => void; onCreated: () => void;
+  /** Opens TGBCL Liquor Bill on top of this form, carrying this bill's liquor
+   *  lines across. Absent when the user may not receive into a store location
+   *  — the panel then says who can. */
+  onOpenLiquor?: (prefill: LiquorBillPrefill) => void;
+}) {
   const [date, setDate] = useState(new Date().toISOString().slice(0,10));
   const [vendor, setVendor] = useState('');
   const [vendorId, setVendorId] = useState('');
@@ -2562,6 +2906,9 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    * source purchases/page.tsx uses (fetchStoreCategories).
    */
   const [storeCats, setStoreCats] = useState<Set<string>>(new Set());
+  /** catKey → the store location's NAME, so a blocked line can say which store
+   *  its bottles belong to ("a LIQUOR STORE item") rather than a generic word. */
+  const [storeNameByCat, setStoreNameByCat] = useState<Map<string, string>>(new Map());
   useEffect(() => {
     (async () => {
       try {
@@ -2569,13 +2916,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
         if (!res.ok) return;                     // leave the set empty = "unknown"
         const json = await res.json();
         const next = new Set<string>();
+        const names = new Map<string, string>();
         for (const st of json.stores || []) {
           // A deactivated store releases its categories back to Central behaviour —
           // same rule materialStoreId() applies server-side.
           if (!st?.is_active) continue;
-          for (const c of st.categories || []) { const k = catKey(c?.category); if (k) next.add(k); }
+          for (const c of st.categories || []) {
+            const k = catKey(c?.category);
+            if (k) { next.add(k); if (!names.has(k)) names.set(k, String(st.name || '')); }
+          }
         }
         setStoreCats(next);
+        setStoreNameByCat(names);
       } catch {
         // Leave empty. Rates then behave normally, and the server still refuses a
         // store-mapped line outright (centralFlowBlock in /api/grn POST).
@@ -2685,10 +3037,10 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   };
 
   /** The checker for ONE line, or null when the map is unreadable / unknown.
-   *  Store-mapped (TGBCL) lines answer 'none' because centralFlowBlock drops
-   *  them from `receivable` before the gate ever sees them — a checker on a
-   *  liquor category could never fire. Declared AFTER storeMappedLine because
-   *  it calls it. */
+   *  Store-mapped (TGBCL) lines answer 'none' because they never reach the gate:
+   *  POST /api/grn refuses a Central bill carrying one (mixed_bill), and a
+   *  liquor bill is never QC-held — a checker on a liquor category could never
+   *  fire. Declared AFTER storeMappedLine because it calls it. */
   const lineChecker = (materialId: string): QcChecker | null => {
     if (!qcMap || !materialId) return null;
     if (storeMappedLine(materialId)) return 'none';
@@ -3170,27 +3522,67 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   /**
    * LINES THIS RECEIPT CANNOT TAKE — SAID BEFORE SAVE, NOT AFTER.
    *
-   * centralFlowBlock() drops a store-mapped (TGBCL liquor) line from the payload
-   * and reports it in `store_blocked`; the receipt otherwise SUCCEEDS. The old
-   * bill form never reached this state — /api/purchases 400s the whole request
-   * on a store-mapped line — so moving the form here introduced a way for a line
-   * to fall off a bill that saved cleanly. SaveNotices says so afterwards; this
-   * says so while there is still something to do about it.
+   * A store-mapped (TGBCL liquor) line is not a Central Store line: its bottles
+   * post into the store location's ledger, and that bill is entered on
+   * TGBCL Liquor Bill (owner rulings #83/#84). POST /api/grn now REFUSES a bill
+   * that mixes the two (400 mixed_bill, nothing saved) instead of dropping the
+   * liquor line off an otherwise successful receipt, so a mixed paper bill is
+   * saved as two receipts: the liquor lines there, the rest here.
    *
-   * It does NOT block. A bill is a fact and the rest of it is perfectly
-   * receivable — refusing the lot would leave a storekeeper holding an invoice
-   * with nowhere to enter any of it.
+   * IT BLOCKS SAVE. The server refuses the mix outright, so letting Save through
+   * would only move the same refusal one round trip later. The panel names the
+   * lines, offers to carry them over to TGBCL Liquor Bill, and to take them off
+   * this bill — after which the rest saves normally.
    */
   const storeBlockedLines = useMemo(
     () => items.map((l, i) => ({ l, i }))
       .filter(({ l }) => l.material_id && storeMappedLine(l.material_id))
-      .map(({ l, i }) => ({
-        no: i + 1,
-        name: String((materials.find((m: any) => m.id === l.material_id) as any)?.name || l.material_id),
-      })),
+      .map(({ l, i }) => {
+        const mat = materials.find(m => m.id === l.material_id);
+        return {
+          no: i + 1,
+          name: String(mat?.name || l.material_id),
+          store: storeNameByCat.get(catKey(mat?.category)) || 'Liquor Store',
+        };
+      }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [items, materials, storeCats],
+    [items, materials, storeCats, storeNameByCat],
   );
+  /** The store name(s) the blocked lines belong to, for one sentence. */
+  const blockedStoreLabel = [...new Set(storeBlockedLines.map(x => x.store))].join(' / ') || 'Liquor Store';
+  /** Carry the liquor lines over to TGBCL Liquor Bill — material, quantity and
+   *  rate as typed here, on the same basis (a CASE-basis line goes over as cases
+   *  at a per-case rate), plus the vendor, bill number and receipt date. This
+   *  bill keeps them until they are removed, so nothing is lost if the liquor
+   *  bill is cancelled. */
+  const moveLiquorLines = () => {
+    if (!onOpenLiquor) return;
+    onOpenLiquor({
+      vendor, vendor_id: vendorId || undefined,
+      invoice_number: noBill ? '' : invoice.trim(), date,
+      lines: items
+        .filter(l => l.material_id && storeMappedLine(l.material_id))
+        .map(l => {
+          const cs = caseBasis(l.material_id, l.entry_mode);
+          const q = n0(l.quantity_received) > 0 ? n0(l.quantity_received) : 0;
+          return {
+            material_id: l.material_id,
+            ...(cs.on ? { cases: q } : { bottles: q }),
+            price: n0(l.unit_price) > 0 ? n0(l.unit_price) : undefined,
+            perCase: cs.on,
+          };
+        }),
+    });
+  };
+  /** Take the liquor lines off THIS bill (after they were entered on TGBCL
+   *  Liquor Bill), so the Central half saves. */
+  const dropLiquorLines = () => {
+    setItems(prev => {
+      const kept = prev.filter(l => !(l.material_id && storeMappedLine(l.material_id)));
+      return kept.length ? kept : [blankLine()];
+    });
+    setOpenCharges(new Set());
+  };
 
   /* ══ ONE MATERIAL = ONE LINE ═════════════════════════════════════════════
    *
@@ -3221,8 +3613,8 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    * inputs, so the form and the route cannot disagree.
    *
    * Mirrors resolveQcRequirement() exactly:
-   *   · store-mapped (TGBCL) lines are excluded, because centralFlowBlock drops
-   *     them before the gate is consulted;
+   *   · store-mapped (TGBCL) lines are excluded, because they never reach the
+   *     gate (a Central bill carrying one is refused; Save is blocked here);
    *   · ANY line whose category maps to a checker holds the WHOLE delivery —
    *     the gate is per GRN, not per line (grn-qc.ts, "THE GRN IS THE UNIT");
    *   · one department across every gated line ⇒ that department, otherwise
@@ -3407,6 +3799,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       return isAdjustment ? true : qr > 0;
     });
     if (cleaned.length === 0) { alert('Add at least one line with a material and qty'); return; }
+    // A LIQUOR LINE CANNOT RIDE ON A CENTRAL BILL. Mirrors the server's own
+    // mixed_bill refusal so it lands before the round trip (Save is also
+    // disabled while one is on the bill — this is the belt to that brace).
+    if (storeBlockedLines.length > 0) {
+      const x = storeBlockedLines[0];
+      alert(`Line ${x.no} (${x.name}) is a ${x.store} item. Liquor bills are entered on TGBCL Liquor Bill — the bottles go straight into ${x.store}. Remove the line to save this bill.`);
+      return;
+    }
     if (!vendor.trim()) { alert('Vendor name required'); return; }
     // A CASH RUN HAS ITS OWN WAY OUT, AND THIS GATE DID NOT KNOW ABOUT IT.
     // The server mints a PCV for a blank cash bill, so a storekeeper who ticked
@@ -3851,6 +4251,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             )}
           </div>
         )}
+        {/* Kept for a response that still carries store_blocked. POST /api/grn
+            now refuses a bill mixing liquor with Central lines instead of
+            dropping them (store_blocked is [] on every save), so this should no
+            longer render — and if it ever does, it points to the door that
+            exists. */}
         {blocked.length > 0 && (
           <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
             <div className="font-semibold flex items-center gap-1.5">
@@ -3858,9 +4263,9 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               {blocked.length} line{blocked.length === 1 ? '' : 's'} {blocked.length === 1 ? 'was' : 'were'} left off this bill.
             </div>
             <div className="text-[11px]">
-              Liquor is procured on the store ledger, not into Central stock, so {blocked.length === 1 ? 'it' : 'they'} could not be
-              received here. Nothing else on the bill was affected. Record {blocked.length === 1 ? 'it' : 'them'} on{' '}
-              <b>Inventory → Liquor Store</b>.
+              Liquor posts into its store location’s ledger, not into Central stock, so {blocked.length === 1 ? 'it' : 'they'} could not be
+              received here. Nothing else on the bill was affected. Enter {blocked.length === 1 ? 'it' : 'them'} on{' '}
+              <b>Goods Receipt → TGBCL Liquor Bill</b>.
             </div>
             {blocked[0]?.error && <div className="text-[11px] opacity-80">{blocked[0].error}</div>}
           </div>
@@ -3884,6 +4289,66 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       </>
     );
   };
+
+  /* ── WHY SAVE IS OFF, SAID WHERE THE STOREKEEPER IS LOOKING ────────────────
+   * A liquor line BLOCKS Save (see storeBlockedLines): the server refuses a
+   * bill that mixes liquor with Central lines, so a mixed paper bill is two
+   * receipts and this panel is the way to the other one. Its reason used to
+   * live in ONE place, under the vendor's item chips — measured ~680 px above
+   * the Line Items in an 860 px viewport — and otherwise only in the disabled
+   * Save button's hover title, which a tablet never shows. So the same panel is
+   * rendered in two places (the chips, and directly under the Line Items
+   * table), each blocked row carries its own chip, and the footer beside the
+   * disabled Save says it in one line. Display only: nothing here changes what
+   * is posted. */
+  const renderStoreBlockPanel = (where: 'top' | 'lines') => storeBlockedLines.length > 0 && (
+    <div data-store-block={where}
+         className="border border-red-300 rounded-lg bg-red-50 p-2.5 text-[11px] text-red-900 space-y-1.5">
+      {storeBlockedLines.map(x => (
+        <div key={x.no} className="font-semibold flex items-start gap-1.5">
+          <Wine className="w-3.5 h-3.5 shrink-0 mt-px" />
+          <span>
+            Line {x.no} ({x.name}) is a {x.store} item. Liquor bills are entered on <b>TGBCL Liquor Bill</b> — the bottles go
+            straight into {x.store}. Remove the line to save this bill.
+          </span>
+        </div>
+      ))}
+      <div className="flex flex-wrap items-center gap-2 pt-0.5">
+        {onOpenLiquor ? (
+          <button type="button" onClick={moveLiquorLines}
+                  title={`Opens TGBCL Liquor Bill with ${storeBlockedLines.length === 1 ? 'this line' : 'these lines'}, the vendor, the bill number and the date filled in. This bill stays open underneath.`}
+                  className="px-2.5 py-1 rounded border border-[#6b2f80] bg-white text-[#6b2f80] hover:bg-[#6b2f80]/10 font-semibold flex items-center gap-1">
+            <Wine className="w-3 h-3" /> Enter {storeBlockedLines.length === 1 ? 'it' : 'them'} on TGBCL Liquor Bill
+          </button>
+        ) : (
+          <span className="text-red-800">
+            TGBCL Liquor Bill is open to staff allowed to receive into {blockedStoreLabel} (Settings → Store Locations → user access) — ask one of them to enter {storeBlockedLines.length === 1 ? 'it' : 'them'}.
+          </span>
+        )}
+        <button type="button" onClick={dropLiquorLines}
+                className="px-2.5 py-1 rounded border border-red-300 bg-white text-red-700 hover:bg-red-50 font-semibold flex items-center gap-1">
+          <Trash2 className="w-3 h-3" /> Remove {storeBlockedLines.length === 1 ? 'the liquor line' : `the ${storeBlockedLines.length} liquor lines`} from this bill
+        </button>
+      </div>
+      {(bill.discountAmount > 0 || bill.deliveryAmount > 0) && (
+        <div className="text-red-800">
+          The bill-level discount / delivery above are split across <b>every</b> line typed, including {storeBlockedLines.length === 1 ? 'this one' : 'these'}.
+          Once {storeBlockedLines.length === 1 ? 'it is' : 'they are'} removed they are split again over the lines that stay — a By % figure
+          shrinks with the goods, a By Amount figure now falls wholly on them — so check it against the Central part of the paper before saving.
+        </div>
+      )}
+    </div>
+  );
+  /** The footer's one line: which line(s) and the way out, beside the disabled Save. */
+  const storeBlockFooter = storeBlockedLines.length === 0 ? '' : (() => {
+    const one = storeBlockedLines.length === 1;
+    const nos = storeBlockedLines.map(x => x.no).join(', ');
+    const names = storeBlockedLines.slice(0, 3).map(x => x.name).join(', ') + (storeBlockedLines.length > 3 ? '…' : '');
+    // Removing the line(s) is the ONLY thing that turns Save back on: carrying
+    // them over to TGBCL Liquor Bill leaves them on this bill until removed.
+    return `Save is off: line${one ? '' : 's'} ${nos} (${names}) ${one ? 'is a' : 'are'} ${blockedStoreLabel} item${one ? '' : 's'} — `
+      + `remove ${one ? 'it' : 'them'} to save this bill. Liquor bills are entered on TGBCL Liquor Bill (see the red panel under the line items).`;
+  })();
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
@@ -4088,7 +4553,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
         ) : (
           <>
           <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
-            <b>This is where a vendor bill is recorded.</b> Every hand-entered bill comes through here — a cash purchase, a
+            <b>This is where a vendor bill is recorded.</b> Every hand-entered Central Store bill comes through here — a cash purchase, a
             sample, a donation, a vendor return, or the full printed invoice that used to be typed on the Purchases screen.
             On save: creates a GRN, writes <code>purchases</code> rows, bumps stock + recipe-cost cascade.
             {/* Stated in the same breath as "bumps stock", because on a gated
@@ -4096,6 +4561,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 is being told what Save does. */}
             {' '}Perishable categories are the exception: those are recorded and <b>held until the kitchen checks them</b> —
             the bill is saved in full, but no stock appears until the kitchen signs.
+            {' '}A TGBCL liquor bill is not entered here — it has its own door, <b>TGBCL Liquor Bill</b>, on the Goods Receipt page.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             {/* ── OF THE TWO DATES ON THIS FORM, THIS IS THE ONE THAT CARRIES
@@ -4319,28 +4785,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             </div>
           )}
 
-          {/* A LINE THIS RECEIPT CANNOT TAKE, said while it can still be moved. */}
-          {storeBlockedLines.length > 0 && (
-            <div className="border border-amber-400 rounded-lg bg-amber-50 p-2.5 text-[11px] text-amber-900 space-y-1">
-              <div className="font-semibold flex items-center gap-1.5">
-                <Wine className="w-3.5 h-3.5 shrink-0" />
-                Line {storeBlockedLines.map(x => x.no).join(', ')} will be left off this receipt.
-              </div>
-              <div>
-                {storeBlockedLines.map(x => x.name).join(', ')} {storeBlockedLines.length === 1 ? 'is' : 'are'} procured on the
-                store ledger, not into Central stock, so {storeBlockedLines.length === 1 ? 'it' : 'they'} cannot be received here.
-                Everything else on the bill saves normally. Record {storeBlockedLines.length === 1 ? 'it' : 'them'} on{' '}
-                <b>Inventory → Liquor Store</b>.
-              </div>
-              {(bill.discountAmount > 0 || bill.deliveryAmount > 0) && (
-                <div>
-                  The bill-level charges are still split across <b>every</b> line, including {storeBlockedLines.length === 1 ? 'this one' : 'these'} —
-                  that is deliberate, because it is the share the vendor&apos;s own bill gives the lines that DO stay here. The totals
-                  below are the whole paper; what this receipt records will be less by the dropped {storeBlockedLines.length === 1 ? 'line' : 'lines'}.
-                </div>
-              )}
-            </div>
-          )}
+          {/* A LINE THIS RECEIPT CANNOT TAKE, said while it can still be moved.
+              Here, under the vendor’s item chips (a chip is one way such a line
+              arrives), AND again directly under the Line Items table — see
+              renderStoreBlockPanel. */}
+          {renderStoreBlockPanel('top')}
 
           {/* ONE MATERIAL = ONE LINE — the same refusal the PO carries and the
               route enforces. Raised as it is typed, not only at Save. */}
@@ -4468,18 +4917,19 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                         </div>
                       )}
 
-                      {/* THE LIQUOR LINE THE SERVER WILL DROP. It is not received
-                          here at all (Inventory → Liquor Store owns that rail),
-                          so it is not in the cash figure — and that rail writes
-                          no petty-cash row, so cash paid for it is recorded
-                          nowhere unless somebody enters it by hand. */}
+                      {/* THE LIQUOR LINE THIS BILL CANNOT TAKE. It is entered on
+                          TGBCL Liquor Bill instead (and Save is blocked until it
+                          is removed from here), so it is not in the cash figure —
+                          and a liquor bill cannot be a petty-cash purchase (the
+                          store rail has no cash-box entry), so cash paid for it
+                          is recorded nowhere unless somebody enters it by hand. */}
                       {cashBill.blocked > 0 && (
                         <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-300 rounded px-2 py-1.5">
-                          {cashBill.blocked} liquor / store-ledger line{cashBill.blocked === 1 ? '' : 's'} worth
-                          {' '}<b className="font-mono">{m2(cashBill.blockedTotal)}</b> {cashBill.blocked === 1 ? 'is' : 'are'} not
-                          {' '}received here and {cashBill.blocked === 1 ? 'is' : 'are'} <b>not</b> in the figure above.
-                          {' '}Record {cashBill.blocked === 1 ? 'it' : 'them'} on <b>Inventory → Liquor Store</b>; if that money also
-                          came out of this box, enter it on <b>Petty Cash</b> separately.
+                          {cashBill.blocked} liquor line{cashBill.blocked === 1 ? '' : 's'} worth
+                          {' '}<b className="font-mono">{m2(cashBill.blockedTotal)}</b> {cashBill.blocked === 1 ? 'is' : 'are'} <b>not</b> in
+                          {' '}the figure above and cannot be saved on this bill.
+                          {' '}Enter {cashBill.blocked === 1 ? 'it' : 'them'} on <b>TGBCL Liquor Bill</b> (a liquor bill is never recorded
+                          as petty cash); if that money also came out of this box, enter it on <b>Petty Cash</b> separately.
                         </div>
                       )}
 
@@ -4857,6 +5307,20 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                             <span className="mt-1 ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-[#af4408]/40 bg-[#FFF3E6] text-[#af4408] text-[9px] font-semibold"
                                   title={`Direct issue: on booking, this line's accepted quantity goes straight to ${dest}'s stock. The bill, GRN and quality checks record here exactly as normal — but the goods do NOT go to the central shelf.`}>
                               <Truck className="w-2.5 h-2.5" /> → {dest}
+                            </span>
+                          );
+                        })()}
+                        {/* THE LINE THAT HOLDS SAVE — named on the line itself, so
+                            "why is Save grey?" is answerable by looking at the
+                            row (no hover on a tablet). See renderStoreBlockPanel. */}
+                        {(() => {
+                          const sb = storeBlockedLines.find(x => x.no === i + 1);
+                          if (!sb) return null;
+                          return (
+                            <span data-store-block-line={sb.no}
+                                  className="mt-1 ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-red-300 bg-red-50 text-red-800 text-[9px] font-semibold"
+                                  title={`${sb.name} is a ${sb.store} item. Liquor bills are entered on TGBCL Liquor Bill — the bottles go straight into ${sb.store}. ${onOpenLiquor ? 'The buttons under the line items carry it over to TGBCL Liquor Bill or remove it from this bill.' : 'The button under the line items removes it from this bill.'}`}>
+                              <Wine className="w-2.5 h-2.5" /> {sb.store} item — remove it to save this bill
                             </span>
                           );
                         })()}
@@ -5246,6 +5710,9 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </table>
             </div>
           </div>
+          {/* The same liquor panel as under the vendor chips, directly under the
+              lines that cause it — see renderStoreBlockPanel. */}
+          {renderStoreBlockPanel('lines')}
           {/* Primary Add-line — full width at the BOTTOM so on mobile the button
               sits right below the material you just added (rather than off-screen
               at the top of the box). Desktop keeps the compact top button. */}
@@ -5296,7 +5763,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           </>
         )}
         </div>
-        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2 shrink-0">
           {held ? (
             <>
               <a href="/grn/qc" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
@@ -5318,19 +5785,31 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           ) : received ? (
             <>
               {Array.isArray(received.store_blocked) && received.store_blocked.length > 0 && (
-                <a href="/inventory/liquor-store" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
-                  <Wine className="w-4 h-4" /> Liquor Store
+                <a href="/grn?liquor=1" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
+                  <Wine className="w-4 h-4" /> TGBCL Liquor Bill
                 </a>
               )}
               <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
             </>
           ) : (
             <>
+              {/* Beside the disabled Save, because a tablet shows no hover title.
+                  Full width on a phone (its own row above the buttons), inline
+                  on wider screens. */}
+              {storeBlockFooter && (
+                <p data-store-block="footer" role="status"
+                   className="w-full sm:w-auto sm:flex-1 sm:min-w-0 self-center text-[11px] leading-snug font-semibold text-red-800 flex items-start gap-1.5">
+                  <Wine className="w-3.5 h-3.5 shrink-0 mt-px" />
+                  <span>{storeBlockFooter}</span>
+                </p>
+              )}
               <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
               <button onClick={submit}
-                      disabled={busy || qcPreRejectLines.length > 0 || dupGroups.length > 0
+                      disabled={busy || qcPreRejectLines.length > 0 || dupGroups.length > 0 || storeBlockedLines.length > 0
                         || (qcPreview.known && qcPreview.required && qcPreview.backCorrection)}
-                      title={dupGroups.length > 0
+                      title={storeBlockedLines.length > 0
+                        ? `This bill carries ${blockedStoreLabel} item(s). Liquor bills are entered on TGBCL Liquor Bill — remove the line(s) to save this bill.`
+                        : dupGroups.length > 0
                         ? 'The same item is on more than one line — it would be delivered once and booked twice. Put the full quantity on one line.'
                         : qcPreRejectLines.length > 0
                         ? 'A held delivery\'s accepted quantity is the checking department\'s to record — enter what actually arrived as Received instead.'
@@ -7167,11 +7646,177 @@ function EditBillModal({ g, isAdmin, onClose, onSaved }: {
 /* back saying a material's weighted average still carries this */
 /* bill's price, and that has to be read, not dismissed.        */
 /* ============================================================ */
+/* ============================================================ */
+/* EDIT A LIQUOR BILL — notes and invoice date ONLY.            */
+/*                                                              */
+/* The indent number and the supplier of a TGBCL bill are also  */
+/* its record on the store ledger (every row's ref / supplier)  */
+/* and on store_bill_charges, so PUT /api/grn/[id] refuses to   */
+/* move them (code liquor_identity) and the line editor has     */
+/* nothing to edit (there are no goods_receipt_note_items).     */
+/* This form offers exactly what the server accepts, and shows  */
+/* the rest read-only with the reason, so nobody hunts for it.  */
+/* ============================================================ */
+function LiquorEditBillModal({ g, onClose, onSaved }: { g: GRN; onClose: () => void; onSaved: () => void }) {
+  const [loaded, setLoaded] = useState<{ invoice_date: string; notes: string } | null>(null);
+  const [form, setForm] = useState<{ invoice_date: string; notes: string } | null>(null);
+  const [row, setRow] = useState<{ invoice_number?: string; vendor?: string; liquor?: LiquorBillDoc | null } | null>(null);
+  const [loadErr, setLoadErr] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [saved, setSaved] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/grn?id=${encodeURIComponent(g.id)}`)
+      .then(r => r.json())
+      .then(d => {
+        if (!alive) return;
+        if (!d?.grn) { setLoadErr(d?.error || 'Could not load this bill.'); return; }
+        const f = { invoice_date: String(d.grn.invoice_date || ''), notes: String(d.grn.notes || '') };
+        setRow(d.grn); setLoaded(f); setForm(f);
+      })
+      .catch(e => { if (alive) setLoadErr(e?.message || 'Could not load this bill.'); });
+    return () => { alive = false; };
+  }, [g.id]);
+
+  const patch = useMemo(() => {
+    if (!form || !loaded) return {} as Record<string, string>;
+    const p: Record<string, string> = {};
+    if (form.invoice_date !== loaded.invoice_date) p.invoice_date = form.invoice_date;
+    if (form.notes !== loaded.notes) p.notes = form.notes;
+    return p;
+  }, [form, loaded]);
+  const dirty = Object.keys(patch).length > 0;
+  const storeName = row?.liquor?.store_name || liquorStoreName(g);
+
+  const submit = async () => {
+    if (!dirty) return;
+    setBusy(true); setErr('');
+    try {
+      const res = await api(`/api/grn/${encodeURIComponent(g.id)}`, {
+        method: 'PUT',
+        body: { ...patch, ...(reason.trim() ? { edit_reason: reason.trim() } : {}) },
+      });
+      const j = await res.json().catch(() => ({}));
+      // The server's sentence verbatim — it names the field and the remedy.
+      if (!res.ok) { setErr(j?.error || `Amend failed (HTTP ${res.status})`); return; }
+      setSaved(Array.isArray(j?.warnings) ? j.warnings.map(String) : []);
+    } catch (e: unknown) {
+      setErr((e as Error)?.message || 'Amend failed');
+    } finally { setBusy(false); }
+  };
+
+  const fieldCls = 'px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] disabled:bg-[#F3EEE7] disabled:text-[#8B7355]';
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="min-w-0">
+            <h2 className="font-bold text-[#2D1B0E] truncate flex items-center gap-1.5"><Wine className="w-4 h-4 text-[#6b2f80] shrink-0" /> Edit liquor bill — {g.grn_number}</h2>
+            <p className="text-[10px] text-[#8B7355]">The amendment is recorded: who, when and what changed.</p>
+          </div>
+          <button onClick={() => (saved ? onSaved() : onClose())} aria-label="Close"><X className="w-5 h-5 text-[#8B7355]" /></button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3 text-xs">
+          {loadErr ? (
+            <div className="text-red-700 flex items-start gap-1.5"><AlertTriangle className="w-4 h-4 shrink-0" /> {loadErr}</div>
+          ) : !form ? (
+            <div className="text-[#8B7355]"><Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading the bill…</div>
+          ) : saved ? (
+            <div className="space-y-2">
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-900 font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> Saved — {Object.keys(patch).map(k => FIELD_LABEL[k] || k).join(', ')} amended.
+              </div>
+              {saved.map((w, i) => <div key={i} className="text-amber-900 bg-amber-50 border border-amber-300 rounded p-2">{w}</div>)}
+            </div>
+          ) : (
+            <>
+              <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                Only the <b>notes</b> and the <b>invoice date</b> can be amended here. The <b>indent number</b> and the
+                {' '}<b>supplier</b>{' '}are also this bill’s record in {storeName} (its ledger rows and TGBCL charges), so they
+                cannot be changed, and its <b>lines</b> cannot be corrected here. If any of those is wrong, an admin can void
+                {' '}{g.grn_number} — that takes its bottles back out of {storeName} while they are untouched — and the bill can
+                then be entered again; otherwise correct the stock with an Adjustment on Inventory → Liquor Store.
+              </p>
+              {err && (
+                <div className="text-red-700 bg-red-50 border border-red-200 rounded p-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0" /> <span>{err}</span>
+                </div>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <label className="flex flex-col gap-1 text-[#6B5744]">Indent no. (not amendable)
+                  <input value={String(row?.invoice_number || g.invoice_number || '')} disabled className={fieldCls} />
+                </label>
+                <label className="flex flex-col gap-1 text-[#6B5744]">Supplier (not amendable)
+                  <input value={String(row?.vendor || g.vendor || '')} disabled className={fieldCls} />
+                </label>
+                <label className="flex flex-col gap-1 text-[#6B5744]">Invoice date
+                  <input type="date" value={form.invoice_date} onChange={e => setForm(f => (f ? { ...f, invoice_date: e.target.value } : f))} className={fieldCls} />
+                </label>
+                <div className="flex flex-col gap-1 text-[#6B5744]">Receipt date (not amendable)
+                  <input value={g.date} disabled className={fieldCls} />
+                </div>
+              </div>
+              <label className="flex flex-col gap-1 text-[#6B5744]">Notes
+                <textarea rows={2} value={form.notes} onChange={e => setForm(f => (f ? { ...f, notes: e.target.value } : f))} className={fieldCls} />
+              </label>
+              <label className="flex flex-col gap-1 text-[#6B5744]">
+                Why is this being amended? <span className="text-[10px] text-[#8B7355]">(optional — goes into the audit trail, not onto the bill)</span>
+                <input value={reason} onChange={e => setReason(e.target.value)} className={fieldCls} />
+              </label>
+            </>
+          )}
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2 shrink-0">
+          {saved ? (
+            <button onClick={onSaved} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
+          ) : (
+            <>
+              <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
+              <button onClick={submit} disabled={busy || !dirty || !!loadErr}
+                      title={dirty ? 'Save the amendment' : 'Change something first'}
+                      className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                {busy ? 'Saving…' : 'Save amendment'}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; onVoided: () => void }) {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [result, setResult] = useState<any>(null);
+  /** A liquor bill voids on the STORE rail: its bottles come back out of the
+   *  store location and its TGBCL charges go. Its frozen bill document is read
+   *  so this modal can name the bottles, in purchase units, before and after. */
+  const liquor = isLiquor(g);
+  const [liqBill, setLiqBill] = useState<LiquorBillDoc | null>(null);
+  useEffect(() => {
+    if (!liquor) return;
+    let alive = true;
+    fetch(`/api/grn?id=${encodeURIComponent(g.id)}`).then(r => r.json())
+      .then(d => { if (alive) setLiqBill(d?.grn?.liquor || null); })
+      .catch(() => { /* the server's own sentences still say what happens */ });
+    return () => { alive = false; };
+  }, [liquor, g.id]);
+  const liqStore = liqBill?.store_name || liquorStoreName(g);
+  const liqLines: LiquorBillLine[] = Array.isArray(liqBill?.lines) ? liqBill.lines : [];
+  /** One line's quantity, purchase-unit lead, off the frozen bill line. */
+  const liqQty = (materialId: string, purchaseQty: number, recipeQty: number) => {
+    const ln = liqLines.find(x => String(x.material_id) === String(materialId));
+    if (!ln) return `${fmtQtyNum(purchaseQty)}`;
+    const meta = liquorLineMeta(ln);
+    return fmtBreakdown(recipeQty, meta) || `${fmtQtyNum(purchaseQty)} ${meta.purchase_unit || ''}`.trim();
+  };
 
   const submit = async () => {
     if (!reason.trim()) { setErr('Give a reason — it is what makes the audit record worth keeping.'); return; }
@@ -7230,7 +7875,79 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
         </div>
 
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-3 text-xs">
-          {!result ? (
+          {!result && liquor ? (
+            /* ── A LIQUOR BILL VOIDS ON THE STORE RAIL ──────────────────────
+               Nothing central to reverse: no Central stock moved and no cost row
+               exists. What comes back out is the bottles, from the store
+               location's ledger, and the bill's TGBCL charges. The server
+               REFUSES rather than clamps when the bottles have moved or been
+               counted — its sentence comes back verbatim below. */
+            <>
+              <div className="rounded-lg border border-red-200 bg-red-50 p-3 space-y-2 text-[#6B5744]">
+                <div className="font-semibold text-red-800 flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4" /> Takes the bottles back out of {liqStore} and removes its TGBCL charges; refused if any have since moved or been counted.
+                </div>
+                <ul className="list-disc pl-4 space-y-1">
+                  <li><b>The bottles this bill posted come back out of {liqStore}</b> — exactly what it recorded, line by line.</li>
+                  <li><b>Its TGBCL charges and Net Indent row are removed</b>, so the indent number can be entered again.</li>
+                  <li><b>The bill is kept, not erased</b> — its document stays in the register struck through, stamped with your name and the time.</li>
+                  <li>Central Store stock, costs and average prices are not touched — this bill never moved them.</li>
+                </ul>
+                <div className="pt-1 border-t border-red-200">
+                  It is refused — with nothing changed — if {liqStore} now holds less of any of these items than this bill added (bottles
+                  have moved to a floor bar, a sale or an adjustment), if {liqStore} has counted any of these items on or after the bill date,
+                  or if the store rows no longer match what the bill recorded. Correct the stock with an Adjustment on Inventory → Liquor Store instead.
+                </div>
+              </div>
+              <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 space-y-0.5">
+                <div className="flex flex-wrap gap-x-3">
+                  <span><b>Supplier:</b> {g.vendor || '—'}</span>
+                  <span><b>Indent no.:</b> {g.invoice_number || '—'}</span>
+                </div>
+                <div className="flex flex-wrap gap-x-3">
+                  <span><b>Receipt date:</b> {g.date}</span>
+                  <span><b>Lines:</b> {Number(g.liquor?.line_count) || 0}</span>
+                  <span><b>Net Indent:</b> {fmt(Number(g.liquor?.net_indent_value) || 0)}</span>
+                </div>
+                {liqLines.length > 0 && (
+                  <div className="pt-1 text-[10px]">
+                    <span className="text-[#8B7355]">Comes back out: </span>
+                    {liqLines.map(ln => `${ln.material_name} ${liqQty(ln.material_id, Number(ln.purchase_qty) || 0, Number(ln.recipe_qty) || 0)}`).join('; ')}
+                  </div>
+                )}
+              </div>
+              {err && (
+                <div className="text-red-700 bg-red-50 border border-red-200 rounded p-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-4 h-4 shrink-0" /> <span>{err}</span>
+                </div>
+              )}
+              <label className="flex flex-col gap-1 text-[#6B5744]">
+                Reason <span className="text-red-600">*</span>
+                <input value={reason} onChange={e => { setReason(e.target.value); if (err) setErr(''); }}
+                       autoFocus placeholder="e.g. indent entered against the wrong store — re-entering"
+                       className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+                <span className="text-[10px] text-[#8B7355]">Shown on the voided row and stored in the audit trail.</span>
+              </label>
+            </>
+          ) : result && (result.liquor || liquor) ? (
+            <>
+              <div className="rounded-lg border border-[#B8A590] bg-[#EFE7DE] p-3 text-[#6B5744] space-y-1">
+                <div className="font-semibold text-[#2D1B0E]">
+                  {result.voided_by || result.voided_at
+                    ? voidedBadgeText({ voided_by: result.voided_by, voided_at: result.voided_at })
+                    : `${result.grn_number || g.grn_number} voided`}
+                </div>
+                {Array.isArray(result.bottles_removed) && result.bottles_removed.length > 0 && (
+                  <div>
+                    Taken back out of {result.store?.name || liqStore}:{' '}
+                    {(result.bottles_removed as Array<{ material_id: string; material_name?: string; purchase_qty?: number; recipe_qty?: number }>)
+                      .map(b => `${b.material_name || ''} ${liqQty(b.material_id, Number(b.purchase_qty) || 0, Number(b.recipe_qty) || 0)}`).join('; ')}.
+                  </div>
+                )}
+              </div>
+              {result.notice && <div className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">{result.notice}</div>}
+            </>
+          ) : !result ? (
             <>
               {/* NOT "Are you sure?". This is the list of things that are about
                   to happen to live inventory and live cost, in the order they
@@ -7416,7 +8133,7 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
               <button onClick={submit} disabled={busy || !reason.trim()}
                       className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                {busy ? 'Reversing…' : 'Reverse stock & void'}
+                {busy ? 'Reversing…' : liquor ? `Take the bottles out of ${liqStore} & void` : 'Reverse stock & void'}
               </button>
             </>
           ) : (

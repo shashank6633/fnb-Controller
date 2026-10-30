@@ -1,6 +1,13 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } from '@/lib/auth';
-import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
+// TGBCL LIQUOR BILLS ON THIS SCREEN (owner rulings #83 / #84): a bill whose
+// lines belong to a store location is routed WHOLE to the store rail — ledger
+// rows + TGBCL charges, no `purchases`, no GRN lines, no central stock. The
+// central path below never sees such a line. See src/lib/liquor-grn.ts.
+import {
+  classifyGrnLines, receiveLiquorGrn, liquorGrnStores, readStoreBill, summariseStoreBill,
+} from '@/lib/liquor-grn';
 // THE house purchase→recipe converter, and the ONLY one. The back-correction
 // floor below weighs a PURCHASE-unit line against a RECIPE-unit balance, and it
 // must use the very factor the bump site uses or the two disagree.
@@ -399,6 +406,15 @@ export async function GET(request: Request) {
         next_cash_voucher: mayRecord ? mintCashVoucherNo(db) : '',
       });
     }
+    /* ── THE TGBCL LIQUOR BILL OPTION ────────────────────────────────────────
+     * Which store locations this screen may offer a liquor bill for, with the
+     * caller's own access to each, the categories it owns (the form filters
+     * its material list by them) and its recent suppliers. ADVISORY like the
+     * cash option above: POST re-derives store access from the session and
+     * fails closed. Only active stores that own at least one category. */
+    if (url.searchParams.get('liquor_option') === '1') {
+      return Response.json({ stores: liquorGrnStores(db, me) });
+    }
     const id = url.searchParams.get('id');
     if (id) {
       const grn = db.prepare(`
@@ -479,8 +495,13 @@ export async function GET(request: Request) {
           before: parse(r.before_json), after: parse(r.after_json),
         }));
       }
+      // A TGBCL LIQUOR GRN has no line rows (items is []): its lines are the
+      // frozen bill document, shipped parsed as grn.liquor. The raw JSON column
+      // never goes on the wire, on either kind of receipt.
+      const liquor = readStoreBill(grn);
+      delete grn.store_bill_json;
       return Response.json({
-        grn: { ...stripEditStamps(grn, isAdmin), items },
+        grn: { ...stripEditStamps(grn, isAdmin), items, liquor },
         is_admin: isAdmin,
         can_amend: canAmend,
         edit_history: editHistory,
@@ -678,6 +699,13 @@ export async function GET(request: Request) {
     // Delete control and the "edited" hint without a second /api/auth/me round
     // trip; it is advisory for the UI only — every write re-checks the role
     // server-side and fails closed.
+    // row.liquor: a TGBCL liquor GRN's summary (store, PINV, line count,
+    // invoice and Net Indent) from its frozen document — null on every central
+    // receipt. The raw JSON column itself never goes on the wire.
+    for (const r of rows) {
+      r.liquor = summariseStoreBill(r);
+      delete r.store_bill_json;
+    }
     return Response.json({ grns: rows.map(r => stripEditStamps(r, isAdmin)), is_admin: isAdmin, can_amend: canAmend });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
@@ -864,13 +892,12 @@ export async function POST(request: Request) {
     // single delivered item.
     // PLACED HERE, on the raw payload, with the other shape checks and BEFORE
     // the store-mapped split below, for two reasons. The "Line N" in the message
-    // then names the caller's own row — checking the filtered `receivable` list
-    // instead would silently renumber it past any store-blocked line and send a
-    // storekeeper to the wrong row. And a repeated material is a defect in the
-    // payload the caller authored, true independently of which lines turn out to
-    // be store-mapped. The two can never disagree about WHAT a duplicate is:
-    // centralFlowBlock keys on the material, so two lines for one material are
-    // always both blocked or both receivable.
+    // then names the caller's own row. And a repeated material is a defect in
+    // the payload the caller authored, true independently of which door the
+    // bill turns out to belong to — so it covers a TGBCL liquor bill (routed
+    // to the store rail below) exactly as it covers a Central Store bill. The
+    // split keys on the material too (classifyGrnLines), so two lines for one
+    // material always land on the same side.
     const dupLine = duplicateLineError(items);
     if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
 
@@ -945,21 +972,41 @@ export async function POST(request: Request) {
       return it;
     });
 
-    // Phase B store guard (batch endpoint → skip + report per line, never fail
-    // the whole GRN): store-mapped materials (liquor) can't be received into
-    // Central stock — they're procured on the store ledger instead.
-    const storeBlocked: { material_id: string; error: string }[] = [];
-    const receivable = normalised.filter((it: any) => {
-      const msg = centralFlowBlock(db, String(it.material_id || ''));
-      if (msg) { storeBlocked.push({ material_id: it.material_id, error: msg }); return false; }
-      return true;
-    });
-    if (receivable.length === 0) {
-      return Response.json({
-        error: `No receivable lines — ${storeBlocked.length} store-mapped line(s) blocked. ${storeBlocked[0]?.error || ''}`,
-        store_blocked: storeBlocked,
-      }, { status: 400 });
+    /* ═══════════════════════════════════════════════════════════════════════
+     * TGBCL LIQUOR BILLS — ONE DOOR PER INDENT (owner rulings #83 / #84)
+     * ═══════════════════════════════════════════════════════════════════════
+     * This used to SKIP store-mapped lines and report them in `store_blocked`,
+     * saving the rest of the bill. Liquor bills are now entered HERE, on the
+     * TGBCL Liquor Bill form, so a bill carrying any store-mapped line goes to
+     * the store rail as a whole (src/lib/liquor-grn.ts): ledger 'purchase'
+     * rows + store_bill_charges in one transaction, the GRN header kept for the
+     * number and the document — and NOTHING below this block runs for it (no
+     * `purchases`, no goods_receipt_note_items, no stock bump, no average
+     * price, no QC gate, no petty cash). A bill MIXING liquor and Central Store
+     * lines is refused there, so the two halves are saved as two receipts.
+     *
+     * Classified on the RAW `items`, not `normalised`: the CASE expansion above
+     * rewrites quantity_received / unit_price for entry_mode 'case', which the
+     * liquor form never sends and the store rail never reads.
+     *
+     * Every check above (date window, one material = one line, the bill-number
+     * mandate, the cash gates) has already run for both kinds of bill.
+     */
+    // `liquor: true` (the TGBCL Liquor Bill form) always takes the store
+    // branch, so a liquor-shaped payload can never fall through to central.
+    const lineClass = classifyGrnLines(db, items as any[]);
+    if (lineClass.store_ids.size > 0 || b?.liquor === true) {
+      const out = receiveLiquorGrn(db, {
+        me, body: b, items: items as any[], cls: lineClass, outletId,
+        date: String(date), vendor, invoiceNumber: invoice_number, paidInCash, noBill,
+      });
+      return Response.json(out.body, { status: out.status });
     }
+    // A Central Store bill: every line is receivable, exactly as before for a
+    // bill with no store-mapped line. `store_blocked` stays on the response as
+    // an always-empty array for the clients that read it.
+    const storeBlocked: { material_id: string; error: string }[] = [];
+    const receivable = normalised;
 
     // Per-line GST, as a PERCENT (5 | 12 | 18 …). Validated HERE, before the
     // transaction opens, because a Response cannot be returned from inside
@@ -1206,6 +1253,11 @@ export async function POST(request: Request) {
     // SAME-DATE MATCHES FIRST, so the hard refusal always wins over the
     // confirmable one when a vendor has used this number on several days
     // including today.
+    // A TGBCL LIQUOR GRN (store_dest_id set) IS NOT IN THIS GUARD. One paper
+    // bill that carried both liquor and Central Store lines is saved as two
+    // receipts under ONE vendor bill number (the liquor half on TGBCL Liquor
+    // Bill, this half here); the liquor half has its own hard, cross-rail
+    // indent guard in src/lib/liquor-grn.ts.
     const dupBill = !billNo ? null : db.prepare(`
       SELECT grn_number, date, status, received_by
         FROM goods_receipt_notes
@@ -1213,6 +1265,7 @@ export async function POST(request: Request) {
          AND LOWER(TRIM(COALESCE(vendor, '')))         = ?
          AND COALESCE(outlet_id, '') = COALESCE(?, '')
          AND status <> 'void'
+         AND COALESCE(store_dest_id, '') = ''
        ORDER BY CASE WHEN date = ? THEN 0 ELSE 1 END, created_at ASC
        LIMIT 1
     `).get(billNo.toLowerCase(), vendorKey, outletId, date) as any;
@@ -1944,9 +1997,10 @@ export async function POST(request: Request) {
         const hasGst = gstProvided(it);
         // LIQUOR IS ZERO-RATED — its duty rides on the TGBCL bill (excise / cess
         // / TCS), never on GST, so a credit here would be claimed twice.
-        // centralFlowBlock already dropped these lines from `receivable`, so in
+        // classifyGrnLines already sent any bill with a store-mapped line to the
+        // store rail (src/lib/liquor-grn.ts, GST forced to 0 there), so in
         // practice this never fires; it is the second lock, mirroring
-        // receive/route.ts. If that guard is ever relaxed per-category, a client
+        // receive/route.ts. If that split is ever relaxed per-category, a client
         // sending 18% still must not write a credit the TGBCL charges carry.
         const gstRate = (!hasGst || isStoreMappedMaterial(db, String(it.material_id || '')))
           ? 0 : Number(it.gst_rate);
@@ -2564,12 +2618,12 @@ export async function POST(request: Request) {
                            cash_voucher_no: cashVoucherIssued || undefined,
                            cash_entry_id: cashRowId || undefined,
                            cash_warning: cashWarning || undefined,
-                           // ⚠ store_blocked above is NOT only a held-panel field.
-                           // A liquor line is filtered out of a receipt that
-                           // otherwise SUCCEEDS, so a form that renders this array
-                           // only inside the QC-hold panel drops a line off the
-                           // bill without a word. It must be shown on the success
-                           // path too.
+                           // store_blocked above is ALWAYS [] on this path now: a
+                           // bill carrying any store-mapped (liquor) line no
+                           // longer reaches here — it is posted whole to the store
+                           // rail, or refused as a mixed bill, by the TGBCL block
+                           // near the top of this handler. Kept for the clients
+                           // that read the field.
                          }, { status: 201 });
   } catch (e: any) {
     console.error('[grn POST]', e);

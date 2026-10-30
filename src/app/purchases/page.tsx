@@ -881,7 +881,7 @@ export default function PurchasesPage() {
       ['date', 'optional', 'DD-MM-YYYY, DD/MM/YYYY or YYYY-MM-DD. Defaults to today. Non-admins cannot backdate beyond the allowed window or use future dates.'],
       ['notes', 'optional', 'Any remark.'],
       ['', '', ''],
-      ['NOTE', '', 'Liquor / store-mapped items are NOT imported here — use the Liquor Store flow. They are reported as skipped, the batch still succeeds.'],
+      ['NOTE', '', 'Liquor / store-mapped items are NOT imported here — their bill is entered on Goods Receipt (GRN) → TGBCL Liquor Bill. They are reported as skipped, the batch still succeeds.'],
       ['NOTE', '', 'Accepts .xlsx, .xls or .csv. Delete the two sample rows before uploading.'],
     ];
     const wsHelp = XLSX.utils.aoa_to_sheet(help);
@@ -1887,7 +1887,7 @@ export default function PurchasesPage() {
                             ))}
                           </div>
                           <p className="text-[10px] text-[#8B7355] mt-1">
-                            Fix the flagged items (or move liquor to Inventory → Liquor Store), then re-upload the downloaded file — already-uploaded rows are auto-skipped, so nothing doubles.
+                            Fix the flagged items (enter liquor on Goods Receipt (GRN) → TGBCL Liquor Bill instead), then re-upload the downloaded file — already-uploaded rows are auto-skipped, so nothing doubles.
                           </p>
                         </div>
                       ) : bulkResult.errors.length > 0 ? (

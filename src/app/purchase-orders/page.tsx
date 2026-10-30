@@ -1867,7 +1867,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         alert(
           `${j.store_blocked.length} line(s) were NOT received:\n` +
           j.store_blocked.map((b: any) => `• ${b.material_name} — ${b.error}`).join('\n') +
-          '\n\nThese must be procured through Inventory → Liquor Store instead.'
+          '\n\nEnter their bill on Goods Receipt (GRN) → TGBCL Liquor Bill instead.'
         );
       }
       // Off-PO acknowledgement — show the receiver that the admin has been

@@ -1,33 +1,29 @@
-import { getDb, logAuditEvent } from '@/lib/db';
+import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { getStoreById, materialStoreId, postLedger, userStoreAccess,
-         invoiceRefHasPurchases, upsertBillCharges, normalizeBillCharges } from '@/lib/store-engine';
-import { caseFactor, packFactor, tripleToRecipe } from '@/lib/pack-units';
+import { getStoreById } from '@/lib/store-engine';
 
 /**
- * POST /api/stores/[id]/procure-bill — BULK bill entry: one supplier invoice
- * with many lines, posted as one 'purchase' ledger row PER LINE in a single
- * transaction (all-or-nothing — a supplier bill must never half-post).
- * Gate: userStoreAccess(...).can_procure. Same central-isolation as /procure.
+ * POST /api/stores/[id]/procure-bill — RETIRED (owner rulings #83/#84, the
+ * liquor-on-GRN switch-over). ONE door per indent.
  *
- * body: {
- *   supplier            — bill header (required unless vendor_id resolves one),
- *   invoice_ref         — REQUIRED: shared ledger `ref`, the bill grouping key,
- *   vendor_id?, date? (YYYY-MM-DD backdate),
- *   lines: [{
- *     material_id,
- *     cases?, bottles?, loose?   — bar counting convention (blank = 0):
- *                                  recipe qty = cases×case_size×pack + bottles×pack + loose,
- *     unit_price                 — ₹ per BOTTLE (purchase unit)…
- *     per_case?                  — …or per CASE when true (÷ case_size),
- *     batch_no?, expiry_date?,
- *   }]
- * }
+ * This was Liquor Store → "New Bill": one supplier invoice, many lines, posted
+ * as one store_stock_ledger 'purchase' row PER LINE (ref = invoice no,
+ * unit_cost = gross ₹/bottle ÷ pack, per-line discount / delivery recorded
+ * only) plus upsertBillCharges for the TGBCL charges, all in one transaction —
+ * never a purchases row, central stock or average_price.
  *
- * Every line is validated (exists + mapped to this store + qty > 0) BEFORE any
- * write; any bad line rejects the whole bill with a per-line error message.
- * → { ok, posted, total_value, skipped: [], lines: [{material_id, ledger_id,
- *      recipe_qty, unit_cost, line_total}] }
+ * TGBCL liquor bills are now entered on Goods Receipt (GRN) → TGBCL Liquor Bill
+ * (POST /api/grn with liquor:true), which writes those same per-line rows with
+ * the same values and calls the same upsertBillCharges in the same transaction,
+ * so every Liquor Store report keeps reading one shape. This POST answers, after
+ * sign-in and the store lookup:
+ *   410 { error, retired: true, use: '/grn?liquor=1' }
+ * Nothing is read from the body and nothing is written. The pre-switch-over
+ * body is in git history (0d32f2b).
+ *
+ * Bills recorded here before the switch-over stay on every Liquor Store tab and
+ * report. Transfers, closing counts, adjustments, opening stock and migration
+ * are separate routes and are unchanged.
  */
 export const dynamic = 'force-dynamic';
 
@@ -41,176 +37,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const store = getStoreById(db, storeId);
     if (!store) return Response.json({ error: 'Store not found' }, { status: 404 });
 
-    const access = userStoreAccess(db, user, storeId);
-    if (!access.can_procure) {
-      return Response.json({ error: `You are not authorized to procure for ${store.name}` }, { status: 403 });
-    }
-
-    const b = await request.json();
-    const invoiceRef = String(b.invoice_ref || '').trim();
-    if (!invoiceRef) return Response.json({ error: 'invoice_ref is required (the bill / invoice number)' }, { status: 400 });
-
-    // Idempotency: a bill with this invoice number is already in the ledger.
-    // Block the whole save so the same invoice can never be posted twice
-    // (double-counting stock). The client shows this as "already uploaded".
-    if (invoiceRefHasPurchases(db, storeId, invoiceRef)) {
-      return Response.json({
-        error: `Invoice "${invoiceRef}" is already recorded for ${store.name} — it was uploaded earlier. Duplicate bills are blocked to avoid double-counting stock. Use a different invoice number, or check the ledger.`,
-        duplicate: true,
-      }, { status: 409 });
-    }
-
-    // Optional bill-level charges (TGBCL: MRP rounding, excise turnover tax,
-    // special excise cess, TCS). Recorded only — they never change unit_cost.
-    const charges = normalizeBillCharges(b.charges);
-    const hasCharges = !!b.charges && typeof b.charges === 'object';
-
-    let vendorId = String(b.vendor_id || '').trim();
-    let supplier = String(b.supplier || '').trim();
-    if (vendorId) {
-      const v = db.prepare('SELECT id, name FROM vendors WHERE id = ?').get(vendorId) as any;
-      if (!v) return Response.json({ error: 'Unknown vendor_id' }, { status: 400 });
-      if (!supplier) supplier = v.name;
-    }
-    if (!supplier) return Response.json({ error: 'supplier is required' }, { status: 400 });
-
-    const date = String(b.date || '').trim();
-    const backdate = /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
-
-    if (!Array.isArray(b.lines) || b.lines.length === 0) {
-      return Response.json({ error: 'lines array is required (at least one bill line)' }, { status: 400 });
-    }
-
-    // ── Validate EVERY line before writing anything ──
-    const prepared: {
-      material_id: string; name: string; unit: string; purchase_unit: string;
-      cases: number; bottles: number; loose: number;
-      recipe_qty: number; unit_cost: number; price_per_bottle: number;
-      line_total: number; batch_no: string; expiry_date: string;
-      discount: number; cgst: number; sgst: number; delivery_charges: number;
-    }[] = [];
-    for (let i = 0; i < b.lines.length; i++) {
-      const line = b.lines[i] || {};
-      const at = `Line ${i + 1}`;
-      const materialId = String(line.material_id || '').trim();
-      if (!materialId) return Response.json({ error: `${at}: material_id is required` }, { status: 400 });
-      const mat = db.prepare(`
-        SELECT id, name, category, unit, purchase_unit, pack_size, case_size
-        FROM raw_materials WHERE id = ?
-      `).get(materialId) as any;
-      if (!mat) return Response.json({ error: `${at}: material not found` }, { status: 400 });
-      if (materialStoreId(db, mat) !== storeId) {
-        return Response.json({
-          error: `${at}: "${mat.name}" is not a ${store.name} material — its category "${mat.category}" is not mapped to this store (Settings → Store Locations)`,
-        }, { status: 400 });
-      }
-      const num = (v: any) => (v === undefined || v === null || v === '') ? 0 : Number(v);
-      const cases = num(line.cases), bottles = num(line.bottles), loose = num(line.loose);
-      if (![cases, bottles, loose].every(v => Number.isFinite(v) && v >= 0)) {
-        return Response.json({ error: `${at} (${mat.name}): cases, bottles and loose must be numbers ≥ 0` }, { status: 400 });
-      }
-      const recipeQty = tripleToRecipe(cases, bottles, loose, mat);
-      if (!(recipeQty > 0)) {
-        return Response.json({ error: `${at} (${mat.name}): enter a quantity — cases, bottles and/or loose` }, { status: 400 });
-      }
-      const rawPrice = Number(line.unit_price);
-      if (!Number.isFinite(rawPrice) || rawPrice < 0) {
-        return Response.json({ error: `${at} (${mat.name}): unit_price must be a number ≥ 0` }, { status: 400 });
-      }
-      const cf = caseFactor(mat);
-      const pricePerBottle = line.per_case ? rawPrice / cf : rawPrice;
-      const pf = packFactor(mat);
-      const unitCost = pf > 1 ? pricePerBottle / pf : pricePerBottle;   // ₹/recipe unit
-      prepared.push({
-        material_id: materialId, name: mat.name, unit: mat.unit,
-        purchase_unit: mat.purchase_unit || mat.unit,
-        cases, bottles, loose,
-        recipe_qty: recipeQty, unit_cost: unitCost, price_per_bottle: pricePerBottle,
-        line_total: Math.round(recipeQty * unitCost * 100) / 100,
-        batch_no: String(line.batch_no || '').trim(),
-        expiry_date: String(line.expiry_date || '').trim(),
-        // Per-line inward charges (recorded only, ≥ 0).
-        discount: Math.max(0, num(line.discount)), cgst: Math.max(0, num(line.cgst)),
-        sgst: Math.max(0, num(line.sgst)), delivery_charges: Math.max(0, num(line.delivery_charges)),
-      });
-    }
-
-    // ── ONE transaction: a ledger 'purchase' row per line, shared header ──
-    const ledgerIds: string[] = [];
-    const backdateStmt = db.prepare(`
-      UPDATE store_stock_ledger SET created_at = ? || ' ' || strftime('%H:%M:%S', 'now') WHERE id = ?
-    `);
-    const totalValue = Math.round(prepared.reduce((s, p) => s + p.line_total, 0) * 100) / 100;
-    let billCharges: any = null;
-    const txn = db.transaction(() => {
-      for (const p of prepared) {
-        const id = postLedger(db, {
-          store_id: storeId,
-          material_id: p.material_id,
-          txn_type: 'purchase',
-          quantity: p.recipe_qty,
-          unit_cost: p.unit_cost,
-          batch_no: p.batch_no,
-          supplier,
-          vendor_id: vendorId,
-          expiry_date: p.expiry_date,
-          ref: invoiceRef,
-          notes: '',
-          created_by: user.email,
-          discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
-        });
-        if (backdate) backdateStmt.run(backdate, id);
-        ledgerIds.push(id);
-      }
-      // Record bill-level charges (invoice_value = Σ line amounts). Only when the
-      // client sent a charges object — same transaction as the ledger posts so
-      // a bill's lines and its charges are all-or-nothing together.
-      if (hasCharges) {
-        billCharges = upsertBillCharges(db, {
-          store_id: storeId, invoice_ref: invoiceRef, supplier, date: backdate || '',
-          invoice_value: totalValue, charges, created_by: user.email,
-        });
-      }
-    });
-    txn();
-
-    logAuditEvent(db, {
-      event_type: 'store.procure_bill',
-      entity_type: 'store_stock_ledger',
-      entity_id: invoiceRef,
-      actor_email: user.email,
-      after: {
-        store_id: storeId, store: store.name,
-        invoice_ref: invoiceRef, supplier, vendor_id: vendorId,
-        date: backdate || undefined,
-        lines: prepared.map((p, i) => ({
-          ledger_id: ledgerIds[i], material_id: p.material_id, material: p.name,
-          cases: p.cases, bottles: p.bottles, loose: p.loose,
-          recipe_qty: p.recipe_qty, recipe_unit: p.unit,
-          price_per_bottle: p.price_per_bottle, unit_cost: p.unit_cost,
-          line_total: p.line_total,
-          batch_no: p.batch_no, expiry_date: p.expiry_date,
-        })),
-        total_value: totalValue,
-        bill_charges: billCharges || undefined,
-      },
-      note: `${store.name}: bill ${invoiceRef} from ${supplier} — ${prepared.length} line(s), ₹${totalValue}`
-        + (billCharges ? ` (Net Indent ₹${billCharges.net_indent_value})` : ''),
-    });
-
     return Response.json({
-      ok: true,
-      posted: prepared.length,
-      total_value: totalValue,
-      bill_charges: billCharges || null,
-      skipped: [],
-      lines: prepared.map((p, i) => ({
-        material_id: p.material_id, ledger_id: ledgerIds[i],
-        recipe_qty: p.recipe_qty, unit_cost: p.unit_cost, line_total: p.line_total,
-      })),
-    }, { status: 201 });
-  } catch (e: any) {
+      error: `New liquor bills are no longer entered here. Enter the bill on Goods Receipt (GRN) → TGBCL Liquor Bill: it records the GRN and posts the bottles straight into ${store.name} with the TGBCL charges and Net Indent. Bills already recorded here stay on the ${store.name} reports, and transfers, closing and adjustments work as before.`,
+      retired: true,
+      use: '/grn?liquor=1',
+    }, { status: 410 });
+  } catch (e: unknown) {
     console.error('[/api/stores/[id]/procure-bill POST]', e);
-    return Response.json({ error: e.message }, { status: 500 });
+    return Response.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
   }
 }
