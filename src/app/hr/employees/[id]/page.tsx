@@ -32,12 +32,14 @@
  *    auto-creatable anywhere: that tree is shared with requisitions, closing
  *    stock, variance and dept-stock, where a typo pollutes load-bearing
  *    operational data — create those on the Departments page first.
- *  - Salary / Documents / Disciplinary are admin-only surfaces: gated
- *    client-side via /api/auth/me + canAdminHr with a plain lock card for
- *    everyone else — and every backing API re-checks canAdminHr server-side
+ *  - Salary / Documents / Disciplinary are canHrFull surfaces (admin, or a
+ *    management role holding "Full HR access" — owner ruling #90): gated
+ *    client-side via /api/auth/me + canHrFull with a plain lock card for
+ *    everyone else — and every backing API re-checks canHrFull server-side
  *    (hiding is UX, not the boundary). Bank LISTS for management with the
- *    account number masked SERVER-side unless the caller is admin
- *    (can_view_full on the wire); add/edit/verify are admin actions.
+ *    account number masked SERVER-side unless the caller passes canHrFull
+ *    (can_view_full on the wire); add/edit/verify are canHrFull actions.
+ *    Designation CREATION stays canAdminHr (HR Settings is admin-only).
  *  - Advances / Assets are read-only history views here (decisions live on
  *    their own admin surfaces); Assets expands a per-asset movement ledger
  *    on demand via GET /api/hr/assets?id=.
@@ -88,6 +90,7 @@ import {
   assetKindMeta,
   assetStatusMeta,
   canAdminHr,
+  canHrFull,
   disciplinaryKindMeta,
   docTypeMeta,
   employeeStatusMeta,
@@ -451,14 +454,18 @@ export default function EmployeeProfilePage() {
 
   /* ---- Phase 4/6 tabs: session tier + lazy per-tab state ---- */
 
-  // Who am I — Salary / Documents / Disciplinary are admin-only surfaces; the
-  // backing APIs re-check canAdminHr server-side (hiding is UX, not the
-  // boundary), and Bank shows admin actions only to admins.
+  // Who am I — Salary / Documents / Disciplinary are canHrFull surfaces
+  // (admin, or a "Full HR access" role — ruling #90); the backing APIs
+  // re-check canHrFull server-side (hiding is UX, not the boundary), and Bank
+  // shows its add/edit/verify actions only to canHrFull. isAdmin (canAdminHr)
+  // is kept ONLY for creating designations — an HR Settings master that
+  // stays admin-only.
   const [me, setMe] = useState<SessionUser | null>(null);
   const [meLoaded, setMeLoaded] = useState(false);
   const isAdmin = canAdminHr(me);
+  const hrFull = canHrFull(me);
 
-  // Salary (admin-only; rows === null means "not fetched yet")
+  // Salary (canHrFull; rows === null means "not fetched yet")
   const [salRows, setSalRows] = useState<SalaryRow[] | null>(null);
   const [salLoading, setSalLoading] = useState(false);
   const [salErr, setSalErr] = useState<string | null>(null);
@@ -484,7 +491,7 @@ export default function EmployeeProfilePage() {
   /** Row id with a verify/reject PATCH in flight. */
   const [bankVerifyBusy, setBankVerifyBusy] = useState<string | null>(null);
 
-  // Documents (admin-only)
+  // Documents (canHrFull)
   const [docRows, setDocRows] = useState<DocRow[] | null>(null);
   const [docLoading, setDocLoading] = useState(false);
   const [docErr, setDocErr] = useState<string | null>(null);
@@ -498,7 +505,8 @@ export default function EmployeeProfilePage() {
   const [docSaving, setDocSaving] = useState(false);
   const [docModalErr, setDocModalErr] = useState<string | null>(null);
 
-  // Advances (read-only history — decisions live on their own admin surface)
+  // Advances (read-only history — GET is canHrFull, so anyone else gets the
+  // API's 403 in the tab banner; decisions live on /hr/payroll)
   const [advRows, setAdvRows] = useState<AdvanceRow[] | null>(null);
   const [advLoading, setAdvLoading] = useState(false);
   const [advErr, setAdvErr] = useState<string | null>(null);
@@ -513,7 +521,7 @@ export default function EmployeeProfilePage() {
     Record<string, { loading: boolean; err: string | null; rows: AssetHistRow[] | null }>
   >({});
 
-  // Disciplinary (admin-only)
+  // Disciplinary (canHrFull)
   const [discRows, setDiscRows] = useState<DiscRow[] | null>(null);
   const [discLoading, setDiscLoading] = useState(false);
   const [discErr, setDiscErr] = useState<string | null>(null);
@@ -1080,19 +1088,19 @@ export default function EmployeeProfilePage() {
     }
   }, [id]);
 
-  // Lazy fetch on first open. Admin-only tabs wait for /api/auth/me and never
-  // fire for non-admins (they render a lock card instead — and the API would
+  // Lazy fetch on first open. canHrFull tabs wait for /api/auth/me and never
+  // fire for anyone else (they render a lock card instead — and the API would
   // 403 anyway; the server is the boundary).
   useEffect(() => {
     if (!id) return;
-    if (tab === 'salary' && meLoaded && isAdmin && salRows === null && !salLoading) loadSalary();
+    if (tab === 'salary' && meLoaded && hrFull && salRows === null && !salLoading) loadSalary();
     else if (tab === 'bank' && bankRows === null && !bankLoading) loadBank();
-    else if (tab === 'documents' && meLoaded && isAdmin && docRows === null && !docLoading) loadDocs();
+    else if (tab === 'documents' && meLoaded && hrFull && docRows === null && !docLoading) loadDocs();
     else if (tab === 'advances' && advRows === null && !advLoading) loadAdvances();
     else if (tab === 'assets' && assetRows === null && !assetLoading) loadAssets();
-    else if (tab === 'disciplinary' && meLoaded && isAdmin && discRows === null && !discLoading) loadDisciplinary();
+    else if (tab === 'disciplinary' && meLoaded && hrFull && discRows === null && !discLoading) loadDisciplinary();
   }, [
-    tab, id, meLoaded, isAdmin,
+    tab, id, meLoaded, hrFull,
     salRows, salLoading, loadSalary,
     bankRows, bankLoading, loadBank,
     docRows, docLoading, loadDocs,
@@ -2052,9 +2060,9 @@ export default function EmployeeProfilePage() {
               </div>
             )}
 
-            {/* ---- Salary (admin-only surface; APIs re-check server-side) ---- */}
+            {/* ---- Salary (canHrFull surface; APIs re-check server-side) ---- */}
             {tab === 'salary' && (
-              meLoaded && !isAdmin ? (
+              meLoaded && !hrFull ? (
                 <LockCard name="Salary" />
               ) : salErr ? (
                 <TabErrorBanner msg={salErr} onRetry={loadSalary} />
@@ -2156,7 +2164,7 @@ export default function EmployeeProfilePage() {
               )
             )}
 
-            {/* ---- Bank (management sees the masked list; admin actions) ---- */}
+            {/* ---- Bank (management sees the masked list; canHrFull actions) ---- */}
             {tab === 'bank' && (
               bankErr ? (
                 <TabErrorBanner msg={bankErr} onRetry={loadBank} />
@@ -2168,7 +2176,7 @@ export default function EmployeeProfilePage() {
                     <h2 className="font-bold text-[#2D1B0E] text-sm flex items-center gap-1.5">
                       <Landmark className="w-4 h-4 text-[#af4408]" /> Bank accounts
                     </h2>
-                    {isAdmin && (
+                    {hrFull && (
                       <button
                         onClick={openBankAdd}
                         className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium"
@@ -2179,7 +2187,7 @@ export default function EmployeeProfilePage() {
                   </div>
                   {!bankCanFull && bankRows.length > 0 && (
                     <p className="px-5 pt-3 text-[11px] text-[#8B7355]">
-                      Account numbers are masked — the full number is visible to admins only.
+                      Account numbers are masked — the full number is visible only to admins and roles with Full HR access.
                     </p>
                   )}
                   {bankRows.length === 0 ? (
@@ -2197,7 +2205,7 @@ export default function EmployeeProfilePage() {
                             <th className="text-left py-2 px-3 font-medium">Type</th>
                             <th className="text-left py-2 px-3 font-medium">Verification</th>
                             <th className="text-left py-2 px-3 font-medium">Active</th>
-                            {isAdmin && <th className="text-right py-2 px-3 font-medium">Actions</th>}
+                            {hrFull && <th className="text-right py-2 px-3 font-medium">Actions</th>}
                           </tr>
                         </thead>
                         <tbody>
@@ -2215,7 +2223,7 @@ export default function EmployeeProfilePage() {
                                 </div>
                               </td>
                               <td className="py-2 px-3 whitespace-nowrap">{row.is_active ? 'Yes' : 'No'}</td>
-                              {isAdmin && (
+                              {hrFull && (
                                 <td className="py-2 px-3 whitespace-nowrap text-right">
                                   <div className="inline-flex items-center gap-2">
                                     {bankVerifyBusy === row.id ? (
@@ -2261,9 +2269,9 @@ export default function EmployeeProfilePage() {
               )
             )}
 
-            {/* ---- Documents (admin-only surface; APIs re-check) ---- */}
+            {/* ---- Documents (canHrFull surface; APIs re-check) ---- */}
             {tab === 'documents' && (
-              meLoaded && !isAdmin ? (
+              meLoaded && !hrFull ? (
                 <LockCard name="Documents" />
               ) : docErr ? (
                 <TabErrorBanner msg={docErr} onRetry={loadDocs} />
@@ -2564,9 +2572,9 @@ export default function EmployeeProfilePage() {
               )
             )}
 
-            {/* ---- Disciplinary (the most restricted surface: admin-only) ---- */}
+            {/* ---- Disciplinary (the most restricted surface: canHrFull) ---- */}
             {tab === 'disciplinary' && (
-              meLoaded && !isAdmin ? (
+              meLoaded && !hrFull ? (
                 <LockCard name="Disciplinary" />
               ) : discErr ? (
                 <TabErrorBanner msg={discErr} onRetry={loadDisciplinary} />
@@ -2695,7 +2703,7 @@ export default function EmployeeProfilePage() {
           </div>
         )}
 
-        {/* Salary revise modal (admin-only surface; the POST re-checks server-side) */}
+        {/* Salary revise modal (canHrFull surface; the POST re-checks server-side) */}
         {reviseOpen && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
             <div
@@ -2783,7 +2791,7 @@ export default function EmployeeProfilePage() {
           </div>
         )}
 
-        {/* Bank add/edit modal (admin-only actions; PUT/POST re-check) */}
+        {/* Bank add/edit modal (canHrFull actions; PUT/POST re-check) */}
         {bankModal && bankDraft && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
             <div
@@ -2896,7 +2904,7 @@ export default function EmployeeProfilePage() {
           </div>
         )}
 
-        {/* Document upload modal (admin-only surface; the POST re-checks) */}
+        {/* Document upload modal (canHrFull surface; the POST re-checks) */}
         {docModal && (
           <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
             <div
@@ -3038,12 +3046,13 @@ function SaveBar({
   );
 }
 
-/** Plain admin-only lock message (the house 403 copy for adminOnly surfaces).
- *  Hiding is UX only — every backing API re-checks canAdminHr server-side. */
+/** Plain lock message for the canHrFull surfaces (admin, or a "Full HR
+ *  access" role — ruling #90). Hiding is UX only — every backing API
+ *  re-checks canHrFull server-side. */
 function LockCard({ name }: { name: string }) {
   return (
     <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-6 flex items-center gap-2 text-sm text-[#8B7355]">
-      <Lock className="w-4 h-4 shrink-0" /> {name} is admin-only.
+      <Lock className="w-4 h-4 shrink-0" /> {name} is limited to admins and roles with Full HR access.
     </div>
   );
 }

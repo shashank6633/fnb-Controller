@@ -1,7 +1,9 @@
 'use client';
 
 /**
- * HR — Payroll (Phase 4). adminOnly (page-catalog flag + every API re-checks).
+ * HR — Payroll (Phase 4). adminOnly + hrFullCap (page-catalog flags: admin, or
+ * a "Full HR access" role with the page ticked — owner ruling #90) + every API
+ * re-checks.
  *
  * Contract: docs/HRMS_DECISIONS.md §5 + owner spec §19. Three tabs:
  *  · Runs — period picker → Create draft → Compute (skipped-employees report
@@ -13,8 +15,8 @@
  *  · Statutory — effective-dated config rows (append-only: create / end /
  *    deactivate; rates are never edited in place).
  *
- * APIs (each verb re-gates on canAdminHr — this page renders the 403 as the
- * plain admin-only lock): /api/hr/payroll, /api/hr/advances, /api/hr/statutory.
+ * APIs (each verb re-gates on canHrFull — this page renders the 403 as the
+ * plain lock): /api/hr/payroll, /api/hr/advances, /api/hr/statutory.
  * Money renders ₹ via toLocaleString('en-IN'). Mutations go through
  * api()/apiJson() (CSRF); GETs are bare fetch. Dates render via fmtIST*.
  */
@@ -949,7 +951,7 @@ export default function HrPayrollPage() {
     }
   };
 
-  /* ── Lock screen (adminOnly) ─────────────────────────────────────────── */
+  /* ── Lock screen (canHrFull) ─────────────────────────────────────────── */
   if (locked) {
     return (
       <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
@@ -958,7 +960,7 @@ export default function HrPayrollPage() {
             <IndianRupee className="w-6 h-6" /> Payroll
           </h1>
           <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-6 text-sm text-[#6B5744]">
-            Payroll is admin-only.
+            Payroll is limited to admins and roles with Full HR access.
           </div>
         </div>
       </div>
@@ -1489,7 +1491,7 @@ export default function HrPayrollPage() {
                                   {configStateMismatch(c.state) === true && (
                                     <span
                                       className="ml-1.5 text-[9px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded-full font-medium align-middle"
-                                      title={`Payroll runs in ${orgState ? `“${orgState}”` : '(no payroll state set)'}, so this ${c.state} rate is NOT applied to any payslip. Set the payroll state in HR Settings — and match the spelling exactly, the comparison is case-sensitive.`}
+                                      title={`Payroll runs in ${orgState ? `“${orgState}”` : '(no payroll state set)'}, so this ${c.state} rate is NOT applied to any payslip. Set the payroll state in HR Settings (admin-only) — and match the spelling exactly, the comparison is case-sensitive.`}
                                     >
                                       other state — not applied
                                     </span>
@@ -1743,7 +1745,7 @@ export default function HrPayrollPage() {
                       Payroll runs in {orgState ? <b>{orgState}</b> : <b>no state yet</b>}, so a rate
                       scoped to “{statForm.state.trim()}” will be saved and shown Active but
                       {' '}<b>never applied</b>. Matching is exact and case-sensitive — correct the
-                      spelling here, or set the payroll state in HR Settings.
+                      spelling here, or set the payroll state in HR Settings (admin-only).
                     </p>
                   )
                 )}

@@ -131,8 +131,13 @@ export function isHrEmployeeStatus(key: string | null | undefined): key is HrEmp
  * Permissions (docs/HRMS_DECISIONS.md §2.6)
  * ------------------------------------------------------------------ */
 
-/** Subset of SessionUser the HR gates read; accepts a full SessionUser too. */
-type HrActor = Pick<SessionUser, 'role' | 'is_head_chef'>;
+/** Subset of SessionUser the HR gates read; accepts a full SessionUser too.
+ *  `can_full_hr_access` is optional so every existing caller (client pages
+ *  holding a narrow `me`, tests building a two-field actor) still type-checks;
+ *  ONLY canHrFull reads it, and it reads absent as "not held". */
+type HrActor = Pick<SessionUser, 'role' | 'is_head_chef'> & {
+  can_full_hr_access?: boolean | null;
+};
 
 /**
  * May view / manage the employee master and designations reads: admin tier,
@@ -147,12 +152,66 @@ export function canManageHr(me: HrActor | null | undefined): boolean {
 }
 
 /**
- * Admin-only HR actions: designation mutations, and (in later phases) salary,
- * bank, documents, payroll.
+ * STRICTLY ADMIN (role === 'admin'). Since owner ruling #90 (2026-10-29) this is
+ * the gate for HR SETTINGS ONLY — PUT /api/hr/settings, the Designations master
+ * (POST/PUT/DELETE /api/hr/designations) and the employee import's
+ * createDesignations flag — which stay admin even for a role holding
+ * "Full HR access". Every other formerly admin-only HR action (salary, bank,
+ * documents, payroll, advances, disciplinary, exits, geofences, biometric, and
+ * the admin decisions on leave / attendance corrections / roster / shifts /
+ * KPIs / tests) gates on canHrFull() below instead. Do NOT widen this function:
+ * widening an existing gate grants retroactively to every caller still on it.
  */
 export function canAdminHr(me: HrActor | null | undefined): boolean {
   if (!me) return false;
   return me.role === 'admin';
+}
+
+/**
+ * The Settings → Roles tick that carries ruling #90, word for word. Shared by
+ * the Roles editor and every screen that names the capability, so the label a
+ * user reads in a 403 is the label the admin ticked.
+ */
+export const HR_FULL_ACCESS_LABEL = 'Full HR access (all HR pages except HR Settings)';
+
+/**
+ * The 403 body every canHrFull-gated route returns. It MUST contain "Admin":
+ * hr/reports/page.tsx matches /admin/i on a refusal to decide that a report
+ * is admin-gated rather than broken.
+ */
+export const HR_FULL_DENIED = 'Admin or "Full HR access" role required';
+
+/**
+ * Admin, OR a management-tier user (Manager tier or HOD — exactly canManageHr)
+ * whose ASSIGNED, ACTIVE role carries `roles.can_full_hr_access` (owner ruling
+ * #90, 2026-10-29: the HR role gets every HR page and action except HR
+ * Settings).
+ *
+ * FAIL CLOSED on every axis:
+ *   · no actor → false;
+ *   · the capability is read with `=== true`, so absent / null / 0 / 1 / 'true'
+ *     never grant — only the boolean getCurrentUser resolves (auth.ts) does;
+ *   · a STAFF-tier role with the tick gets nothing: canManageHr must also hold,
+ *     the same tier rule as the page gate (page-catalog.ts hrFullCapOpens);
+ *   · getCurrentUser resolves the capability to false for a deactivated role
+ *     or a user with no role_id, so neither can pick it up here.
+ *
+ * This decides ACTIONS and data, at ROLE level. It never opens a page on its
+ * own — page access is page-catalog.ts's (the five flagged rows, and only when
+ * ticked) — and it does NOT read page ticks: a user whose personal page list
+ * hides the five pages still passes it if their role carries the tick. That
+ * is the frozen ruling-#90 contract and the same shape as every sibling gate:
+ * canManageHr (the HR employee APIs answer a manager whose page list hides
+ * /hr/employees) and the finance capability (finance-reports-access.ts →
+ * financeCapOpens, which reads the role column and the page FLAG, not the
+ * user's page map). The Settings → Roles help says so to the owner.
+ */
+export function canHrFull(
+  me: (Pick<SessionUser, 'role' | 'is_head_chef'> & { can_full_hr_access?: boolean | null }) | null | undefined,
+): boolean {
+  if (!me) return false;
+  if (me.role === 'admin') return true;
+  return canManageHr(me) && me.can_full_hr_access === true;
 }
 
 /* ------------------------------------------------------------------ *

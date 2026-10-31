@@ -10,8 +10,9 @@
  * button) is deferred with employee self-service by owner ruling §8.3 — this
  * page only maintains the fences that flow will evaluate against.
  *
- * The page is adminOnly via its page-catalog flag; the API re-checks
- * (GET canManageHr, mutations canAdminHr) and the 403 is surfaced as friendly
+ * The page is adminOnly + hrFullCap via its page-catalog flags (admin, or a
+ * "Full HR access" role with the page ticked — owner ruling #90); the API
+ * re-checks (GET canManageHr, mutations canHrFull) and the 403 is surfaced as friendly
  * copy instead of pretending the buttons will work. Soft delete only —
  * the Active toggle PUTs is_active; rows are never removed.
  *
@@ -137,7 +138,7 @@ export default function HrGeofencesPage() {
       if (!gRes.ok) {
         setError(
           gJson?.error ||
-            (gRes.status === 403 ? 'Geofences is admin-only.' : 'Could not load geofences.'),
+            (gRes.status === 403 ? 'Geofences is limited to admins and roles with Full HR access.' : 'Could not load geofences.'),
         );
         setGeofences(null);
         return;
@@ -181,7 +182,7 @@ export default function HrGeofencesPage() {
   }, [geofences, showInactive]);
 
   const friendly = (status: number, serverMsg: string | undefined, fallback: string): string => {
-    if (status === 403) return 'Only admins can change geofences — ask an admin to make this change.';
+    if (status === 403) return 'Only admins and roles with Full HR access can change geofences — ask one of them to make this change.';
     return serverMsg || fallback;
   };
 
@@ -312,7 +313,7 @@ export default function HrGeofencesPage() {
               <Radar className="w-6 h-6" /> Geofences
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
-              Location fences GPS check-ins evaluate against — one or more per outlet. Admin-only.
+              Location fences GPS check-ins evaluate against — one or more per outlet. Admins and roles with Full HR access.
             </p>
           </div>
           <button

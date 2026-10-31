@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, type HrGeofence } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, type HrGeofence } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -17,12 +17,12 @@ import { reportServerError } from '@/lib/error-alerts';
  *          API GETs — this check is the security boundary.
  * POST   /api/hr/geofences { name, outlet_id?, lat, lng, radius_m?,
  *          accuracy_threshold_m?, grace_seconds? } → { geofence }
- *          Admin only. outlet_id defaults to the caller's current outlet ONLY
+ *          Admin or "Full HR access" (canHrFull). outlet_id defaults to the caller's current outlet ONLY
  *          when the body key is absent (an explicit '' is stored as '').
- * PUT    /api/hr/geofences { id, ...fields } → { geofence }. Admin only.
+ * PUT    /api/hr/geofences { id, ...fields } → { geofence }. Admin or "Full HR access" (canHrFull).
  *          Partial update; every provided field re-validates.
  * DELETE /api/hr/geofences?id=   (id also accepted in a JSON body)
- *          → { ok: true }. Admin only. Soft deactivate (is_active = 0).
+ *          → { ok: true }. Admin or "Full HR access" (canHrFull). Soft deactivate (is_active = 0).
  *
  * Validation (400): lat ∈ [-90, 90], lng ∈ [-180, 180], radius_m > 0,
  * accuracy_threshold_m > 0, grace_seconds ≥ 0.
@@ -85,7 +85,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -153,7 +153,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }
@@ -217,7 +217,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, tasks/*); the module contract writes
   // DELETE { id }. Accept both so neither caller shape breaks.

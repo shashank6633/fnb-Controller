@@ -282,6 +282,21 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
       'it is the stamp proving WHEN the register\'s start date was fixed. A rewritable stamp is ' +
       'not evidence of anything, and the bill-handover screens show it to the owner as evidence.',
   }],
+  // THE SMARTOFFICE BIOMETRIC CONNECTOR'S STATE. Readable through its own gated
+  // route only (/api/hr/biometric/smartoffice — admin or "Full HR access"),
+  // never through this any-signed-in-user door. Measured 2026-10-29 (HR access
+  // escalation check): a plain STAFF session's GET /api/settings returned the
+  // connector's network address and the 30-minute auto-sync status row, whose
+  // last_message carries the failure text of whatever the address answered.
+  // The API key itself was already redacted by SECRET_KEY_RE ('api_key'); these
+  // four match nothing there. WRITES are unchanged — the hr_ prefix is owned by
+  // /api/hr/settings (OWNED_PREFIXES below), so this door was already shut to
+  // them; only the READ half is added. No screen reads these keys from here
+  // (grep: the Biometric page reads the connector route).
+  ['hr_smartoffice_base_url',  { read: 'admin' }],
+  ['hr_smartoffice_serials',   { read: 'admin' }],
+  ['hr_smartoffice_last_sync', { read: 'admin' }],
+  ['hr_smartoffice_auto_sync', { read: 'admin' }],
 ]);
 
 /**

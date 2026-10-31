@@ -3181,6 +3181,19 @@ function initializeSchema(db: Database.Database) {
     // tick in Settings → Roles, so the Store Manager can run the label printer). Off on
     // every role until the owner ticks it; an admin always may.
     if (!rCols.some((c: any) => c.name === 'can_manage_label_printer')) db.exec(`ALTER TABLE roles ADD COLUMN can_manage_label_printer INTEGER NOT NULL DEFAULT 0`);
+    // "Full HR access (all HR pages except HR Settings)" — owner ruling #90,
+    // 2026-10-29. Lifts the adminOnly tier on exactly five HR pages (Geofences,
+    // Biometric & Import, Payroll & Advances, Employee Documents, Disciplinary &
+    // Exits — the `hrFullCap` rows in page-catalog.ts) and the canHrFull() API
+    // gates behind them (src/lib/hr.ts), for a Manager-tier or HOD role. HR
+    // Settings and every non-HR admin surface stay admin-only. A BOOLEAN, like
+    // can_view_finance_reports above: the page set is a code constant, so it
+    // cannot be widened from the UI.
+    //
+    // DEFAULT 0 AND NO BACKFILL / SEED / UPDATE. Adding the column grants it to
+    // nobody — including the production "HR" role. The owner ticks it himself in
+    // Settings → Roles (roles are his; see check-boot-migrations.js).
+    if (!rCols.some((c: { name: string }) => c.name === 'can_full_hr_access')) db.exec(`ALTER TABLE roles ADD COLUMN can_full_hr_access INTEGER NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)

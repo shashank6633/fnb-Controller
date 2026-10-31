@@ -1,11 +1,12 @@
 'use client';
 
 /**
- * HR — Disciplinary & Exits (Phase 6). ADMIN-ONLY page.
+ * HR — Disciplinary & Exits (Phase 6). adminOnly + hrFullCap page (admin, or a
+ * "Full HR access" role with the page ticked — owner ruling #90).
  *
  * Contract: docs/HRMS_DECISIONS.md §2 (the API is the boundary — this page
- * renders only what canAdminHr lets through; a 403 renders the plain
- * admin-only lock copy). Three tabs:
+ * renders only what canHrFull lets through; a 403 renders the plain
+ * lock copy). Three tabs:
  *
  *  · Disciplinary — hr_disciplinary_records via /api/hr/disciplinary
  *    (employee filter + kind chips + open/closed chips + search; create/edit
@@ -663,14 +664,15 @@ export default function HrExitsPage() {
 
   /* ════════════════════════ Render ════════════════════════ */
 
-  // adminOnly lock — the catalog flag keeps non-admins off the page, and the
-  // API 403 keeps this honest even if a link slips through.
+  // Lock — the catalog flags keep everyone but admins and "Full HR access"
+  // roles off the page, and the API 403 keeps this honest even if a link
+  // slips through.
   if (locked) {
     return (
       <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-6 flex items-center gap-2 text-sm text-[#6B5744]">
-            <Lock className="w-4 h-4 shrink-0" /> Disciplinary &amp; Exits is admin-only.
+            <Lock className="w-4 h-4 shrink-0" /> Disciplinary &amp; Exits is limited to admins and roles with Full HR access.
           </div>
         </div>
       </div>
@@ -691,7 +693,7 @@ export default function HrExitsPage() {
               <ShieldAlert className="w-6 h-6" /> Disciplinary &amp; Exits
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
-              Disciplinary records, the resignation ladder and exit clearance. Admin-only.
+              Disciplinary records, the resignation ladder and exit clearance. Admins and roles with Full HR access.
             </p>
           </div>
           {tab === 'disciplinary' ? (

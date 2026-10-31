@@ -51,6 +51,12 @@ export interface CatalogUser {
    *  every read is `user.can_view_finance_reports && entry.financeCap` — which
    *  is what makes it structurally incapable of opening an unflagged page. */
   can_view_finance_reports?: boolean;
+  /** `roles.can_full_hr_access` for the assigned, ACTIVE role ("Full HR access
+   *  (all HR pages except HR Settings)", owner ruling #90). Read by ONE gate:
+   *  the adminOnly test, and only through hrFullCapOpens() — which also needs
+   *  the page's own `hrFullCap` flag, a Manager-tier or HOD user, and the page
+   *  ticked by its exact path. Absent/false ⇒ nothing changes anywhere. */
+  can_full_hr_access?: boolean;
 }
 
 export interface PageEntry {
@@ -99,9 +105,34 @@ export interface PageEntry {
   /**
    * When true, ONLY an Admin (role === 'admin') may see/open this page —
    * stricter than mgmtOnly/hodOnly. Used for admin-only consoles like the App
-   * Errors page. Non-admins are blocked even with an explicit page_access grant.
+   * Errors page. Non-admins are blocked even with an explicit page_access grant
+   * — with ONE exception, `hrFullCap` below, carried by five HR rows only.
    */
   adminOnly?: boolean;
+  /**
+   * THE ONE EXCEPTION TO adminOnly (owner ruling #90, 2026-10-29: "Full HR
+   * access (all HR pages except HR Settings)"). On a row that is ALSO adminOnly,
+   * a user may open the page without being an admin when ALL of these hold —
+   * hrFullCapOpens() is the only reader:
+   *   1. their assigned, active role carries `can_full_hr_access` (Settings →
+   *      Roles), resolved fail-CLOSED in BOTH getCurrentUser and proxy.ts;
+   *   2. they are management for HR: Manager tier or HOD (canManageHr). A
+   *      staff-tier role with the tick gets nothing;
+   *   3. their effective page map names THIS row's path EXACTLY. The capability
+   *      lifts the tier, it never grants a page: a null / [] / garbled map
+   *      ("all pages") does not open these, and neither does a bare '/hr'
+   *      prefix grant.
+   *
+   * Carried by exactly FIVE rows: /hr/geofences, /hr/biometric, /hr/payroll,
+   * /hr/documents, /hr/exits. /hr/settings is deliberately NOT flagged — it
+   * stays admin-only, and so does every non-HR admin page. As with financeCap
+   * the set lives in ONE place: HR_FULL_CAP_PATHS is derived from these flags.
+   *
+   * PREFIX LAW APPLIES: bestEntry() is longest-prefix, so a detail route under
+   * a flagged row inherits it. A new child a capability holder must NOT see
+   * needs its own adminOnly row WITHOUT this flag.
+   */
+  hrFullCap?: boolean;
   /**
    * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
    * THIS page, even when the map never names it.
@@ -824,24 +855,28 @@ export const PAGE_CATALOG: PageSection[] = [
       // live on one page; geofences and the biometric mapping/import are the
       // config surfaces behind attendance and stay adminOnly like /hr/settings.
       { path: '/hr/attendance', label: 'Attendance',           mgmtOnly: true },
-      { path: '/hr/geofences',  label: 'Geofences',            adminOnly: true },
-      { path: '/hr/biometric',  label: 'Biometric & Import',   adminOnly: true },
+      // hrFullCap (ruling #90): a Manager/HOD role holding "Full HR access" may
+      // also open these two — with the page ticked. See PageEntry.hrFullCap.
+      { path: '/hr/geofences',  label: 'Geofences',            adminOnly: true, hrFullCap: true },
+      { path: '/hr/biometric',  label: 'Biometric & Import',   adminOnly: true, hrFullCap: true },
       // Phases 3-7 (owner ordered all phases 2026-08-16). Money, identity and
       // disciplinary surfaces are adminOnly — the only flag that holds against
       // the NULL-page_access fail-open; team-facing operations are mgmtOnly.
       { path: '/hr/shifts',      label: 'Shifts',               mgmtOnly: true },
       { path: '/hr/roster',      label: 'Roster',               mgmtOnly: true },
       { path: '/hr/leave',       label: 'Leave',                mgmtOnly: true },
-      { path: '/hr/payroll',     label: 'Payroll & Advances',   adminOnly: true },
-      { path: '/hr/documents',   label: 'Employee Documents',   adminOnly: true },
+      { path: '/hr/payroll',     label: 'Payroll & Advances',   adminOnly: true, hrFullCap: true },
+      { path: '/hr/documents',   label: 'Employee Documents',   adminOnly: true, hrFullCap: true },
       { path: '/hr/sops',        label: 'SOP Library',          mgmtOnly: true },
       { path: '/hr/training',    label: 'Training',             mgmtOnly: true },
       { path: '/hr/tests',       label: 'Knowledge Tests',      mgmtOnly: true },
       { path: '/hr/performance', label: 'Performance',          mgmtOnly: true },
       { path: '/hr/assets',      label: 'Employee Assets',      mgmtOnly: true },
       { path: '/hr/recruitment', label: 'Recruitment',          mgmtOnly: true },
-      { path: '/hr/exits',       label: 'Disciplinary & Exits', adminOnly: true },
+      { path: '/hr/exits',       label: 'Disciplinary & Exits', adminOnly: true, hrFullCap: true },
       { path: '/hr/reports',     label: 'HR Reports',           mgmtOnly: true },
+      // NO hrFullCap, deliberately (ruling #90): HR Settings — designations, the
+      // attendance engine and roster-policy knobs — stays ADMIN ONLY.
       { path: '/hr/settings',  label: 'HR Settings',  adminOnly: true },
     ],
   },
@@ -1173,6 +1208,40 @@ export function financeCapOpens(user: CatalogUser | null, pathname: string): boo
  *  so a sixth flagged row cannot disagree with the API allowlist. */
 export const FINANCE_CAP_PATHS: string[] =
   PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.financeCap).map(p => p.path);
+/** Is `pathname` under a catalog entry that "Full HR access" may open? Same
+ *  bestEntry() longest-prefix walk as isAdminOnlyPath, so the two always judge
+ *  the SAME row — /hr/settings resolves to its own unflagged row, never to
+ *  /hr's. proxy.ts uses this to decide when to resolve the capability at all. */
+export function isHrFullCapPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.hrFullCap;
+}
+/**
+ * Can this user open `pathname` because they hold "Full HR access"? THE ONLY
+ * PLACE the capability is read for pages. Every condition is required, and
+ * every one fails closed (see PageEntry.hrFullCap):
+ *   1. `can_full_hr_access === true` (strict — absent / null / 1 never grant);
+ *   2. Manager tier or HOD — a staff-tier role with the tick gets nothing;
+ *   3. the matched entry carries `hrFullCap` (so /hr/settings and every
+ *      non-HR admin page can never be opened by it);
+ *   4. the effective page map is a parseable array naming that entry's path
+ *      EXACTLY (after trim). A null / [] / garbled map, or a bare '/hr' prefix
+ *      grant, does NOT count — the capability lifts the admin tier, it never
+ *      grants a page the role has not ticked.
+ */
+export function hrFullCapOpens(user: CatalogUser | null, pathname: string): boolean {
+  if (!user || user.can_full_hr_access !== true) return false;
+  if (!(user.role === 'manager' || user.is_head_chef)) return false;
+  const entry = bestEntry(pathname);
+  if (!entry?.hrFullCap) return false;
+  if (!user.page_access) return false;
+  let map: unknown;
+  try { map = JSON.parse(user.page_access); } catch { return false; }
+  if (!Array.isArray(map) || map.length === 0) return false;
+  return map.some(p => typeof p === 'string' && p.trim() === entry.path);
+}
+/** The "Full HR access" pages, DERIVED from the catalog rather than retyped. */
+export const HR_FULL_CAP_PATHS: string[] =
+  PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.hrFullCap).map(p => p.path);
 /** Is `pathname` under an admin-only catalog entry (role === 'admin' only)? */
 export function isAdminOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.adminOnly;
@@ -1400,7 +1469,10 @@ export function firstAllowedPath(user: CatalogUser | null): string {
         && !(p.hodOnly && !user.is_head_chef)
         && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
              && !(p.financeCap && user.can_view_finance_reports))
-        && !(p.adminOnly && user.role !== 'admin')
+        // hrFullCap WIDENS the adminOnly test exactly as financeCap widens
+        // mgmtOnly above — omit it and a role whose map holds only the five
+        // HR-capability pages lands on '/login' and bounces (ruling #90).
+        && !(p.adminOnly && user.role !== 'admin' && !hrFullCapOpens(user, p.path))
         && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
     }
   }
@@ -1443,7 +1515,11 @@ export function canAccessPage(
   // whatever their page_access map says — runs before the null-map grant so
   // legacy full-access staff can't reach it either. (Admins already returned
   // true above, so this only ever affects non-admins.)
-  if (isAdminOnlyPath(pathname)) return false;
+  // hrFullCapOpens() is the ONE exception to adminOnly (ruling #90): it needs
+  // the role's "Full HR access" tick AND Manager/HOD AND this page's hrFullCap
+  // flag AND the page ticked by its exact path — so it opens only the five
+  // flagged HR rows, never /hr/settings, never any other admin page.
+  if (isAdminOnlyPath(pathname) && !hrFullCapOpens(user, pathname)) return false;
 
   // GRE-gated pages (the Guest Feedback floor pages): a non-admin must either
   // be management or carry the ASSIGNED named GRE role. Runs here, before the
@@ -1612,7 +1688,8 @@ export function canAccessPageStrict(
   // ever open the flagged rows, never mgmtOnly as a class.
   if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
       && !financeCapOpens(user, pathname)) return false;
-  if (isAdminOnlyPath(pathname)) return false;
+  // hrFullCapOpens(): the ONE exception to adminOnly — see canAccessPage.
+  if (isAdminOnlyPath(pathname) && !hrFullCapOpens(user, pathname)) return false;
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
   // Kept in sync with canAccessPage deliberately: this function is MEASURED,
   // not wired up, and the day it is wired up the feedback module must not

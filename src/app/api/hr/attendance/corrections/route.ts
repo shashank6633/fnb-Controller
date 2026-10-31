@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canManageHr, canAdminHr, HR_ATTENDANCE_EVENT_TYPES } from '@/lib/hr';
+import { canManageHr, canHrFull, HR_FULL_DENIED, HR_ATTENDANCE_EVENT_TYPES } from '@/lib/hr';
 import {
   applyCorrection,
   businessDateOf,
@@ -39,7 +39,8 @@ import { reportServerError } from '@/lib/error-alerts';
  *      decision back. reject: decision metadata only, nothing moves
  *      (review_reason REQUIRED — a silent rejection is not reviewable).
  *
- * Gates: GET/POST canManageHr, PATCH canAdminHr (decisions are admin acts).
+ * Gates: GET/POST canManageHr, PATCH canHrFull (decisions belong to an admin
+ * or a management role holding "Full HR access" — owner ruling #90).
  * The proxy does NOT protect API GETs — these handlers are the security
  * boundary (§2.1). Errors are GENERIC on the wire except the engine's
  * caller-safe whitelist; e.message otherwise never leaves the server.
@@ -264,10 +265,10 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // Decisions are ADMIN acts (variance pattern: requesting is management,
+  // Decisions are canHrFull acts (admin or "Full HR access") (variance pattern: requesting is management,
   // deciding is not).
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 import { todayIST } from '@/lib/format-date';
 
@@ -19,8 +19,9 @@ import { todayIST } from '@/lib/format-date';
  *      One resignation + its hr_exit_clearance items (keyed by employee_id).
  *
  * POST { employee_id, resignation_date, notice_days?, reason? } → { resignation }
- *      Gate: canAdminHr — the /hr/exits page is adminOnly in the catalog, so
- *      the API matches (admins submit on behalf of staff — employees may
+ *      Gate: canHrFull (admin, or a management role holding "Full HR
+ *      access" — owner ruling #90) — the /hr/exits page is adminOnly +
+ *      hrFullCap in the catalog, so the API matches (they submit on behalf of staff — employees may
  *      have no login at all). notice_days defaults to the employee's
  *      notice_period_days when the key is absent; last_working_date is
  *      COMPUTED = resignation_date + notice_days. One OPEN resignation per
@@ -28,7 +29,7 @@ import { todayIST } from '@/lib/format-date';
  *      An employee already in an exit state (resigned/terminated/former) is
  *      refused with a 409 — rehire first.
  *
- * PATCH { id, action, note? }                    — decisions, canAdminHr.
+ * PATCH { id, action, note? }                    — decisions, canHrFull.
  *      The status ladder is enforced IN ORDER via status-guarded UPDATEs (a
  *      lost race is a 409, never a clobber):
  *        'manager_approve'  submitted        → manager_approved (stamps manager_by/at)
@@ -49,8 +50,8 @@ import { todayIST } from '@/lib/format-date';
  *      The decision note is preserved in the audit event (the schema has no
  *      decision-note columns; the schema is frozen).
  *
- * PATCH { id, status: 'cleared'|'waived', note? } — clearance item, canAdminHr
- *      (the page is adminOnly; every verb here matches the catalog flag).
+ * PATCH { id, status: 'cleared'|'waived', note? } — clearance item, canHrFull
+ *      (the page is adminOnly + hrFullCap; every verb here matches the catalog).
  *      id here is the hr_exit_clearance row id; stamps cleared_by/cleared_at.
  *
  * Errors return GENERIC messages only. Audit: hr.resignation.submit /
@@ -112,10 +113,11 @@ const RESIGNATION_SELECT = `
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // /hr/exits is adminOnly in the catalog — every verb here matches (§2.1:
+  // /hr/exits is adminOnly + hrFullCap in the catalog — every verb here
+  // matches with canHrFull (§2.1:
   // the proxy does not protect API GETs, so this handler is the boundary).
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -171,9 +173,9 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // Submit is admin too — the only submit UI lives on the adminOnly page.
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  // Submit is canHrFull too — the only submit UI lives on the /hr/exits page.
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: any = {};
@@ -296,7 +298,7 @@ export async function PATCH(request: Request) {
   );
 }
 
-/** The resignation status ladder — every decision is canAdminHr. */
+/** The resignation status ladder — every decision is canHrFull. */
 async function decideResignation(
   request: Request,
   me: any,
@@ -307,8 +309,8 @@ async function decideResignation(
   if (!['manager_approve', 'hr_approve', 'withdraw', 'complete'].includes(action)) {
     return Response.json({ error: 'Unknown action' }, { status: 400 });
   }
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -507,9 +509,10 @@ async function decideResignation(
   }
 }
 
-/** Clearance item update ({id, status cleared|waived, note}) — canAdminHr:
- *  the /hr/exits page is adminOnly in the catalog, so every verb here
- *  matches; the admin-gated 'complete' above stays the decision boundary. */
+/** Clearance item update ({id, status cleared|waived, note}) — canHrFull:
+ *  the /hr/exits page is adminOnly + hrFullCap in the catalog, so every verb
+ *  here matches; the canHrFull-gated 'complete' above stays the decision
+ *  boundary. */
 async function updateClearanceItem(
   request: Request,
   me: any,
@@ -517,8 +520,8 @@ async function updateClearanceItem(
   status: string,
   body: any,
 ): Promise<Response> {
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
   if (status !== 'cleared' && status !== 'waived') {
     return Response.json({ error: 'Status must be cleared or waived' }, { status: 400 });

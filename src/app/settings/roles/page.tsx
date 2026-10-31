@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { PAGE_CATALOG } from '@/lib/page-catalog';
+import { HR_FULL_ACCESS_LABEL } from '@/lib/hr';
 import { Shield, Plus, Pencil, Trash2, X, Check, Loader2, Users, ChevronDown, ChevronRight } from 'lucide-react';
 
 interface Role {
@@ -20,6 +21,11 @@ interface Role {
   can_view_finance_reports: number;
   /** May change the Label Printer & Design settings (Kitchen Production). Admin always may. */
   can_manage_label_printer: number;
+  /** "Full HR access (all HR pages except HR Settings)" — ruling #90. Lifts the
+   *  admin-only gate on exactly five HR pages (the `hrFullCap` rows in
+   *  page-catalog.ts) and their admin-only HR actions, for a Manager-tier or
+   *  HOD role. Not a tier — see page-catalog.ts hrFullCap / hr.ts canHrFull. */
+  can_full_hr_access: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -37,6 +43,10 @@ const TIERS = [
 
 const tierLabel = (t: string) => TIERS.find((x) => x.v === t)?.label || t;
 
+/** Tooltip on the five `hrFullCap` page rows (ruling #90). */
+const HR_FULL_CAP_TITLE =
+  `Admin-only page. A Manager-tier or HOD role can also open it when “${HR_FULL_ACCESS_LABEL}” is ticked above AND this page is ticked here.`;
+
 function parsePages(pa: string | null): string[] {
   if (!pa) return [];
   try { const a = JSON.parse(pa); return Array.isArray(a) ? a : []; } catch { return []; }
@@ -48,6 +58,7 @@ const blankDraft = () => ({
   can_void_bill_handover: false,
   can_view_finance_reports: false,
   can_manage_label_printer: false,
+  can_full_hr_access: false,
   pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
@@ -87,6 +98,9 @@ export default function RolesAdmin() {
       can_view_finance_reports: !!role.can_view_finance_reports,
       // Seeded from the role for the same reason as the line above (save() writes the whole draft).
       can_manage_label_printer: !!role.can_manage_label_printer,
+      // Seeded from the role for the same reason again: leaving it out would
+      // silently REVOKE "Full HR access" the next time the role is saved.
+      can_full_hr_access: !!role.can_full_hr_access,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -141,6 +155,7 @@ export default function RolesAdmin() {
         can_void_bill_handover: draft.can_void_bill_handover,
         can_view_finance_reports: draft.can_view_finance_reports,
         can_manage_label_printer: draft.can_manage_label_printer,
+        can_full_hr_access: draft.can_full_hr_access,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
         can_request_discount: draft.can_request_discount,
         max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
@@ -280,6 +295,25 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.can_manage_label_printer} onChange={(e) => setDraft({ ...draft, can_manage_label_printer: e.target.checked })} /> Can change label printer settings
                 </label>
+                {/* Full HR access (owner ruling #90, 2026-10-29). The second
+                    capability that reaches past a tier gate — this one past
+                    adminOnly, on five HR pages only. It needs Manager tier or HOD
+                    (canHrFull / hrFullCapOpens refuse a Staff-tier holder), so
+                    ticking is disabled there; a box that is already ticked stays
+                    UNtickable so it can always be removed. Defaults off on every
+                    role, the production HR role included — the owner ticks it. */}
+                {(() => {
+                  const hrFullNeedsTier = draft.base_role === 'staff' && !draft.is_head_chef;
+                  return (
+                    <label
+                      className={`flex items-center gap-2 text-sm ${hrFullNeedsTier && !draft.can_full_hr_access ? 'text-[#B79A82]' : 'text-[#2D1B0E]'}`}
+                      title={hrFullNeedsTier ? 'Choose the Manager tier or tick “Is HOD” first — Full HR access only works for management (Manager tier or HOD).' : undefined}>
+                      <input type="checkbox" checked={draft.can_full_hr_access}
+                        disabled={hrFullNeedsTier && !draft.can_full_hr_access}
+                        onChange={(e) => setDraft({ ...draft, can_full_hr_access: e.target.checked })} /> {HR_FULL_ACCESS_LABEL}
+                    </label>
+                  );
+                })()}
               </div>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
@@ -293,6 +327,35 @@ export default function RolesAdmin() {
                 have these pages ticked in its page list below; this checkbox only lifts the management-only
                 restriction on them.
               </p>
+              <p className="-mt-1 text-[11px] text-[#8B7355]">
+                “{HR_FULL_ACCESS_LABEL}” opens exactly five admin-only HR screens:
+                <strong> Payroll &amp; Advances</strong>, <strong>Employee Documents</strong>,
+                <strong> Disciplinary &amp; Exits</strong>, <strong>Geofences</strong> and
+                <strong> Biometric &amp; Import</strong>. <strong>HR Settings</strong> (Designations, the
+                attendance-engine and roster-policy knobs) stays <strong>admin-only</strong>, and so does every
+                admin page outside HR. It needs the <strong>Manager</strong> tier or <strong>Is HOD</strong> — a
+                Staff-tier user who is not an HOD gets nothing from it. The role must ALSO have those pages ticked in its page list
+                below (a role left on “all pages”, with nothing ticked, does not get them). It also unlocks the
+                admin-only actions on the other HR pages: leave, attendance-correction and roster decisions;
+                shift, leave-type, KPI, test-question and roster-config edits; full bank account numbers, salary,
+                documents and disciplinary records; and the biometric connector — address, serials, devices,
+                replacing the API key (which is never shown) and device commands.
+                <strong> Page ticks decide which screens open; the HR data and actions themselves go with the
+                role:</strong> every Manager-tier or HOD user on a role with this tick can use them, even one whose
+                own page list (Settings → Page Access) hides these screens. Put only people who may see salary, bank
+                and document records on such a role.
+              </p>
+              {draft.base_role === 'admin' && (
+                <p className="-mt-1 text-[11px] text-purple-700">
+                  This is an Admin-tier role: it already opens every HR page, HR Settings included, so “{HR_FULL_ACCESS_LABEL}” changes nothing for it.
+                </p>
+              )}
+              {draft.base_role === 'staff' && !draft.is_head_chef && draft.can_full_hr_access && (
+                <p className="-mt-1 text-[11px] text-amber-700 flex items-start gap-1">
+                  <span aria-hidden>⚠</span>
+                  <span>“{HR_FULL_ACCESS_LABEL}” is ticked, but it only works for Manager-tier or HOD users — on this Staff-tier role it opens <b>nothing</b> for anyone not personally marked HOD. Move the role to the Manager tier, tick “Is HOD”, or untick it.</span>
+                </p>
+              )}
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can void a bill handover” retires a vendor-bill record, with a reason, at any stage —
                 including one Accounts has already confirmed. A void is never a delete: the row survives
@@ -389,6 +452,7 @@ export default function RolesAdmin() {
                                       <input type="checkbox" checked={draft.pages.has(p.path)} disabled={lockedHod} onChange={() => togglePage(p.path)} />
                                       <span className="flex-1">{p.label}</span>
                                       {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">HOD only</span>}
+                                      {p.hrFullCap && <span title={HR_FULL_CAP_TITLE} className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">Admin · Full HR</span>}
                                     </label>
                                   );
                                 })}
@@ -427,6 +491,7 @@ export default function RolesAdmin() {
                                 <input type="checkbox" checked={draft.pages.has(p.path)} disabled={lockedHod} onChange={() => togglePage(p.path)} />
                                 {p.label}
                                 {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">HOD only</span>}
+                                {p.hrFullCap && <span title={HR_FULL_CAP_TITLE} className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded-full font-medium">Admin · Full HR</span>}
                               </label>
                               );
                             })}

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, type HrShift } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, type HrShift } from '@/lib/hr';
 import { getHrDayCutoff } from '@/lib/hr-attendance';
 import { splitShiftInvariantProblem } from '@/lib/hr-roster-generate';
 import { reportServerError } from '@/lib/error-alerts';
@@ -20,14 +20,14 @@ import { reportServerError } from '@/lib/error-alerts';
  * POST   /api/hr/shifts { name, start_hhmm?, end_hhmm?, split_json?,
  *          break_minutes?, grace_minutes?, late_after_minutes?,
  *          early_out_before_minutes?, overtime_after_minutes?, department_id? }
- *          → { shift }. Admin only. 409 on a duplicate ACTIVE shift name
+ *          → { shift }. Admin or "Full HR access" (canHrFull). 409 on a duplicate ACTIVE shift name
  *          (deactivated names may be reused). department_id, when given, must
  *          exist in departments (the mapping contract: validate refs on CREATE).
  * PUT    /api/hr/shifts { id, ...any of the POST fields, is_active? }
- *          → { shift }. Admin only. Partial update; provided HH:MM fields are
+ *          → { shift }. Admin or "Full HR access" (canHrFull). Partial update; provided HH:MM fields are
  *          re-validated; rename runs the same active-dup check.
  * DELETE /api/hr/shifts?id=   (id also accepted in a JSON body)
- *          → { ok: true }. Admin only. SOFT delete (is_active = 0) — roster
+ *          → { ok: true }. Admin or "Full HR access" (canHrFull). SOFT delete (is_active = 0) — roster
  *          rows referencing the shift keep rendering via LEFT JOIN; only the
  *          pickers hide it.
  *
@@ -140,7 +140,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -229,7 +229,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }
@@ -347,7 +347,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, hr/designations); DELETE { id } accepted too.
   const url = new URL(request.url);
