@@ -9,7 +9,7 @@
  * Set the storage_location field on each material via Inventory → Edit.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   MapPin,
   Loader2,
@@ -48,7 +48,34 @@ import {
 } from '@/lib/closing-tax';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-const today = () => new Date().toISOString().slice(0, 10);
+/* The default COUNT date is today in INDIA, the same day the server's date
+   guard and /inventory/closing-sheet use. The UTC date
+   (toISOString().slice(0, 10)) is still yesterday between 00:00 and 05:30 IST,
+   so a count saved in that window used to land on the previous day unasked. */
+const today = () => todayIST();
+
+/**
+ * One GET, read to the end, that never throws. Returns the parsed body, or a
+ * short reason a person can read in a banner: the HTTP status where there was
+ * one, "cut off or unreadable" when a 2xx body would not parse (a reply cut
+ * short mid-stream), "no reply" when the request itself failed. A failed read
+ * must be SAID, never quietly turned into an empty list.
+ */
+async function readJson(url: string): Promise<{ ok: true; json: any } | { ok: false; why: string }> {
+  let res: Response;
+  try { res = await fetch(url); }
+  catch (e: any) { return { ok: false, why: `no reply from the server${e?.message ? `: ${e.message}` : ''}` }; }
+  if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
+  try { return { ok: true, json: await res.json() }; }
+  catch { return { ok: false, why: `HTTP ${res.status}, but the reply was cut off or unreadable` }; }
+}
+
+/** The list a half of the sheet carried, or null when that half did not load. */
+const listOf = (r: Awaited<ReturnType<typeof readJson>>, key: 'items' | 'dates'): any[] | null =>
+  (r.ok && Array.isArray(r.json?.[key]) ? r.json[key] : null);
+/** Why a half did not load — for the banner. */
+const whyNot = (r: Awaited<ReturnType<typeof readJson>>, key: 'items' | 'dates'): string =>
+  (r.ok ? `the reply carried no ${key === 'items' ? 'item' : 'date'} list` : r.why);
 /** The small grey recipe hint printed under a purchase-unit figure (house
  *  style). Null when the material has no real pack conversion, so a pack-1
  *  item never gets a second line repeating the same number. */
@@ -420,9 +447,40 @@ export default function ClosingStockByLocationPage() {
   // Admin / Manager / HOD (head-chef) / Store Manager may pick any department and
   // see the per-area rollup.
   const [me, setMe] = useState<any>(null);
+  /* A failed or unreadable /api/auth/me used to be swallowed, leaving `me`
+     null for the life of the page: an admin then got the non-admin view (no
+     system stock, shortage, excess or variance; no department picker) with
+     nothing saying why. Retry once; if it still fails, SAY so (roleBanner). */
+  const [meError, setMeError] = useState(false);
   useEffect(() => {
-    fetch('/api/auth/me').then(r => r.json()).then(d => { setMe(d?.user || null); setMeRole(d?.user?.role || null); }).catch(() => {});
+    let live = true;
+    const load = async (attempt: number) => {
+      const r = await readJson('/api/auth/me');
+      if (!live) return;
+      if (r.ok && r.json?.user) {
+        setMe(r.json.user); setMeRole(r.json.user.role || null); setMeError(false);
+        return;
+      }
+      if (attempt === 0) { setTimeout(() => { if (live) load(1); }, 1500); return; }
+      setMeError(true);
+    };
+    load(0);
+    return () => { live = false; };
   }, []);
+  const roleBanner = meError ? (
+    <div className="flex items-start gap-2 bg-red-50 border border-red-300 rounded-xl px-4 py-2.5 text-xs text-red-800">
+      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+      <span className="flex-1">
+        <strong>Could not confirm your role — reload the page.</strong> Until it loads, this page shows its most
+        limited view: admin figures (system stock, shortage, excess, variance) and the department picker are hidden.
+        Reload before saving any counts.
+      </span>
+      <button onClick={() => window.location.reload()}
+              className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">
+        Reload
+      </button>
+    </div>
+  ) : null;
   const isAdmin = meRole === 'admin';
   // Can this viewer see/update ALL departments (and the rollup)?
   const canSeeAllDepts = !!me && (me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef || !!me.is_store_manager);
@@ -516,7 +574,7 @@ export default function ClosingStockByLocationPage() {
   const [extraByDept, setExtraByDept] = useState<Record<string, any[]>>({});
   // The Record sheet's date. Declared here, before the department-list effect
   // below, because that effect sends it (?date=) and refetches when it changes.
-  const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
+  const [closingDate, setClosingDate] = useState(todayIST());
   useEffect(() => {
     if (!me) return;
     if (!activeDeptId) { setDeptRequested(null); setDeptScopeError(false); setDeptScopeLoading(false); return; }
@@ -642,7 +700,12 @@ export default function ClosingStockByLocationPage() {
      instant it is saved (see recordCountVariance's header): there is no hold on
      that rail, so the screen must not stay silent and let the absence of
      "sent for variance approval" read as "nothing differed". */
-  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number; notCounted?: number; deptImmediate?: boolean } | null>(null);
+  /* `semiHeld` — the SUB-RECIPE half was refused by its own zero-pattern
+     guard AFTER the raw-material half of the same submit was already stored.
+     The "nothing was saved" dialog would be untrue there, so the question is
+     asked in this result box instead, and its confirm re-sends only the
+     sub-recipe rows. */
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number; notCounted?: number; deptImmediate?: boolean; semiHeld?: ZeroGuardInfo & { onConfirm: () => void } } | null>(null);
   /* THE ZERO-PATTERN REFUSAL (owner requirement 7). Every save path on this page
      — the modal, the CSV upload and the per-area keypad — posts to a route that
      answers 409 + `zero_guard` when an implausible share of the filled-in lines
@@ -657,14 +720,27 @@ export default function ClosingStockByLocationPage() {
      (req 2/3) — never a browser-side recomputation. */
   const [valued, setValued] = useState<{
     date: string; items: any[]; semi: any[]; total: number; priced: boolean;
+    /** Why the sub-recipe half could not be read back (null = it was). */
+    semiFail?: string | null;
   } | null>(null);
   const [closingHistory, setClosingHistory] = useState<any[]>([]);
+  /* Why each half of the date LIST failed to load (null = it loaded). A failed
+     list must never read as "No closing stock records found". */
+  const [historyListFail, setHistoryListFail] = useState<{ raw: string | null; semi: string | null }>({ raw: null, semi: null });
+  const historyListSeq = useRef(0);
   const [showHistory, setShowHistory] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyDate, setHistoryDate] = useState<string | null>(null);
   const [historyItems, setHistoryItems] = useState<any[]>([]);
   const [historySemi, setHistorySemi] = useState<any[]>([]);
   const [historySummary, setHistorySummary] = useState<any>(null);
+  /* Why each half of the open date's sheet failed to load (null = it loaded).
+     While either is set the sheet is INCOMPLETE: totals are withheld and the
+     CSV is refused, so a partial sheet can never pass for the whole day. */
+  const [historyFail, setHistoryFail] = useState<{ raw: string | null; semi: string | null }>({ raw: null, semi: null });
+  /* Request sequence for the History detail: only the newest view may write
+     the screen, so a late reply for one date can never land under another. */
+  const historySeq = useRef(0);
   // Per-area rollup (admin/HOD only) — each area's overall physical closing value
   // for the selected date. Sourced from summary.by_area on /api/closing-stock.
   const [byArea, setByArea] = useState<any[]>([]);
@@ -1011,7 +1087,7 @@ export default function ClosingStockByLocationPage() {
   };
 
   const openClosingStock = async () => {
-    const openDate = new Date().toISOString().split('T')[0];
+    const openDate = todayIST();
     setClosingStockOpen(true);
     setClosingDate(openDate);
     setClosingResult(null);
@@ -1048,13 +1124,15 @@ export default function ClosingStockByLocationPage() {
       const semiQs = new URLSearchParams({ date: d, department_id: activeDeptId, counted_only: '1' });
       const [res, semiRes] = await Promise.all([
         fetch(`/api/closing-stock?${qs}`),
-        fetch(`/api/closing-stock/semi?${semiQs}`),
+        readJson(`/api/closing-stock/semi?${semiQs}`),
       ]);
       if (!res.ok) { setValued(null); return; }
       const json = await res.json();
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
       const items: any[] = json.items || [];
-      const semi: any[] = semiJson.items || [];
+      // The sub-recipe half failing used to read as "no sub-recipes" and the
+      // total quietly left them out. Now it is marked (semiFail) on screen.
+      const semiList = listOf(semiRes, 'items');
+      const semi: any[] = semiList || [];
       // The sheet total is the SUM OF THE LINES SHOWN — every addend is a
       // server-stored total_value, and a footer that disagreed with its own
       // column would be a bug. (A summary total from the API could legitimately
@@ -1065,7 +1143,7 @@ export default function ClosingStockByLocationPage() {
       // valuation columns, say so instead of printing a column of em-dashes.
       const priced = items.some(i => i.total_value != null || i.rate_source != null)
         || semi.some(s => s.total_value != null || s.rate_per_unit != null);
-      setValued({ date: d, items, semi, total, priced });
+      setValued({ date: d, items, semi, total, priced, semiFail: semiList ? null : whyNot(semiRes, 'items') });
     } catch { setValued(null); }
   };
 
@@ -1076,53 +1154,154 @@ export default function ClosingStockByLocationPage() {
    * one combined closing value rather than the raw half only.
    */
   const fetchClosingHistory = async () => {
-    try {
-      const [res, semiRes] = await Promise.all([
-        fetch('/api/closing-stock'),
-        fetch('/api/closing-stock/semi'),
-      ]);
-      const json = res.ok ? await res.json() : { dates: [] };
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({ dates: [] })) : { dates: [] };
-      const byDate = new Map<string, any>();
-      for (const d of json.dates || []) byDate.set(d.date, { ...d });
-      for (const s of semiJson.dates || []) {
-        const hit = byDate.get(s.date);
-        if (hit) {
-          hit.semi_count = s.item_count || 0;
-          hit.total_value = (Number(hit.total_value) || 0) + (Number(s.total_value) || 0);
-        } else {
-          byDate.set(s.date, {
-            date: s.date, item_count: 0, semi_count: s.item_count || 0,
-            total_value: Number(s.total_value) || 0,
-            total_variance_value: 0, shortage_count: 0, excess_count: 0,
-          });
-        }
+    // A failed half used to become `{ dates: [] }` — a dead list read as
+    // "No closing stock records found". Each half's failure is now kept and
+    // shown (historyListFail), and the newest call alone writes the list.
+    const seq = ++historyListSeq.current;
+    const [res, semiRes] = await Promise.all([
+      readJson('/api/closing-stock'),
+      readJson('/api/closing-stock/semi'),
+    ]);
+    if (seq !== historyListSeq.current) return;
+    const rawDates = listOf(res, 'dates');
+    const semiDates = listOf(semiRes, 'dates');
+    setHistoryListFail({
+      raw: rawDates ? null : whyNot(res, 'dates'),
+      semi: semiDates ? null : whyNot(semiRes, 'dates'),
+    });
+    // Without the raw-material index there is no honest list to draw.
+    if (!rawDates) { setClosingHistory([]); return; }
+    /* Each index answers at most its 50 newest dates. A date older than one
+       index's 50th is not "0 rows" in that half, it is just not covered, so
+       its count there is unknown (raw_known / semi_known = false) and the
+       History CSV check does not hold that count against the loaded sheet. */
+    const oldest = (list: any[]) => (list.length >= 50
+      ? list.reduce((m: string, x: any) => (String(x.date) < m ? String(x.date) : m), String(list[0].date))
+      : null);
+    const rawOldest = oldest(rawDates);
+    const semiOldest = semiDates ? oldest(semiDates) : null;
+    const byDate = new Map<string, any>();
+    for (const d of rawDates) {
+      byDate.set(d.date, { ...d, raw_known: true, semi_known: !!semiDates && (semiOldest == null || String(d.date) >= semiOldest) });
+    }
+    for (const s of semiDates || []) {
+      const hit = byDate.get(s.date);
+      if (hit) {
+        hit.semi_count = s.item_count || 0;
+        hit.total_value = (Number(hit.total_value) || 0) + (Number(s.total_value) || 0);
+      } else {
+        byDate.set(s.date, {
+          date: s.date, item_count: 0, semi_count: s.item_count || 0,
+          total_value: Number(s.total_value) || 0,
+          total_variance_value: 0, shortage_count: 0, excess_count: 0,
+          raw_known: rawOldest == null || String(s.date) >= rawOldest, semi_known: true,
+        });
       }
-      setClosingHistory([...byDate.values()].sort((a, b) => String(b.date).localeCompare(String(a.date))));
-    } catch (_) {}
+    }
+    setClosingHistory([...byDate.values()].sort((a, b) => String(b.date).localeCompare(String(a.date))));
   };
 
+  /* THE HISTORY SHEET IS ALL OR MARKED. On 31 Oct the raw-material request
+     failed while the semi-finished one answered, and the page drew the 89
+     semi rows alone at ₹0 — and a CSV of only those — with nothing on screen
+     to say anything was missing. Now: everything is cleared first (a failed
+     load can never show the previous date's rows under this heading), each
+     half's failure is kept separately (non-2xx, unreadable body, no reply),
+     and only the newest request may write the screen. */
   const viewHistoryDate = async (d: string) => {
+    const seq = ++historySeq.current;
     setHistoryDate(d);
     setHistoryLoading(true);
-    try {
-      // Raw-material counts, plus the same date's semi-finished counts across
-      // every department (counted_only=1 → saved rows, not the full catalogue).
-      const [res, semiRes] = await Promise.all([
-        fetch(`/api/closing-stock?date=${d}`),
-        fetch(`/api/closing-stock/semi?date=${d}&counted_only=1`),
-      ]);
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
-      setHistorySemi(semiJson.items || []);
-      if (res.ok) {
-        const json = await res.json();
-        setHistoryItems(json.items || []);
-        setHistorySummary(json.summary || null);
-        setByArea(json.summary?.by_area || []);
-      }
-    } catch (_) {}
+    setHistoryItems([]);
+    setHistorySemi([]);
+    setHistorySummary(null);
+    setHistoryFail({ raw: null, semi: null });
+    // Raw-material counts, plus the same date's semi-finished counts across
+    // every department (counted_only=1 → saved rows, not the full catalogue).
+    const [res, semiRes] = await Promise.all([
+      readJson(`/api/closing-stock?date=${d}`),
+      readJson(`/api/closing-stock/semi?date=${d}&counted_only=1`),
+    ]);
+    if (seq !== historySeq.current) return;   // a newer view owns the screen now
+    const rawItems = listOf(res, 'items');
+    const semiItems = listOf(semiRes, 'items');
+    setHistoryFail({
+      raw: rawItems ? null : whyNot(res, 'items'),
+      semi: semiItems ? null : whyNot(semiRes, 'items'),
+    });
+    if (semiItems) setHistorySemi(semiItems);
+    /* by_area is NOT taken from here any more. History never shows it; the
+       only place it appeared was the page's own Area rollup, labelled with the
+       TOP-LEVEL date — so opening a history date used to put that date's area
+       figures under another date's heading (and leave them there). The rollup
+       is reloadRollup()'s alone. */
+    if (rawItems && res.ok) {
+      setHistoryItems(rawItems);
+      setHistorySummary(res.json.summary || null);
+    }
     setHistoryLoading(false);
   };
+
+  /** Leave the open date: nothing of it may linger, and a reply still in
+   *  flight for it is ignored (the sequence moves on). */
+  const backToHistoryDates = () => {
+    historySeq.current++;
+    setHistoryDate(null);
+    setHistoryLoading(false);
+    setHistoryItems([]);
+    setHistorySemi([]);
+    setHistorySummary(null);
+    setHistoryFail({ raw: null, semi: null });
+  };
+
+  /** Retry reloads the date list too, so the row counts the CSV check
+   *  compares against are as fresh as the sheet. */
+  const retryHistory = () => {
+    fetchClosingHistory();
+    if (historyDate) viewHistoryDate(historyDate);
+  };
+
+  /* THE FILE IS THE WHOLE SHEET OR NOTHING. Refused (button off, reason shown,
+     and downloadHistoryCsv itself returns) when either half failed to load,
+     or when the rows loaded do not match the date list's own count for this
+     date — the owner's 31 Oct file held 0 of 1328 raw-material rows. */
+  const historyLine = historyDate ? closingHistory.find((h: any) => h.date === historyDate) : undefined;
+  const historyCsvBlock: string | null = (() => {
+    const missing = [historyFail.raw && 'raw-material', historyFail.semi && 'semi-finished'].filter(Boolean);
+    if (missing.length) {
+      return `Download is off — the ${missing.join(' and ')} counts for this date did not load, so the file would be missing them. Retry first.`;
+    }
+    if (!historyLine) return null;
+    /* Worded without blaming either side: the two were read at different
+       moments, and either one can be the stale one (a count saved after the
+       list was read, or after the sheet was). Retry rereads both. A sheet that
+       stays SHORT after a Retry has one other cause: the list counts every
+       stored row, but the sheet can only show rows whose raw material /
+       sub-recipe still exists (the routes' JOIN) — said plainly, since a Retry
+       will not clear that. */
+    const off: string[] = [];
+    const short: string[] = [];
+    let shortBy = 0;
+    const wantRaw = Number(historyLine.item_count) || 0;
+    const wantSemi = Number(historyLine.semi_count) || 0;
+    if (historyLine.raw_known !== false && historyItems.length !== wantRaw) {
+      off.push(`${historyItems.length} raw-material row(s) loaded, but the date list counts ${wantRaw}`);
+      if (historyItems.length < wantRaw) { short.push('a raw material'); shortBy += wantRaw - historyItems.length; }
+    }
+    if (historyLine.semi_known !== false && historySemi.length !== wantSemi) {
+      off.push(`${historySemi.length} semi-finished row(s) loaded, but the date list counts ${wantSemi}`);
+      if (historySemi.length < wantSemi) { short.push('a sub-recipe'); shortBy += wantSemi - historySemi.length; }
+    }
+    if (off.length) {
+      return `Download is off — ${off.join('; ')}. This sheet and the date list disagree, so the file is held back. ` +
+        `Retry reloads both, which clears a difference caused by counts saved in the meantime.` +
+        (short.length
+          ? ` If a Retry does not clear it, the ${shortBy} row(s) this sheet is short are most likely saved counts for ` +
+            `${short.join(' or ')} that no longer exists: the sheet cannot show them, so the file would leave them out.`
+          : '');
+    }
+    return null;
+  })();
 
   /**
    * Download the counted sheet for the ONE date currently open in History.
@@ -1148,6 +1327,7 @@ export default function ClosingStockByLocationPage() {
    */
   const downloadHistoryCsv = () => {
     if (!historyDate) return;
+    if (historyCsvBlock) return;   // the reason is on screen under the button
     const rows: Record<string, string | number>[] = [];
 
     for (const item of historyItems) {
@@ -1253,11 +1433,41 @@ export default function ClosingStockByLocationPage() {
   };
 
   /**
-   * @param confirmZeros re-run of a submit the zero-pattern guard refused. The
-   * payload is rebuilt from the SAME on-screen entries, which have not changed
-   * — the dialog is modal and the grid is behind it.
+   * The sub-recipe half was refused by ITS zero-pattern guard after the
+   * raw-material half of the same submit had already been stored. Confirming
+   * re-sends exactly the refused sub-recipe rows with confirm_zeros — and
+   * nothing else, since the raw counts are already in.
    */
-  const submitClosingStock = async (confirmZeros = false) => {
+  const semiHeldAfterRaw = (
+    guard: ZeroGuardInfo, forDate: string,
+    rows: { sub_recipe_id: string; physical_stock: number; notes: string }[],
+  ) => ({
+    ...guard,
+    onConfirm: async () => {
+      setClosingSubmitting(true);
+      const errs: string[] = [];
+      try {
+        const again = await postSemiCounts(forDate, rows, errs, true);
+        setClosingResult(prev => (prev ? { ...prev, semi: again.saved, semiHeld: undefined, errors: [...prev.errors, ...errs] } : prev));
+        if (again.saved > 0) {
+          await fetchClosingHistory();
+          await loadValuedSheet(forDate);
+        }
+      } finally {
+        setClosingSubmitting(false);
+      }
+    },
+  });
+
+  /**
+   * @param confirmZeros re-run of a submit the RAW-MATERIAL zero-pattern guard
+   * refused. The payload is rebuilt from the SAME on-screen entries, which have
+   * not changed — the dialog is modal and the grid is behind it.
+   * @param confirmSemiZeros the same for the SUB-RECIPE half. Kept separate: a
+   * confirm given for the raw zeros must never wave the sub-recipe zeros
+   * through too — they get their own warning.
+   */
+  const submitClosingStock = async (confirmZeros = false, confirmSemiZeros = false) => {
     setClosingSubmitting(true);
     setClosingResult(null);
     try {
@@ -1315,7 +1525,7 @@ export default function ClosingStockByLocationPage() {
         if (!res.ok && res.status === 409) {
           const guard = readZeroGuard(json);
           if (guard) {
-            setZeroGuard({ ...guard, what: 'this sheet', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+            setZeroGuard({ ...guard, what: 'this sheet', onConfirm: () => { setZeroGuard(null); submitClosingStock(true, confirmSemiZeros); } });
             setClosingSubmitting(false);
             return;
           }
@@ -1346,18 +1556,21 @@ export default function ClosingStockByLocationPage() {
         rawNotCounted = json.not_counted || 0;
         rawDeptImmediate = json.dept_immediate === true;
       }
-      const semi = await postSemiCounts(closingDate, semiToSubmit, errors, confirmZeros);
-      if (semi.guard) {
-        // The raw half may already be saved; re-running the whole submit is
-        // safe because each count is keyed (date, material, department) and is
-        // delete-then-inserted, and the server re-reads live stock, so a count
-        // that already reconciled produces no second variance.
-        setZeroGuard({ ...semi.guard, what: 'the sub-recipe counts', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+      // The sub-recipe half carries ITS OWN confirm, never the raw half's.
+      const semi = await postSemiCounts(closingDate, semiToSubmit, errors, confirmSemiZeros);
+      if (semi.guard && rawSaved === 0) {
+        // Nothing from this submit is stored, so the dialog's "nothing was
+        // saved" is true. Confirming re-runs the submit with the sub-recipe
+        // confirm added and the raw-material confirm left as it was.
+        setZeroGuard({ ...semi.guard, what: 'the sub-recipe counts', onConfirm: () => { setZeroGuard(null); submitClosingStock(confirmZeros, true); } });
         setClosingSubmitting(false);
         return;
       }
+      // Raw counts ARE stored when semi.guard is set here — so the sub-recipe
+      // question is asked in the result box (semiHeld), which says so.
       const semiSaved = semi.saved;
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate,
+        semiHeld: semi.guard ? semiHeldAfterRaw(semi.guard, closingDate, semiToSubmit) : undefined });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1595,7 +1808,7 @@ export default function ClosingStockByLocationPage() {
       /* THE PARSED FILE IS SENT FROM HERE, and a zero-guard retry re-sends THIS
          payload — the file is not re-read and the rows are not re-derived, so
          the number the dialog quoted is the number that gets written. */
-      await sendParsedCsv(items, semiItems, errors, false);
+      await sendParsedCsv(items, semiItems, errors, false, false);
     } catch (err: any) {
       setClosingResult({ success: 0, errors: [err.message] });
     } finally {
@@ -1608,6 +1821,8 @@ export default function ClosingStockByLocationPage() {
     semiItems: { sub_recipe_id: string; physical_stock: number; notes: string }[],
     parseErrors: string[],
     confirmZeros: boolean,
+    /** The sub-recipe rows' own confirm — never inherited from the raw rows'. */
+    confirmSemiZeros: boolean,
   ) => {
     setClosingSubmitting(true);
     // Copy, so a retry does not accumulate the first attempt's messages.
@@ -1632,7 +1847,7 @@ export default function ClosingStockByLocationPage() {
           if (guard) {
             setZeroGuard({
               ...guard, what: 'this file',
-              onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+              onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true, confirmSemiZeros); },
             });
             return;
           }
@@ -1653,17 +1868,21 @@ export default function ClosingStockByLocationPage() {
         rawNotCounted = json.not_counted || 0;
         rawDeptImmediate = json.dept_immediate === true;
       }
-      // Sub-recipe rows from the same file go to the semi route.
-      const semi = await postSemiCounts(closingDate, semiItems, errors, confirmZeros);
-      if (semi.guard) {
+      // Sub-recipe rows from the same file go to the semi route, with their
+      // OWN confirm (a confirm for the raw rows' zeros does not carry over).
+      const semi = await postSemiCounts(closingDate, semiItems, errors, confirmSemiZeros);
+      if (semi.guard && rawSaved === 0) {
+        // Nothing from this file is stored yet — "nothing was saved" is true.
         setZeroGuard({
           ...semi.guard, what: 'the sub-recipe rows in this file',
-          onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+          onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, confirmZeros, true); },
         });
         return;
       }
+      // Raw rows ARE stored when semi.guard is set here — ask in the result box.
       const semiSaved = semi.saved;
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate,
+        semiHeld: semi.guard ? semiHeldAfterRaw(semi.guard, closingDate, semiItems) : undefined });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1721,6 +1940,8 @@ export default function ClosingStockByLocationPage() {
   // equals its own column (a summary figure from the API could cover a wider
   // scope than the rows on screen).
   const historyValueTotal = sumValue(historyItems) + sumValue(historySemi);
+  /** A half of the open date's sheet did not load — see historyFail. */
+  const historyIncomplete = !!(historyFail.raw || historyFail.semi);
   /** Does this date have any stored valuation at all? Counts saved before the
    *  valuation columns existed have none — say so instead of showing ₹0. */
   const historyPriced = historyItems.some((i: any) => i.total_value != null || i.rate_source != null)
@@ -1752,12 +1973,18 @@ export default function ClosingStockByLocationPage() {
   // Per-area rollup for the top-level date — admin / HOD / store-manager only.
   // Uses the summary.by_area block, which is date-scoped and independent of any
   // department filter, so it always reflects every area's overall closing value.
+  // A failed read used to hide the panel without a word; now it says so.
+  const [rollupFail, setRollupFail] = useState<string | null>(null);
   const reloadRollup = async () => {
-    if (!canSeeAllDepts) { setByArea([]); return; }
-    try {
-      const json = await fetch(`/api/closing-stock?date=${date}`).then(r => r.json());
-      setByArea(json?.summary?.by_area || []);
-    } catch { setByArea([]); }
+    if (!canSeeAllDepts) { setByArea([]); setRollupFail(null); return; }
+    const r = await readJson(`/api/closing-stock?date=${date}`);
+    if (r.ok && Array.isArray(r.json?.summary?.by_area)) {
+      setByArea(r.json.summary.by_area);
+      setRollupFail(null);
+    } else {
+      setByArea([]);
+      setRollupFail(r.ok ? 'the reply carried no area rollup' : r.why);
+    }
   };
   useEffect(() => { reloadRollup(); /* eslint-disable-next-line */ }, [date, canSeeAllDepts]);
 
@@ -1956,6 +2183,7 @@ export default function ClosingStockByLocationPage() {
             <ChevronLeft size={16} /> Back to locations
           </button>
         </div>
+        {roleBanner}
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 flex items-center gap-3 flex-wrap">
           <MapPin className="text-[#af4408]" size={22} />
           <div className="flex-1">
@@ -2288,6 +2516,8 @@ export default function ClosingStockByLocationPage() {
         </label>
       </div>
 
+      {roleBanner}
+
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Locations</div>
@@ -2336,6 +2566,13 @@ export default function ClosingStockByLocationPage() {
       {renderDeptScope()}
 
       {/* Per-area rollup — admin/HOD view of each area's overall closing value. */}
+      {canSeeAllDepts && rollupFail && (
+        <div className="flex items-center gap-2 bg-red-50 border border-red-300 rounded-xl px-4 py-2.5 text-xs text-red-800">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+          <span className="flex-1">The area rollup for {date} could not be loaded ({rollupFail}). Saved counts are not affected.</span>
+          <button onClick={() => reloadRollup()} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
+        </div>
+      )}
       {canSeeAllDepts && byArea.length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <div className="text-xs font-semibold text-[#2D1B0E] mb-2">Area rollup — physical closing value ({date})</div>
@@ -2452,14 +2689,40 @@ export default function ClosingStockByLocationPage() {
               </div>
             </div>
 
+            {roleBanner && <div className="px-6 pt-4">{roleBanner}</div>}
+
             {showHistory ? (
               /* History View */
               <div className="px-6 py-5 space-y-4">
-                {closingHistory.length === 0 ? (
-                  <div className="text-center py-12 text-[#8B7355]">
-                    <ClipboardCheck className="w-10 h-10 mx-auto mb-3 opacity-30" />
-                    <p>No closing stock records found</p>
+                {/* A list that failed to load says so — it is never shown as
+                    "No closing stock records found". Without the raw-material
+                    index no list is drawn at all; without the semi-finished
+                    one, each value is marked as raw materials only. */}
+                {!historyDate && (historyListFail.raw || historyListFail.semi) && (
+                  <div className="flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-xs text-red-800">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 space-y-1">
+                      {historyListFail.raw && (
+                        <p><strong>The list of closing-stock dates could not be loaded</strong> ({historyListFail.raw}).</p>
+                      )}
+                      {historyListFail.semi && (
+                        <p>
+                          <strong>The semi-finished part of the list could not be loaded</strong> ({historyListFail.semi})
+                          {historyListFail.raw ? '.' : ' — the values below leave out sub-recipes.'}
+                        </p>
+                      )}
+                      <p>The saved counts are <strong>not lost</strong> — reading them failed, nothing was deleted.</p>
+                    </div>
+                    <button onClick={() => fetchClosingHistory()} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
                   </div>
+                )}
+                {!historyDate && historyListFail.raw ? null : closingHistory.length === 0 && !historyDate ? (
+                  historyListFail.semi ? null : (
+                    <div className="text-center py-12 text-[#8B7355]">
+                      <ClipboardCheck className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                      <p>No closing stock records found</p>
+                    </div>
+                  )
                 ) : !historyDate ? (
                   <div className="space-y-2">
                     <h3 className="text-sm font-semibold text-[#2D1B0E]">Closing Stock Records</h3>
@@ -2487,7 +2750,10 @@ export default function ClosingStockByLocationPage() {
                                 every tier sees it (req 4). Shown only when the
                                 server sends it. */}
                             {h.total_value != null && (
-                              <span className="text-[#2D1B0E]">Value: <span className="font-semibold font-mono">{fmtMoney(h.total_value)}</span></span>
+                              <span className="text-[#2D1B0E]">
+                                Value: <span className="font-semibold font-mono">{fmtMoney(h.total_value)}</span>
+                                {historyListFail.semi && <span className="ml-1 text-red-700">(raw materials only)</span>}
+                              </span>
                             )}
                             {isAdmin && h.shortage_count > 0 && (
                               <span className="flex items-center gap-1 text-red-500"><TrendingDown className="w-3 h-3" />{h.shortage_count} shortage</span>
@@ -2507,7 +2773,7 @@ export default function ClosingStockByLocationPage() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-between">
                       <div>
-                        <button onClick={() => setHistoryDate(null)} className="text-xs text-[#af4408] hover:underline mb-1">&larr; Back to dates</button>
+                        <button onClick={backToHistoryDates} className="text-xs text-[#af4408] hover:underline mb-1">&larr; Back to dates</button>
                         <h3 className="text-sm font-semibold text-[#2D1B0E]">
                           Closing Stock — {new Date(historyDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}
                         </h3>
@@ -2520,34 +2786,74 @@ export default function ClosingStockByLocationPage() {
                             column at all. */}
                         <button
                           onClick={downloadHistoryCsv}
-                          disabled={!historyItems.length && !historySemi.length}
-                          title={`Download the ${historyItems.length + historySemi.length} recorded row(s) for this date as CSV`}
+                          disabled={(!historyItems.length && !historySemi.length) || !!historyCsvBlock}
+                          title={historyCsvBlock || `Download the ${historyItems.length + historySemi.length} recorded row(s) for this date as CSV`}
                           className="mt-1.5 inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Download className="w-3.5 h-3.5" /> Download CSV
                         </button>
+                        {historyCsvBlock && (
+                          <p className="mt-1 max-w-md text-[11px] text-red-700">
+                            {historyCsvBlock}{' '}
+                            {!historyIncomplete && (
+                              <button onClick={retryHistory} className="underline font-medium">Retry</button>
+                            )}
+                          </p>
+                        )}
                       </div>
-                      {historySummary && (
+                      {(historySummary || historyIncomplete) && (
                         <div className="flex gap-4 text-xs">
-                          <span className="text-[#6B5744]">Items: <span className="font-bold">{historySummary.total_items}</span></span>
-                          {historySemi.length > 0 && (
+                          {/* INCOMPLETE, never a confident figure, while a half is missing. */}
+                          {historyIncomplete && (
+                            <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 font-bold uppercase tracking-wide">Incomplete</span>
+                          )}
+                          <span className="text-[#6B5744]">Items: {historyFail.raw
+                            ? <span className="font-bold text-red-700">not loaded</span>
+                            : <span className="font-bold">{historySummary?.total_items ?? historyItems.length}</span>}
+                          </span>
+                          {historyFail.semi ? (
+                            <span className="text-[#6B5744]">Semi-finished: <span className="font-bold text-red-700">not loaded</span></span>
+                          ) : historySemi.length > 0 && (
                             <span className="text-[#6B5744]">Semi-finished: <span className="font-bold">{historySemi.length}</span></span>
                           )}
-                          {historyPriced && (
+                          {historyIncomplete ? (
+                            <span className="text-[#2D1B0E]">Closing value: <span className="font-bold text-red-700">INCOMPLETE</span></span>
+                          ) : historyPriced && (
                             <span className="text-[#2D1B0E]">Closing value: <span className="font-bold font-mono">{fmtMoney(historyValueTotal)}</span></span>
                           )}
-                          {historyPriced && historyTax.taxed > 0 && (
+                          {!historyIncomplete && historyPriced && historyTax.taxed > 0 && (
                             <span className="text-[#2D1B0E]" title={`${CLOSING_TAX_TITLE} ${historyTaxNotes.title}`}>
                               {CLOSING_TAX_LABEL}: <span className="font-bold font-mono">{fmtMoney(historyTax.tax)}</span>
                               <span className="ml-1 text-[10px] text-[#8B7355]">({historyTaxNotes.rate})</span>
                             </span>
                           )}
-                          {isAdmin && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
-                          {isAdmin && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
-                          {isAdmin && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
+                          {/* From the raw-material half only — absent when it did not load. */}
+                          {isAdmin && historySummary && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
+                          {isAdmin && historySummary && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
+                          {isAdmin && historySummary && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
                         </div>
                       )}
                     </div>
+                    {/* THE BANNER. Names the half that failed and how, says the
+                        saved counts are not lost, and offers Retry. */}
+                    {historyIncomplete && (
+                      <div className="flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-xs text-red-800">
+                        <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                        <div className="flex-1 space-y-1">
+                          {historyFail.raw && (
+                            <p><strong>Raw-material counts for this date could not be loaded</strong> ({historyFail.raw}).</p>
+                          )}
+                          {historyFail.semi && (
+                            <p><strong>Semi-finished counts for this date could not be loaded</strong> ({historyFail.semi}).</p>
+                          )}
+                          <p>
+                            The saved counts are <strong>not lost</strong> — reading them failed, nothing was deleted.
+                            This sheet is incomplete: its totals are withheld and Download CSV is off until it loads in full.
+                          </p>
+                        </div>
+                        <button onClick={retryHistory} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
+                      </div>
+                    )}
                     <div className="overflow-x-auto max-h-[60vh] overflow-y-auto rounded-lg border border-[#E8D5C4]">
                       <table className="w-full text-sm">
                         <thead className="sticky top-0 bg-[#FFF1E3] z-10">
@@ -2581,6 +2887,13 @@ export default function ClosingStockByLocationPage() {
                           </tr>
                         </thead>
                         <tbody>
+                          {historyFail.raw && (
+                            <tr className="border-t border-[#E8D5C4]/50 bg-red-50">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3 text-xs font-medium text-red-700">
+                                Raw-material counts not loaded ({historyFail.raw}) — see the message above.
+                              </td>
+                            </tr>
+                          )}
                           {historyItems.map((item: any) => {
                             const isShortage = item.variance < 0;
                             const isExcess = item.variance > 0;
@@ -2647,13 +2960,20 @@ export default function ClosingStockByLocationPage() {
                           {/* Semi-finished counts for this date (req 1 + 4).
                               Valued by cost_per_unit in the sub-recipe's own
                               yield unit — no purchase unit, no pack factor. */}
-                          {historySemi.length > 0 && (
+                          {(historySemi.length > 0 || historyFail.semi) && (
                             <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
                               <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3">
                                 <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-[#6B5744]">
                                   <Layers className="w-3.5 h-3.5" /> Semi-finished / sub-recipes
                                   <span className="font-normal normal-case text-[10px] text-[#8B7355]">— counted and costed per yield unit</span>
                                 </span>
+                              </td>
+                            </tr>
+                          )}
+                          {historyFail.semi && (
+                            <tr className="border-t border-[#E8D5C4]/50 bg-red-50">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3 text-xs font-medium text-red-700">
+                                Semi-finished counts not loaded ({historyFail.semi}) — see the message above.
                               </td>
                             </tr>
                           )}
@@ -2689,6 +3009,19 @@ export default function ClosingStockByLocationPage() {
                             quantities and per-unit rates do not — those print an
                             em-dash rather than a meaningless sum. */}
                         <tfoot className="sticky bottom-0 bg-[#FFF1E3] text-xs font-semibold text-[#2D1B0E]">
+                          {historyIncomplete ? (
+                            /* No figure at all while a half is missing — a
+                               partial ₹ here would pass for the whole day. */
+                            <tr className="border-t-2 border-[#D4B896]">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3">
+                                Sheet total — <span className="text-red-700">INCOMPLETE</span>
+                                <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                                  {[historyFail.raw && 'raw-material', historyFail.semi && 'semi-finished'].filter(Boolean).join(' and ')} counts
+                                  not loaded, so no total is shown
+                                </span>
+                              </td>
+                            </tr>
+                          ) : (
                           <tr className="border-t-2 border-[#D4B896]">
                             <td colSpan={isAdmin ? 3 : 2} className="py-2 px-3">
                               Sheet total
@@ -2723,10 +3056,11 @@ export default function ClosingStockByLocationPage() {
                             )}
                             <td className="py-2 px-3" />
                           </tr>
+                          )}
                         </tfoot>
                       </table>
                     </div>
-                    {!historyPriced && (
+                    {!historyPriced && !historyIncomplete && (
                       <p className="text-[11px] italic text-[#8B7355]">
                         No stored valuation for this date — these counts were recorded before closing stock was valued. Historical rows are never re-priced from today&apos;s rates.
                       </p>
@@ -3176,6 +3510,28 @@ export default function ClosingStockByLocationPage() {
                           </p>
                         )}
                         {closingResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
+                        {/* The SUB-RECIPE zero-pattern refusal, asked here because
+                            the raw-material counts above WERE saved. Its own
+                            confirm, re-sending only the refused sub-recipe rows. */}
+                        {closingResult.semiHeld && (
+                          <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 space-y-1.5">
+                            <p className="font-semibold flex items-center gap-1.5">
+                              <AlertTriangle className="w-4 h-4 text-amber-600" />
+                              Sub-recipe counts were NOT saved — {closingResult.semiHeld.zeros} of {closingResult.semiHeld.counted} filled-in
+                              sub-recipe lines read 0 ({Math.round((Number(closingResult.semiHeld.share) || 0) * 100)}%).
+                            </p>
+                            {closingResult.semiHeld.message && <p className="text-[#6B5744]">{closingResult.semiHeld.message}</p>}
+                            <p className="text-[#6B5744]">
+                              A blank sub-recipe cell means <b>not counted</b>; a typed 0 means <b>counted, found empty</b>.
+                              Fix the blanks and save again, or confirm if those shelves really were empty.
+                            </p>
+                            <button onClick={closingResult.semiHeld.onConfirm} disabled={closingSubmitting}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50">
+                              {closingSubmitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <AlertTriangle className="w-3.5 h-3.5" />}
+                              Yes — record {closingResult.semiHeld.zeros} sub-recipes as empty
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -3196,7 +3552,7 @@ export default function ClosingStockByLocationPage() {
                   * leading `*` so the rate-basis lock reads them as prose
                   * (scripts/check-rate-basis.js isProseLine) instead of as an
                   * LPP read — the sentence stays, the false hit goes. */}
-                {valued && (valued.items.length > 0 || valued.semi.length > 0) && (
+                {valued && (valued.items.length > 0 || valued.semi.length > 0 || !!valued.semiFail) && (
                   <div className="rounded-lg border border-[#E8D5C4] overflow-hidden">
                     <div className="px-3 py-2 bg-[#FFF1E3] flex items-center justify-between gap-3 flex-wrap">
                       <div className="text-xs font-semibold text-[#2D1B0E]">
@@ -3206,10 +3562,18 @@ export default function ClosingStockByLocationPage() {
                         </span>
                       </div>
                       <div className="text-xs text-[#6B5744]">
-                        Sheet total <span className="font-mono font-semibold text-[#2D1B0E]">{fmtMoney(valued.total)}</span>
+                        Sheet total {valued.semiFail
+                          ? <span className="font-semibold text-red-700">INCOMPLETE</span>
+                          : <span className="font-mono font-semibold text-[#2D1B0E]">{fmtMoney(valued.total)}</span>}
                       </div>
                     </div>
-                    {!valued.priced ? (
+                    {valued.semiFail && (
+                      <p className="px-3 py-2 text-xs text-red-800 bg-red-50 border-t border-red-200">
+                        The semi-finished half of this sheet could not be read back ({valued.semiFail}), so it is not
+                        listed and no total is shown. What was saved is unchanged — check it in View History.
+                      </p>
+                    )}
+                    {!valued.priced && !valued.semiFail ? (
                       <p className="px-3 py-3 text-xs text-amber-800 bg-amber-50">
                         The counts saved, but this server build did not return per-item valuation, so no rate or value can be shown.
                       </p>
@@ -3288,7 +3652,9 @@ export default function ClosingStockByLocationPage() {
                               {/* Cross-material quantities never add up (ml + g + BTL) — em-dash. */}
                               <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>
                               <td className="py-2 px-3 text-right"><CrossDash what="rate total" /></td>
-                              <td className="py-2 px-3 text-right font-mono">{fmtMoney(valued.total)}</td>
+                              <td className="py-2 px-3 text-right font-mono">
+                                {valued.semiFail ? <span className="font-sans text-red-700">INCOMPLETE</span> : fmtMoney(valued.total)}
+                              </td>
                             </tr>
                           </tfoot>
                         </table>
