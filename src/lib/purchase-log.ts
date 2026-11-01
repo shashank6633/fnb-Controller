@@ -5,7 +5,26 @@ import { claimJoin } from './po-receipts';
 // The "Tax % Applied (GST)" base. GST only — compensation cess sits on the
 // GROSS line value and GST on the post-discount value, so the two cannot share
 // a denominator and must never share a percentage. See src/lib/tax-applied.ts.
-import { taxAppliedSumsSql } from './tax-applied';
+import { taxAppliedSumsSql, gstValue, taxAppliedPercent } from './tax-applied';
+// THE BILL GRAND TOTAL column and the TAX VALUE / TAX % columns (owner #5,
+// ruling 93). The arithmetic is IMPORTED, never re-typed: effectiveChargeSql()
+// / effectiveBillValueSql() read a charge off the bill DOCUMENT (the GRN line
+// on a PO-receipt mirror, the purchases row otherwise — the rail the Purchase
+// Report Summary, the Purchase Bill Summary and the GRN Inward Register all
+// share), effectiveLineTotalSql() is the per-line Grand Total the Bill Summary
+// sums, and the bill figure PRINTED is the Bill Summary's own total_bill_value
+// for the bill — see billGrandTotals() below.
+import {
+  withGrnCharges, grnLineJoinSql, grnSourcedSql, poReceiptMirrorSql,
+  effectiveChargeSql, effectiveLineTotalSql,
+} from './purchase-charges';
+// The Tax % denominator on a PURCHASE row: the value GST was CHARGED on — the
+// subtotal, except on a PO receipt part-rejected at the door, where it is the
+// ACCEPTED value, as the GRN Inward Register strikes it and as this log's own
+// GRN row already does (ROUND(accepted × rate, 2)). Without it the PURCHASE row
+// and the GRN row of one delivery printed two rates (14.40% vs 18.00%).
+import { gstChargedValueSql, gstBaseAcceptedSql } from './purchase-gst-base';
+import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-summary';
 
 /**
  * PURCHASE LOG — one row per ITEM per BILL, across all three procurement
@@ -156,6 +175,28 @@ import { taxAppliedSumsSql } from './tax-applied';
  * These refusals are DATA, not prose in a component: PURCHASE_LOG_NO_TOTAL_NOTES
  * ships on every payload so the screen and the CSV state them identically.
  *
+ * BILL GRAND TOTAL (2026-10-29, owner #5 / ruling 93) is a PER-BILL column, not
+ * a fourth total and not a cross-source sum: every PURCHASE and GRN line carries
+ * the Purchase Bill Summary's Grand Total for the WHOLE bill it sits on, read
+ * from that report (one source, `purchases`, on the effective charge rail) and
+ * proved against it on every request — see billGrandTotals() at the end of this
+ * file. Repeated on every line of a bill, so it is never totalled anywhere.
+ *
+ * TAX VALUE (GST) / TAX % APPLIED (GST) (same date, same ruling) are read off
+ * the BILL DOCUMENT — the row's own CGST + SGST, except on a PURCHASE row booked
+ * by a PO receive, whose GST lives only on its GRN line and is read from there
+ * (tax_value / tax_percent / tax_from_grn, gst_value on the totals). That is
+ * the rail the Purchase Report Summary sums, so the PURCHASE tax total equals
+ * its GST for the same filters. The RATE is struck on the value GST was
+ * charged on (src/lib/purchase-gst-base.ts): the subtotal, except on a PO
+ * receipt part-rejected at the door, where it is the ACCEPTED value — as the
+ * GRN Inward Register and this log's GRN row strike it — so the PURCHASE and
+ * GRN rows of one delivery print one rate. On exactly those lines the
+ * Summary's rate (received base) reads lower; tax_base_accepted /
+ * gst_base_accepted_lines carry the disclosure. The eight RECORDED charge columns, Total Amount
+ * and every total built on them are unchanged; on a mirror row the tax columns
+ * and the recorded CGST/SGST columns therefore differ, and both renderers say why.
+ *
  * KNOWN, DISCLOSED IMPRECISION (a writer defect, not a reporting choice): an
  * ad-hoc GRN mirrors GROSS value into `purchases` and copies no discount, so
  * Total Amount on those PURCHASE rows is high by the discount their GRN line
@@ -263,6 +304,104 @@ export interface PurchaseLogRow {
   /** "<grn_number>#<material_id>" — the one receipt event behind up to 3 rows. */
   link_key: string | null;
   notes: string;
+  /**
+   * TAX VALUE (GST) — CGST + SGST as the BILL DOCUMENT states it for this line
+   * (owner #5, ruling 93). On a GRN or an ordinary PURCHASE row that is the
+   * row's own cgst + sgst. On a PURCHASE row booked by a PO receive it is the
+   * paired GRN line's, because that route records the GST on the GRN line only
+   * and leaves this row's cgst/sgst at 0 — the same effective rail the Purchase
+   * Report Summary and the Bill Summary read, so the figure equals theirs.
+   * The recorded cgst / sgst fields above are NOT changed by this.
+   *
+   * null — BLANK, NEVER 0 — where no GST was typed, and on every PO row.
+   */
+  tax_value: number | null;
+  /**
+   * TAX % APPLIED (GST) on that same basis: tax_value ÷ (the value GST was
+   * charged on − discount). That value is the subtotal, except on a PO receipt
+   * part-rejected at the door, where it is the ACCEPTED value — the GRN Inward
+   * Register's basis and this log's GRN row's, so one delivery reads one rate
+   * (tax_base_accepted). null = none.
+   */
+  tax_percent: number | null;
+  /** true when tax_value / tax_percent were read off the paired GRN line (a PO receipt's mirror row). */
+  tax_from_grn: boolean;
+  /** true when tax_percent was struck on the ACCEPTED value of a part-rejected PO receipt (PURCHASE rows only). */
+  tax_base_accepted: boolean;
+  /**
+   * true on a PURCHASE row booked by a PO receive whose GRN line has since
+   * been deleted: its tax is UNAVAILABLE (blank), not "no GST entered".
+   */
+  tax_unavailable: boolean;
+  /**
+   * BILL GRAND TOTAL — the grand total of the WHOLE BILL this line sits on:
+   * Subtotal − Discount + CGST + SGST + both cesses + TCS + delivery + MRP
+   * round-off, over every line of that bill. It is the Purchase Bill Summary's
+   * own `total_bill_value` for that bill, over the same date window, so the two
+   * reports print one number per bill (owner #5, ruling 93).
+   *
+   * NOT a per-line figure and NOT this line's Total Amount: the SAME number is
+   * repeated on every line of the bill — the PURCHASE row and the GRN row of one
+   * delivery alike — so it must NEVER be added down the column. Nothing in this
+   * file or the route totals it; PURCHASE_LOG_NO_TOTAL_NOTES says why.
+   *
+   * null (blank / em dash) when there is no bill to quote:
+   *   • every PO row — an order is not a bill;
+   *   • a GRN row whose delivery has no booked purchase line in the window
+   *     (every line rejected) or whose lines fall on two bills;
+   *   • a bill whose figure did NOT reconcile with the Bill Summary — blanked
+   *     rather than printed, see bill_grand_total_check on the totals.
+   * `bill_grand_total_reason` carries the sentence for each of those.
+   */
+  bill_grand_total: number | null;
+  /** The Bill Summary's bill_key for that bill — pivot to its CSV's Bill Key column. */
+  bill_key: string | null;
+  /** That bill in plain words (vendor · PINV / GRN number / vendor bill / day). */
+  bill_label: string | null;
+  /** How many purchase lines that bill has — the Bill Summary's `lines`. */
+  bill_lines: number | null;
+  /** Why bill_grand_total is null, one sentence; '' when it carries a figure. */
+  bill_grand_total_reason: string;
+  /**
+   * How many of that bill's lines are cost rows booked from a goods receipt
+   * whose GRN line has since been DELETED — the Bill Summary's own
+   * unpaired_mirror_rows for the bill. > 0 means the printed Bill Grand Total
+   * is SHORT: the tax and charges recorded on the deleted line are missing,
+   * exactly as on the Bill Summary and the Purchases register, which flag the
+   * same bill. null where no figure is printed. A FLAG — it moves no figure.
+   */
+  bill_unpaired_lines: number | null;
+  /** The "understated" warning for bill_grand_total, one paragraph; '' when the bill is sound. */
+  bill_understated_note: string;
+}
+
+/**
+ * How the Bill Grand Total column was proved against the Purchase Bill Summary
+ * for THIS response. `mismatched` > 0 is a defect: those bills print blank and
+ * every renderer must say so in words.
+ */
+export interface PurchaseLogBillCheck {
+  /** Distinct bills the PURCHASE / GRN rows of this response point at. */
+  bills: number;
+  /** Matched to the Bill Summary's bill: same line count, same total to the paisa. */
+  matched: number;
+  /**
+   * Bills past the Bill Summary's own 5,000-bill row cap, so there was no row
+   * there to compare with. Printed from this file's figure, which is the same
+   * SQL arithmetic (effectiveLineTotalSql, same window). 0 unless the window
+   * holds more than 5,000 bills.
+   */
+  unverified: number;
+  /** Bills whose figure disagreed with the Bill Summary — printed BLANK. */
+  mismatched: number;
+  /**
+   * Bills printed WITH a figure that is UNDERSTATED (bill_unpaired_lines > 0):
+   * a GRN line behind one of their cost rows has been deleted. A defect, said
+   * in words beside the figure and in the CSV's captions. 0 today.
+   */
+  understated: number;
+  /** Those bills in plain words (their bill_label), for the CSV caption. */
+  understated_bills: string[];
 }
 
 /**
@@ -342,6 +481,29 @@ export interface PurchaseLogSourceMoney {
   taxed_bill_value: number;
   /** Lines behind taxed_bill_value — how many recorded GST > 0. */
   taxed_lines: number;
+  /**
+   * THE TAX VALUE (GST) COLUMN'S TOTAL — Σ of the rows' tax_value, i.e. the
+   * bill document's CGST + SGST (the paired GRN line's on a PO receipt's
+   * mirror row). It differs from tax_cgst_sgst above only on those mirror
+   * rows, whose own columns record 0; tax_cgst_sgst stays the RECORDED figure
+   * because bill_amount (Total Amount) is built from it and must keep footing.
+   * null on PO. A 0 here is "no GST anywhere in this source" and renders blank.
+   */
+  gst_value: number | null;
+  /** The Tax % column's base on that same basis — Σ(value GST was charged on − discount) over
+   *  GST-bearing lines: the subtotal, except the ACCEPTED value on a part-rejected PO receipt. */
+  gst_taxed_bill_value: number;
+  /** Lines behind gst_taxed_bill_value. */
+  gst_taxed_lines: number;
+  /** Lines whose tax_value was read off their paired GRN line (PURCHASE only; 0 elsewhere). */
+  gst_from_grn_lines: number;
+  /**
+   * GST-bearing lines whose Tax % base is the ACCEPTED value because the
+   * delivery was part-rejected at the door (PURCHASE only; 0 elsewhere). On
+   * those lines — and only those — this source's Tax % differs from the
+   * Purchase Report Summary's, which still divides by the received value.
+   */
+  gst_base_accepted_lines: number;
 }
 
 /** A column left without a total on purpose, and the reason, shipped as data. */
@@ -412,6 +574,18 @@ export const PURCHASE_LOG_NO_TOTAL_NOTES: PurchaseLogNoTotalNote[] = [
       + 'purchases row mirroring it, so PURCHASE + GRN + PO reads roughly double the real spend. '
       + 'Spend = the PURCHASE totals. Use the Link key to see the same delivery on two rows.',
   },
+  {
+    column: 'Bill Grand Total',
+    reason:
+      'No total, on purpose. It is the grand total of the WHOLE bill a line sits on (Subtotal − '
+      + 'discount + every tax and charge — the Purchase Bill Summary’s Grand Total for that bill), '
+      + 'repeated on every line of that bill and on both the PURCHASE and the GRN row of one '
+      + 'delivery, so adding the column down counts each bill once per line. For the period’s '
+      + 'grand total use Reports → Purchase Bill Summary. Blank on PO lines: an order is not a bill. '
+      + 'On a line with no invoice, GRN or bill number the “bill” is that vendor’s unnumbered '
+      + 'purchases for the day, which the Bill Summary groups as one bill and which can span '
+      + 'several vendor invoices.',
+  },
 ];
 
 export interface PurchaseLogTotals {
@@ -467,6 +641,8 @@ export interface PurchaseLogTotals {
    * instead of two hand-written copies drifting apart.
    */
   goods_value_caveat: string;
+  /** How the rows' Bill Grand Total figures were proved — see PurchaseLogBillCheck. */
+  bill_grand_total_check: PurchaseLogBillCheck;
 }
 
 export interface PurchaseLogResult {
@@ -602,6 +778,11 @@ function emptyMoney(source: PurchaseLogSource): PurchaseLogSourceMoney {
     // renders as an em dash off a 0 base — never 0%.
     taxed_bill_value: 0,
     taxed_lines: 0,
+    gst_value: noCharges ? null : 0,
+    gst_taxed_bill_value: 0,
+    gst_taxed_lines: 0,
+    gst_from_grn_lines: 0,
+    gst_base_accepted_lines: 0,
   };
 }
 
@@ -732,6 +913,31 @@ function buildUnion(f: {
         p.compensation_cess AS compensation_cess,
         p.tcs AS tcs, p.delivery_charges AS delivery_charges,
         p.mrp_round_off AS mrp_round_off,
+        -- THE BILL DOCUMENT'S GST, for the Tax Value / Tax % columns only
+        -- (owner #5, ruling 93). A PO receive records the GST on the GRN line
+        -- and leaves this purchases row's cgst/sgst at 0, so the eight columns
+        -- above say "no tax" on a bill that carried 18%. These four read the
+        -- GRN line for exactly those rows and the row itself for every other
+        -- — the imported effective rail, the same expressions the Purchase
+        -- Report Summary sums — so the tax column equals that report. The eight
+        -- recorded columns above, Total Amount and every total built on them
+        -- are untouched. Same position in all three branches (UNION is
+        -- positional).
+        ${effectiveChargeSql('cgst', 'p', 'gl')}           AS doc_cgst,
+        ${effectiveChargeSql('sgst', 'p', 'gl')}           AS doc_sgst,
+        ${effectiveChargeSql('discount', 'p', 'gl')}       AS doc_discount,
+        -- The Tax % BASE, not the subtotal: the value GST was charged on
+        -- (src/lib/purchase-gst-base.ts). Equal to effectiveBillValueSql() on
+        -- every line that rejected nothing; the ACCEPTED value on a PO receipt
+        -- part-rejected at the door — the base the GRN branch below uses.
+        ${gstChargedValueSql('p', 'gl')}                   AS doc_bill_value,
+        ${grnSourcedSql('gl')}                             AS doc_from_grn,
+        ${gstBaseAcceptedSql('p', 'gl')}                   AS doc_base_accepted,
+        -- A PO-receipt cost mirror whose GRN line is GONE: its own cgst/sgst
+        -- are the receive route's placeholder 0, so the tax cells are blank —
+        -- and the hover must say "unavailable", not "no GST was entered".
+        CASE WHEN ${poReceiptMirrorSql('p')} = 1 AND gl.purchase_id IS NULL
+             THEN 1 ELSE 0 END                             AS doc_unpaired,
         -- Tail of the note starting at the GRN number, if any. The regex that
         -- turns this into a link_key lives in JS; SQLite has no REGEXP here.
         CASE WHEN instr(COALESCE(p.notes, ''), 'GRN-') > 0
@@ -748,6 +954,9 @@ function buildUnion(f: {
         COALESCE(p.notes, '')                             AS notes
       FROM purchases p
       LEFT JOIN raw_materials rm ON rm.id = p.material_id
+      -- The paired GRN line (grn_line CTE — every statement over this union is
+      -- wrapped in withGrnCharges). Cannot fan out: one GRN line per row at most.
+      ${grnLineJoinSql('p', 'gl')}
       WHERE p.date >= ? AND p.date <= ?${venFilter('p.vendor')}${matFilter('p.material_id')}
     `);
     params.push(f.from, f.to);
@@ -810,6 +1019,16 @@ function buildUnion(f: {
         gi.compensation_cess AS compensation_cess,
         gi.tcs AS tcs, gi.delivery_charges AS delivery_charges,
         gi.mrp_round_off AS mrp_round_off,
+        -- The bill document's GST: a GRN line IS the document, so its own
+        -- figures, on its own value — exactly what this row always showed.
+        gi.cgst                                           AS doc_cgst,
+        gi.sgst                                           AS doc_sgst,
+        gi.discount                                       AS doc_discount,
+        ROUND(gi.quantity_accepted * gi.unit_price, 2)    AS doc_bill_value,
+        0                                                 AS doc_from_grn,
+        -- Its Value IS the accepted value already, so nothing is re-based.
+        0                                                 AS doc_base_accepted,
+        0                                                 AS doc_unpaired,
         g.grn_number                                      AS link_raw,
         0                                                 AS is_mirror,
         COALESCE(NULLIF(TRIM(gi.notes), ''), TRIM(COALESCE(g.notes, ''))) AS notes
@@ -929,6 +1148,9 @@ function buildUnion(f: {
         NULL AS discount, NULL AS cgst, NULL AS sgst,
         NULL AS special_excise_cess, NULL AS compensation_cess, NULL AS tcs,
         NULL AS delivery_charges, NULL AS mrp_round_off,
+        -- No bill document behind an order: no GST, blank (never 0).
+        NULL AS doc_cgst, NULL AS doc_sgst, NULL AS doc_discount,
+        NULL AS doc_bill_value, 0 AS doc_from_grn, 0 AS doc_base_accepted, 0 AS doc_unpaired,
         -- The GRN this ordered line was received on, via po_item_id. NULL until
         -- it is received (or when the receipt fell outside this date window).
         --
@@ -1017,6 +1239,7 @@ export function getPurchaseLog(
     },
     no_total_notes: PURCHASE_LOG_NO_TOTAL_NOTES,
     goods_value_caveat: `${GOODS_VALUE_CAVEAT_HEADLINE} ${goodsValueCaveatDetail(emptyMoney('PURCHASE'))}`,
+    bill_grand_total_check: { bills: 0, matched: 0, unverified: 0, mismatched: 0, understated: 0, understated_bills: [] },
   };
   // buildUnion returns '' only if `source` matched nothing, which the
   // normalisation above makes impossible — but an empty compound SELECT is a
@@ -1031,7 +1254,10 @@ export function getPurchaseLog(
   // lineTotalAmount() does per row. Anything else and the footer stops footing
   // the column above it by a paisa or two, which is exactly the kind of drift
   // that makes an owner distrust the whole report.
-  const agg = db.prepare(`
+  // withGrnCharges: the PURCHASE branch LEFT JOINs the grn_line CTE (for the
+  // doc_* tax columns), so every statement over the union carries the CTE. A
+  // statement whose union has no PURCHASE branch simply never reads it.
+  const agg = db.prepare(withGrnCharges(`
     SELECT source,
            COUNT(*)                                                  AS lines,
            COALESCE(SUM(value), 0)                                   AS value,
@@ -1074,7 +1300,32 @@ export function getPurchaseLog(
            )}
     FROM (${union})
     GROUP BY source
-  `).all(...params) as Array<Record<string, number> & { source: string }>;
+  `)).all(...params) as Array<Record<string, number> & { source: string }>;
+
+  // ── THE TAX VALUE (GST) / TAX % APPLIED (GST) TOTALS, per source ──────────
+  // Over the bill DOCUMENT's GST (the doc_* columns), the figure the two tax
+  // columns print per row — so each footer foots its own column. A separate
+  // statement because taxAppliedSumsSql() names its outputs taxed_bill_value /
+  // taxed_lines, which the recorded-rail aggregate above already uses; one
+  // formula, imported, never re-typed under a second alias.
+  const docAgg = db.prepare(withGrnCharges(`
+    SELECT source,
+           COALESCE(SUM(COALESCE(doc_cgst, 0) + COALESCE(doc_sgst, 0)), 0) AS doc_gst,
+           COALESCE(SUM(CASE WHEN doc_from_grn = 1 THEN 1 ELSE 0 END), 0)  AS doc_from_grn_lines,
+           -- GST-bearing lines whose base is the ACCEPTED value (a PO receipt
+           -- part-rejected at the door) — the only lines on which this rate
+           -- and the Purchase Report Summary's part company. Drives the note.
+           COALESCE(SUM(CASE WHEN doc_base_accepted = 1
+                              AND COALESCE(doc_cgst, 0) + COALESCE(doc_sgst, 0) > 0
+                             THEN 1 ELSE 0 END), 0)                    AS doc_base_accepted_lines,
+           ${taxAppliedSumsSql(
+             'COALESCE(doc_cgst, 0) + COALESCE(doc_sgst, 0)',
+             'COALESCE(doc_bill_value, 0) - COALESCE(doc_discount, 0)',
+           )}
+    FROM (${union})
+    GROUP BY source
+  `)).all(...params) as Array<Record<string, number> & { source: string }>;
+  const docBySource = new Map(docAgg.map(d => [String(d.source), d]));
 
   const totals: PurchaseLogTotals = {
     ...empty,
@@ -1138,6 +1389,13 @@ export function getPurchaseLog(
       // exactly the right answer for an order nobody has billed.
       taxed_bill_value: r2(a.taxed_bill_value),
       taxed_lines: num(a.taxed_lines),
+      // The bill document's GST for this source — what the Tax Value / Tax %
+      // columns total. null on PO (no document), like every PO charge.
+      gst_value: noCharges ? null : r2(num(docBySource.get(src)?.doc_gst)),
+      gst_taxed_bill_value: r2(num(docBySource.get(src)?.taxed_bill_value)),
+      gst_taxed_lines: num(docBySource.get(src)?.taxed_lines),
+      gst_from_grn_lines: num(docBySource.get(src)?.doc_from_grn_lines),
+      gst_base_accepted_lines: num(docBySource.get(src)?.doc_base_accepted_lines),
     };
   }
 
@@ -1161,7 +1419,7 @@ export function getPurchaseLog(
   //
   // row_id is the final tie-break so the LIMIT takes a deterministic prefix
   // rather than an arbitrary one.
-  const raw = db.prepare(`
+  const raw = db.prepare(withGrnCharges(`
     SELECT * FROM (${union})
     ORDER BY date ASC,
              vendor COLLATE NOCASE ASC,
@@ -1171,7 +1429,7 @@ export function getPurchaseLog(
              doc_no ASC,
              row_id ASC
     LIMIT ?
-  `).all(...params, PURCHASE_LOG_MAX_ROWS) as any[];
+  `)).all(...params, PURCHASE_LOG_MAX_ROWS) as any[];
 
   const rows: PurchaseLogRow[] = raw.map((r) => {
     const src = r.source as PurchaseLogSource;
@@ -1193,6 +1451,16 @@ export function getPurchaseLog(
       mrp_round_off: nullNum(r.mrp_round_off),
     };
     const value = r2(r.value);
+    // The bill document's GST on this line (see doc_* in buildUnion), through
+    // the SAME helpers every tax column in the app uses. BLANK, NEVER 0, where
+    // no GST was typed (ruling 93): gstValue() returns 0 for a line whose CGST
+    // and SGST were both left at 0, and that 0 becomes null here. A PO line is
+    // already null (no columns at all).
+    const docTax = {
+      cgst: nullNum(r.doc_cgst), sgst: nullNum(r.doc_sgst),
+      discount: nullNum(r.doc_discount), value: nullNum(r.doc_bill_value),
+    };
+    const docGst = gstValue(docTax);
     return {
       source: src,
       date: String(r.date || ''),
@@ -1215,10 +1483,276 @@ export function getPurchaseLog(
       // (Falls back to the bare GRN number if the material row was purged.)
       link_key: grn ? (materialId2 ? `${grn}#${materialId2}` : grn) : null,
       notes: String(r.notes || '').trim(),
+      tax_value: docGst == null || docGst === 0 ? null : docGst,
+      tax_percent: taxAppliedPercent(docTax),
+      tax_from_grn: num(r.doc_from_grn) === 1,
+      tax_base_accepted: num(r.doc_base_accepted) === 1 && docGst != null && docGst !== 0,
+      tax_unavailable: num(r.doc_unpaired) === 1,
+      // Filled in by billGrandTotals() below; a PO row keeps these.
+      bill_grand_total: null,
+      bill_key: null,
+      bill_label: null,
+      bill_lines: null,
+      bill_grand_total_reason: src === 'PO' ? BILL_GT_REASON_PO : '',
+      bill_unpaired_lines: null,
+      bill_understated_note: '',
     };
   });
 
+  // ── THE BILL GRAND TOTAL, per row ─────────────────────────────────────────
+  // Only PURCHASE and GRN rows sit on a bill. A ?source=po request has none, so
+  // it never pays for the Bill Summary read.
+  if (rows.some(r => r.source !== 'PO')) {
+    totals.bill_grand_total_check = billGrandTotals(db, from, to, rows, raw.map(r => String(r.row_id ?? '')));
+  }
+
   return { rows, totals, truncated: totals.lines > rows.length, from, to };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BILL GRAND TOTAL — the Purchase Bill Summary's figure, on every line of
+// the bill (owner #5, ruling 93: "Purchase Report: Add purchase date, tax
+// details, GST %, and grand total" → "a per-BILL Grand Total" on this log).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHAT IS PRINTED. For each PURCHASE / GRN row: the Bill Summary's own
+// total_bill_value (src/lib/purchase-bill-summary.ts getPurchaseBillSummary,
+// :1272-1410 — SUM(line_total) GROUP BY bill_key at :1315/:1321) for the bill
+// the line belongs to, over the SAME date window, no vendor filter, PO receipts
+// included and unnumbered purchases grouped per vendor-day — i.e. exactly what
+// Reports → Purchase Bill Summary prints for that window by default. Not
+// recomputed and not re-rounded: the number on this log IS that number.
+//
+// WHICH BILL A LINE IS ON. The Bill Summary keys bills with a private CASE
+// (billKeyExpr, purchase-bill-summary.ts:1086-1092) that it exposes per BILL,
+// never per purchases row, and this lane may not edit that file. So the key is
+// restated below as BILL_KEY_SQL — the same five branches in the same order —
+// and that restatement is NEVER trusted on its own word: every bill it forms is
+// checked against the Bill Summary's row for the same key, on BOTH its line
+// count and its total (this file's own SUM of effectiveLineTotalSql, the
+// identical per-line expression the Bill Summary sums, purchase-bill-summary.ts
+// :1109). A bill that disagrees on either prints BLANK, is counted in
+// bill_grand_total_check.mismatched, and the screen and the CSV both say so —
+// so if billKeyExpr ever changes and this copy does not, the column goes blank
+// and loud rather than quietly quoting a different bill's money.
+//   ⚠ When billKeyExpr changes, change BILL_KEY_SQL with it. Better still, have
+//   purchase-bill-summary.ts export a per-row key and delete this copy.
+//
+// GRN ROWS are the same delivery seen from the bill side, so they print the
+// same figure as the purchases rows that delivery booked: the GRN's id is read
+// off goods_receipt_note_items by row id, and the bill is the one its purchases
+// rows (purchases.grn_id, the hard link) fall on. A GRN with no booked line in
+// the window (every line rejected) has no bill in the Bill Summary and prints
+// blank, with that reason.
+//
+// IT MOVES NO OTHER FIGURE. Read-only SELECTs; nothing here touches `value`,
+// `total_amount`, a charge column, a totals field or the row order.
+
+/** BILL KEY — restated from purchase-bill-summary.ts:1086-1092 (billKeyExpr,
+ *  with fromPoReceiptSql :1016-1021 inlined) and checked against it per bill on
+ *  every request. 'group' mode — the Bill Summary's default (:1173-1174). */
+const BILL_KEY_SQL = `CASE
+        WHEN (TRIM(COALESCE(p.grn_id, '')) <> '' AND EXISTS (
+              SELECT 1 FROM goods_receipt_notes g_src
+               WHERE g_src.id = TRIM(p.grn_id)
+                 AND g_src.po_id IS NOT NULL AND TRIM(g_src.po_id) <> ''))
+                                                    THEN 'GRN:' || TRIM(p.grn_id)
+        WHEN TRIM(COALESCE(p.invoice_id, '')) <> '' THEN 'INV:' || TRIM(p.invoice_id)
+        WHEN TRIM(COALESCE(p.grn_id, '')) <> ''     THEN 'GRN:' || TRIM(p.grn_id)
+        WHEN TRIM(COALESCE(p.bill_no, '')) <> ''    THEN 'BILL:' || LOWER(TRIM(p.vendor)) || '|' || LOWER(TRIM(p.bill_no)) || '|' || p.date || '|' || COALESCE(p.outlet_id, '')
+        ELSE 'DAY:' || LOWER(TRIM(p.vendor)) || '|' || p.date || '|' || COALESCE(p.outlet_id, '')
+      END`;
+
+const BILL_GT_REASON_PO =
+  'An order is not a bill — there is no grand total until it is received. See the GRN and PURCHASE rows with the same Link key.';
+const BILL_GT_REASON_NO_BILL =
+  'No booked purchase line of this delivery falls in this period (for example every line was rejected), so the Purchase Bill Summary has no bill for it.';
+const BILL_GT_REASON_SPLIT =
+  'The purchase lines this delivery booked fall on more than one bill in the Purchase Bill Summary, so no single bill total can be quoted for this line.';
+const BILL_GT_REASON_MISMATCH =
+  'BLANKED: this bill did not reconcile with the Purchase Bill Summary (line count or total differ), so no figure is printed rather than one that disagrees. Report it.';
+
+/** "Rs 1,234.50" for a reason sentence — en-IN grouping, always two decimals,
+ *  "Rs" like the rest of this file's prose (it also reaches the CSV). */
+const inr = (n: number) =>
+  'Rs ' + r2(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/** The bill in plain words, from the Bill Summary's own row for it. */
+function billLabelFrom(b: Pick<PurchaseBillRow, 'bill_kind' | 'vendor' | 'invoice_id' | 'bill_no' | 'grn_number' | 'po_number' | 'date'>): string {
+  const v = b.vendor || '(no vendor)';
+  switch (b.bill_kind) {
+    case 'INV': return `${v} · invoice ${b.invoice_id}${b.bill_no ? ` · vendor bill ${b.bill_no}` : ''}`;
+    case 'GRN': return `${v} · ${b.grn_number || 'GRN'}${b.po_number ? ` (PO ${b.po_number})` : ''}${b.bill_no ? ` · vendor bill ${b.bill_no}` : ''}`;
+    case 'BILL': return `${v} · vendor bill ${b.bill_no} · ${b.date}`;
+    default: return `${v} · ${b.date} · no bill number, so the Bill Summary groups this vendor’s unnumbered purchases for the day as one bill`;
+  }
+}
+
+/**
+ * The warning beside a Bill Grand Total that is SHORT because a GRN line behind
+ * one of the bill's cost rows has been deleted — '' when nothing is missing.
+ * Written for ONE bill (the shared unpairedMirrorNote() is worded for the
+ * Bill Summary's rows, where a Subtotal and charge cells sit beside it). No
+ * rupee figure: what the deleted line held cannot be known from here.
+ * `flaggedThere` = the figure was matched to the Bill Summary's own row, which
+ * prints the same short total with its own UNDERSTATED flag.
+ */
+function billUnderstatedNote(unpaired: number, lines: number, flaggedThere: boolean): string {
+  if (!(unpaired > 0)) return '';
+  const one = unpaired === 1;
+  // "the only line" / "all 3 lines" / "1 of the 2 lines" — never "1 of the 1 line".
+  const which = unpaired >= lines
+    ? (lines === 1 ? 'the only line on this bill was' : `all ${lines} lines on this bill were`)
+    : `${unpaired} of the ${lines} lines on this bill ${one ? 'was' : 'were'}`;
+  return `UNDERSTATED — ${which} booked from a goods receipt whose GRN line (the bill document) has since been deleted, `
+    + `so the tax and charges recorded on ${one ? 'that GRN line are' : 'those GRN lines are'} missing from this Bill Grand Total`
+    + (flaggedThere ? ' — the Purchase Bill Summary prints the same short figure for this bill and flags it UNDERSTATED' : '')
+    + '. How much is missing cannot be known from here. Do not pay a vendor against this figure — report it: a cost '
+    + 'row outliving its bill document means a GRN was deleted without unwinding the purchase.';
+}
+
+/**
+ * Fill bill_grand_total / bill_key / bill_label / bill_lines on every PURCHASE
+ * and GRN row, in place, and return the proof counts. `rowIds[i]` is the source
+ * table's id for rows[i] (purchases.id / goods_receipt_note_items.id).
+ */
+function billGrandTotals(
+  db: DatabaseT.Database,
+  from: string,
+  to: string,
+  rows: PurchaseLogRow[],
+  rowIds: string[],
+): PurchaseLogBillCheck {
+  // 1. Every purchases row in the window → its bill key, plus this file's own
+  //    figure for that bill (window SUM of the imported per-line expression).
+  //    No vendor / material / source filter: a bill's total is the WHOLE bill.
+  //    `unpaired` is a FLAG beside the figure, not part of it: a cost row booked
+  //    from a goods receipt whose GRN line is gone — the same expression as
+  //    chargeSourceCountsSql()'s unpaired_mirror_rows (and doc_unpaired above).
+  const mine = db.prepare(withGrnCharges(`
+    SELECT purchase_id, grn_id, bill_key,
+           COUNT(*)        OVER (PARTITION BY bill_key) AS bill_lines,
+           SUM(line_total) OVER (PARTITION BY bill_key) AS bill_total,
+           SUM(unpaired)   OVER (PARTITION BY bill_key) AS bill_unpaired
+      FROM (
+        SELECT p.id                             AS purchase_id,
+               TRIM(COALESCE(p.grn_id, ''))     AS grn_id,
+               ${BILL_KEY_SQL}                  AS bill_key,
+               ${effectiveLineTotalSql('p', 'gl')} AS line_total,
+               CASE WHEN ${poReceiptMirrorSql('p')} = 1 AND gl.purchase_id IS NULL
+                    THEN 1 ELSE 0 END           AS unpaired
+          FROM purchases p
+          ${grnLineJoinSql('p', 'gl')}
+         WHERE p.date >= ? AND p.date <= ?
+      )
+  `)).all(from, to) as Array<{ purchase_id: string; grn_id: string; bill_key: string | null; bill_lines: number; bill_total: number; bill_unpaired: number }>;
+
+  const keyOfPurchase = new Map<string, string>();
+  const keysOfGrn = new Map<string, Set<string>>();
+  const mineByKey = new Map<string, { lines: number; total: number; unpaired: number }>();
+  for (const m of mine) {
+    // The Bill Summary maps a NULL key to '' (String(r.bill_key || '')), so
+    // this side does too — the two maps must use one spelling of every key.
+    const k = String(m.bill_key || '');
+    keyOfPurchase.set(String(m.purchase_id), k);
+    if (m.grn_id) {
+      const set = keysOfGrn.get(m.grn_id) || new Set<string>();
+      set.add(k);
+      keysOfGrn.set(m.grn_id, set);
+    }
+    if (!mineByKey.has(k)) mineByKey.set(k, { lines: num(m.bill_lines), total: num(m.bill_total), unpaired: num(m.bill_unpaired) });
+  }
+
+  // 2. The Bill Summary itself, for the same window, on its defaults.
+  const bs = getPurchaseBillSummary({ from, to }, db);
+  const bsByKey = new Map<string, PurchaseBillRow>();
+  for (const b of bs.rows) bsByKey.set(b.bill_key, b);
+
+  // 3. GRN rows → their GRN's id, one read for all of them.
+  const grnItemIds = rows.map((r, i) => (r.source === 'GRN' ? rowIds[i] : '')).filter(Boolean);
+  const grnOfItem = new Map<string, string>();
+  if (grnItemIds.length) {
+    const found = db.prepare(`
+      SELECT id, TRIM(COALESCE(grn_id, '')) AS grn_id
+        FROM goods_receipt_note_items
+       WHERE id IN (SELECT value FROM json_each(?))
+    `).all(JSON.stringify(grnItemIds)) as Array<{ id: string; grn_id: string }>;
+    for (const f of found) grnOfItem.set(String(f.id), String(f.grn_id || ''));
+  }
+
+  // 4. Settle each referenced bill ONCE: the Bill Summary's figure when this
+  //    side agrees with it on lines AND total, blank when it does not.
+  type Settled = { total: number | null; lines: number; label: string; reason: string; unpaired: number | null; understated: string };
+  const settled = new Map<string, Settled>();
+  const check: PurchaseLogBillCheck = { bills: 0, matched: 0, unverified: 0, mismatched: 0, understated: 0, understated_bills: [] };
+  const settle = (key: string) => {
+    const hit = settled.get(key);
+    if (hit) return hit;
+    const m = mineByKey.get(key);
+    const b = bsByKey.get(key);
+    let out: Settled;
+    if (b && m && b.lines === m.lines && Math.abs(b.total_bill_value - m.total) <= 0.0051) {
+      // THE printed figure is the Bill Summary's, untouched — and so is its
+      // UNDERSTATED flag: the Bill Summary's own count of lines whose GRN line
+      // is gone, the count its screen flags the same bill by.
+      const unpaired = num(b.unpaired_mirror_rows);
+      out = {
+        total: b.total_bill_value, lines: b.lines, label: billLabelFrom(b), reason: '',
+        unpaired, understated: billUnderstatedNote(unpaired, b.lines, true),
+      };
+      check.matched++;
+    } else if (!b && m && bs.truncated) {
+      // Past the Bill Summary's 5,000-bill row cap: no row there to compare,
+      // so the same arithmetic from this side, rounded the way it rounds.
+      out = {
+        total: r2(m.total), lines: m.lines, label: key, reason: '',
+        unpaired: m.unpaired, understated: billUnderstatedNote(m.unpaired, m.lines, false),
+      };
+      check.unverified++;
+    } else {
+      out = {
+        total: null, lines: m?.lines ?? 0, label: b ? billLabelFrom(b) : key,
+        reason: `${BILL_GT_REASON_MISMATCH} This log: ${m?.lines ?? 0} line(s), ${inr(m?.total ?? 0)}; `
+          + `Bill Summary: ${b ? `${b.lines} line(s), ${inr(b.total_bill_value)}` : 'no such bill'}.`,
+        // No figure is printed, so there is nothing to call short.
+        unpaired: null, understated: '',
+      };
+      check.mismatched++;
+    }
+    if (out.understated) {
+      check.understated++;
+      check.understated_bills.push(out.label);
+    }
+    check.bills++;
+    settled.set(key, out);
+    return out;
+  };
+
+  rows.forEach((r, i) => {
+    if (r.source === 'PO') return;
+    let key: string | undefined;
+    if (r.source === 'PURCHASE') {
+      key = keyOfPurchase.get(rowIds[i]);
+      // Cannot happen — the row came from the same table and window — but a
+      // row with no bill must say so rather than print another row's figure.
+      if (key === undefined) { r.bill_grand_total_reason = BILL_GT_REASON_NO_BILL; return; }
+    } else {
+      const keys = keysOfGrn.get(grnOfItem.get(rowIds[i]) || '');
+      if (!keys || keys.size === 0) { r.bill_grand_total_reason = BILL_GT_REASON_NO_BILL; return; }
+      if (keys.size > 1) { r.bill_grand_total_reason = BILL_GT_REASON_SPLIT; return; }
+      key = [...keys][0];
+    }
+    const s = settle(key);
+    r.bill_key = key;
+    r.bill_label = s.label;
+    r.bill_lines = s.lines;
+    r.bill_grand_total = s.total;
+    r.bill_grand_total_reason = s.reason;
+    r.bill_unpaired_lines = s.unpaired;
+    r.bill_understated_note = s.understated;
+  });
+
+  return check;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

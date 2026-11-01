@@ -12,8 +12,10 @@ import {
 // src/lib/tax-applied.ts for why cess is NOT in here (different taxable base).
 import {
   TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
-  gstValue, taxAppliedPercent, taxCsvNumber,
+  taxAppliedPercent, taxCsvNumber,
 } from '@/lib/tax-applied';
+// The one caption that explains a PURCHASE Tax % struck on the ACCEPTED value.
+import { acceptedBaseTotalNote } from '@/lib/purchase-gst-base';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * PURCHASE LOG — GET /api/reports/purchase-log   (management only)
@@ -54,6 +56,15 @@ import {
  * three SEPARATE figures, and the CSV writes them as three separately captioned
  * rows that say in words why they must not be added. If you are ever tempted to
  * add a `total_value`, re-read this block: that single number is the bug.
+ *
+ * THE ONE GRAND TOTAL THAT IS HERE, AND WHY IT IS NOT THAT BUG (2026-10-29,
+ * owner #5 / ruling 93): each PURCHASE and GRN row carries `bill_grand_total`,
+ * the Purchase Bill Summary's Grand Total for the WHOLE BILL that line sits on.
+ * It is a per-bill figure from ONE source (purchases, effective charge rail),
+ * read from that report and proved against it per bill — never a sum across
+ * sources and never a sum of this file's rows. It repeats on every line of its
+ * bill, so it is the last CSV column, appears in NO totals row, and the notes
+ * block says it must not be added down. See src/lib/purchase-log.ts.
  * ─────────────────────────────────────────────────────────────────────────
  * WHAT "NO GRAND TOTAL" DOES **NOT** FORBID — read before deleting the totals
  * ─────────────────────────────────────────────────────────────────────────
@@ -131,6 +142,32 @@ const csvCell = (v: unknown, numeric = false): string => {
 };
 
 /**
+ * A source's Tax Value total with "no GST anywhere" as null — blank, never 0
+ * (ruling 93), the same rule the per-line cells get from tax_value. A real
+ * figure — and a PO block's null — pass through as is.
+ */
+const gstOrBlank = (v: number | null): number | null => (v == null || v === 0 ? null : v);
+
+/**
+ * A source's Tax % total: Σ(document GST) ÷ Σ(taxed base), money-weighted, by
+ * the SAME helper the per-line cells use, over the same basis as gst_value.
+ */
+const sourceTaxPercent = (m: PurchaseLogSourceMoney): number | null =>
+  taxAppliedPercent({ gst: m.gst_value, taxed_bill_value: m.gst_taxed_bill_value, taxed_lines: m.gst_taxed_lines, lines: m.lines });
+
+/**
+ * The appended per-bill column's heading. Says in the heading itself that the
+ * figure repeats per line and must not be summed, because a CSV reader never
+ * sees the screen's tooltip.
+ */
+const BILL_GRAND_TOTAL_CSV_HEADER =
+  'Bill Grand Total INR (the WHOLE bill this line sits on: subtotal - discount + every tax and charge; '
+  + '= Purchase Bill Summary Grand Total for that bill; on a line with no invoice, GRN or bill number it is that '
+  + 'vendor\'s unnumbered purchases for the day, which the Bill Summary groups as one bill and which can span '
+  + 'several vendor invoices; repeated on every line of the bill, so NEVER sum this column; '
+  + 'blank on PO lines and where no bill can be quoted)';
+
+/**
  * CSV columns, header and accessor declared together.
  *
  * Kept as one list rather than a header array plus a separate row builder
@@ -192,8 +229,26 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown; numeric?:
   // Blank, never 0, when the line recorded no GST: a PO line has no charge
   // columns at all, and on the tax-inclusive import rows the tax was never
   // split out, so "no GST recorded" is the only supportable statement.
-  { header: TAX_VALUE_CSV_HEADER,   cell: r => taxCsvNumber(gstValue(r)),          numeric: true },
-  { header: TAX_PERCENT_CSV_HEADER, cell: r => taxCsvNumber(taxAppliedPercent(r)), numeric: true },
+  // OWNER #5 / RULING 93, 2026-10-29 — two changes to the VALUES, none to the
+  // position or the heading:
+  //  • BLANK, NEVER 0, WHERE NO GST WAS TYPED. This cell used to write 0 on
+  //    every line that recorded no CGST/SGST; a 0 in a tax column claims the
+  //    vendor charged none. Blank sums the same in a spreadsheet.
+  //  • READ OFF THE BILL DOCUMENT (r.tax_value / r.tax_percent, computed in
+  //    src/lib/purchase-log.ts). On a PURCHASE row booked by a PO receive the
+  //    GST lives only on the GRN line, so this column used to print 0 for a
+  //    bill that carried 18%; it now prints the GRN line's GST, as the heading
+  //    always promised ("tax actually charged on the bill") and as the Purchase
+  //    Report Summary sums it. The CGST/SGST columns above stay as recorded.
+  { header: TAX_VALUE_CSV_HEADER,   cell: r => taxCsvNumber(r.tax_value), numeric: true },
+  { header: TAX_PERCENT_CSV_HEADER, cell: r => taxCsvNumber(r.tax_percent), numeric: true },
+  // ── BILL GRAND TOTAL, APPENDED LAST (owner #5, ruling 93) ──────────────────
+  // The Purchase Bill Summary's Grand Total for the WHOLE bill this line sits
+  // on, repeated on every line of that bill (src/lib/purchase-log.ts,
+  // billGrandTotals). Appended so no existing column moves. It is deliberately
+  // NOT in any totals row below — captionRow leaves it empty — because adding
+  // it down the column counts each bill once per line; the notes block says so.
+  { header: BILL_GRAND_TOTAL_CSV_HEADER, cell: r => (r.bill_grand_total == null ? '' : r.bill_grand_total), numeric: true },
 ];
 
 /**
@@ -258,11 +313,12 @@ function sourceTotalsRow(label: string, money: PurchaseLogSourceMoney): string {
   const figures: Array<[number, number | null | undefined]> = [
     [VALUE_COL, money.goods_value],
     [TOTAL_COL, money.bill_amount],
-    // Sigma(CGST+SGST) for the source, and Sigma(GST) / Sigma(taxed base) as the rate
-    // — money-weighted, computed by the SAME helper the per-line cells use, and
-    // blank (never 0) when the source recorded no GST at all.
-    [TAX_VALUE_COL, money.tax_cgst_sgst],
-    [TAX_PCT_COL, taxAppliedPercent(money)],
+    // Sigma(document GST) for the source — the total of the Tax Value column
+    // above it, so it foots that column — and Sigma(GST) / Sigma(taxed base) as
+    // the rate, money-weighted, by the SAME helper the per-line cells use.
+    // Blank (never 0) when the source recorded no GST at all (ruling 93).
+    [TAX_VALUE_COL, gstOrBlank(money.gst_value)],
+    [TAX_PCT_COL, sourceTaxPercent(money)],
   ];
   for (const c of CHARGE_TOTAL_COLS) {
     const v = money[c.key];
@@ -339,6 +395,30 @@ export async function GET(req: Request) {
       // once, so the CSV and the on-screen banner say identical words.
       lines.push(captionRow(''));
       lines.push(captionRow(`!! ${totals.goods_value_caveat}`));
+      // The per-bill column's proof. Said only when it FAILED somewhere: a bill
+      // whose figure disagreed with the Purchase Bill Summary prints blank, and
+      // a blank nobody explains reads as "no bill" — this says it is a defect.
+      const bc = totals.bill_grand_total_check;
+      if (bc && bc.mismatched > 0) {
+        lines.push(captionRow(
+          `!! BILL GRAND TOTAL: ${bc.mismatched} of ${bc.bills} bills did not reconcile with the Purchase Bill Summary `
+          + 'and are left BLANK in the last column rather than printed with a figure that disagrees. This is a defect — report it.'));
+      }
+      // A bill printed WITH a figure that is SHORT: a GRN line behind one of its
+      // cost rows was deleted. The file has no per-row reason column, so the
+      // bills are named here. Said only when one exists (0 today), so every
+      // other download is unchanged — the same rule as the line above.
+      if (bc && bc.understated > 0) {
+        const one = bc.understated === 1;
+        const shown = bc.understated_bills.slice(0, 20);
+        const more = bc.understated_bills.length - shown.length;
+        lines.push(captionRow(
+          `!! BILL GRAND TOTAL: ${bc.understated} bill${one ? ' is' : 's are'} UNDERSTATED in the last column — `
+          + `${one ? 'it holds' : 'each holds'} at least one line booked from a goods receipt whose GRN line (the bill document) `
+          + 'has since been deleted, so the tax and charges recorded on the deleted GRN line are missing from the figure. How much is missing '
+          + `cannot be known from here. Do not pay a vendor against ${one ? 'it' : 'them'} — report it. `
+          + `${one ? 'Bill' : 'Bills'}: ${shown.join(' | ')}${more > 0 ? ` | and ${more} more` : ''}.`));
+      }
 
       const m = totals.money;
       // A source the FILTER excluded must not print a totals row at all. With
@@ -363,6 +443,24 @@ export async function GET(req: Request) {
       if (inScope('po')) lines.push(sourceTotalsRow(`TOTALS — PO (${totals.po_lines} lines) = ORDERED, not spent. DO NOT ADD to PURCHASE`, m.PO));
       if (source !== 'all') {
         lines.push(captionRow(`Filtered to ${source.toUpperCase()} rows only, so the other sources are not totalled here — their absence is the filter, not a zero.`));
+      }
+      // Why Tax Value can differ from CGST + SGST on a PURCHASE row. Said only
+      // when this file holds such a row, so every other download is unchanged.
+      const fromGrn = inScope('purchase') ? m.PURCHASE.gst_from_grn_lines : 0;
+      if (fromGrn > 0) {
+        lines.push(captionRow(
+          `TAX VALUE (GST) and TAX % on PURCHASE rows: ${fromGrn} line${fromGrn === 1 ? ' was' : 's were'} booked straight from a `
+          + 'goods receipt with no invoice number of ours (as a PO receive books its lines), so the GST is recorded on the GRN '
+          + 'line only. Those two columns read it from there (the bill document — as the Purchase Report Summary does), so on '
+          + 'those rows Tax Value can differ from the row\'s own CGST + SGST columns, which keep their recorded 0. With no '
+          + 'vendor or item filter, the PURCHASE Tax Value total equals the Summary\'s GST for the same period.'));
+      }
+      // Why a PURCHASE Tax % can differ from the Summary's. Said only when this
+      // file holds a PO receipt part-rejected at the door, so every other
+      // download is unchanged. Same words as the screen's hover.
+      const accBase = inScope('purchase') ? (m.PURCHASE.gst_base_accepted_lines || 0) : 0;
+      if (accBase > 0) {
+        lines.push(captionRow(`TAX % on PURCHASE rows: ${acceptedBaseTotalNote(accBase)}`));
       }
 
       // ── 2. THE TWO HEADLINE FIGURES, NAMED APART ─────────────────────────

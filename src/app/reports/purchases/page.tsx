@@ -85,6 +85,10 @@ import {
   TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
   gstValue, taxAppliedPercent, fmtTaxPercent, taxCsvNumber, taxAppliedNote,
 } from '@/lib/tax-applied';
+// The Purchase log's Tax % on a part-rejected PO receipt is struck on the
+// ACCEPTED value (the GRN Inward Register's basis) — the shared wording for
+// saying so, used by the Purchases register too.
+import { acceptedBaseRowNote, acceptedBaseTotalNote } from '@/lib/purchase-gst-base';
 import {
   ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays,
   ScrollText, Info, Loader2, BarChart3, Sigma, Receipt, Truck,
@@ -226,6 +230,35 @@ interface LogRow {
   delivery_charges: number | null; mrp_round_off: number | null;
   link_key: string;              // ties a GRN line to the purchases row it created
   notes: string;
+  /**
+   * THE OWNER'S TAX COLUMNS (#5, ruling 93), computed server-side in
+   * src/lib/purchase-log.ts off the BILL DOCUMENT: the row's own CGST + SGST,
+   * except on a PURCHASE row booked by a PO receive, whose GST lives only on its
+   * GRN line (tax_from_grn). null = BLANK, never ₹0 / 0.00%: no GST typed, or a
+   * PO line. Optional so an older cached payload degrades to an em dash.
+   */
+  tax_value?: number | null;
+  tax_percent?: number | null;
+  tax_from_grn?: boolean;
+  /** Tax % struck on the ACCEPTED value of a part-rejected PO receipt (GRN Inward Register basis). */
+  tax_base_accepted?: boolean;
+  /** A PO receipt's purchase row whose GRN line is gone: tax UNAVAILABLE, not "no GST". */
+  tax_unavailable?: boolean;
+  /**
+   * BILL GRAND TOTAL — the WHOLE bill this line sits on (Subtotal − discount +
+   * every tax and charge), the Purchase Bill Summary's own figure for that bill.
+   * The SAME number on every line of the bill, so it is never added down.
+   * null on PO lines and where no bill can be quoted — the reason says why.
+   */
+  bill_grand_total?: number | null;
+  bill_key?: string | null;
+  bill_label?: string | null;
+  bill_lines?: number | null;
+  bill_grand_total_reason?: string;
+  /** Lines of that bill whose GRN line was deleted — > 0 means the figure is SHORT (the Bill Summary flags it too). */
+  bill_unpaired_lines?: number | null;
+  /** The UNDERSTATED warning for that figure; '' / absent when the bill is sound. */
+  bill_understated_note?: string;
 }
 
 /**
@@ -267,6 +300,18 @@ interface SourceMoney {
    */
   taxed_bill_value: number;
   taxed_lines: number;
+  /**
+   * The Tax Value (GST) / Tax % Applied (GST) columns' totals, on the same
+   * bill-document basis as the row cells (see LogRow.tax_value). Differs from
+   * tax_cgst_sgst only by PURCHASE rows booked by a PO receive. Optional for a
+   * cached payload.
+   */
+  gst_value?: number | null;
+  gst_taxed_bill_value?: number;
+  gst_taxed_lines?: number;
+  gst_from_grn_lines?: number;
+  /** GST-bearing lines whose Tax % base is the ACCEPTED value (part-rejected PO receipt). */
+  gst_base_accepted_lines?: number;
 }
 
 interface LogResponse {
@@ -281,6 +326,12 @@ interface LogResponse {
      * the downloaded CSV state the identical words and the identical number.
      */
     goods_value_caveat: string;
+    /**
+     * How the Bill Grand Total column was proved against the Purchase Bill
+     * Summary for this response. mismatched > 0 is a DEFECT: those bills print
+     * blank and the page says so in red.
+     */
+    bill_grand_total_check?: { bills: number; matched: number; unverified: number; mismatched: number };
   };
   truncated: boolean; from: string; to: string;
 }
@@ -1123,19 +1174,126 @@ function SourceBadge({ source }: { source: LogSource }) {
 const ROW_PAINT_CAP = 600;
 
 /**
- * The log table's columns BEFORE Value, in order. The tfoot's label cell spans
- * exactly these, so inserting a column here keeps every totals figure under its
- * own heading. A hard-coded colSpan would put the Value total under Vendor the
- * first time somebody adds a column.
+ * THE TABLE'S COLUMN ORDER (owner #5, ruling 93, 2026-10-29): Date and Doc No,
+ * then the owner's three — Tax % Applied (GST), Tax Value (GST) and the per-BILL
+ * Grand Total — at the FRONT, then everything that used to follow Doc No, in
+ * its old order. On screen only: the CSV keeps its column order and appends
+ * the bill total at the end (src/app/api/reports/purchase-log/route.ts).
+ *
+ * FRONT_HEADS lead the table; the tfoot's first cell spans exactly these.
+ * The owner's three are rendered explicitly right after them.
+ */
+const FRONT_HEADS: { label: string }[] = [
+  { label: 'Source' }, { label: 'Date' }, { label: 'Doc No' },
+];
+
+/**
+ * The columns between the owner's three and Value, in order. The tfoot's label
+ * cell spans exactly these, right-aligned against the Value figure, so
+ * inserting a column here keeps every totals figure under its own heading. A
+ * hard-coded colSpan would put the Value total under Vendor the first time
+ * somebody adds a column.
  */
 const LEAD_HEADS: { label: string; right?: boolean }[] = [
-  { label: 'Source' }, { label: 'Date' }, { label: 'Doc No' },
   { label: 'Invoice ID (ours)' }, { label: 'Bill No (vendor)' }, { label: 'Vendor' },
   { label: 'Item' }, { label: 'Category' },
   // Right-aligned but NEVER totalled: qty is in each line's own purchase unit
   // and a rate is Rs per unit. See the no-total notes under the table.
   { label: 'Qty', right: true }, { label: 'Rate', right: true },
 ];
+
+/** The owner's three front columns, counted once for colCount. */
+const OWNER_FRONT_COLS = 3;
+
+/**
+ * Hover text for the Bill Grand Total column. Literal glyphs only (see the
+ * SWC note in the paragraph under the cards).
+ */
+const BILL_GT_TITLE =
+  'GRAND TOTAL OF THE WHOLE BILL this line sits on: Subtotal − discount + CGST + SGST + both cesses + TCS + '
+  + 'delivery + MRP round-off, over every line of that bill — the Purchase Bill Summary’s Grand Total for the '
+  + 'same bill and period. The SAME figure repeats on every line of the bill (and on the PURCHASE and the GRN '
+  + 'row of one delivery), so never add this column down; it has no total. Blank on PO lines: an order is not a bill.';
+
+/** Per-cell hover for Bill Grand Total: which bill, how many lines — or why it is blank. */
+function billGtTitle(r: LogRow): string {
+  if (r.bill_grand_total == null) return r.bill_grand_total_reason || BILL_GT_TITLE;
+  const n = r.bill_lines ?? 0;
+  // A vendor-day group (no bill number anywhere) is the Bill Summary's "bill"
+  // for that vendor's unnumbered purchases of the day — said as such.
+  const where = isVendorDayBill(r) ? 'in this vendor-day group' : 'on this bill';
+  const head = `${r.bill_label ? `${r.bill_label} — ` : ''}${n} line${n === 1 ? '' : 's'} ${where}.`;
+  // A SHORT figure says so first, before anything that describes it as a total.
+  return `${r.bill_understated_note ? `${r.bill_understated_note}\n\n` : ''}${head}\n\n${BILL_GT_TITLE}`;
+}
+
+/** The Bill Summary keys an unnumbered vendor-day group 'DAY:…' (src/lib/purchase-log.ts BILL_KEY_SQL). */
+function isVendorDayBill(r: LogRow): boolean {
+  return String(r.bill_key || '').startsWith('DAY:');
+}
+
+/**
+ * The Tax Value column's hover IN THIS LOG. The shared text closes by saying
+ * an em dash means "unavailable (a PO line …)" — true on the reports that print
+ * ₹0 for an untaxed line, but this log prints a dash there too (ruling 93), so
+ * on its own it would explain every untaxed line as a PO line. Said once, here,
+ * on the header and every cell; the cell adds which case it is.
+ */
+const LOG_TAX_VALUE_TITLE = `${TAX_VALUE_TITLE}\n\nIN THIS LOG an em dash ALSO means NO GST WAS ENTERED on the `
+  + 'line — shown blank, not ₹0, because a zero would claim the vendor charged none. Hover a dash for which it is.';
+
+/** Why one row's tax cell is blank — the THIS ROW line under the column's hover. */
+function blankTaxWhy(r: LogRow, kind: 'value' | 'percent'): string {
+  if (r.source === 'PO') {
+    return 'THIS ROW: a PO line — an order is not a bill, so it has no tax figures at all. Blank, never ₹0 / 0.00%.';
+  }
+  if (r.tax_unavailable) {
+    return 'THIS ROW: UNAVAILABLE, not zero — a purchase booked straight from a goods receipt whose GRN line (the bill '
+      + 'document, where its GST is recorded) has since been deleted, so its tax cannot be read.';
+  }
+  if (kind === 'percent' && r.tax_value != null) {
+    return 'THIS ROW: GST was recorded, but the value less discount is zero or negative, so a percentage would mean nothing.';
+  }
+  return 'THIS ROW: no GST was entered on this line — shown blank, not ₹0 / 0.00%, because a zero would claim the '
+    + 'vendor charged none. On a line from the old tax-inclusive import any tax sits inside Value and was never split out.';
+}
+
+/**
+ * Per-cell hover for the two tax columns: the column's text, then what is
+ * true of THIS row — why it is blank (no GST entered, a PO line, or a deleted
+ * GRN line), that a PURCHASE row booked by a PO receive read its figure off the
+ * GRN line (its own CGST / SGST columns further right still show the row's
+ * recorded ₹0), and that a part-rejected receipt's rate is struck on the
+ * ACCEPTED value — so no two cells ever read as a contradiction.
+ */
+function taxCellTitle(r: LogRow, kind: 'value' | 'percent'): string {
+  const base = kind === 'value' ? LOG_TAX_VALUE_TITLE : TAX_PERCENT_TITLE;
+  const notes: string[] = [];
+  const blank = kind === 'value' ? r.tax_value == null : r.tax_percent == null;
+  if (blank) notes.push(blankTaxWhy(r, kind));
+  if (r.tax_from_grn) {
+    notes.push(`THIS ROW: read off its GRN line${r.link_key ? ` (${r.link_key})` : ''} — the bill document. `
+      + 'This purchase row was booked straight from a goods receipt with no invoice number of ours (as a PO receive '
+      + 'books its lines), so the GST is recorded on the GRN line only and the row’s own CGST / SGST columns show what '
+      + 'the row itself recorded (₹0).');
+  }
+  if (kind === 'percent' && !blank && r.tax_base_accepted) notes.push(acceptedBaseRowNote());
+  return notes.length ? `${base}\n\n${notes.join('\n\n')}` : base;
+}
+
+/**
+ * A source's Tax Value / Tax % totals as a TaxAppliedRow, on the same
+ * bill-document basis as the row cells. Blank, never ₹0, when the source
+ * carried no GST at all (ruling 93).
+ */
+function sourceTax(mm: SourceMoney) {
+  return {
+    gst: mm.gst_value == null || mm.gst_value === 0 ? null : mm.gst_value,
+    taxed_bill_value: mm.gst_taxed_bill_value ?? null,
+    taxed_lines: mm.gst_taxed_lines ?? null,
+    lines: mm.lines,
+  };
+}
 
 /** The charge columns. `k` indexes BOTH LogRow (the cell) and SourceMoney (the total). */
 const CHARGE_COLS: { k: ChargeKey; label: string }[] = [
@@ -1248,11 +1406,14 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
   const shown = paintAll ? rows : rows.slice(0, ROW_PAINT_CAP);
   const t = data?.totals;
   const money = t?.money;
-  // LEAD_HEADS + Value + Total Amount + Rejected + charges + Tax Value (GST)
-  // + Tax % Applied (GST) + Link key. The two tax columns are OUTSIDE the
-  // showCharges condition because they render whether or not the charge block
-  // is shown — see the <th> pair.
-  const colCount = LEAD_HEADS.length + 3 + (showCharges ? CHARGE_COLS.length : 0) + 2 + 1;
+  // FRONT_HEADS + the owner's three (Tax % Applied (GST), Tax Value (GST), Bill
+  // Grand Total) + LEAD_HEADS + Value + Total Amount + Rejected + charges + Link
+  // key. The owner's three are OUTSIDE the showCharges condition because they
+  // render whether or not the charge block is shown — see the <th> trio.
+  const colCount = FRONT_HEADS.length + OWNER_FRONT_COLS + LEAD_HEADS.length + 3
+    + (showCharges ? CHARGE_COLS.length : 0) + 1;
+  // The Bill Grand Total proof. mismatched > 0 is a defect and is said in red.
+  const billCheck = t?.bill_grand_total_check;
   // Only sources that actually have lines get a totals row. A source the filter
   // excluded has no business printing "0 lines, ₹0" under a spend column.
   const footSources = SOURCE_ORDER.filter(s => (money?.[s]?.lines ?? 0) > 0);
@@ -1402,8 +1563,27 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
             <strong> Total Amount</strong> here counts only the tax each purchase row carries itself, so on a bill received against a PO
             it comes out <strong>lower</strong> than the Summary’s <em>Grand Total</em>, which reads that bill’s tax off the GRN.
             Use the <strong>Summary</strong> tab for what is payable to a vendor; use this log to see which document each line came from.
-            This log also lists three document types that must never be added up, so it has no single grand total to name.
+            This log also lists three document types that must never be added up, so it has no single grand total for the period.
+            {/* OWNER #5 / RULING 93 — the three front columns, said in words.
+                Literal glyphs only, no HTML entity (see the SWC note above). */}
+            {' '}The three columns after <strong>Doc No</strong> read the bill document:
+            <strong> Tax % Applied</strong> and <strong>Tax Value</strong> are the GST the bill charged — on a purchase booked straight
+            from a goods receipt, as a PO receive books it, that is read off its GRN line, as the Summary tab does — and are blank where no GST was entered.
+            <strong> Bill Grand Total</strong> is the whole bill’s total (Subtotal − discount + every tax and charge): the Purchase
+            Bill Summary’s figure for that bill, or for a vendor’s unnumbered purchases of the day, repeated on each of its lines, so never add it down.
           </p>
+        </div>
+      )}
+
+      {/* THE BILL GRAND TOTAL PROOF, when it failed. Every bill figure on this
+          log is checked against the Purchase Bill Summary on every load; a bill
+          that disagreed is printed BLANK, and an unexplained blank would read as
+          "no bill". The CSV carries the same sentence. */}
+      {billCheck && billCheck.mismatched > 0 && (
+        <div className="bg-red-50 border-2 border-red-300 rounded-xl px-4 py-3 text-sm text-red-900 flex gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+          <p><strong>Bill Grand Total: {fmtNum(billCheck.mismatched)} of {fmtNum(billCheck.bills)} bills did not reconcile with the Purchase Bill Summary</strong>
+            {' '}and are left blank rather than printed with a figure that disagrees. This is a defect — please report it.</p>
         </div>
       )}
 
@@ -1426,8 +1606,19 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
         <div className="overflow-x-auto">
           <table className="w-full text-sm whitespace-nowrap">
             <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
-              {LEAD_HEADS.map((h, i) => (
-                <th key={h.label} className={`py-2 ${i === 0 ? 'pr-3' : 'px-3'}${h.right ? ' text-right' : ''}`}>{h.label}</th>
+              {FRONT_HEADS.map((h, i) => (
+                <th key={h.label} className={`py-2 ${i === 0 ? 'pr-3' : 'px-3'}`}>{h.label}</th>
+              ))}
+              {/* THE OWNER'S THREE, AT THE FRONT (#5, ruling 93). Rendered
+                  ALWAYS, not behind the charge toggle: they are the tax and
+                  grand-total question itself. Per LINE the percentage is exact
+                  — one document line, nothing to blend. The bill total is the
+                  WHOLE bill's, repeated per line, and is never totalled. */}
+              <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
+              <th className="py-2 px-3 text-right" title={LOG_TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+              <th className="py-2 px-3 text-right border-r-2 border-[#E8D5C4]" title={BILL_GT_TITLE}>Bill Grand Total</th>
+              {LEAD_HEADS.map(h => (
+                <th key={h.label} className={`py-2 px-3${h.right ? ' text-right' : ''}`}>{h.label}</th>
               ))}
               <th className="py-2 px-3 text-right">Value</th>
               {/* The column the owner went looking for. Kept next to Value so the
@@ -1435,13 +1626,6 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
               <th className="py-2 px-3 text-right" title="Value − discount + CGST + SGST + cesses + TCS + delivery + MRP round-off. Blank on PO lines: an order carries no charge columns.">Total Amount</th>
               <th className="py-2 px-3 text-right">Rejected</th>
               {showCharges && CHARGE_COLS.map(c => <th key={String(c.k)} className="py-2 px-3 text-right">{c.label}</th>)}
-              {/* THE OWNER'S TWO COLUMNS. Rendered ALWAYS, not behind the charge
-                  toggle: they are the tax question itself, not one of the eight
-                  recorded-only charge columns a reader hides to fit the table on
-                  screen. Per LINE the percentage is exact — this is one document
-                  line, so there is nothing to blend. */}
-              <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
-              <th className="py-2 px-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
               <th className="py-2 pl-3">Link key</th>
             </tr></thead>
             <tbody>
@@ -1454,6 +1638,34 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                   <td className="py-2 pr-3"><SourceBadge source={r.source} /></td>
                   <td className="py-2 px-3 text-[#6B5744]">{r.date || '—'}</td>
                   <td className="py-2 px-3 font-medium">{r.doc_no || '—'}</td>
+                  {/* An em dash on a PO line (no charge columns exist there) and
+                      on a line where no GST was entered — never ₹0 and never
+                      0.00% (ruling 93). The figures come from the server off the
+                      bill document; on a PO receipt's purchase row that is its
+                      GRN line, and the cell's hover says so. On a PURCHASE row
+                      from the old tax-inclusive import the tax IS inside Value
+                      and was never split out, so blank is the honest answer. */}
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744] border-l-2 border-[#F0E4D6]"
+                      title={taxCellTitle(r, 'percent')}>{fmtTaxPercent(r.tax_percent ?? null)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]"
+                      title={taxCellTitle(r, 'value')}>{fmtSignedINR(r.tax_value ?? null)}</td>
+                  {/* The WHOLE bill's grand total, the same on every line of it
+                      — said under the figure, so a column of repeats reads as
+                      one bill and not as line amounts to add. */}
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#2D1B0E] border-r-2 border-[#F0E4D6] cursor-help"
+                      title={billGtTitle(r)}>
+                    {fmtSignedINR(r.bill_grand_total ?? null)}
+                    {r.bill_grand_total != null && (
+                      <span className="block text-[10px] font-normal text-[#8B7355]">{isVendorDayBill(r) ? 'vendor-day' : 'whole bill'} · {fmtNum(r.bill_lines ?? 0)} line{r.bill_lines === 1 ? '' : 's'}</span>
+                    )}
+                    {/* SHORT — a GRN line behind one of this bill's cost rows was
+                        deleted. Said in red where the number is, as the Bill
+                        Summary and the Purchases register say it; the hover
+                        carries the sentence. */}
+                    {r.bill_grand_total != null && r.bill_understated_note && (
+                      <span className="block text-[10px] font-semibold text-red-700">understated — see note</span>
+                    )}
+                  </td>
                   <td className="py-2 px-3 text-[#6B5744]">{r.invoice_id || '—'}</td>
                   <td className="py-2 px-3 text-[#6B5744]">{r.bill_no || '—'}</td>
                   <td className="py-2 px-3 text-[#6B5744]">{r.vendor || '—'}</td>
@@ -1473,13 +1685,6 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                       symbol. This prints −₹0.50, to the paisa, and still an em dash
                       for a charge the source does not carry. */}
                   {showCharges && CHARGE_COLS.map(c => <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(r[c.k])}</td>)}
-                  {/* An em dash on a PO line (no charge columns exist there) and
-                      on a line that recorded no GST — never ₹0 and never 0.00%.
-                      On a PURCHASE row from the old tax-inclusive import the tax
-                      IS inside Value and was never split out, so "no GST
-                      recorded" is the only honest thing this column can say. */}
-                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744] border-l-2 border-[#F0E4D6]">{fmtSignedINR(gstValue(r))}</td>
-                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744]" title={TAX_PERCENT_TITLE}>{fmtTaxPercent(taxAppliedPercent(r))}</td>
                   <td className="py-2 pl-3 text-[11px] text-[#8B7355] font-mono">{r.link_key || '—'}
                     {r.notes && <span className="block text-[10px] text-[#B8A48E] font-sans whitespace-normal max-w-[220px]">{r.notes}</span>}</td>
                 </tr>
@@ -1495,10 +1700,45 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
               <tfoot className="border-t-2 border-[#E8D5C4]">
                 {footSources.map(src => {
                   const mm = money[src];
+                  const tax = sourceTax(mm);
                   return (
                     <tr key={src} className="text-[12px] bg-[#FFFBF6]">
-                      {/* RIGHT-aligned, and NOT sticky. This cell spans ten
-                          columns (~1,500px), so `position: sticky; left: 0`
+                      {/* The front block's label: badge + TOTAL against the two
+                          tax totals. The full label sits again against Value
+                          below, so whichever end of the table is in view, its
+                          figures are named. */}
+                      <td colSpan={FRONT_HEADS.length} className="py-2 pr-3 text-right font-semibold text-[#6B5744]">
+                        <SourceBadge source={src} />
+                        <span className="ml-2">TOTAL</span>
+                      </td>
+                      {/* THE SOURCE'S TAX FIGURES — server totals over the full
+                          filtered set, like every other figure on this row, so
+                          they exceed the painted rows when the list is capped.
+                          Same bill-document basis as the cells above them, so
+                          each foots its own column. The rate is Σ(GST) ÷
+                          Σ(taxed base), money-weighted, and the base counts only
+                          the lines that carried GST: over all 2,165 PURCHASE
+                          lines an 18% bill would read 0.01%. Blank, never ₹0,
+                          when the source carried no GST at all. */}
+                      <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#F0E4D6]"
+                          title={TAX_PERCENT_TITLE + taxAppliedNote(tax)
+                            + ((mm.gst_base_accepted_lines || 0) > 0 ? `\n\n${acceptedBaseTotalNote(mm.gst_base_accepted_lines || 0)}` : '')}>
+                        {fmtTaxPercent(taxAppliedPercent(tax))}
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums font-bold"
+                          title={src === 'PURCHASE' && (mm.gst_from_grn_lines || 0) > 0
+                            ? `${LOG_TAX_VALUE_TITLE}\n\n${fmtNum(mm.gst_from_grn_lines || 0)} of these lines were booked straight from a goods receipt with no invoice number of ours (as a PO receive books its lines), whose GST is read off the GRN line — so this total can exceed the CGST + SGST columns further right, which hold what the purchase rows themselves recorded.`
+                            : LOG_TAX_VALUE_TITLE}>
+                        {fmtSignedINR(tax.gst)}
+                      </td>
+                      {/* NEVER A TOTAL. Each figure in this column is a whole
+                          bill's, repeated on each of its lines — adding them
+                          counts every bill once per line. */}
+                      <td className="py-2 px-3 text-right border-r-2 border-[#F0E4D6] cursor-help" title={BILL_GT_TITLE}>
+                        <span className="text-[10px] font-normal text-[#8B7355]">per bill · not added</span>
+                      </td>
+                      {/* RIGHT-aligned, and NOT sticky. This cell spans seven
+                          columns (~1,100px), so `position: sticky; left: 0`
                           pins a cell wider than the scroll box and its opaque
                           background paints over every figure to its right —
                           measured, not guessed. Right-aligned instead puts the
@@ -1528,18 +1768,6 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                       {showCharges && CHARGE_COLS.map(c => (
                         <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(mm[c.k])}</td>
                       ))}
-                      {/* THE SOURCE'S TAX FIGURES — server totals over the full
-                          filtered set, like every other figure on this row, so
-                          they exceed the painted rows when the list is capped.
-                          The rate is Σ(GST) ÷ Σ(taxed base), money-weighted, and
-                          `taxed_bill_value` deliberately counts only the lines
-                          that carried GST: over all 2,165 PURCHASE lines an 18%
-                          bill would read 0.01%. */}
-                      <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#F0E4D6]">{fmtSignedINR(mm.tax_cgst_sgst)}</td>
-                      <td className="py-2 px-3 text-right tabular-nums font-bold"
-                          title={TAX_PERCENT_TITLE + taxAppliedNote(mm)}>
-                        {fmtTaxPercent(taxAppliedPercent(mm))}
-                      </td>
                       <td className="py-2 pl-3" />
                     </tr>
                   );
@@ -1549,7 +1777,8 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                     Totals are computed by the server over <strong>all {fmtNum(t?.lines || 0)} matching line{(t?.lines || 0) === 1 ? '' : 's'}</strong>, not
                     over the rows painted above — so they can be larger than what you can see, and the row cap can never understate them.
                     Each source is totalled on its own; the three are never added. <strong>Qty</strong> and <strong>Rate</strong> have
-                    no total by design{showCharges ? ', and neither does Discount on the PURCHASE row' : ''} — see “Why some columns have no total” above.
+                    no total by design{showCharges ? ', and neither does Discount on the PURCHASE row' : ''}; nor does <strong>Bill Grand Total</strong>,
+                    which repeats each whole bill’s total on every one of its lines — see “Why some columns have no total” above.
                   </td>
                 </tr>
               </tfoot>

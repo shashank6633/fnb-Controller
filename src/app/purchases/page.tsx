@@ -35,6 +35,49 @@ import { api } from '@/lib/api';
 import StockOnHandNote from '@/components/StockOnHandNote';
 import type { StockOnHand, StockLeg } from '@/components/StockOnHandNote';
 import { useStockOnHand } from '@/lib/use-stock-on-hand';
+// OWNER #5 (ruling 93): tax details, GST % and grand total on this register.
+// Every figure, heading and blank rule below is IMPORTED from the two modules
+// the purchase reports already use — never re-typed here — so this page, the
+// Purchase Report, the Purchase Bill Summary and the GRN Inward Register quote
+// one number per bill. The per-row figures themselves come from
+// POST /api/purchases/line-charges, which reads the same effective rail.
+import {
+  PURCHASE_CHARGE_COLUMNS,
+  BILL_VALUE_CSV_HEADER,
+  TOTAL_AMOUNT_CSV_HEADER,
+  CHARGE_NOTE_CSV_HEADER,
+  chargeCell,
+  hasUnpairedMirrorRows,
+  unpairedMirrorNote,
+  fmtSignedINR,
+  r2,
+  type PurchaseChargeKey,
+  type PurchaseChargeRow,
+} from '@/lib/purchase-charges';
+import {
+  TAX_VALUE_LABEL,
+  TAX_PERCENT_LABEL,
+  TAX_VALUE_TITLE,
+  TAX_PERCENT_TITLE,
+  TAX_VALUE_CSV_HEADER,
+  TAX_PERCENT_CSV_HEADER,
+  taxAppliedPercent,
+  fmtTaxPercent,
+  taxCsvNumber,
+  taxAppliedNote,
+} from '@/lib/tax-applied';
+// The Tax % denominator's wording: why a part-rejected PO receipt's rate is
+// struck on the ACCEPTED value (the GRN Inward Register's basis), shared with
+// the Purchase log so the two say one thing.
+import { acceptedBaseRowNote, acceptedBaseTotalNote } from '@/lib/purchase-gst-base';
+
+/** Tax Value header / cell hover ON THIS REGISTER. The shared text's closing
+ *  line explains an em dash as "a PO line" — this register lists no PO lines,
+ *  so it says what an em dash means here instead. */
+const REGISTER_TAX_VALUE_TITLE = `${TAX_VALUE_TITLE}\n\nON THIS REGISTER (which lists no PO lines) an em dash `
+  + 'means NO GST WAS RECORDED on the purchase — a zero would claim the vendor charged none — or, on a '
+  + 'goods-receipt row whose GRN line has been deleted, that its tax cannot be read (or, while the figures could not '
+  + 'be loaded, just that). Hover the dash for which.';
 
 function formatCurrency(value: number): string {
   return '₹' + value.toLocaleString('en-IN', { maximumFractionDigits: 2 });
@@ -223,8 +266,162 @@ function snapshotFromRow(p: any): SnapshotCell | null {
   };
 }
 
+/* ══ TAX, GST % AND GRAND TOTAL PER ROW — OWNER #5 / RULING 93 ════════════════
+ *
+ * One row of POST /api/purchases/line-charges. Every money field is the
+ * EFFECTIVE rail (src/lib/purchase-charges.ts): the paired GRN line for a
+ * PO-receipt cost mirror (no PINV of ours, a grn_id), the `purchases` columns
+ * otherwise — including an Enter Vendor Bill receipt, which carries our PINV
+ * and books its GST and charges on the row itself. The mirror row's own
+ * GST and discount columns are zero (two carry a ₹25 delivery share, which the
+ * rail does not add twice), which is why the old "Total Inward" — computed
+ * here from those columns — was short on every PO receipt (Ruling 6, fixed in
+ * the reports, now fixed here).
+ *
+ * Money arrives UNROUNDED so the footer is r2(Σ raw) — the reports' SQL SUM
+ * arithmetic — and never a sum of cells already rounded for display.
+ */
+interface LineCharge extends Record<PurchaseChargeKey, number> {
+  id: string;
+  /** SUBTOTAL — goods as billed (GRN quantity_received × rate on a mirror). */
+  bill_value: number;
+  /** The goods value GST was CHARGED on, before discount — the Tax % base.
+   *  = bill_value, except on a PO receipt part-rejected at the door (accepted). */
+  gst_base: number;
+  /** 1 = gst_base is that accepted value and differs from bill_value. */
+  gst_base_accepted: number;
+  /** GRAND TOTAL — subtotal − discount + every charge. */
+  total_amount: number;
+  /** gstValue(): CGST + SGST. null = unavailable (mirror whose GRN line is gone). */
+  tax_value: number | null;
+  /** taxAppliedPercent(): null whenever no GST is recorded — never 0.00%. */
+  gst_percent: number | null;
+  grn_sourced: number;
+  is_mirror: number;
+  unpaired_mirror: number;
+}
+
+/** The single row as the shared helpers read it (chargeCell, hasUnpairedMirrorRows, …). */
+function chargeRowOf(c: LineCharge): PurchaseChargeRow {
+  return {
+    ...c,
+    count: 1,
+    po_receipt_rows: c.is_mirror ? 1 : 0,
+    grn_sourced_rows: c.grn_sourced ? 1 : 0,
+    unpaired_mirror_rows: c.unpaired_mirror ? 1 : 0,
+  };
+}
+
+/** Was any GST TYPED on this row? No → every GST cell is BLANK, never ₹0 / 0%. */
+function hasGst(c: LineCharge): boolean {
+  return (Number(c.cgst) || 0) !== 0 || (Number(c.sgst) || 0) !== 0;
+}
+
+const CHARGE_COL = (k: PurchaseChargeKey) => PURCHASE_CHARGE_COLUMNS.find((c) => c.key === k)!;
+
+/**
+ * The non-GST parts of a row's Grand Total, as short signed phrases for the
+ * line under the figure ("−₹100.00 disc. · +₹30.00 delivery"). Zero parts are
+ * left out. Discount is SUBTRACTED, so it is shown negated with a true minus.
+ * The subtotal is named only where it differs from the Total column — i.e. on a
+ * PO receipt whose booked rate is already net of the GRN's discount — because
+ * that is the one case where Total + charges would not foot to Grand Total.
+ */
+function grandTotalParts(c: LineCharge, bookedTotal: number): string[] {
+  const parts: string[] = [];
+  if (r2(c.bill_value) !== r2(bookedTotal)) parts.push(`on subtotal ${fmtSignedINR(c.bill_value)}`);
+  const add = (v: number, label: string) => {
+    const x = r2(v);
+    if (x === 0) return;
+    parts.push(`${x > 0 ? '+' : ''}${fmtSignedINR(x)} ${label}`);
+  };
+  add(-(Number(c.discount) || 0), 'disc.');
+  add(Number(c.compensation_cess) || 0, 'comp. cess');
+  add(Number(c.special_excise_cess) || 0, 'spl. excise cess');
+  add(Number(c.tcs) || 0, 'TCS');
+  add(Number(c.delivery_charges) || 0, 'delivery');
+  add(Number(c.mrp_round_off) || 0, 'round-off');
+  return parts;
+}
+
+/** The GRN number a register row carries (GET /api/purchases joins it in; the
+ *  shared Purchase type does not declare it). '' when the row has no GRN. */
+function grnNumberOf(p: unknown): string {
+  return String((p as { grn_number?: unknown } | null)?.grn_number ?? '').trim();
+}
+
+/**
+ * ONE row whose GRN line is gone, in words written for one row. The shared
+ * unpairedMirrorNote() is worded for a group ("1 of 1 line here is a PO
+ * receipt …") and stays on the footer, which IS a group. No rupee figure:
+ * what the deleted line held cannot be known from here.
+ */
+function rowUnpairedNote(grnNumber: string): string {
+  return `UNDERSTATED — this purchase was booked straight from a goods receipt${grnNumber ? ` (${grnNumber})` : ''} whose GRN`
+    + ' line (the bill document) has since been deleted, so its tax and charges cannot be read — a cell left blank is'
+    + ' unavailable, not zero — and its Subtotal falls back to the booked cost, so the Grand Total is short by whatever'
+    + ' that line charged. How much is missing cannot be known from here. Do not pay a vendor against this figure —'
+    + ' report it: a cost row outliving its bill document means a GRN was deleted without unwinding the purchase.';
+}
+
+/**
+ * The Excel "Charge Basis Note" for ONE row. The shared chargeNote() is
+ * written for a group ("1 of 1 lines — includes PO receipts — …"); this says
+ * the same thing about the single line the row is. '' on an ordinary row,
+ * whose figures are its own columns.
+ */
+function rowChargeNote(c: LineCharge, grnNumber: string): string {
+  if (c.unpaired_mirror) return rowUnpairedNote(grnNumber);
+  if (c.grn_sourced) {
+    return `tax, charges and Subtotal read from its GRN line${grnNumber ? ` on ${grnNumber}` : ''} (the bill document);`
+      + ' the GRN Inward Register prints this Grand Total as that line\'s Total Inward';
+  }
+  return '';
+}
+
+/** The whole arithmetic, for the Grand Total cell's hover text. */
+function grandTotalTitle(c: LineCharge, grnNumber: string): string {
+  const f = (v: number) => fmtSignedINR(Number(v) || 0);
+  // A SHORT figure says so FIRST, and is never called "payable".
+  let t = c.unpaired_mirror ? `${rowUnpairedNote(grnNumber)}\n\n` : '';
+  t += `Grand Total = Subtotal ${f(c.bill_value)} − Discount ${f(c.discount)}`
+    + ` + CGST ${f(c.cgst)} + SGST ${f(c.sgst)}`
+    + ` + Comp. Cess ${f(c.compensation_cess)} + Spl. Excise Cess ${f(c.special_excise_cess)}`
+    + ` + TCS ${f(c.tcs)} + Delivery ${f(c.delivery_charges)} + Round-off ${f(c.mrp_round_off)}`
+    + ` = ${f(c.total_amount)}.${c.unpaired_mirror ? '' : ' What is payable to the vendor for this line.'}`;
+  // Which other report prints THIS figure, said only where it is true: only a
+  // line that came in on a goods receipt is on the GRN Inward Register at all,
+  // and the Bill Summary prints bills, not lines. A goods-receipt row read off
+  // its GRN line (grn_sourced) is the register's own line arithmetic. A row
+  // that carries our Invoice ID books ACCEPTED goods, while the register's
+  // Total Inward counts everything RECEIVED — equal unless goods were rejected
+  // at the door (known item K3, the owner's decision), so the hover says so.
+  if (grnNumber && !c.unpaired_mirror) {
+    t += c.grn_sourced
+      ? ` This line came in on goods receipt ${grnNumber}: the GRN Inward Register prints this figure as its Total Inward.`
+      : ` This line came in on goods receipt ${grnNumber}: the GRN Inward Register prints this figure as its Total Inward`
+        + ' — or more, by the value of the rejected goods, where part of the line was rejected at the door.';
+  }
+  t += ' The Purchase Bill Summary adds up the lines of each bill, and the Purchase Report Summary adds them up by'
+    + ' vendor, item, month and so on — for the same purchases their totals equal this register’s footer.';
+  if (c.grn_sourced) {
+    t += ' This is a goods-receipt row: its tax, charges and Subtotal are read from the GRN line (the bill'
+      + ' document), not from the purchase cost row, whose GST and discount columns are zero.';
+  }
+  return t;
+}
+
 export default function PurchasesPage() {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
+  /** Effective tax / grand-total figures per purchases.id (owner #5). */
+  const [lineCharges, setLineCharges] = useState<Record<string, LineCharge>>({});
+  /** 'loading' renders "…", 'error' renders "—" with a reload note — never a
+   *  fallback to the old purchases-column arithmetic, which is wrong on every
+   *  PO receipt and would look exactly like a real figure. */
+  const [chargesStatus, setChargesStatus] = useState<'loading' | 'ok' | 'error'>('loading');
+  /** Last-request-wins: a slow answer for an older filter must not overwrite
+   *  the figures for the rows now on screen. */
+  const chargesTicket = useRef(0);
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
   /* NOTE — the vendor master, the store-category set, matUnits(), recipeHint()
      and caseBasis() left with "Enter Full Bill". Every one of them existed to
@@ -361,9 +558,45 @@ export default function PurchasesPage() {
       const res = await fetch(`/api/purchases${qs ? '?' + qs : ''}`);
       if (!res.ok) throw new Error('Failed to fetch purchases');
       const json = await res.json();
-      setPurchases(json.purchases || []);
+      const rows: Purchase[] = json.purchases || [];
+      setPurchases(rows);
+      // Not awaited: the register renders at once and the tax / grand-total
+      // cells read "…" until their figures land.
+      void fetchLineCharges(rows.map((p) => p.id));
     } catch (err: any) {
       setError(err.message);
+    }
+  };
+
+  /* ── TAX, GST % AND GRAND TOTAL FOR THE ROWS LOADED (owner #5) ──────────────
+   * One POST for every row the register holds — the list, the footer and the
+   * Excel export all read this one map. The ids go as a JSON array (json_each
+   * on the server), so the count is not bounded by SQLite's variable limit.
+   * POST through api(), because '/api/purchases' is a CSRF-guarded prefix.
+   * Returns the map (or null on failure) so the export can await it. */
+  const fetchLineCharges = async (ids: string[]): Promise<Record<string, LineCharge> | null> => {
+    const ticket = ++chargesTicket.current;
+    setChargesStatus('loading');
+    try {
+      const res = await api('/api/purchases/line-charges', { method: 'POST', body: { ids } });
+      if (!res.ok) throw new Error('Failed to load purchase tax figures');
+      const json = await res.json();
+      const map: Record<string, LineCharge> = {};
+      for (const l of (json?.lines || []) as LineCharge[]) map[String(l.id)] = l;
+      if (ticket === chargesTicket.current) {
+        setLineCharges(map);
+        setChargesStatus('ok');
+      }
+      return map;
+    } catch {
+      // Drop the previous figures too: a row line-edited since they were read
+      // would otherwise keep printing its old tax beside a footer that says
+      // the figures could not be loaded.
+      if (ticket === chargesTicket.current) {
+        setLineCharges({});
+        setChargesStatus('error');
+      }
+      return null;
     }
   };
 
@@ -575,6 +808,56 @@ export default function PurchasesPage() {
     .reduce((sum, p) => sum + p.total_price, 0);
 
   const vendorCount = new Set(purchases.map((p) => p.vendor).filter(Boolean)).size;
+
+  /* ── THE FOOTER: every row the filters select, ALL PAGES ────────────────────
+   * Summed from the RAW figures and rounded once — the arithmetic the reports'
+   * SQL SUMs use — so for the same window this footer equals Reports → Purchase
+   * Report (Summary) and the Purchase Bill Summary to the paisa. Not a hook, so
+   * it can sit above the early returns.
+   *
+   * Tax % on the footer follows the reports' aggregate rule
+   * (effectiveTaxAppliedSumsSql): the base is the post-discount value of the
+   * lines that CARRIED GST, not of every line, so 18% bills read 18.00% and
+   * not a blended 0.01%. taxAppliedNote() says over how many lines. Each
+   * line's base is the value GST was CHARGED on (gst_base) — the same base its
+   * own Tax % cell divides by, so the footer is the blend of the rates above
+   * it. That equals the Summary's base on every line that rejected nothing;
+   * on a PO receipt part-rejected at the door it is the ACCEPTED value (the
+   * GRN Inward Register's basis), and the footer's hover says the Summary
+   * reads lower there — acceptedBaseTotalNote(). */
+  const footer = (() => {
+    let spend = 0, cgst = 0, sgst = 0, grand = 0, taxedBase = 0, taxedLines = 0, unpaired = 0, missing = 0, acceptedBase = 0;
+    for (const p of sortedPurchases) {
+      spend += Number(p.total_price) || 0;
+      const c = lineCharges[p.id];
+      if (!c) { missing++; continue; }
+      cgst += Number(c.cgst) || 0;
+      sgst += Number(c.sgst) || 0;
+      grand += Number(c.total_amount) || 0;
+      if ((Number(c.cgst) || 0) + (Number(c.sgst) || 0) > 0) {
+        taxedBase += (Number(c.gst_base) || 0) - (Number(c.discount) || 0);
+        taxedLines++;
+        if (c.gst_base_accepted) acceptedBase++;
+      }
+      if (c.unpaired_mirror) unpaired++;
+    }
+    const count = sortedPurchases.length;
+    const taxRow = { cgst, sgst, taxed_bill_value: taxedBase, taxed_lines: taxedLines, count };
+    return {
+      count,
+      spend: r2(spend),
+      cgst: r2(cgst),
+      sgst: r2(sgst),
+      tax: r2(cgst + sgst),
+      grand: r2(grand),
+      anyGst: cgst !== 0 || sgst !== 0,
+      pct: taxAppliedPercent(taxRow),
+      pctNote: taxAppliedNote(taxRow) + (acceptedBase > 0 ? `\n\n${acceptedBaseTotalNote(acceptedBase)}` : ''),
+      unpaired,
+      // Figures are complete only when every selected row has its charges.
+      complete: chargesStatus === 'ok' && missing === 0,
+    };
+  })();
 
   /* ══ THIS PAGE NO LONGER WRITES A PURCHASE ═══════════════════════════════
    *
@@ -896,23 +1179,101 @@ export default function PurchasesPage() {
   // ---- Export the purchase list currently in view (honours the applied
   // search + date filters; with no filters that is every purchase). ----
   const exportPurchases = async () => {
+    // The tax / grand-total columns must be REAL figures or the file must not
+    // be written: blank tax cells would read "no GST" on bills that carried it.
+    // Re-fetch when the map is not complete for the rows being exported.
+    let charges = lineCharges;
+    if (chargesStatus !== 'ok' || sortedPurchases.some((p) => !charges[p.id])) {
+      const fresh = await fetchLineCharges(purchases.map((p) => p.id));
+      if (!fresh) {
+        alert('Could not load the tax and grand-total figures, so the export was not created. Please try again.');
+        return;
+      }
+      charges = fresh;
+    }
     const XLSX = await import('xlsx');
-    const rows = sortedPurchases.map((p: any) => ({
-      date: p.date || '',
-      item_name: p.material_name || p.material_id || '',
-      vendor: p.vendor || '',
-      invoice_id: p.invoice_id || '',
-      bill_no: p.bill_no || '',
-      brand: p.brand || '',
-      quantity: Number(p.purchase_qty ?? p.quantity ?? 0),
-      purchase_unit: p.material_purchase_unit || p.material_unit || '',
-      unit_price: Number(p.purchase_unit_price ?? p.unit_price ?? 0),
-      total_amount: Number(p.total_price ?? 0),
-      notes: p.notes || '',
-    }));
-    const header = ['date', 'item_name', 'vendor', 'invoice_id', 'bill_no', 'brand', 'quantity', 'purchase_unit', 'unit_price', 'total_amount', 'notes'];
+    /* ── THE ELEVEN ORIGINAL COLUMNS KEEP THEIR PLACES; THE REST ARE APPENDED ──
+     * A saved sheet or a formula pointing at column J of last month's export
+     * keeps working only if every existing column stays where it was, so the
+     * owner-#5 columns go on the RIGHT, in this order: CGST, SGST, the six
+     * other charges, Tax Value (GST), Tax % Applied (GST), then Subtotal and
+     * Grand Total (so Subtotal − Discount + charges = Grand Total foots by hand
+     * even on a PO receipt, whose `total_amount` here is the booked cost), then
+     * the charge-basis note. Headings are the reports' own CSV headings,
+     * imported, so this file lines up with /reports/purchases column for column.
+     *
+     * BLANK, NEVER 0: a row on which no GST was typed gets EMPTY CGST, SGST, Tax
+     * Value and Tax % cells (null → no cell), and a mirror row whose GRN line is
+     * gone gets empty charge cells (chargeCell's rule). Numbers go out as
+     * numbers, so a SUM over any appended column is the footer figure. */
+    const TAX_KEYS: PurchaseChargeKey[] = ['cgst', 'sgst'];
+    const OTHER_COLS = PURCHASE_CHARGE_COLUMNS.filter((c) => !TAX_KEYS.includes(c.key));
+    const appended = [
+      CHARGE_COL('cgst').csvHeader,
+      CHARGE_COL('sgst').csvHeader,
+      ...OTHER_COLS.map((c) => c.csvHeader),
+      TAX_VALUE_CSV_HEADER,
+      TAX_PERCENT_CSV_HEADER,
+      BILL_VALUE_CSV_HEADER,
+      TOTAL_AMOUNT_CSV_HEADER,
+      CHARGE_NOTE_CSV_HEADER,
+    ];
+    const rows = sortedPurchases.map((p: any) => {
+      const row: Record<string, string | number | null> = {
+        date: p.date || '',
+        item_name: p.material_name || p.material_id || '',
+        vendor: p.vendor || '',
+        invoice_id: p.invoice_id || '',
+        bill_no: p.bill_no || '',
+        brand: p.brand || '',
+        quantity: Number(p.purchase_qty ?? p.quantity ?? 0),
+        purchase_unit: p.material_purchase_unit || p.material_unit || '',
+        unit_price: Number(p.purchase_unit_price ?? p.unit_price ?? 0),
+        total_amount: Number(p.total_price ?? 0),
+        notes: p.notes || '',
+      };
+      const c = charges[p.id];
+      if (!c) {
+        // A row deleted between the register load and this export: say so in
+        // the note column rather than print figures nobody read.
+        for (const h of appended) row[h] = null;
+        row[CHARGE_NOTE_CSV_HEADER] = 'tax and grand total unavailable — this purchase was not found; reload and export again';
+        return row;
+      }
+      const cr = chargeRowOf(c);
+      const gst = hasGst(c);
+      const cell = (k: PurchaseChargeKey) => {
+        const v = chargeCell(cr, CHARGE_COL(k));
+        return v == null ? null : v;
+      };
+      row[CHARGE_COL('cgst').csvHeader] = gst ? cell('cgst') : null;
+      row[CHARGE_COL('sgst').csvHeader] = gst ? cell('sgst') : null;
+      for (const oc of OTHER_COLS) row[oc.csvHeader] = cell(oc.key);
+      row[TAX_VALUE_CSV_HEADER] = gst && c.tax_value != null ? r2(c.tax_value) : null;
+      const pct = taxCsvNumber(c.gst_percent);
+      row[TAX_PERCENT_CSV_HEADER] = pct === '' ? null : pct;
+      row[BILL_VALUE_CSV_HEADER] = r2(c.bill_value);
+      row[TOTAL_AMOUNT_CSV_HEADER] = r2(c.total_amount);
+      // ONE row's note, worded for one row (rowChargeNote): where its charges
+      // were read from, or — on a row whose GRN line is gone — the UNDERSTATED
+      // warning. The shared chargeNote() / unpairedMirrorNote() are written for
+      // groups and read "1 of 1 lines — includes PO receipts — …" here.
+      const basis = rowChargeNote(c, grnNumberOf(p));
+      // A part-rejected PO receipt: Tax % (U) is struck on the ACCEPTED value,
+      // not the Subtotal (V) — said in the row's own note, because a reader
+      // checking U = T ÷ (V − Discount) by hand would otherwise find it wrong.
+      const acc = gst && c.gst_base_accepted
+        ? `Tax % struck on the ${r2(c.gst_base)} accepted less discount, not the ${r2(c.bill_value)} received Subtotal `
+          + '(part rejected at the door; GRN Inward Register basis — the Purchase Report Summary and Bill Summary divide by the received value)'
+        : '';
+      row[CHARGE_NOTE_CSV_HEADER] = [basis, acc].filter(Boolean).join('; ');
+      return row;
+    });
+    const header = ['date', 'item_name', 'vendor', 'invoice_id', 'bill_no', 'brand', 'quantity', 'purchase_unit', 'unit_price', 'total_amount', 'notes', ...appended];
     const ws = XLSX.utils.json_to_sheet(rows, { header });
-    ws['!cols'] = header.map((h) => ({ wch: h === 'item_name' ? 28 : h === 'notes' ? 30 : 14 }));
+    ws['!cols'] = header.map((h) => ({
+      wch: h === 'item_name' ? 28 : h === 'notes' ? 30 : h === CHARGE_NOTE_CSV_HEADER ? 60 : appended.includes(h) ? 18 : 14,
+    }));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Purchases');
     const tag = (appliedFilters.from || appliedFilters.to)
@@ -1350,11 +1711,12 @@ export default function PurchasesPage() {
               <thead>
                 <tr className="text-[#8B7355] border-b border-[#E8D5C4] bg-white/50">
                   <th
-                    className="text-left py-3 px-4 font-medium cursor-pointer select-none hover:text-[#3D2614] transition-colors"
+                    className="text-left py-3 px-4 font-medium cursor-pointer select-none hover:text-[#3D2614] transition-colors whitespace-nowrap"
                     onClick={toggleSort}
+                    title="The purchase date — the bill / receipt date the cost is booked against. Click to sort."
                   >
                     <span className="inline-flex items-center gap-1">
-                      Date
+                      Purchase Date
                       {sortDir === 'desc' ? (
                         <ChevronDown className="w-3.5 h-3.5" />
                       ) : (
@@ -1369,8 +1731,23 @@ export default function PurchasesPage() {
                   <th className="text-left py-3 px-4 font-medium">Brand</th>
                   <th className="text-right py-3 px-4 font-medium">Qty</th>
                   <th className="text-right py-3 px-4 font-medium">Unit Price</th>
-                  <th className="text-right py-3 px-4 font-medium">Total</th>
-                  <th className="text-right py-3 px-4 font-medium">Total Inward</th>
+                  <th className="text-right py-3 px-4 font-medium" title="Booked goods cost — what the Purchase Report totals as Spend. Normally qty × the booked rate, before the tax and charges recorded separately (CGST, SGST and the parts of Grand Total). On the April 2026 bulk-import rows it is the line total as imported from the vendor's sheet, which on many of them already includes the vendor's tax — no GST was split out on those rows, so their tax columns are blank.">Total</th>
+                  {/* OWNER #5 — tax details, GST % and grand total. Headings and
+                      hover text are the reports' own, imported. */}
+                  <th className="text-right py-3 px-4 font-medium" title={CHARGE_COL('cgst').title}>{CHARGE_COL('cgst').label}</th>
+                  <th className="text-right py-3 px-4 font-medium" title={CHARGE_COL('sgst').title}>{CHARGE_COL('sgst').label}</th>
+                  <th className="text-right py-3 px-4 font-medium whitespace-nowrap" title={REGISTER_TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+                  <th className="text-right py-3 px-4 font-medium whitespace-nowrap" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
+                  {/* Was "Total Inward". Same position, same meaning (what the
+                      GRN Inward Register calls Total Inward), now read from the
+                      effective rail so a PO receipt carries its GRN line's tax. */}
+                  <th
+                    className="text-right py-3 px-4 font-medium whitespace-nowrap"
+                    title="GRAND TOTAL — subtotal − discount + CGST + SGST + cesses + TCS + delivery + round-off: what is payable to the vendor for the line. For a line that came in on a goods receipt (one with a GRN No) it is the GRN Inward Register's Total Inward for that line — except that the register also counts goods rejected at the door on a line with an Invoice ID, and a row marked understated has lost its GRN line. A line with no GRN No (a bulk import or CSV upload) is not on that register. The Purchase Bill Summary adds up the lines of each bill and the Purchase Report Summary adds them up by vendor, item, month and so on; for the same purchases their totals equal this column's footer. On a goods-receipt row with no Invoice ID the tax, charges and Subtotal are read from its GRN line. Hover a figure for its arithmetic."
+                  >
+                    Grand Total
+                    <div className="text-[10px] font-normal text-[#B8A590]">(Total Inward)</div>
+                  </th>
                   <th className="text-left py-3 px-4 font-medium" title="The purchase order this bill was received against, when it came from one">PO No</th>
                   <th className="text-left py-3 px-4 font-medium" title="The goods receipt this bill came in on. Read from the real grn_id link, not from notes text. Blank for purchases that never went through a GRN — imports and direct bills.">GRN No</th>
                   <th
@@ -1453,31 +1830,101 @@ export default function PurchasesPage() {
                     <td className="py-3 px-4 text-right text-green-400 font-mono font-medium">
                       {formatCurrency(p.total_price)}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono">
-                      {(() => {
-                        // ALWAYS print a number. This is a right-aligned money
-                        // column sitting next to Total; a dash reads as "the
-                        // system lost the value" — which is exactly how it was
-                        // reported. Every other inward surface (GRN detail, GRN
-                        // print, both register CSVs, the bulk-upload preview on
-                        // this same page) prints one unconditionally.
-                        // The emphasis test is "is ANY charge column recorded",
-                        // NOT "does the net come to zero": a ₹100 discount plus
-                        // ₹100 delivery nets to zero and both are real.
-                        const c = (k: string) => Number((p as any)[k]) || 0;
-                        // compensation_cess is the EIGHTH charge column: GST
-                        // Compensation Cess, distinct from special_excise_cess
-                        // (which means TGBCL Special Excise Cess everywhere it
-                        // is read). Both are recorded-only and both add.
-                        const KEYS = ['discount', 'cgst', 'sgst', 'compensation_cess', 'special_excise_cess', 'tcs', 'delivery_charges', 'mrp_round_off'];
-                        const anyCharge = KEYS.some((k) => c(k) !== 0);
-                        const charges = -c('discount') + c('cgst') + c('sgst') + c('compensation_cess') + c('special_excise_cess') + c('tcs') + c('delivery_charges') + c('mrp_round_off');
-                        const val = (Number(p.total_price) || 0) + charges;
-                        return anyCharge
-                          ? <span className="text-[#af4408] font-medium">{formatCurrency(val)}</span>
-                          : <span className="text-[#8B7355]" title="No inward charges recorded — same as Total">{formatCurrency(val)}</span>;
-                      })()}
-                    </td>
+                    {/* ── OWNER #5: CGST · SGST · Tax Value (GST) · Tax % Applied
+                        (GST) · Grand Total ────────────────────────────────────
+                        All five read POST /api/purchases/line-charges — the
+                        EFFECTIVE rail. This cell used to add the purchases
+                        row's own charge columns, whose GST and discount are zero
+                        on every PO receipt (the bill's tax is on the GRN line), so
+                        a ₹1,180 bill printed ₹1,000 here. Ruling 6 fixed that in
+                        the reports; this is the same fix on the register.
+                        BLANK, NEVER ₹0 / 0%, where no GST was typed: a 0 in a tax
+                        column is a claim the vendor charged none, and on the
+                        tax-inclusive import rows tax WAS charged and never split
+                        out. "…" while the figures load; "—" with a reason if they
+                        could not be loaded — never a fallback to the old
+                        arithmetic, which is wrong exactly where it looks right. */}
+                    {(() => {
+                      const c = lineCharges[p.id];
+                      const pending = (
+                        <span
+                          className="text-[#B8A590]"
+                          title={chargesStatus === 'error'
+                            ? 'The tax and grand-total figures could not be loaded. Reload the page.'
+                            : chargesStatus === 'loading' ? 'Loading…' : 'This purchase was not found when the figures were read. Reload the page.'}
+                        >
+                          {chargesStatus === 'loading' ? '…' : '—'}
+                        </span>
+                      );
+                      if (!c) {
+                        return (
+                          <>
+                            <td className="py-3 px-4 text-right font-mono">{pending}</td>
+                            <td className="py-3 px-4 text-right font-mono">{pending}</td>
+                            <td className="py-3 px-4 text-right font-mono">{pending}</td>
+                            <td className="py-3 px-4 text-right font-mono">{pending}</td>
+                            <td className="py-3 px-4 text-right font-mono">{pending}</td>
+                          </>
+                        );
+                      }
+                      const cr = chargeRowOf(c);
+                      const gst = hasGst(c);
+                      const blank = (why: string) => <span className="text-[#B8A590]" title={why}>—</span>;
+                      const noGstWhy = 'No GST recorded on this purchase — shown blank, not ₹0, because a zero would claim the vendor charged none.';
+                      const unavailableWhy = 'Unavailable, not zero: this is a goods-receipt row whose GRN line (the bill document) has been deleted, so its tax cannot be read. See the warning under Grand Total.';
+                      // WHY the cell is blank decides the hover text. A mirror row
+                      // whose GRN line is gone reads cgst = sgst = 0 off its cost
+                      // row, so `gst` is false there too — but its GST was charged
+                      // and is merely unreadable. Saying "no GST recorded" on it
+                      // would be the false claim the blank exists to avoid.
+                      const blankWhy = c.unpaired_mirror ? unavailableWhy : noGstWhy;
+                      const taxCell = (k: 'cgst' | 'sgst') => {
+                        if (!gst) return blank(blankWhy);
+                        const v = chargeCell(cr, CHARGE_COL(k));
+                        return v == null ? blank(unavailableWhy) : <span>{fmtSignedINR(v)}</span>;
+                      };
+                      const parts = grandTotalParts(c, Number(p.total_price) || 0);
+                      const warn = hasUnpairedMirrorRows(cr);
+                      // Emphasis = "does this line carry ANY charge or tax", not
+                      // "does the net differ" — ₹100 discount + ₹100 delivery
+                      // nets to zero and both are real.
+                      const emphasised = gst || parts.length > 0 || c.grn_sourced === 1;
+                      return (
+                        <>
+                          <td className="py-3 px-4 text-right font-mono text-[#3D2614] whitespace-nowrap">{taxCell('cgst')}</td>
+                          <td className="py-3 px-4 text-right font-mono text-[#3D2614] whitespace-nowrap">{taxCell('sgst')}</td>
+                          <td className="py-3 px-4 text-right font-mono text-[#3D2614] whitespace-nowrap" title={REGISTER_TAX_VALUE_TITLE}>
+                            {gst && c.tax_value != null ? fmtSignedINR(c.tax_value) : blank(blankWhy)}
+                          </td>
+                          {/* A part-rejected PO receipt's rate is struck on the
+                              ACCEPTED value (the register's basis), not on the
+                              Subtotal shown under Grand Total — the hover says so,
+                              so 18.00% beside "on subtotal ₹1,000.00" never reads
+                              as a sum that does not work. */}
+                          <td className="py-3 px-4 text-right font-mono text-[#3D2614] whitespace-nowrap"
+                              title={gst && c.gst_base_accepted
+                                ? `${TAX_PERCENT_TITLE}\n\n${acceptedBaseRowNote(fmtSignedINR(c.gst_base), fmtSignedINR(c.bill_value))}`
+                                : TAX_PERCENT_TITLE}>
+                            {c.gst_percent != null
+                              ? fmtTaxPercent(c.gst_percent)
+                              : blank(gst ? 'No rate: the value GST was charged on, less discount, is zero or negative, so a percentage would mean nothing.' : blankWhy)}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono" title={grandTotalTitle(c, grnNumberOf(p))}>
+                            <span className={`whitespace-nowrap ${emphasised ? 'text-[#af4408] font-medium' : 'text-[#8B7355]'}`}>
+                              {fmtSignedINR(c.total_amount)}
+                            </span>
+                            {/* One phrase per line, each kept whole, so a signed
+                                figure never breaks away from its sign or label. */}
+                            {parts.map((t) => (
+                              <div key={t} className="text-[10px] leading-tight text-[#8B7355] whitespace-nowrap">{t}</div>
+                            ))}
+                            {warn && (
+                              <div className="text-[10px] font-semibold text-red-700 whitespace-nowrap">understated — see note</div>
+                            )}
+                          </td>
+                        </>
+                      );
+                    })()}
                     <td className="py-3 px-4">
                       {(() => {
                         // The STORED link wins. `po_number` reaches this row through
@@ -1569,9 +2016,10 @@ export default function PurchasesPage() {
                 ))}
                 {paginatedPurchases.length === 0 && (
                   <tr>
-                    {/* 14, matching the header row above. It was 13, so the
-                        empty state sat one column short of the table. */}
-                    <td colSpan={14} className="py-12 text-center text-[#8B7355]">
+                    {/* 18, matching the header row above (14 + CGST, SGST, Tax
+                        Value, Tax % — owner #5). It was once 13 against 14,
+                        and the empty state sat one column short of the table. */}
+                    <td colSpan={18} className="py-12 text-center text-[#8B7355]">
                       <ShoppingCart className="w-10 h-10 mx-auto mb-3 opacity-40" />
                       <p>No purchases found.</p>
                       {/* This page cannot add one any more, so it must not ask.
@@ -1586,6 +2034,57 @@ export default function PurchasesPage() {
                   </tr>
                 )}
               </tbody>
+              {/* ── FOOTER TOTAL (owner #5) — EVERY row the filters select, on
+                  every page, not just the 15 shown. Same window as Export. For
+                  the same dates this is the Purchase Report Summary's Spend,
+                  CGST, SGST, Tax Value, Tax % and Grand Total. */}
+              {sortedPurchases.length > 0 && (
+                <tfoot>
+                  <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF8F0] font-semibold text-[#2D1B0E]">
+                    <td colSpan={8} className="py-3 px-4 text-left">
+                      Total · {footer.count.toLocaleString('en-IN')} purchase{footer.count === 1 ? '' : 's'}
+                      <span className="ml-1 text-[11px] font-normal text-[#8B7355]">
+                        (all pages, current filters)
+                      </span>
+                    </td>
+                    {/* To the paisa (fmtSignedINR), not the cells' ≤2-decimal
+                        formatter: a period total reading "₹69,30,446.4" looks
+                        like a typo next to the paisa-exact Grand Total beside it. */}
+                    <td className="py-3 px-4 text-right font-mono text-green-600 whitespace-nowrap" title="Σ Total (booked goods cost) — the Purchase Report's Spend for the same purchases.">{fmtSignedINR(footer.spend)}</td>
+                    {!footer.complete ? (
+                      <td
+                        colSpan={5}
+                        className="py-3 px-4 text-right font-normal text-xs text-[#8B7355]"
+                        title="The tax and grand-total footer figures are shown only when every selected row has its tax figures."
+                      >
+                        {chargesStatus === 'error'
+                          ? 'Tax and grand-total figures could not be loaded — reload the page.'
+                          : chargesStatus === 'loading' ? 'Loading tax and grand-total figures…'
+                          : 'Some purchases were not found when the figures were read — reload the page.'}
+                      </td>
+                    ) : (
+                      <>
+                        <td className="py-3 px-4 text-right font-mono whitespace-nowrap">{footer.anyGst ? fmtSignedINR(footer.cgst) : <span className="text-[#B8A590]" title="No GST recorded on any of these purchases.">—</span>}</td>
+                        <td className="py-3 px-4 text-right font-mono whitespace-nowrap">{footer.anyGst ? fmtSignedINR(footer.sgst) : <span className="text-[#B8A590]" title="No GST recorded on any of these purchases.">—</span>}</td>
+                        <td className="py-3 px-4 text-right font-mono whitespace-nowrap" title={REGISTER_TAX_VALUE_TITLE}>{footer.anyGst ? fmtSignedINR(footer.tax) : <span className="text-[#B8A590]" title="No GST recorded on any of these purchases.">—</span>}</td>
+                        <td className="py-3 px-4 text-right font-mono whitespace-nowrap" title={TAX_PERCENT_TITLE + footer.pctNote}>{fmtTaxPercent(footer.pct)}</td>
+                        <td className="py-3 px-4 text-right font-mono text-[#af4408] whitespace-nowrap">
+                          {fmtSignedINR(footer.grand)}
+                          {footer.unpaired > 0 && (
+                            <div
+                              className="text-[10px] font-semibold text-red-700"
+                              title={unpairedMirrorNote({ count: footer.count, unpaired_mirror_rows: footer.unpaired }) || ''}
+                            >
+                              understated — {footer.unpaired} line{footer.unpaired === 1 ? '' : 's'} lost {footer.unpaired === 1 ? 'its' : 'their'} GRN line
+                            </div>
+                          )}
+                        </td>
+                      </>
+                    )}
+                    <td colSpan={4} className="py-3 px-4" />
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
 
