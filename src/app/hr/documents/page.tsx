@@ -1,11 +1,12 @@
 'use client';
 
 /**
- * HR — Employee Documents vault (Phase 4). ADMIN-ONLY page.
+ * HR — Employee Documents vault (Phase 4). adminOnly + hrFullCap page (admin,
+ * or a "Full HR access" role with the page ticked — owner ruling #90).
  *
  * Contract: docs/HRMS_DECISIONS.md D4 (BLOBs in SQLite behind an HR-gated
  * route) + §2 (the API is the boundary — this page just renders what
- * canAdminHr lets through; a 403 renders the plain admin-only lock copy).
+ * canHrFull lets through; a 403 renders the plain lock copy).
  *
  * Surfaces:
  *  · Employee Combobox filter + an "Expiring in 60 days" toggle chip
@@ -167,7 +168,7 @@ export default function HrDocumentsPage() {
       if (!res.ok) {
         setError(
           res.status === 401 || res.status === 403
-            ? 'Employee Documents is admin-only.'
+            ? 'Employee Documents is limited to admins and roles with Full HR access.'
             : "Couldn't load documents",
         );
         return;
@@ -341,7 +342,7 @@ export default function HrDocumentsPage() {
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
               Identity &amp; employment document vault
-              {loading ? '' : ` — ${total} document${total === 1 ? '' : 's'}`}. Admin-only.
+              {loading ? '' : ` — ${total} document${total === 1 ? '' : 's'}`}. Admins and roles with Full HR access.
             </p>
           </div>
           <button
@@ -375,7 +376,7 @@ export default function HrDocumentsPage() {
           </div>
         </div>
 
-        {/* Load error / admin-only lock */}
+        {/* Load error / canHrFull lock */}
         {error && (
           <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm flex items-center justify-between gap-3">
             <span>{error}</span>
@@ -686,7 +687,7 @@ export default function HrDocumentsPage() {
                 </div>
 
                 <p className="text-[11px] text-[#8B7355]">
-                  Files are stored in the vault and served only to admins, always as a download.
+                  Files are stored in the vault and served only to admins and roles with Full HR access, always as a download.
                   New documents start as Unverified.
                 </p>
               </div>

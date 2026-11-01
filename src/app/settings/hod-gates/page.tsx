@@ -110,11 +110,13 @@ export default function HodGatesPage() {
   const { hodRows, mgmtRows, adminRows } = useMemo(() => {
     const hod: { path: string; label: string; section: string }[] = [];
     const mgmt: { path: string; label: string; section: string }[] = [];
-    const adm: { path: string; label: string; section: string }[] = [];
+    // hrFullCap: one of the five HR pages a role with "Full HR access" may
+    // also open (ruling #90) — annotated below so "Admins only" stays true.
+    const adm: { path: string; label: string; section: string; hrFullCap?: boolean }[] = [];
     for (const s of PAGE_CATALOG) {
       for (const p of s.pages) {
         if (p.hodOnly) hod.push({ path: p.path, label: p.label, section: s.label });
-        else if (p.adminOnly) adm.push({ path: p.path, label: p.label, section: s.label });
+        else if (p.adminOnly) adm.push({ path: p.path, label: p.label, section: s.label, hrFullCap: !!p.hrFullCap });
         else if (p.mgmtOnly) mgmt.push({ path: p.path, label: p.label, section: s.label });
       }
     }
@@ -274,7 +276,9 @@ export default function HodGatesPage() {
               <Lock className="w-4 h-4 text-[#8B7355]" /> Admin-only pages
             </div>
             <div className="text-xs text-[#8B7355] mt-0.5">
-              Admins only, even with an explicit grant. Read-only here — not toggleable.
+              Admins only, even with an explicit grant — except the five marked HR, which a Manager-tier or
+              HOD role with “Full HR access” (Settings → Roles) can also open when the page is ticked.
+              Read-only here — not toggleable.
             </div>
           </div>
           <ul className="divide-y divide-[#F0E9DE]">
@@ -282,6 +286,10 @@ export default function HodGatesPage() {
               <li key={r.path} className="px-4 py-2 text-xs text-[#6B5744]">
                 <span className="text-[#2D1B0E]">{r.label}</span>
                 <span className="ml-1.5 text-[#8B7355]">{r.path}</span>
+                {r.hrFullCap && (
+                  <span title="Also opens for a Manager-tier or HOD role with “Full HR access” — with this page ticked."
+                        className="ml-1.5 text-[9px] bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded-full font-medium">HR</span>
+                )}
               </li>
             ))}
           </ul>

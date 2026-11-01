@@ -7,11 +7,61 @@ import { routedLineState } from '@/lib/routed-requisitions';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
-  zeroEntriesSentence, fmtLineQtyPU, issueLedgerWatermark,
-  type CentralStockShort,
+  zeroEntriesSentence, fmtLineQtyPU, issueLedgerWatermark, lineFactor,
+  type CentralStockShort, type LineCompletenessRow,
 } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
+// Owner ruling #86a "refuse" (2026-10-28) and its addendum "Yes, guard it too"
+// (2026-10-29): party stock already handed over on another open party
+// requisition — the SAME separate pre-check store-issue makes, see PROMISED TO
+// ANOTHER PARTY below.
+import { partyIssueShortfall, partyTransferTakesOlderClaims, type PartyIssueShortfall } from '@/lib/party-pending';
+
+/** One material the party-promise refusal names — store-issue's row, field for
+ *  field (store-issue/route.ts PartyPromisedRow). */
+type PartyPromisedRow = PartyIssueShortfall & {
+  code: 'party_promised';
+  line_id: string; req_item_id: string; line_ids: string[];
+  /** The cap in the LINE's own unit: what the line's quantity may grow by. */
+  line_unit: string; max_add_qty: number;
+};
+
+/** store-issue's partyPromisedResponse, verbatim: 409, code 'party_promised',
+ *  `short` (one row per material, its own sentence) and `blockers` (the
+ *  requisitions holding the stock, oldest first), nothing written. */
+function partyPromisedResponse(rows: PartyPromisedRow[]): Response {
+  const blockers: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    for (const b of row.blockers) {
+      const k = `${b.req_id}|${row.material_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      blockers.push({ ...b, material_id: row.material_id, material: row.material });
+    }
+  }
+  return Response.json({
+    error: rows.map(x => x.message).join(' '),
+    code: 'party_promised',
+    short: rows,
+    blockers,
+    applied: 0,
+  }, { status: 409 });
+}
+
+/** One line as the party-promise pre-check reads it (store-issue's selLine
+ *  columns that matter here): fresh quantity_issued and the raw pack columns. */
+type PartyLineRow = {
+  id: string; material_id: string; quantity_issued: number | null; line_unit: string | null;
+  unit: string | null; purchase_unit: string | null; pack_size: number | null;
+};
+
+/** Thrown inside the transaction to roll it back; the catch answers it with
+ *  partyPromisedResponse. */
+function partyPromisedError(rows: PartyPromisedRow[]): Error & { partyPromised: PartyPromisedRow[] } {
+  return Object.assign(new Error('party_promised'), { partyPromised: rows });
+}
 
 /**
  * Store Manager processes a chef-approved requisition.
@@ -154,6 +204,14 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *                                          the write lock.
  *   po_price_required | po_vendor_required | po_unit_unrecognised
  *   po_qty_too_small                     → { code, material, req_item_id }
+ *
+ * Error (409) on a PARTY requisition only (owner ruling #86a + addendum
+ * 2026-10-29), store-issue's envelope exactly — nothing written:
+ *   party_promised                       → { code, error, short: [{ kind, material,
+ *                                            material_id, line_id, req_item_id,
+ *                                            line_ids, message, … the
+ *                                            party-pending.ts figures }],
+ *                                            blockers, applied: 0 }
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -659,6 +717,96 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         applied: 0,
       }, { status: 400 });
     }
+
+    // ── PROMISED TO ANOTHER PARTY (owner ruling #86a "Show + refuse",
+    //    2026-10-28; addendum "Yes, guard it too", 2026-10-29) ────────────────
+    // The /requisitions Process window posts here, and it could still issue a
+    // PARTY line whose stock is already issued on another open party
+    // requisition: a party line's issue moves nothing on the internal rail
+    // (checkCentralIssue skipReason 'party' — the floor above never holds one),
+    // and the party transfer below reads only the raw balance, so it took the
+    // last FUEL that REQ-2026-1388 had been handed (measured, round 1:
+    // FUEL 1 on the books, issued on 1388; Process FUEL 1 on a new party
+    // requisition answered 200 and the transfer left the books at 0).
+    //
+    // THE SAME REFUSAL store-issue makes (store-issue/route.ts, PROMISED TO
+    // ANOTHER PARTY): per material, the gesture's net change to this
+    // requisition's quantity is weighed by src/lib/party-pending.ts
+    // partyIssueShortfall against the central books less every OTHER open
+    // party requisition's handed-over, not-yet-moved stock (and this
+    // requisition's own) — REFUSED WHOLE, nothing written: 409, code
+    // 'party_promised', `short` + `blockers`, the store's own sentence. Only a
+    // material one of whose lines this POST raises can be refused (a credit is
+    // never weighed — lowering a line is how a claim is given back), and only
+    // where another party holds some of it: with no other claim the party
+    // transfer's own floor decides, exactly as before.
+    //
+    // MIRRORS THIS ROUTE'S WRITE LOOP, not store-issue's: absolute and
+    // unfiltered — every non-routed line, an omitted one written as 0, a held
+    // line written back as found, and the figure issueLineQtyToRecord records
+    // (for a party line, the posted one). Routed lines (never written here),
+    // store-mapped (liquor) materials and unit-review lines are never claims
+    // and never weighed.
+    //
+    // A SEPARATE PRE-CHECK. THE RULE, planCentralDebit (called, not changed),
+    // checkCentralIssue, desk-rule.ts, party-fulfillment.ts and the routed
+    // handling above are untouched; an internal requisition never reaches it.
+    // Asked here, again inside the transaction right after the atomic claim,
+    // and — THE OLDEST KEEPS ITS CLAIM — at the party transfer.
+    const isParty = r.purpose === 'party';
+    // Read fresh, like store-issue's selLine: the raw pack columns lineFactor
+    // reads, and the line's quantity_issued as it stands now.
+    const selPartyLine = db.prepare(`
+      SELECT ri.id, ri.material_id, ri.quantity_issued, ri.unit AS line_unit,
+             rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+      WHERE ri.id = ? AND ri.req_id = ?
+    `);
+    const asPromisedRow = (sf: PartyIssueShortfall, lineIds: string[]): PartyPromisedRow => {
+      const lineId = lineIds[0] || String(items.find(it => String(it.material_id) === String(sf.material_id))?.id || '');
+      const cur = lineId ? (selPartyLine.get(lineId, id) as PartyLineRow | undefined) : undefined;
+      const { factor } = lineFactor(cur?.line_unit, cur || {});
+      return {
+        ...sf, code: 'party_promised', line_id: lineId, req_item_id: lineId,
+        line_ids: lineIds.length ? lineIds : (lineId ? [lineId] : []),
+        line_unit: String(cur?.line_unit ?? ''),
+        max_add_qty: Math.round((sf.max_add_recipe / (factor || 1)) * 1e6) / 1e6,
+      };
+    };
+    const partyPromisedRows = (): PartyPromisedRow[] => {
+      if (!isParty) return [];
+      const byMat = new Map<string, { add: number; lineIds: string[] }>();
+      for (const it of items) {
+        if (isRoutedItem(it)) continue;              // the write loop leaves it alone
+        const cur = selPartyLine.get(String(it.id), id) as PartyLineRow | undefined;
+        if (!cur) continue;
+        const before = Number(cur.quantity_issued) || 0;
+        const posted = Number((lineMap.get(it.id) || {}).quantity_issued) || 0;
+        const after = heldItemIds.has(String(it.id))
+          ? before
+          : issueLineQtyToRecord(db, { reqItemId: it.id, beforeLineQty: before, afterLineQty: posted }).afterLineQty;
+        const { factor, needsReview } = lineFactor(cur.line_unit, cur);
+        if (needsReview) continue;                   // the transfer never moves it
+        const matId = String(cur.material_id || '');
+        const m = byMat.get(matId) || { add: 0, lineIds: [] };
+        m.add += (after - before) * (factor || 1);
+        if (after > before + 1e-9) m.lineIds.push(String(it.id));
+        byMat.set(matId, m);
+      }
+      const rows: PartyPromisedRow[] = [];
+      for (const [matId, m] of byMat) {
+        if (m.lineIds.length === 0) continue;        // only an issue is refused
+        const sf = partyIssueShortfall(db, { reqId: id, materialId: matId, addRecipe: m.add });
+        if (sf) rows.push(asPromisedRow(sf, m.lineIds));
+      }
+      return rows;
+    };
+    if (isParty) {
+      const promisedRows = partyPromisedRows();
+      if (promisedRows.length > 0) return partyPromisedResponse(promisedRows);
+    }
+
     // PAST THIS POINT THE GESTURE IS GOING AHEAD WITHOUT THE HELD LINES. Their
     // rows go back on the 200 (held_lines / stock_held_note, assembled after the
     // transaction), and the write loop leaves their quantity_issued untouched.
@@ -1275,6 +1423,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // wrote (party-fulfillment.ts, "THE SHELF MARK GOES ON THE CLOSING
       // GESTURE'S ROW") — the store_process row it closed at, never an older one.
       const ledgerSince = issueLedgerWatermark(db);
+      // PROMISED TO ANOTHER PARTY, AGAIN, UNDER THE LOCK (ruling #86a): the
+      // pre-flight read the claims before the outlet await; another process
+      // may have issued since. The claim above holds the write lock and
+      // nothing is written yet, so the lines read exactly as the write loop
+      // will find them. Same rows, same 409, rolled back.
+      if (isParty) {
+        const again = partyPromisedRows();
+        if (again.length > 0) throw partyPromisedError(again);
+      }
 
       // --- 1. Record what was issued.
       // This route itself writes NOTHING to raw_materials.current_stock or
@@ -1724,6 +1881,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return !(lineIssueComplete(it) && !it.deferred_until);
       });
       if (!linkedPoId && poDroppedOwing.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
+        // ── THE OLDEST KEEPS ITS CLAIM, AT THE TRANSFER (ruling #86a with
+        // #80's default; store-issue's olderClaimsAtTransfer) ───────────────
+        // The transfer moves this requisition's whole not-yet-moved quantity
+        // per material, reading only the raw balance. Where an OLDER open
+        // party requisition was handed the same stock first and it has not
+        // left the books, it would take the older party's goods. Only a
+        // submit that issues something is refused here, and only where the
+        // older claims are the reason (party-pending.ts
+        // partyTransferTakesOlderClaims: a material the books cannot cover
+        // even without them is the transfer's own floor's, unchanged). 409
+        // 'party_promised', the whole transaction rolled back.
+        if (raisedIds.size > 0) {
+          // Unlike store-issue, this route runs the transfer on any submit
+          // (complete or not), so the sentence says which: the same test as
+          // `allDone` below, on the store's own lines (routed ones are not).
+          const completes = items.filter(it => !isRoutedItem(it)).every(it => {
+            const x = owesNow.get(String(it.id), id) as (LineCompletenessRow & {
+              is_rejected: number | null; store_rejected: number | null; deferred_until: string | null;
+            }) | undefined;
+            if (!x) return false;
+            if (x.is_rejected || x.store_rejected) return true;
+            return lineIssueComplete(x) && !x.deferred_until;
+          });
+          const taken = partyTransferTakesOlderClaims(db, id, { completes }).map(sf => asPromisedRow(sf, []));
+          if (taken.length > 0) throw partyPromisedError(taken);
+        }
         applyPartyFulfillment(db, id, me.email, { ledgerSince });
       }
 
@@ -1911,6 +2094,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     return Response.json({ success: true, ...result });
   } catch (e: any) {
+    // Party stock promised elsewhere (ruling #86a), met under the lock or at
+    // the transfer: the pre-flight's refusal, same envelope, nothing written.
+    if (e && Array.isArray(e.partyPromised) && e.partyPromised.length > 0) {
+      console.warn('[req store-process] party stock promised elsewhere:', e.partyPromised.map((x: PartyPromisedRow) => x.material).join(', '));
+      return partyPromisedResponse(e.partyPromised);
+    }
     console.error('[req store-process]', e);
     // THE FLOOR FIRED INSIDE THE TRANSACTION. The pre-flight above refuses this
     // before anything is written, so reaching here means the balance moved

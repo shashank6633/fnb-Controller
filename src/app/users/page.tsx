@@ -825,7 +825,8 @@ function PageAccessSection({ editing, setEditing, departments, roles, rolesReady
                         key={p.path}
                         className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 rounded"
                         title={
-                          p.adminOnly ? 'Admins only — this tick is ignored for everyone else.'
+                          p.hrFullCap ? 'Admins only by default. A Manager-tier or HOD user whose role has “Full HR access” (Settings → Roles) can also open it — WITH this tick. Without that capability, this tick is ignored for non-admins.'
+                          : p.adminOnly ? 'Admins only — this tick is ignored for everyone else.'
                           : p.hodOnly ? 'HODs (Is HOD) and admins only — this tick is ignored for other users.'
                           : p.financeCap ? 'Management only by default. A role with “View finance & purchase reports” (Settings → Roles) can also open it — WITH this tick. Without that capability, this tick is ignored for non-management.'
                           : p.mgmtOnly ? 'Admins, Managers and HODs only — this tick is ignored for other users.'
@@ -835,6 +836,11 @@ function PageAccessSection({ editing, setEditing, departments, roles, rolesReady
                         <input type="checkbox" checked={draft.has(p.path)} onChange={() => togglePage(p.path)} />
                         <span className="text-[#2D1B0E]">{p.label}</span>
                         {p.adminOnly && <span className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded-full font-medium">Admin</span>}
+                        {/* "HR": the five admin-only HR pages a role with "Full HR
+                            access" can also open (ruling #90) — so the Admin
+                            badge never claims a tick is dead when Settings →
+                            Roles can revive it. */}
+                        {p.hrFullCap && <span className="text-[9px] bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded-full font-medium">HR</span>}
                         {p.hodOnly && <span className="text-[9px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full font-medium">HOD</span>}
                         {p.financeCap
                           ? <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium">Finance</span>

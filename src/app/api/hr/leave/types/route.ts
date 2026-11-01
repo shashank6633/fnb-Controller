@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, type HrLeaveType } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, type HrLeaveType } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -17,11 +17,11 @@ import { reportServerError } from '@/lib/error-alerts';
  *          API GETs — this check is the security boundary (§2.1).
  * POST   /api/hr/leave/types { name, annual_entitlement?, carry_forward_max?,
  *          encashable?, max_consecutive_days?, is_paid? } → { leave_type }
- *          Admin only. 409 on COLLATE NOCASE duplicate name.
+ *          Admin or "Full HR access" (canHrFull). 409 on COLLATE NOCASE duplicate name.
  * PUT    /api/hr/leave/types { id, ...any of the POST fields, is_active? }
- *          → { leave_type }. Admin only. Rename runs the same dup check.
+ *          → { leave_type }. Admin or "Full HR access" (canHrFull). Rename runs the same dup check.
  * DELETE /api/hr/leave/types?id=   (id also accepted in a JSON body)
- *          → { ok: true, pending_requests, warning? }. Admin only. Soft
+ *          → { ok: true, pending_requests, warning? }. Admin or "Full HR access" (canHrFull). Soft
  *          deactivate — ALWAYS allowed, even while balances/requests still
  *          reference the type: deactivation only hides it from pickers;
  *          existing rows keep the label, and already-pending requests remain
@@ -75,7 +75,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -126,7 +126,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -195,7 +195,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, tasks/*); the module contract writes DELETE { id }.
   // Accept both so neither caller shape breaks.

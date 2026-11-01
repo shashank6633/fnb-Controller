@@ -84,7 +84,14 @@ import { packFactor, shownPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import {
   deskLineComplete, deskLineBasis, planDeskDebit, forecastDeskTake, type DeskTakeForecast,
   forecastDeskPartyTransfer, deskPartyHeadroom, deskCovers, type DeskPartyForecast, type DeskPartyShort,
+  deskGrid, deskOnGrid,
 } from '@/lib/desk-rule';
+// Party stock issued elsewhere (ruling #86a): the store's own words and
+// figures, ONE copy shared with party-pending.ts and the Process window.
+import {
+  promiseFig, promiseFigPU, promiseIsAre, promiseHasHave, isAreShown, hasHaveShown,
+  noneFreeWords, freeIsWords, freeCellWords, apportionShown,
+} from '@/lib/party-promise-words';
 // ROUTED LINES (rulings #45, #74): a line for an item a Direct Issue rule sends
 // straight to another department (Meat / Poultry / Seafood → Kitchen) is that
 // department's to send, by department transfer — never issued from here. The
@@ -164,6 +171,51 @@ interface ReqLine extends MergeLineFields {
   routed_department_id?: string | null;
   routed?: unknown;
   routed_department_name?: string | null;
+  /** PROMISED TO OTHER PARTY REQUISITIONS (owner ruling #86a, api/requisitions
+   *  ?id= via src/lib/party-pending.ts partyPendingClaims). A party
+   *  requisition's goods leave the central books only when the WHOLE
+   *  requisition is complete (party-fulfillment.ts), so goods already issued on
+   *  an open party requisition are still inside current_stock. These say how
+   *  much of it, on which OTHER open party requisitions (this one excluded),
+   *  in the PURCHASE unit. Absent / 0 = nothing promised: the cell reads as it
+   *  always did. */
+  promised_elsewhere_purchase?: number | null;
+  /** The same total in RECIPE units, when the route sends it (exact). */
+  promised_elsewhere_recipe?: number | null;
+  /** One entry per other open party requisition holding a claim, as the route
+   *  orders them. issued_at / qty_recipe are read when present. */
+  promised_elsewhere_reqs?: PromisedReq[] | null;
+  /** current_stock − promised_elsewhere, PURCHASE units. Can be NEGATIVE (more
+   *  is promised than the books hold). Not printed as is: the cell's "free" /
+   *  "short N" also takes out this requisition's own_pending_* (stockLevel),
+   *  so every row of a material prints the same figure. */
+  free_purchase?: number | null;
+  free_recipe?: number | null;
+  /** THIS requisition's own handed-over, not-yet-moved quantity of the
+   *  material (0 unless it is an open party requisition), and of that, what
+   *  the books cannot cover once the OLDER parties' claims are honoured
+   *  (ruling #80) — 0 when covered. RECIPE / PURCHASE units. */
+  own_pending_recipe?: number | null;
+  own_pending_purchase?: number | null;
+  own_claim_short_recipe?: number | null;
+  own_claim_short_purchase?: number | null;
+}
+/** One other open party requisition's claim on this line's material
+ *  (party-pending.ts partyPromisedForRequisition, oldest first). */
+interface PromisedReq {
+  req_id?: string;
+  req_number: string;
+  event_name?: string | null;
+  event_date?: string | null;
+  department?: string | null;
+  /** PURCHASE units issued there that have not left the central books. */
+  qty_purchase: number;
+  /** The same in RECIPE units. */
+  qty_recipe?: number | null;
+  pending_recipe?: number | null;
+  purchase_unit?: string | null;
+  /** When that claim began — its line's first hand-over. */
+  issued_at?: string | null;
 }
 interface Requisition {
   id: string; req_number: string; purpose: string;
@@ -1629,6 +1681,445 @@ function ForecastBasisNote() {
   );
 }
 
+/* ── PROMISED TO OTHER PARTY REQUISITIONS (owner ruling #86a, 2026-10-29) ────
+   A party requisition's goods leave the central books only when the WHOLE
+   requisition is complete (src/lib/party-fulfillment.ts header; the internal
+   rail skips a party line, issue-stock.ts checkCentralIssue skipReason
+   'party'). Until then they are still inside rm.current_stock — so "In store"
+   counted FUEL 1 pc that was already handed over on REQ-2026-1388, and the
+   store issued that same pc again on REQ-2026-1389 (production, 2026-10-28).
+
+   THE RULING, "Show + refuse":
+     SHOW   — the In store cell says how much of the books is already issued on
+              OTHER open party requisitions (api/requisitions ?id= line fields
+              promised_elsewhere_* / free_* / own_*, built by
+              src/lib/party-pending.ts partyPromisedForRequisition), and the dot
+              is scored on what is FREE.
+     REFUSE — store-issue refuses an Issue on a PARTY line, 409 code
+              'party_promised', in two cases (party-pending.ts):
+                · partyIssueShortfall — the books cannot cover the issue once
+                  every OTHER open party requisition's handed-over, not-yet-moved
+                  stock (and this requisition's own) is held back;
+                · partyTransferTakesOlderClaims — the issue completes the
+                  store's part, and the transfer would take stock an OLDER open
+                  party requisition was handed first (ruling #80: the oldest
+                  keeps its claim).
+              Party lines only; THE RULE (central-debit-clamp.ts), desk-rule.ts
+              and the transfer are untouched.
+   This page forecasts both BEFORE the click, from those fields, by the server's
+   own arithmetic and in its own words (forecastPartyPromised) — words only,
+   never a guard: nothing is disabled and every POST is what it was, so the
+   store's books at the moment of the click decide, and the server's own
+   sentence is shown verbatim if it refuses. A requisition no other party
+   requisition competes with renders exactly as before. */
+const PROMISED_CODE = 'party_promised';
+
+type PromisedClaim = PromisedReq & { recipe: number; pu: number; startMs: number };
+
+/** party-pending.ts r6: 6-dp, -0 normalised. */
+const r6 = (n: number): number => {
+  const v = Math.round((Number(n) || 0) * 1e6) / 1e6;
+  return v === 0 ? 0 : v;
+};
+
+/** party-pending.ts tsMs: a timestamp as epoch ms, for ordering only (SQLite's
+ *  zone-less "YYYY-MM-DD HH:MM:SS" is UTC). Unparseable → NaN. */
+function claimMs(s: unknown): number {
+  const t = String(s ?? '').trim();
+  if (!t) return NaN;
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(t) ? `${t.replace(' ', 'T')}Z` : t;
+  return Date.parse(iso);
+}
+
+/** party-pending.ts claimStart: when a line's claim began — its FIRST
+ *  hand-over (issue_history's earliest `at`), else issued_at. NaN when none. */
+function lineClaimStartMs(line: ReqLine): number {
+  let first = Infinity;
+  try {
+    const h: unknown = JSON.parse(String(line.issue_history || '[]'));
+    if (Array.isArray(h)) {
+      for (const e of h) {
+        const ms = claimMs((e as { at?: unknown } | null)?.at);
+        if (Number.isFinite(ms) && ms < first) first = ms;
+      }
+    }
+  } catch { /* malformed history — fall through */ }
+  return Number.isFinite(first) ? first : claimMs(line.issued_at);
+}
+
+/** The other open party requisitions' claims on this line's material
+ *  (promised_elsewhere_reqs, one per requisition, oldest first), each with its
+ *  RECIPE figure — the route's own, else its purchase figure through the pack. */
+function promisedOthersOf(line: ReqLine): PromisedClaim[] {
+  const rows = Array.isArray(line.promised_elsewhere_reqs) ? line.promised_elsewhere_reqs : [];
+  const pf = lineUnits(line).pf || 1;
+  const out: PromisedClaim[] = [];
+  for (const r of rows) {
+    if (!r) continue;
+    const pu = Number(r.qty_purchase);
+    const rc = r.qty_recipe ?? r.pending_recipe;
+    const recipe = rc != null && Number.isFinite(Number(rc)) ? Number(rc)
+      : Number.isFinite(pu) ? r6(pu * pf) : 0;
+    if (!(recipe > 1e-9)) continue;
+    out.push({ ...r, recipe, pu: Number.isFinite(pu) ? pu : recipe / pf, startMs: claimMs(r.issued_at) });
+  }
+  return out;
+}
+
+/** RECIPE units of this line's material issued on OTHER open party
+ *  requisitions and not yet moved off the central books. 0 when none. */
+function promisedRecipeOf(line: ReqLine): number {
+  const r = Number(line.promised_elsewhere_recipe);
+  if (line.promised_elsewhere_recipe != null && Number.isFinite(r)) return Math.max(0, r);
+  const p = Number(line.promised_elsewhere_purchase);
+  if (line.promised_elsewhere_purchase != null && Number.isFinite(p)) {
+    return Math.max(0, r6(p * (lineUnits(line).pf || 1)));
+  }
+  return promisedOthersOf(line).reduce((s, c) => s + c.recipe, 0);
+}
+
+/** Does this line carry claims the central floor does not see? Only a line the
+ *  store serves from central: not routed (ruling #45), not a liquor /
+ *  store-mapped material (party-pending.ts leaves both out of every claim). */
+function promisedApplies(line: ReqLine): boolean {
+  return !isRoutedLine(line) && !Number(line.central_flow_blocked || 0);
+}
+
+const OPEN_PARTY_STATUSES = ['chef_approved', 'mgmt_approved', 'store_processed'];
+
+/** party-pending.ts ownIssuedMoved: this requisition's store-served,
+ *  resolvable lines of a material — RECIPE units issued (each line's
+ *  quantity_issued plus what `add` adds to it, LINE units, through lineFactor)
+ *  and what its party transfer already moved for the material
+ *  (party_moved_recipe), and when its claim began (the earliest first
+ *  hand-over; a line first handed over by the gesture begins "now"). */
+function ownClaimOf(req: Requisition, materialId: string, add?: Map<string, number>): {
+  issued: number; moved: number; startMs: number; lines: ReqLine[];
+} {
+  const lines = storeLinesOf(req).filter(l => String(l.material_id || '') === String(materialId));
+  let issued = 0;
+  let startMs = Infinity;
+  for (const l of lines) {
+    const basis = deskLineBasis(l);
+    if (!basis) continue;                         // lineFactor needsReview — never a claim
+    const before = Number(l.quantity_issued) || 0;
+    const plus = add?.get(l.id) || 0;
+    issued += (before + plus) * (basis.factor || 1);
+    const ms = before > 0 ? lineClaimStartMs(l) : plus > 0 ? Date.now() : NaN;
+    if (Number.isFinite(ms) && ms < startMs) startMs = ms;
+  }
+  const moved = Math.max(0, Number(lines[0]?.party_moved_recipe) || 0);
+  return { issued: r6(issued), moved: r6(moved), startMs, lines };
+}
+
+/** RECIPE units THIS party requisition already issued of the line's material
+ *  that have not left the central books yet — the route's own_pending_recipe,
+ *  else issued − moved (ownClaimOf). They leave with this requisition's
+ *  transfer, so on a party line they are part of what the line still needs
+ *  from the books. 0 on an internal or closed requisition, a routed /
+ *  store-mapped line, or a unit the page cannot resolve. */
+function ownPartyPendingRecipe(req: Requisition, line: ReqLine): number {
+  if (req.purpose !== 'party' || !promisedApplies(line)) return 0;
+  if (!OPEN_PARTY_STATUSES.includes(String(req.status || ''))) return 0;
+  if (!deskLineBasis(line)) return 0;
+  const s = Number(line.own_pending_recipe);
+  if (line.own_pending_recipe != null && Number.isFinite(s)) return Math.max(0, s);
+  const o = ownClaimOf(req, String(line.material_id || ''));
+  return r6(Math.max(0, o.issued - o.moved));
+}
+
+/** Of that own quantity, what the books cannot cover once the OLDER open party
+ *  requisitions' claims are honoured (ruling #80) — the route's
+ *  own_claim_short_recipe, else party-pending.ts's own formula
+ *  min(own, max(0, older + own − max(0, central))). */
+function ownClaimShortRecipe(req: Requisition, line: ReqLine, own: number): number {
+  if (!(own > 1e-9)) return 0;
+  const s = Number(line.own_claim_short_recipe);
+  if (line.own_claim_short_recipe != null && Number.isFinite(s)) return Math.max(0, s);
+  const start = ownClaimOf(req, String(line.material_id || '')).startMs;
+  const older = promisedOthersOf(line).filter(c => Number.isFinite(c.startMs) && c.startMs < start)
+    .reduce((t, c) => t + c.recipe, 0);
+  return r6(Math.min(own, Math.max(0, older + own - Math.max(0, Number(line.current_stock) || 0))));
+}
+
+/* THE SERVER'S WORDS — not transcribed any more but SHARED (round 3):
+   src/lib/party-promise-words.ts is the one copy the store's 409
+   (party-pending.ts), this desk and the Process window all print through, so
+   the desk says before the click exactly what the store says after it, and a
+   row's cell, hover and pre-check never say one figure two ways. */
+/** party-pending.ts fig: a RECIPE quantity as the storekeeper reads it, PURCHASE unit first. */
+const promisedFig = (recipe: number, meta: PackMeta): string => promiseFig(recipe, meta);
+const promisedIsAre = (recipe: number, meta: PackMeta) => promiseIsAre(recipe, meta);
+const promisedHasHave = (recipe: number, meta: PackMeta) => promiseHasHave(recipe, meta);
+/** party-pending.ts noneFreeWords. */
+const promisedNoneFree = (freeRecipe: number, meta: PackMeta): string => noneFreeWords(freeRecipe, meta);
+/** The material's pack meta as lineUnits reads it (current_stock is RECIPE
+ *  units; every promised / free figure is printed through this). */
+function lineMetaOf(line: ReqLine): PackMeta {
+  return {
+    unit: line.material_unit || line.unit || '',
+    purchase_unit: line.material_purchase_unit,
+    pack_size: line.material_pack_size,
+  };
+}
+/** "A", "A and B", "A, B and C" (party-pending.ts joinNames). */
+function joinAnd(xs: string[]): string {
+  if (xs.length <= 1) return xs[0] || '';
+  return `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`;
+}
+const reqLabel = (c: { req_number: string; event_name?: string | null }) =>
+  `${c.req_number}${c.event_name ? ` (${c.event_name})` : ''}`;
+/** party-pending.ts reqLabelQty: "REQ-x (Event, 3 CASE)" — the holder with what it holds. */
+const reqLabelQty = (c: { req_number: string; event_name?: string | null }, qty: string) =>
+  `${c.req_number} (${c.event_name ? `${c.event_name}, ` : ''}${qty})`;
+/** party-pending.ts calls planCentralDebit(stock, ask, shownAs) with the bare
+ *  shownPurchaseQty converter (no alts) — its `fits`, transcribed: on the
+ *  6-dp grid, or the ask's shown figure IS the balance's (shown of its grid
+ *  point, or of itself). */
+function promisedFits(stock: number, ask: number, meta: PackMeta): boolean {
+  const a = Number(ask) || 0;
+  if (!(a > 0)) return true;
+  const available = (Number(stock) || 0) > 0 ? Number(stock) : 0;
+  const shownAsk = Number(shownPurchaseQty(deskOnGrid(a), meta)) || 0;
+  const renderings = [Number(shownPurchaseQty(deskOnGrid(available), meta)) || 0, Number(shownPurchaseQty(available, meta)) || 0];
+  return deskGrid(a) <= deskGrid(available) || renderings.some(v => v > 0 && v === shownAsk);
+}
+
+interface PromisedShort {
+  /** 'issue' — partyIssueShortfall; 'transfer' — partyTransferTakesOlderClaims. */
+  kind: 'issue' | 'transfer';
+  materialId: string;
+  /** The line the refusal is about (for 'transfer', this requisition's line of
+   *  that material — often NOT a line the gesture issues). */
+  line: ReqLine;
+  /** The gesture's lines of that material (for 'issue'). */
+  lineIds: string[];
+  /** The store's sentence, without its after-the-fact "Nothing was issued …". */
+  message: string;
+}
+interface PromisedForecast {
+  /** At least one row — the store refuses the WHOLE gesture. */
+  refused: boolean;
+  /** The rows, by the line each names. */
+  byLine: Record<string, PromisedShort>;
+  /** The rows, in the server's order. */
+  lines: PromisedShort[];
+}
+
+/**
+ * THE STORE'S PARTY-PROMISE REFUSAL, FORECAST BEFORE THE CLICK — store-issue's
+ * partyPromisedRows (the issue entries' add per material, then
+ * party-pending.ts partyIssueShortfall) and, where no row is refused and the
+ * gesture runs the party transfer, partyTransferTakesOlderClaims — on exactly
+ * the batch the button posts (same lines, same order, same resolver). Pure;
+ * reads the queue payload, so it is the books as this page last loaded them.
+ *
+ *   issue    : others = every OTHER open party requisition's claim (> 0 or no
+ *              row); own before / after = max(0, issued (+ add) − moved);
+ *              ask = after − before; refused unless planCentralDebit(central −
+ *              others − own before, ask) fits.
+ *   transfer : the gesture completes the store's part; per material this
+ *              requisition still holds, older = the claims handed over before
+ *              its own; refused when central covers its own claim but central −
+ *              older does not.
+ */
+function forecastPartyPromised(
+  req: Requisition, batch: Array<{ line: ReqLine; qty: number }>, deferIds?: Set<string>,
+): PromisedForecast {
+  const out: PromisedForecast = { refused: false, byLine: {}, lines: [] };
+  if (req.purpose !== 'party') return out;
+  // The gesture's issue entries per line (the write loop's own filters).
+  const add = new Map<string, number>();
+  for (const { line, qty } of batch) {
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q <= 0) continue;
+    if (line.is_rejected || line.store_rejected || isRoutedLine(line)) continue;
+    add.set(line.id, (add.get(line.id) || 0) + q);
+  }
+  if (add.size === 0) return out;
+  const byMat = new Map<string, { add: number; lineIds: string[] }>();
+  for (const [id, q] of add) {
+    const line = (req.items || []).find(l => l.id === id);
+    const basis = line ? deskLineBasis(line) : null;
+    if (!line || !basis) continue;                 // the transfer never moves a unit-review line
+    const mat = String(line.material_id || '');
+    const m = byMat.get(mat) || { add: 0, lineIds: [] };
+    m.add += q * (basis.factor || 1);
+    m.lineIds.push(id);
+    byMat.set(mat, m);
+  }
+  // ── 'issue' — partyIssueShortfall, per material.
+  for (const [mat, m] of byMat) {
+    const line = (req.items || []).find(l => l.id === m.lineIds[0]);
+    if (!line || !promisedApplies(line)) continue;      // store-mapped: central never holds it
+    const raw = line.current_stock;
+    const basis = deskLineBasis(line);
+    if (raw == null || !Number.isFinite(Number(raw)) || !basis) continue;
+    const others = r6(promisedRecipeOf(line));
+    if (!(deskGrid(others) > 0)) continue;
+    const own = ownClaimOf(req, mat);
+    const addR = r6(m.add);
+    const ownBefore = r6(Math.max(0, own.issued - own.moved));
+    const ownAfter = r6(Math.max(0, own.issued + addR - own.moved));
+    const ask = r6(ownAfter - ownBefore);
+    if (!(deskGrid(ask) > 0)) continue;
+    const meta = basis.meta;
+    const central = Number(raw) || 0;
+    const free = r6(central - others - ownBefore);
+    if (promisedFits(free, ask, meta)) continue;
+    const claims = promisedOthersOf(line);
+    const maxAdd = r6(Math.max(0, free));
+    const name = String(line.material_name || 'This item');
+    const ownHolds = deskGrid(ownBefore) > 0;
+    // The holders' figures add up to the total printed beside them — the same
+    // largest-remainder split the store's sentence makes (party-pending.ts).
+    const ap = apportionShown([
+      ...claims.map(b => ({ key: String(b.req_id || b.req_number), recipe: b.recipe })),
+      ...(ownHolds ? [{ key: String(req.id), recipe: ownBefore }] : []),
+    ], meta);
+    const holders = claims.map((b, i) => (claims.length > 1 || ownHolds ? reqLabelQty(b, promiseFigPU(ap.shown[i], meta)) : reqLabel(b)));
+    if (ownHolds) holders.push(`this requisition (${req.req_number ? `${req.req_number}, ` : ''}${promiseFigPU(ap.shown[claims.length], meta)})`);
+    const held = r6(others + ownBefore);
+    const heldFig = promiseFigPU(ap.total, meta);
+    const H = joinAnd(holders);
+    const noneFree = promisedNoneFree(maxAdd, meta);
+    const lead = shownPurchaseQty(maxAdd, meta) > 0
+      ? `${name}: the store holds ${promisedFig(central, meta)} on its books, but ${heldFig} of it `
+        + `${isAreShown(ap.total)} already issued on ${H} and ${hasHaveShown(ap.total)} not left the books, so only `
+        + `${promisedFig(maxAdd, meta)} is free — ${promisedFig(ask, meta)} cannot be issued on this line. Issue ${promisedFig(maxAdd, meta)} or less, or `
+      : deskGrid(held) <= deskGrid(central)
+        ? `${name}: the store's ${promisedFig(central, meta)} ${promisedIsAre(central, meta)} already issued on ${H} and `
+          + `${promisedHasHave(central, meta)} not left the books, so ${noneFree} for this line — `
+        : `${name}: the store holds ${promisedFig(Math.max(0, central), meta)} on its books, but ${heldFig} `
+          + `${isAreShown(ap.total)} already issued on ${H} and ${hasHaveShown(ap.total)} not left them, so ${noneFree} for this line — `;
+    const row: PromisedShort = {
+      kind: 'issue', materialId: mat, line, lineIds: m.lineIds,
+      message: `${lead}receive more ${name}, or Undo it there first.`,
+    };
+    for (const id of m.lineIds) out.byLine[id] = row;
+    out.lines.push(row);
+  }
+  if (out.lines.length > 0) { out.refused = true; return out; }   // refused before anything is written
+  // ── 'transfer' — only when this gesture runs the party transfer and it
+  // stands: every store line complete ('certain'), or the try closes every line.
+  // partyForecastFor walks the STORE's lines only (storeLinesOf), as
+  // store-issue's storePartDone does — a routed line never holds it back.
+  const pfc = partyForecastFor(req, batch, deferIds);
+  const runs = pfc.runs === 'certain'
+    || (pfc.runs === 'closes' && !pfc.unknown && Object.values(pfc.takes).every(t => t.complete));
+  if (!runs) return out;
+  const seen = new Set<string>();
+  for (const l of storeLinesOf(req)) {
+    const mat = String(l.material_id || '');
+    if (seen.has(mat)) continue;
+    seen.add(mat);
+    if (!promisedApplies(l)) continue;
+    const basis = deskLineBasis(l);
+    const raw = l.current_stock;
+    if (!basis || raw == null || !Number.isFinite(Number(raw))) continue;
+    const own = ownClaimOf(req, mat, add);
+    const ownRecipe = r6(Math.max(0, own.issued - own.moved));
+    if (!(deskGrid(ownRecipe) > 0)) continue;
+    const olderClaims = promisedOthersOf(l).filter(c => Number.isFinite(c.startMs) && c.startMs < own.startMs);
+    const older = r6(olderClaims.reduce((s, c) => s + c.recipe, 0));
+    if (!(deskGrid(older) > 0)) continue;
+    const meta = basis.meta;
+    const central = Number(raw) || 0;
+    if (!promisedFits(central, ownRecipe, meta)) continue;          // the transfer's own floor decides
+    const free = r6(central - older);
+    if (promisedFits(free, ownRecipe, meta)) continue;
+    const maxAdd = r6(Math.max(0, free));
+    const name = String(l.material_name || 'This item');
+    const ap = apportionShown(olderClaims.map(b => ({ key: String(b.req_id || b.req_number), recipe: b.recipe })), meta);
+    const H = joinAnd(olderClaims.map((b, i) => (olderClaims.length > 1 ? reqLabelQty(b, promiseFigPU(ap.shown[i], meta)) : reqLabel(b))));
+    const row: PromisedShort = {
+      kind: 'transfer', materialId: mat, line: own.lines[0] || l, lineIds: [],
+      message: `${name}: issuing this completes the store's part of ${req.req_number || 'this requisition'}, and its party transfer `
+        + `would then take this requisition's ${promisedFig(ownRecipe, meta)} of ${name} off the books — but ${promiseFigPU(ap.total, meta)} of the `
+        + `store's ${promisedFig(central, meta)} ${isAreShown(ap.total)} already issued on ${H}, handed over earlier, and `
+        + `${hasHaveShown(ap.total)} not left the books, so `
+        + `${shownPurchaseQty(maxAdd, meta) > 0 ? `only ${promisedFig(maxAdd, meta)} is free` : promisedNoneFree(maxAdd, meta)} for this requisition. `
+        + `Receive more ${name}, or Undo ${name} on one of them first.`,
+    };
+    out.byLine[row.line.id] = row;
+    out.lines.push(row);
+  }
+  out.refused = out.lines.length > 0;
+  return out;
+}
+
+/** The pre-check's banner for a multi-line gesture (Issue All, Issue Selected,
+ *  the Issue All confirmation): the store refuses the WHOLE gesture, every
+ *  other line included — each refusal in the store's own words. Nothing
+ *  renders when nothing is refused. */
+function PartyPromisedBanner({ forecast, gesture }: { forecast: PromisedForecast; gesture: string }) {
+  if (!forecast.refused) return null;
+  return (
+    <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+      <div className="font-semibold">
+        ⛔ Stock already issued on another open party requisition — on {gesture} the store will{' '}
+        <b>refuse the whole issue</b> and save nothing, the other lines included:
+      </div>
+      <ul className="text-[10px] mt-0.5 space-y-0.5 list-disc pl-4">
+        {forecast.lines.map(s => <li key={`${s.kind}-${s.materialId}`}>{s.message}</li>)}
+      </ul>
+    </div>
+  );
+}
+
+/** A 409 'party_promised' read onto the lines it names (store-issue
+ *  partyPromisedResponse: `short[]` rows carrying line_id / line_ids and the
+ *  row's own sentence), verbatim. Matched against EVERY line of the
+ *  requisition — a 'transfer' row names a line the gesture may not have
+ *  issued. Forgiving about shape (a swallowed refusal reads as "the app
+ *  ignored me"): with no row matched, a single-line gesture takes the whole
+ *  sentence, else the lines this page's own pre-check named (`fallbackIds`). */
+function readPartyPromised(
+  payload: { code?: unknown; error?: unknown; short?: unknown; lines?: unknown; blocked?: unknown } | null | undefined,
+  lineIds: string[],
+  batch: { id: string }[],
+  fallbackIds: string[],
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (String(payload?.code || '') !== PROMISED_CODE) return out;
+  const err = String(payload?.error || '').trim();
+  const pick = (v: unknown) => (Array.isArray(v) ? (v as Record<string, unknown>[]) : null);
+  const rows = pick(payload?.short) || pick(payload?.lines) || pick(payload?.blocked)
+    || (payload?.short && typeof payload.short === 'object' ? [payload.short as Record<string, unknown>] : []);
+  const known = new Set(lineIds);
+  for (const b of rows) {
+    const ids = [String(b?.req_item_id || b?.line_id || b?.id || ''),
+                 ...(Array.isArray(b?.line_ids) ? (b.line_ids as unknown[]).map(String) : [])].filter(id => id && known.has(id));
+    const msg = String(b?.message || b?.error || err).trim();
+    for (const id of ids) out[id] = out[id] && out[id] !== msg ? `${out[id]} ${msg}` : msg;
+  }
+  if (Object.keys(out).length === 0) {
+    if (batch.length === 1) out[batch[0].id] = err;
+    else for (const id of fallbackIds) if (known.has(id)) out[id] = err;
+  }
+  return out;
+}
+
+/** A refused party-promise issue, shown on the line (keyed by line id). */
+interface PromisedRefusal {
+  reqId: string;
+  /** The server's sentence, verbatim. */
+  message: string;
+  /** The gesture posted more than one line — the whole of it was refused. */
+  whole: boolean;
+  /** promisedSigOf the line at the refusal: a load that changes it drops the panel. */
+  sig: string;
+}
+/** What the refusal was about: the line's own state, the books, and the claims. */
+function promisedSigOf(it: ReqLine): string {
+  return [
+    lineSigOf(it), lineApprovalSigOf(it), String(it.deferred_until || ''),
+    it.current_stock == null ? '' : Math.round((Number(it.current_stock) || 0) * 1e6),
+    Math.round(promisedRecipeOf(it) * 1e6),
+    it.party_moved_recipe == null ? '' : Math.round((Number(it.party_moved_recipe) || 0) * 1e6),
+  ].join('|');
+}
+
 export default function StoreRequisitionsPage() {
   const [list, setList] = useState<Requisition[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -1720,7 +2211,16 @@ export default function StoreRequisitionsPage() {
   // Party lines another gesture's transfer lowered and reopened, by line id —
   // see PartyShortNote.
   const [partyShort, setPartyShort] = useState<Record<string, PartyShortNote>>({});
+  // Issues the store refused because the stock is already issued on another
+  // open party requisition (409 'party_promised', ruling #86a), by line id —
+  // see PromisedRefusal. Same lifetime as centralShort.
+  const [promisedRefusal, setPromisedRefusal] = useState<Record<string, PromisedRefusal>>({});
   const clearBlocked = (...lineIds: string[]) => {
+    setPromisedRefusal(s => {
+      const hit = lineIds.filter(id => id in s);
+      if (hit.length === 0) return s;
+      const n = { ...s }; for (const id of hit) delete n[id]; return n;
+    });
     setReversalShort(s => {
       const hit = lineIds.filter(id => id in s);
       if (hit.length === 0) return s;
@@ -1772,9 +2272,34 @@ export default function StoreRequisitionsPage() {
   };
   const showIssueError = (
     j: { code?: unknown; error?: unknown; blocked?: unknown } | null | undefined,
-    batch: { id: string; material_name: string }[], fallback: string,
+    batch: { id: string; material_name: string; material_id?: string }[], fallback: string,
     reqId?: string,
+    /** The requisition as this page held it and the entries the gesture
+     *  posted (LINE units) — for the party-promise refusal's panels (#86a). */
+    ctx?: { req: Requisition; posted: Array<{ line: ReqLine; qty: number }> },
   ): boolean => {
+    /* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (ruling #86a): the
+       store's 409 'party_promised'. Nothing was issued. The server's sentence
+       goes on the line(s) it names, verbatim, and stays until that line is
+       acted on, Refresh, or a load shows the line, the books or the claims
+       moved; a multi-line gesture (refused whole) also alerts it, as does a
+       refusal that lands on no line the storekeeper can see. */
+    if (String(j?.code || '') === PROMISED_CODE) {
+      const fallbackIds = ctx ? forecastPartyPromised(ctx.req, ctx.posted).lines.map(s => s.line.id) : [];
+      const lineIds = ctx ? (ctx.req.items || []).map(l => l.id) : batch.map(b => b.id);
+      const msgs = readPartyPromised(j as Parameters<typeof readPartyPromised>[0], lineIds, batch, fallbackIds);
+      const whole = batch.length > 1;
+      const add: Record<string, PromisedRefusal> = {};
+      for (const [id, message] of Object.entries(msgs)) {
+        const line = ctx ? (ctx.req.items || []).find(l => l.id === id) : undefined;
+        add[id] = { reqId: reqId || ctx?.req.id || '', message: message || String(j?.error || fallback), whole,
+                    sig: line ? promisedSigOf(line) : '' };
+      }
+      if (Object.keys(add).length > 0) setPromisedRefusal(s => ({ ...s, ...add }));
+      if (reqId) setExpanded(p => (p.has(reqId) ? p : new Set(p).add(reqId)));
+      if (whole || !batch.some(b => b.id in add)) alert(String(j?.error || '').trim() || fallback);
+      return true;
+    }
     // DELIVERED DIRECT (ruling #68), refused by the route: this screen was
     // opened before the merged PO's Direct Issue receipt, so it still offered
     // the line. The server's sentence verbatim, then re-read the list so the
@@ -2012,6 +2537,17 @@ export default function StoreRequisitionsPage() {
       if (hit.length === 0) return s;
       const n = { ...s }; for (const id of hit) delete n[id]; return n;
     });
+    // A party-promise refusal (ruling #86a) is about the line, the books and
+    // the other requisitions' claims as they stood: any of them moved, or the
+    // line is gone from the queue, and the sentence is history.
+    setPromisedRefusal(s => {
+      const hit = Object.keys(s).filter(id => {
+        const x = byLine.get(id);
+        return !x || x.rq.id !== s[id].reqId || promisedSigOf(x.line) !== s[id].sig;
+      });
+      if (hit.length === 0) return s;
+      const n = { ...s }; for (const id of hit) delete n[id]; return n;
+    });
     // A lowered-and-reopened note is about the line AT the figure its sentence
     // names: once the line records anything else, is complete or rejected, the
     // sentence is history (the row says what holds now).
@@ -2044,6 +2580,7 @@ export default function StoreRequisitionsPage() {
     setCentralShort({});
     setReversalShort({});
     setPartyShort({});
+    setPromisedRefusal({});
     setRefreshKey(k => k + 1);
   };
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
@@ -2104,8 +2641,9 @@ export default function StoreRequisitionsPage() {
       });
       const j = await r.json();
       if (!r.ok) {
-        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name })),
-                       'Issue selected failed', req.id);
+        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name, material_id: l.material_id })),
+                       'Issue selected failed', req.id,
+                       { req, posted: resolvedLines.map(x => ({ line: x.l, qty: x.r.qty })) });
         return;
       }
       // A 200 is not "all of it" any more — see announceHeld.
@@ -2331,8 +2869,8 @@ export default function StoreRequisitionsPage() {
           setRefreshKey(k => k + 1);
           return;
         }
-        showIssueError(j, [{ id: line.id, material_name: line.material_name }],
-                       'Issue failed', req.id);
+        showIssueError(j, [{ id: line.id, material_name: line.material_name, material_id: line.material_id }],
+                       'Issue failed', req.id, { req, posted: [{ line, qty }] });
         return;
       }
       // One 'issue' entry that the floor holds leaves nothing issuable, and the
@@ -2467,8 +3005,8 @@ export default function StoreRequisitionsPage() {
       });
       const j = await r.json();
       if (!r.ok) {
-        const refused = showIssueError(j, [{ id: line.id, material_name: line.material_name }],
-                                       'Issue + defer failed', req.id);
+        const refused = showIssueError(j, [{ id: line.id, material_name: line.material_name, material_id: line.material_id }],
+                                       'Issue + defer failed', req.id, { req, posted: [{ line, qty }] });
         /* THE REFUSED SPLIT CLOSES (round 10). The central floor refused this
            exact gesture, and the editor has no quantity box — its "Issue &
            defer balance" could only post the same figures again and be refused
@@ -2858,8 +3396,9 @@ export default function StoreRequisitionsPage() {
       });
       const j = await r.json();
       if (!r.ok) {
-        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name })),
-                       'Issue all failed', req.id);
+        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name, material_id: l.material_id })),
+                       'Issue all failed', req.id,
+                       { req, posted: resolvedLines.map(x => ({ line: x.l, qty: x.r.qty })) });
         // Close the confirmation so the panels underneath are reachable — the
         // modal sits over the very lines the refusal is about.
         setConfirmIssueAll(null);
@@ -3032,6 +3571,7 @@ export default function StoreRequisitionsPage() {
                      centralShort={centralShort}
                      reversalShort={reversalShort}
                      partyShort={partyShort}
+                     promisedRefusal={promisedRefusal}
                      onUndo={(line) => undoLine(req, line)}
                      onReject={(line) => rejectLine(req, line)}
                      onUnreject={(line) => unrejectLine(req, line)}
@@ -3094,6 +3634,68 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
      heading, in the words the server's alert will use after the click. Nothing
      held ⇒ the original markup, untouched. */
   const forecast = forecastCentralHolds(req, lines.map(l => ({ line: l, qty: resolveQty(l, l.remaining).qty })));
+  /* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (ruling #86a) — the
+     store's pre-check refuses the WHOLE Confirm over one such line, before the
+     transfer or the central floor is ever asked, so this modal names those
+     lines and lists every line as not issued. Asked on the very batch Confirm
+     posts. Nothing refused ⇒ the branches below, untouched. */
+  const promised = forecastPartyPromised(req, lines.map(l => ({ line: l, qty: resolveQty(l, l.remaining).qty })));
+  if (promised.refused && lines.length > 0) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onCancel}>
+        <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+          <div className="px-5 py-3 border-b border-[#E8D5C4]">
+            <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+              <Send className="w-4 h-4 text-emerald-600" /> Issue all items
+            </div>
+            <div className="text-[11px] text-[#8B7355] mt-0.5">
+              {req.req_number} — nothing will be issued to <b className="text-[#6B5744]">{req.department_name}</b>:
+            </div>
+          </div>
+          <div className="p-4 max-h-[50vh] overflow-y-auto space-y-3">
+            <div>
+              <div className="text-[11px] font-semibold text-red-800 mb-1">
+                NOT issued — the store refuses this whole issue over stock already issued on another open party
+                requisition, so none of them goes:
+              </div>
+              <ul className="space-y-1">
+                {lines.map(l => {
+                  const U = lineUnits(l);
+                  const u = U.pu;
+                  const rq = resolveQty(l, l.remaining);
+                  const refusedHere = !!promised.byLine[l.id];
+                  return (
+                    <li key={l.id} className="flex items-center justify-between text-sm border-b border-red-200/60 py-1.5">
+                      <span className={refusedHere ? 'text-red-900 font-semibold' : 'text-red-900'}>{l.material_name}</span>
+                      <span className="font-mono font-semibold text-red-700">
+                        × {fmtHandOverPU(U, rq.qty)}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+                        {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+            <PartyPromisedBanner forecast={promised} gesture="Confirm & Issue" />
+            <ForecastBasisNote />
+          </div>
+          <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+            <button onClick={onCancel} disabled={busy}
+                    className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+              Cancel
+            </button>
+            {/* NOT disabled, like every forecast on this page: the store decides
+                by its books at the click and names what it refuses. */}
+            <button onClick={onConfirm} disabled={busy}
+                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              Confirm & Issue
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   const heldIds = new Set(forecast.held.map(l => l.id));
   const item = (l: ReqLine & { remaining: number }) => {
     const U = lineUnits(l);
@@ -3388,23 +3990,197 @@ function owedQty(line: ReqLine): number {
  * `qty` is RETURNED in recipe units on purpose: the caller prints it through
  * U.stockPU for the purchase figure the column tooltip promises, and prints it
  * raw as the small "= N g" hint. Converting it here would divide it twice.
+ *
+ * WHAT IS FREE, NOT WHAT IS ON THE BOOKS (owner ruling #86a). Goods issued on an
+ * open PARTY requisition stay inside current_stock until that whole
+ * requisition is complete, so the bands are scored on `free` = the books less
+ * what is already issued on OTHER open party requisitions
+ * (promised_elsewhere_*), and on a PARTY line the need also counts what THIS
+ * requisition already issued that has not left the books — it leaves with
+ * this requisition's transfer. FUEL on REQ-2026-1389 (1 issued, 0 outstanding,
+ * books 1, 1 issued on REQ-2026-1388) read green; it is red. With nothing
+ * promised elsewhere and nothing pending, every figure here is the one it
+ * always was.
+ *
+ * THE PRINTED "free" IS THE SAME ON EVERY ROW OF A MATERIAL: the books less
+ * EVERY open party requisition's handed-over, not-yet-moved stock — the other
+ * parties' (promised_elsewhere_*) AND, on a line of an open party requisition
+ * that holds some itself, this requisition's own (own_pending_recipe), named
+ * on its own line in the cell. Before, the own part was left in "free": with
+ * PANEER 10 kg all issued (3 kg on REQ-CK-3002, 7 kg on REQ-CK-3001) the desk
+ * printed "free 3 kg" on 3002 and "free 7 kg" on 3001 at the same moment,
+ * over a pre-check saying "none of it is free for this line".
+ *
+ * EVERY PROMISED / FREE / SHORT FIGURE IS PRINTED AT THE COLUMN'S OWN PRECISION
+ * (round 2 re-check of #86a): U.stockPU — pack-units.ts shownPurchaseQty, the
+ * "In store" figure itself, 3 dp of the purchase unit — and a figure that
+ * rounds to 0 there IS 0: it is not printed, and nothing is called short,
+ * "cannot be covered" or "not covered for every party" over it. Measured
+ * before: BISLARI 10 CASE (= 480 pcs), 2.083 CASE (100 pcs) held on REQ-CK-7001,
+ * then REQ-CK-7002 issued the 7.917 CASE the desk showed free (380.016 pcs,
+ * accepted by the shown-figure rule) — and every row of the material printed
+ * "short 0.00033333 CASE", the holder's hover said 0.00033333 CASE "cannot be
+ * covered", and the dots went red / amber, while the store completes both
+ * requisitions (its transfer takes the balance by the same rule). Only what
+ * this cell PRINTS and colours follows the display; the arithmetic below, the
+ * pre-check (forecastPartyPromised) and every server decision are unchanged.
+ *
+ * ROUND 3 (re-check of round 2), display only:
+ *   · A LINE THAT NEEDS NOTHING IS NEVER "SHORT". An INTERNAL line already
+ *     issued in full turned red — "Short — … so none of it is free. This line
+ *     still needs 0 CASE." — whenever every unit of its material on the books
+ *     was promised to parties; production read green "In stock". Red now needs
+ *     a need that PRINTS (a party line's outstanding crumb included); the
+ *     promised note still shows, plainly, with "This line needs nothing more
+ *     from the store." The books at 0 or below stay red exactly as production.
+ *   · ONE WORDING FOR WHAT IS FREE (party-promise-words.ts, shared with the
+ *     store's 409 and the pre-check): a positive crumb below one printed step
+ *     is "less than 0.001 CASE" in the cell, the hover and the store's
+ *     sentence alike — before, "free 0 CASE" / "none of it is free" here over
+ *     "less than 0.001 CASE of it is free" there.
+ *   · ROUNDED PARTS ADD UP TO THE ROUNDED TOTAL: every open party claim on the
+ *     material (the other requisitions' and this one's own) is printed by
+ *     largest remainder (apportionShown) — the same split the store's
+ *     sentence makes — and the "promised" total is the sum of the printed
+ *     claims. "10 CASE promised — 2.083 to REQ-A, 7.916 to REQ-B" (9.999)
+ *     reads 2.083 + 7.917, and REQ-B's claim prints 7.917 on every row.
+ *   · The titles join their sentences with full stops ("In stock. This line
+ *     still needs …", never "In stock This line …").
  */
-function stockLevel(line: ReqLine): {
+function stockLevel(line: ReqLine, req?: Requisition): {
   qty: number | null; dot: string; text: string; title: string;
+  /** Promised to other open party requisitions — null when nothing is. */
+  promised: null | {
+    /** Each other open party requisition's claim that prints, oldest first,
+     *  with its printed figure (PURCHASE units, 3 dp — largest remainder). */
+    claims: Array<PromisedClaim & { shown: number }>;
+    /** Their total AS PRINTED: the sum of the printed claims (PURCHASE). */
+    totalShown: number;
+    /** The same total in RECIPE units, exact. */
+    totalRecipe: number;
+    /** THIS open party requisition's own handed-over, not-yet-moved stock of
+     *  the material as printed on its own line (PURCHASE; 0 = no such line). */
+    ownShown: number;
+    /** RECIPE units: the books less what is promised elsewhere and less this
+     *  requisition's own — negative = short. */
+    freeRecipe: number;
+  };
 } {
-  const raw = (line as any).current_stock;
-  if (raw == null) return { qty: null, dot: '', text: '', title: '' };
+  const raw = line.current_stock;
+  if (raw == null) return { qty: null, dot: '', text: '', title: '', promised: null };
   const qty = Number(raw) || 0;                       // recipe units (rm.current_stock)
   const U = lineUnits(line);
+  const meta = lineMetaOf(line);
   // lineSplit, not a raw (effective − issued): on a store-rejected line the
   // remainder was CANCELLED, so this line needs nothing more off the shelf and
   // must not paint the material red for a demand that no longer exists.
-  const need = U.toRecipe(lineSplit(line).outstanding);  // line basis → recipe basis
+  const owing = U.toRecipe(lineSplit(line).outstanding);  // line basis → recipe basis
+  const own = req && !line.is_rejected && !line.store_rejected ? ownPartyPendingRecipe(req, line) : 0;
+  const need = owing + own;
   const reorder = Number(line.reorder_level) || 0;    // recipe units (rm.reorder_level)
+  // A RECIPE figure as this column prints it (U.stockPU: shownPurchaseQty, 3 dp
+  // of the purchase unit), and whether it prints as anything at all — a figure
+  // that rounds to 0 is 0 (see the header).
+  const shows = (r: number) => U.stockPU(r) > 0;
+  const steps = (shown: number) => Math.round((Number(shown) || 0) * 1000);
+  const applies = promisedApplies(line);
+  const promisedRecipe = applies ? promisedRecipeOf(line) : 0;
+  const others = applies ? promisedOthersOf(line) : [];
+  // This requisition's own handed-over, not-yet-moved stock of the material
+  // (material-level, so a rejected line of it still sees it: the goods are
+  // still on the books).
+  const ownAll = applies && req ? ownPartyPendingRecipe(req, line) : 0;
+  // EVERY OPEN PARTY CLAIM ON THE MATERIAL, SPLIT ONCE (header, round 3): the
+  // other requisitions' (a lone total when the route named none) and this
+  // one's own, keyed by requisition id as the store's sentence keys them.
+  const otherParts = others.length > 0
+    ? others.map(c => ({ key: String(c.req_id || c.req_number), recipe: c.recipe }))
+    : promisedRecipe > 0 ? [{ key: '', recipe: promisedRecipe }] : [];
+  const ap = apportionShown([
+    ...otherParts,
+    ...(ownAll > 0 && req ? [{ key: String(req.id), recipe: ownAll }] : []),
+  ], meta);
+  const promisedShown = otherParts.reduce((s, _, i) => s + steps(ap.shown[i]), 0) / 1000;
+  const ownAllShown = ownAll > 0 ? ap.shown[otherParts.length] : 0;
+  const hasPromised = promisedShown > 0;
+  const claims = hasPromised && others.length > 0
+    ? others.map((c, i) => ({ ...c, shown: ap.shown[i] })).filter(c => c.shown > 0) : [];
+  const free = hasPromised ? qty - promisedRecipe : qty;
+  // Printed only beside other parties' claims.
+  const held = hasPromised ? ownAll : 0;
+  const heldShown = hasPromised ? ownAllShown : 0;
+  const hasHeld = heldShown > 0;
+  const freeNet = hasHeld ? free - held : free;
+  const promised = !hasPromised ? null : {
+    claims, totalShown: promisedShown, totalRecipe: promisedRecipe,
+    ownShown: heldShown, freeRecipe: freeNet,
+  };
+  const fig = (r: number) => promiseFig(r, meta);
+  const figPU = (shown: number) => promiseFigPU(shown, meta);
+  // Sentences joined with full stops: "In stock" alone, or "In stock. …".
+  const withNotes = (lead: string, ...notes: string[]) => {
+    const n = notes.filter(Boolean);
+    return n.length > 0 ? `${lead}. ${n.join(' ')}` : lead;
+  };
+  const named = claims.length > 0 ? joinAnd(claims.map(reqLabel)) : 'other open party requisitions';
+  const promisedWords = !hasPromised ? ''
+    : !hasHeld
+      ? `The books hold ${fig(qty)}, and ${figPU(promisedShown)} of it is already issued on ${named} and has not left them `
+        + `(a party requisition's goods leave the books only when every line of it is complete), so `
+        + `${freeIsWords(free, meta, { short: f => `the books are ${f} short of what is promised` })}.`
+      : `The books hold ${fig(qty)}, and ${figPU(promisedShown)} of it is already issued on ${named} and ${figPU(heldShown)} on this `
+        + `requisition${req?.req_number ? ` (${req.req_number})` : ''}, none of which has left them `
+        + `(a party requisition's goods leave the books only when every line of it is complete), so `
+        + `${freeIsWords(freeNet, meta, { short: f => `the books are ${f} short of what is already issued` })}.`;
+  // What this line still needs, as parts that add up to the total printed:
+  // its own handed-over stock (the split above) plus what is outstanding.
+  const ownShown = own > 0 ? ownAllShown : 0;
+  const owingShown = U.stockPU(owing);
+  const needShows = shows(need);
+  const needWords = ownShown > 0
+    ? `This line still needs ${figPU((steps(ownShown) + steps(owingShown)) / 1000)} to leave the books: `
+      + `${figPU(ownShown)} it already issued that has not left them yet`
+      + `${owingShown > 0 ? `, plus ${figPU(owingShown)} outstanding` : ''}.`
+    : hasPromised && !needShows ? 'This line needs nothing more from the store.'
+    : '';
+  /* A PARTY LINE IS SCORED THE WAY THE STORE NOW DECIDES IT (party-pending.ts):
+     what it already issued stands against the claims handed over BEFORE it
+     (ruling #80, the oldest keeps its claim — own_claim_short_recipe), and
+     anything more it is issued must fit the books less EVERY other party's
+     claim less its own (partyIssueShortfall). So the oldest of two parties
+     holding the last FUEL is not "short" — the later one is. */
+  const isPartyLine = !!req && req.purpose === 'party' && applies;
+  const ownShort = isPartyLine && req ? ownClaimShortRecipe(req, line, own) : 0;
+  const room = free - own;
+  // A shortfall against the claims is one only when it PRINTS (header): below
+  // one printed step it is 0 — the outstanding itself included (round 3: an
+  // outstanding crumb is nothing owed, so it is never "short"). With no claim
+  // printed in the cell (nothing promised elsewhere, nothing of its own
+  // pending) the tests are the ones they always were — `free` is then the
+  // books.
+  const owingShort = owing > 1e-9
+    && (hasPromised || shows(own) ? shows(owing) && shows(owing - room) : room < owing - 1e-9);
+  // A LINE THAT NEEDS NOTHING IS NEVER RED OVER THE CLAIMS (round 3, header):
+  // only a need that prints can be short of what is free. qty ≤ 0 stays red,
+  // exactly as production.
+  const red = qty <= 0 || (isPartyLine
+    ? shows(ownShort) || owingShort
+    : hasPromised ? needShows && (!shows(free) || shows(need - free)) : free < need);
 
-  if (qty <= 0 || qty < need) {
+  if (red) {
+    const internalNote = hasPromised && req && req.purpose !== 'party' && qty > 0
+      ? ' An internal issue is not held back for party requisitions: it takes the goods off the books now, and the '
+        + 'party requisitions named are then short unless more is received.'
+      : '';
+    const ownShortWords = shows(ownShort)
+      ? ` Of the ${figPU(ownShown)} this requisition already issued, ${fig(ownShort)} cannot be covered once the claims handed `
+        + `over before it are kept (the oldest keeps its claim).`
+      : '';
+    const owingWords = isPartyLine && owingShort
+      ? ` The ${fig(owing)} still outstanding is more than the books have free for it.`
+      : '';
     return {
-      qty, dot: 'bg-red-500', text: 'text-red-700 font-semibold',
+      qty, dot: 'bg-red-500', text: 'text-red-700 font-semibold', promised,
       // A NEGATIVE book balance is a real state once every issue debits central,
       // and it is not the same statement as "out of stock" — it says the book
       // has been over-issued against and needs a count, which is a different
@@ -3412,17 +4188,39 @@ function stockLevel(line: ReqLine): {
       // nicer: a floor invents stock the shelf does not have.
       title: qty < 0
         ? 'Book balance is NEGATIVE — more has been issued than the book ever received. Needs a physical count.'
+        // Red here only because the books hold nothing (qty is 0 — every other
+        // red needs a need that prints): production's words, then the note.
+        : hasPromised && !needShows
+          ? withNotes('Out of stock in the store', promisedWords, needWords)
+        : hasPromised
+          ? `Short — ${promisedWords}${needWords ? ` ${needWords}` : ` This line still needs ${fig(need)}.`}`
+            + `${ownShortWords}${owingWords}${internalNote}`
         : qty === 0 ? 'Out of stock in the store'
+        : needWords ? `Short — the books hold ${fig(qty)}. ${needWords}${ownShortWords}${owingWords} A party requisition's `
+            + `goods leave the books only when every line of it is complete.`
         : 'Short — less on the shelf than this line still needs',
     };
   }
-  if (reorder > 0 && qty - need <= reorder) {
+  // COVERED HERE, NOT FOR EVERY PARTY HOLDING IT: this line's own claim
+  // stands (it came first), but a later claim among those named does not.
+  if (isPartyLine && hasPromised && shows(own) && shows(-room)) {
     return {
-      qty, dot: 'bg-amber-500', text: 'text-amber-700',
-      title: 'Enough for this line, but the store drops to its reorder point once it goes out',
+      qty, dot: 'bg-amber-500', text: 'text-amber-700', promised,
+      title: `Covered for this line, but not for every party requisition holding it — ${promisedWords}`
+        + `${needWords ? ` ${needWords}` : ''} This requisition's ${figPU(ownShown)} was handed over before the claims the books `
+        + `cannot cover — the oldest keeps its claim, so the later ones are the short ones.`,
     };
   }
-  return { qty, dot: 'bg-emerald-500', text: 'text-[#6B5744]', title: 'In stock' };
+  if (reorder > 0 && free - need <= reorder) {
+    return {
+      qty, dot: 'bg-amber-500', text: 'text-amber-700', promised,
+      title: withNotes('Enough for this line, but the store drops to its reorder point once it goes out', promisedWords, needWords),
+    };
+  }
+  return {
+    qty, dot: 'bg-emerald-500', text: 'text-[#6B5744]', promised,
+    title: withNotes('In stock', promisedWords, needWords),
+  };
 }
 
 function lineSplit(line: ReqLine): {
@@ -3849,6 +4647,8 @@ function ReqCard(props: {
   reversalShort: Record<string, ReversalShort>;
   /** Party lines another gesture's transfer lowered and reopened (final pass). */
   partyShort: Record<string, PartyShortNote>;
+  /** Issues refused 409 'party_promised' (ruling #86a), by line id. */
+  promisedRefusal: Record<string, PromisedRefusal>;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -3873,6 +4673,15 @@ function ReqCard(props: {
   const allForecast = forecastCentralHolds(
     req, openLines.map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
   const selForecast = forecastCentralHolds(
+    req, openLines.filter(l => props.selectedIds.has(l.id))
+      .map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
+  /* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (ruling #86a) — the
+     store's pre-check, forecast on the same two batches. It refuses a gesture
+     WHOLE before the transfer or the central floor is asked, so where it
+     refuses, its banner is the one shown (forecastPartyPromised). */
+  const allPromised = forecastPartyPromised(
+    req, openLines.map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
+  const selPromised = forecastPartyPromised(
     req, openLines.filter(l => props.selectedIds.has(l.id))
       .map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
   /* AND PER ROW, ALONE — the row's own Issue Now (or "Issue & defer balance")
@@ -3946,6 +4755,19 @@ function ReqCard(props: {
     const split = !!props.editDefer[line.id] && Number.isFinite(sq) && sq > 0;
     const qty = split ? sq : props.resolveQty(line, outstanding).qty;
     return forecastCentralHolds(req, [{ line, qty }], split ? new Set([line.id]) : undefined);
+  };
+  /* …and the party-promise pre-check for that same row gesture (ruling #86a):
+     the row's Issue Now (or the split's captured hand-over), scored alone. */
+  const rowPromised = (line: ReqLine): PromisedForecast | undefined => {
+    if (req.purpose !== 'party') return undefined;
+    if (line.is_rejected || line.store_rejected || isRoutedLine(line)) return undefined;
+    const outstanding = lineSplit(line).outstanding;
+    if (!(outstanding > 0)) return undefined;
+    const sq = props.splitIssueQty[line.id]?.qty;
+    const split = !!props.editDefer[line.id] && Number.isFinite(sq) && sq > 0;
+    const qty = split ? sq : props.resolveQty(line, outstanding).qty;
+    const f = forecastPartyPromised(req, [{ line, qty }], split ? new Set([line.id]) : undefined);
+    return f.refused ? f : undefined;
   };
   const partialText = partialSummary(req);
   const statusTone: Record<string, string> = {
@@ -4108,7 +4930,27 @@ function ReqCard(props: {
           non-deferred, remaining>0) line. Only on the Pending Issue tab, and
           only when at least one such line exists. Clicking opens a confirmation
           modal (handled by the page) before anything is POSTed. */}
-      {props.showIssueAll && openIssuableLines(req).length > 0 && !forecastBlocks(allForecast) && (
+      {/* THE SAME BAR WHEN A LINE ASKS FOR STOCK ALREADY ISSUED ON ANOTHER OPEN
+          PARTY REQUISITION (ruling #86a): the store refuses the WHOLE Issue All
+          over it, so nothing on this requisition is "ready", and the lines are
+          named on the bar — visible on a collapsed card, where Issue All is
+          pressed. A separate branch; the two below run only when this one does
+          not. */}
+      {props.showIssueAll && openLines.length > 0 && allPromised.refused && (
+        <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] space-y-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-[#8B7355]">
+              0 of {openLines.length} open item{openLines.length > 1 ? 's' : ''} ready to hand over.
+            </span>
+            <button onClick={props.onIssueAll}
+                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-medium flex items-center gap-1.5">
+              <Send className="w-3.5 h-3.5" /> Issue All Items
+            </button>
+          </div>
+          <PartyPromisedBanner forecast={allPromised} gesture="Issue All" />
+        </div>
+      )}
+      {props.showIssueAll && openIssuableLines(req).length > 0 && !allPromised.refused && !forecastBlocks(allForecast) && (
         <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] flex items-center justify-between gap-2">
           <span className="text-[11px] text-[#8B7355]">
             {openIssuableLines(req).length} open item{openIssuableLines(req).length > 1 ? 's' : ''} ready to hand over.
@@ -4126,7 +4968,7 @@ function ReqCard(props: {
           is not ready — and the banner says before the click what the alert
           says after it. Shown on the bar, not inside the rows, because the bar
           is visible on a COLLAPSED card, which is where Issue All is pressed. */}
-      {props.showIssueAll && openIssuableLines(req).length > 0 && forecastBlocks(allForecast) && (() => {
+      {props.showIssueAll && openIssuableLines(req).length > 0 && !allPromised.refused && forecastBlocks(allForecast) && (() => {
         const n = openLines.length;
         // Neither a held line nor one typed to 0 is going out: the route holds
         // the first and skips the second (forecastCentralHolds `idle`). On a
@@ -4174,13 +5016,21 @@ function ReqCard(props: {
           advance warning, scored on the checked lines only. Its own row below
           the bar (nothing renders when every checked line is covered), so the
           bar above is unchanged markup. */}
-      {props.selectable && expanded && selectedCount > 0 && forecastBlocks(selForecast) && (
+      {/* Already issued on another open party requisition (ruling #86a): the
+          store refuses the whole Issue Selected — said instead of the floor's
+          banner, which would be about a gesture that never reaches it. */}
+      {props.selectable && expanded && selectedCount > 0 && selPromised.refused && (
+        <div className="px-4 pb-2 bg-emerald-50/60">
+          <PartyPromisedBanner forecast={selPromised} gesture="Issue Selected" />
+        </div>
+      )}
+      {props.selectable && expanded && selectedCount > 0 && !selPromised.refused && forecastBlocks(selForecast) && (
         <div className="px-4 pb-2 bg-emerald-50/60">
           <CentralHoldBanner forecast={selForecast} gesture="Issue Selected" scope="selected line" />
         </div>
       )}
       {/* The transfer Issue Selected runs reopens another party line (final pass). */}
-      {props.selectable && expanded && selectedCount > 0 && !forecastBlocks(selForecast)
+      {props.selectable && expanded && selectedCount > 0 && !selPromised.refused && !forecastBlocks(selForecast)
         && partyLeftOpenSentence(selForecast.party) !== '' && (
         <div className="px-4 pb-2 bg-emerald-50/60">
           <PartyLeftOpenNote party={selForecast.party} gesture="Issue Selected" />
@@ -4211,14 +5061,20 @@ function ReqCard(props: {
                     is exactly how the store was reading the numbers. */}
                 <th className="text-right py-1.5 px-2 font-medium" title="Quantity requested, in the PURCHASE unit (BTL / kg / PKT / pcs). The small grey line is the recipe equivalent.">Requested</th>
                 {/* "In store", NOT "In hand". Under department-based inventory a
-                    gram leaves central the moment it is issued, so this number is
-                    the CENTRAL STORE's shelf and nothing else — goods already
-                    handed to a kitchen are gone from it even though they are
-                    still in the building. "In hand" read as "what the company
-                    has", which is now a different and larger number. Kept to two
-                    short words so the row still fits a tablet without the table
-                    going into horizontal scroll. */}
-                <th className="text-right py-1.5 px-2 font-medium whitespace-nowrap" title="What the central store holds. Goods already issued to a kitchen are not counted here. Shown in the PURCHASE unit. Red = nothing, or less than this line still needs. Amber = enough, but the store hits its reorder point once it goes out. Green = enough to spare.">In store</th>
+                    gram an INTERNAL requisition issues leaves central the moment
+                    it is issued, so this number is the CENTRAL STORE's books and
+                    nothing else. "In hand" read as "what the company has", which
+                    is a different and larger number. Kept to two short words so
+                    the row still fits a tablet without the table going into
+                    horizontal scroll.
+                    THE PARTY EXCEPTION (ruling #86a): a PARTY requisition's goods
+                    leave these books only when the whole requisition is complete
+                    (party-fulfillment.ts), so goods already handed over on an open
+                    party requisition ARE still counted here. The tooltip used to
+                    say "Goods already issued to a kitchen are not counted here",
+                    which was untrue for them; the cell now names them, this
+                    requisition's own not-yet-moved part, and what is free. */}
+                <th className="text-right py-1.5 px-2 font-medium whitespace-nowrap" title="What the central store's books hold, in the PURCHASE unit. Goods issued on an INTERNAL requisition leave these books when they are issued. Goods issued on a PARTY requisition stay on them until every line of that party requisition is complete, so they are still counted here — when any are, the cell names how much is already issued on other open party requisitions (and, on a party requisition that holds some itself, how much on this one) and how much is free. Red = nothing free, or less free than this line still needs. On a party line: red when the books hold nothing, when less is free than is still outstanding, or when what this requisition already issued cannot be covered once the claims handed over before it are kept (the oldest keeps its claim). Amber = enough, but the store hits its reorder point once it goes out, or this party line's claim stands but a later party requisition holding the same stock is short. Green = enough to spare. Liquor-store items move on the Liquor Store ledger.">In store</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="HOD-approved quantity, in the PURCHASE unit (overrides requested if set)">HOD OK</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Handed over so far, in the PURCHASE unit">Issued so far</th>
                 <th className="text-right py-1.5 px-2 font-medium" title="Still owed, in the PURCHASE unit">Outstanding</th>
@@ -4280,6 +5136,8 @@ function ReqCard(props: {
                          short={props.centralShort[line.id] && !heldPanelSettled(req, line) ? props.centralShort[line.id] : undefined}
                          refusedReversal={props.reversalShort[line.id]?.reqId === req.id ? props.reversalShort[line.id] : undefined}
                          partyShort={props.partyShort[line.id]?.reqId === req.id ? props.partyShort[line.id] : undefined}
+                         promised={rowPromised(line)}
+                         promisedRefusal={props.promisedRefusal[line.id]?.reqId === req.id ? props.promisedRefusal[line.id] : undefined}
                          centralHold={rowHold(line)}
                          centralTake={takeFc?.takes[line.id]}
                          centralParty={takeFc?.party}
@@ -4329,6 +5187,15 @@ function LineRow(props: {
   refusedReversal?: ReversalShort;
   /** Set when another gesture's party transfer lowered and reopened THIS line. */
   partyShort?: PartyShortNote;
+  /** Set when the store WILL refuse this row's own Issue because the stock is
+   *  already issued on another open party requisition (ruling #86a) — the
+   *  forecast, before the click (ReqCard rowPromised). Its rows may be about
+   *  another line: issuing this one can complete the store's part, and the
+   *  transfer would take an older party's claim on a different item. */
+  promised?: PromisedForecast;
+  /** Set when the store DID refuse an issue on this line for that reason —
+   *  the server's 409 'party_promised' sentence, verbatim. */
+  promisedRefusal?: PromisedRefusal;
   /** The party transfer this row's own button runs (ReqCard rowTakeFc): whether
    *  it fulfils the requisition and the lines it leaves open. */
   centralParty?: CentralBatchForecast['party'];
@@ -4620,24 +5487,84 @@ function LineRow(props: {
           of deciding. Without it the storekeeper approved a hand-over blind and
           found out at the shelf. current_stock is RECIPE units (material-level),
           so it converts with stockPU, never the line-basis toPU.
-          This is not "what the company has": issuing moves the gram out of
-          central and into the receiving department, so a kitchen's shelf is
-          invisible here by design. Do not "helpfully" add department stock into
-          this figure — the storekeeper cannot hand over what is already in
-          somebody else's fridge. */}
+          This is not "what the company has": an internal issue moves the gram
+          out of central and into the receiving department, so a kitchen's shelf
+          is invisible here by design. Do not "helpfully" add department stock
+          into this figure — the storekeeper cannot hand over what is already in
+          somebody else's fridge. A PARTY issue does not move it until the whole
+          requisition is complete, so those goods are still in this figure — the
+          promised / free lines under it say how much (ruling #86a). */}
       <td className="py-1.5 px-2 text-right font-mono">
         {(() => {
           // A routed line (ruling #45) is never served from this shelf, so its
           // red / amber / green would answer a question nobody is asking here.
           if (routed) return <span className="text-[#C0A98F]" title={`Not issued from the central store — ${routedDept} sends it`}>—</span>;
-          const st = stockLevel(line);
+          const st = stockLevel(line, props.req);
           if (st.qty == null) return <span className="text-[#C0A98F]">—</span>;
+          /* PROMISED ELSEWHERE (ruling #86a): "1 pcs · 1 pcs promised to
+             REQ-2026-1388 (Kuldeep Sing) · free 0 pcs" — the purchase unit
+             first; up to two requisitions named, the rest as "+k more" with
+             every one in the hover. On a line of an open party requisition
+             that already holds some of it, that part gets its own line
+             ("· 1 pcs issued here, not yet off the books") and is out of
+             "free" too, so every row of a material prints the same free
+             figure. Absent when nothing is promised, so the cell is what it
+             always was. */
+          const pr = st.promised;
+          // Every figure here at the column's own precision (stockLevel's
+          // header) and as stockLevel printed it: the claims split so they add
+          // up to the "promised" total (largest remainder, the store's own
+          // split), the free line in the store's own words — all through
+          // party-promise-words.ts, the one copy the 409 and the pre-check use.
+          const pMeta = lineMetaOf(line);
+          const pNum = (shown: number) => fmtNum(shown);
+          const pFig = (shown: number) => promiseFigPU(shown, pMeta);
+          const claimTitle = pr && pr.claims.length > 0
+            ? 'Already issued on these open party requisitions and not yet off the central books '
+              + '(their goods leave only when every line of the requisition is complete):\n'
+              + pr.claims.map(c => `${reqLabel(c)} — ${pFig(c.shown)}${U.pf > 1 ? ` (= ${fmtNum(c.recipe)} ${U.recipeUnit})` : ''}`).join('\n')
+            : undefined;
           return (
             <span title={st.title}>
               <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle ${st.dot}`} />
               <span className={st.text}>{fmtNum(U.stockPU(st.qty))}{unitTag}</span>
               {U.pf > 1 && (
                 <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(st.qty)} {U.recipeUnit}</div>
+              )}
+              {pr && (() => {
+                // A requisition number and a figure never break across lines
+                // (REQ-2026-1388 split at its hyphen on the 768-wide tablet).
+                const nw = (s: string) => <span className="whitespace-nowrap">{s}</span>;
+                const claim = (c: PromisedClaim) => <>{nw(c.req_number)}{c.event_name ? ` (${c.event_name})` : ''}</>;
+                return (
+                  <div className="text-[9px] font-sans font-normal text-[#6B5744] whitespace-normal max-w-[12rem] ml-auto leading-snug"
+                       title={claimTitle}>
+                    · {nw(pFig(pr.totalShown))} promised{' '}
+                    {pr.claims.length === 0 ? 'to other open party requisitions'
+                      : pr.claims.length === 1 ? <>to {claim(pr.claims[0])}</>
+                      : <>
+                          —{' '}
+                          {pr.claims.slice(0, 2).map((c, i) => (
+                            <Fragment key={`${c.req_number}-${i}`}>{i > 0 ? ', ' : ''}{nw(`${pNum(c.shown)} to`)} {claim(c)}</Fragment>
+                          ))}
+                          {pr.claims.length > 2 ? <>, {nw(`+${pr.claims.length - 2} more`)}</> : ''}
+                        </>}
+                  </div>
+                );
+              })()}
+              {pr && pr.ownShown > 0 && (
+                <div className="text-[9px] font-sans font-normal text-[#6B5744] whitespace-normal max-w-[12rem] ml-auto leading-snug">
+                  · <span className="whitespace-nowrap">{pFig(pr.ownShown)}</span> issued here, not yet off the books
+                </div>
+              )}
+              {pr && (
+                <div className={`text-[9px] font-sans whitespace-nowrap ${st.text}`}>
+                  {/* "short N" only when N prints; a negative crumb is "free
+                      0", never "short 0"; a positive crumb is "free less than
+                      0.001 <unit>" — the store's own words for it
+                      (party-promise-words.ts freeCellWords). */}
+                  · {freeCellWords(pr.freeRecipe, pMeta)}
+                </div>
               )}
             </span>
           );
@@ -4838,6 +5765,28 @@ function LineRow(props: {
               <span>The party transfer could not cover this line — its record was lowered and it is open again</span>
             </div>
             {props.partyShort.message ? <div className="mt-0.5 opacity-90">{props.partyShort.message}</div> : null}
+          </div>
+        )}
+        {/* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION — THE STORE REFUSED
+            (ruling #86a, 409 'party_promised'). The server's sentence verbatim;
+            it names the requisition holding the stock and the way out. Stays
+            until this line is acted on, Refresh, or a load shows the line, the
+            books or the claims moved (promisedSigOf). */}
+        {props.promisedRefusal && (
+          <div className="mb-1 rounded border border-rose-300 bg-rose-50 px-1.5 py-1 text-[10px] leading-snug text-rose-900 max-w-[15rem] md:max-w-[22rem]">
+            <div className="font-semibold flex items-start gap-1">
+              <AlertCircle className="w-3 h-3 mt-[1px] shrink-0" />
+              <span>Refused — this stock is already issued on another party requisition</span>
+            </div>
+            {props.promisedRefusal.message ? <div className="mt-0.5 opacity-90">{props.promisedRefusal.message}</div> : null}
+            {/* The store's sentence already ends "Nothing was issued and the
+                requisition is unchanged."; said here only when it does not. */}
+            {!/Nothing was issued/.test(props.promisedRefusal.message) && (
+              <div className="mt-0.5 opacity-90">Nothing was issued and the requisition is unchanged.</div>
+            )}
+            {props.promisedRefusal.whole && (
+              <div className="mt-0.5 opacity-90">The store refused the whole gesture, every other line in it included.</div>
+            )}
           </div>
         )}
         {/* ── THE CENTRAL STORE WILL NOT GIVE THE GOODS ───────────────────────
@@ -5470,7 +6419,23 @@ function LineRow(props: {
                 left the shelf, and THE RULE closes it when less than one printed
                 step is still owed. Said under the box so the storekeeper reads
                 the gram figure before the click. Silent on every ordinary row. */}
-            {saysTake(props.centralTake) && !props.centralHold && !props.short && outstanding > 0 && !deferOpen && (() => {
+            {/* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION — SAID BEFORE THE
+                CLICK (ruling #86a). The store's pre-check refuses this row's own
+                gesture (Issue Now, or the split's captured hand-over) before the
+                transfer or the central floor is asked, so this sentence stands in
+                for the take / hold notes below, which would describe a hand-over
+                that does not happen. Stood down while the server's own refusal
+                panel is on the line, and on a plain Defer (nothing handed over).
+                Words only: the button still posts, and the store decides by its
+                books at that moment. */}
+            {props.promised && !props.promisedRefusal && outstanding > 0 && (!deferOpen || splitMode) && (
+              <div className="w-full text-[9px] text-red-800 font-semibold"
+                   title="A party requisition's goods leave the central books only when every line of it is complete, so stock already issued on another open party requisition is still counted in In store. The store keeps it for the requisitions it was already issued on and will NOT issue it again here. (Liquor-store items are not affected: their stock moves on the Liquor Store ledger.)">
+                The store will NOT issue this —{' '}
+                <span className="font-normal text-red-900">{props.promised.lines.map(s => s.message).join(' ')}</span>
+              </div>
+            )}
+            {!props.promised && saysTake(props.centralTake) && !props.centralHold && !props.short && outstanding > 0 && !deferOpen && (() => {
               const tk = props.centralTake!;
               if (tk.rail === 'party') {
                 // The lead, the take and what the transfer leaves open, from the
@@ -5508,7 +6473,7 @@ function LineRow(props: {
                 reopens it (desk-rule.ts `shortTake`; the route's party_short).
                 Said before the click: SALT's Issue Now took THREE MANGO from
                 20/20 to 15/20 open with nothing on SALT's row (tb_issue_block). */}
-            {!saysTake(props.centralTake) && !props.centralHold && !props.short && outstanding > 0 && !deferOpen
+            {!props.promised && !saysTake(props.centralTake) && !props.centralHold && !props.short && outstanding > 0 && !deferOpen
               && props.centralParty && props.centralParty.runs !== 'none'
               && partyLeftOpenSentence(props.centralParty, line.id) !== '' && (
               <div className="w-full text-[9px] text-amber-800">
@@ -5519,7 +6484,7 @@ function LineRow(props: {
                 that panel is about the gesture it refused, and a split the
                 storekeeper opens again afterwards would otherwise sit silent
                 over a figure the store will refuse the same way (c19). */}
-            {props.centralHold && outstanding > 0
+            {!props.promised && props.centralHold && outstanding > 0
               && ((!props.short && (!deferOpen || splitMode)) || (!!props.short && splitMode)) && (() => {
               const h = props.centralHold!;
               const cap = `${fmtCapPU(h.availPU, h.pf)} ${h.purchaseUnit}`;

@@ -4977,7 +4977,9 @@ function SimpleMaterialPicker({
     const el = ref.current;
     if (!el || typeof window === 'undefined') return;
     const r = el.getBoundingClientRect();
-    const width = Math.max(r.width, 300);
+    // Wide enough for a full item name beside its unit and rate (owner,
+    // 2026-10-30: names were cut off); never wider than the screen.
+    const width = Math.min(Math.max(r.width, 460), window.innerWidth - 16);
     const left = Math.min(r.left, window.innerWidth - width - 8);
     setPos({ top: r.bottom + 4, left: Math.max(8, left), width });
   };
@@ -5048,19 +5050,20 @@ function SimpleMaterialPicker({
                       title={takenLine ? `Already on line ${takenLine} — add the extra quantity there` : undefined}
                       className={`w-full text-left px-2 py-1 rounded text-xs flex flex-col items-stretch gap-0.5 ${
                         takenLine ? 'bg-[#FFF8F0] text-[#A08B76] cursor-default' : 'hover:bg-[#FFF1E3]'}`}>
-                <span className="flex items-center gap-2 w-full">
-                  <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
-                  <span className="flex-1 min-w-0 truncate">{m.name}</span>
+                <span className="flex items-start gap-2 w-full">
+                  <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0 pt-px">{m.sku || '·'}</span>
+                  {/* The FULL name, wrapped — never cut to "…" (owner, 2026-10-30). */}
+                  <span className="flex-1 min-w-0 whitespace-normal break-words">{m.name}</span>
                   {takenLine ? (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0 whitespace-nowrap">
                       already on line {takenLine}
                     </span>
                   ) : (<>
-                    <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
+                    <span className="text-[10px] text-[#6B5744] shrink-0 whitespace-nowrap pt-px">{poUnitOf(m)}</span>
                     {/* Rate carries its own basis: a bare "₹86.00" next to a list
                         of kitchen materials reads as ₹/g. poRateOf is already
                         ₹/purchase-unit — say which unit that is. */}
-                    <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
+                    <span className="text-[10px] font-mono text-[#6B5744] shrink-0 whitespace-nowrap pt-px">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
                   </>)}
                 </span>
                 {/* IN HAND, BEFORE THE PICK (owner's ask #1). Store and Dept as
@@ -5088,10 +5091,10 @@ function SimpleMaterialPicker({
               {unmappedHint && <div className="px-2 pb-1 text-[10px] text-[#8B7355]">{unmappedHint}</div>}
               <div className="space-y-0.5">
                 {offList.map(m => (
-                  <div key={m.id} className="w-full px-2 py-1 rounded text-xs flex items-center gap-2 bg-[#FAF6F0] text-[#A08B76]">
-                    <span className="text-[10px] font-mono w-16 shrink-0">{m.sku || '·'}</span>
-                    <span className="flex-1 truncate">{m.name}</span>
-                    <span className="text-[10px]">{poUnitOf(m)}</span>
+                  <div key={m.id} className="w-full px-2 py-1 rounded text-xs flex items-start gap-2 bg-[#FAF6F0] text-[#A08B76]">
+                    <span className="text-[10px] font-mono w-16 shrink-0 pt-px">{m.sku || '·'}</span>
+                    <span className="flex-1 min-w-0 whitespace-normal break-words">{m.name}</span>
+                    <span className="text-[10px] shrink-0 whitespace-nowrap pt-px">{poUnitOf(m)}</span>
                     {onMapAndPick ? (
                       <button type="button" disabled={mapBusy}
                               onClick={async () => { setOpen(false); setQ(''); await onMapAndPick(m); }}

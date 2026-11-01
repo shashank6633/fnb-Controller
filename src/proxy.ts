@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { canAccessPage, firstAllowedPath, isFinanceCapPath } from '@/lib/page-catalog';
+import { canAccessPage, firstAllowedPath, isFinanceCapPath, isHrFullCapPath } from '@/lib/page-catalog';
 import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
 import {
@@ -457,6 +457,9 @@ export function proxy(req: NextRequest) {
         role_is_active: row.role_id ? !!row.role_active : null,
         // Resolved below by its own query, deliberately NOT in the SELECT above.
         can_view_finance_reports: false,
+        // Same rule, same reason: "Full HR access" (ruling #90) is resolved by
+        // its own fail-CLOSED query below, never by the fail-open SELECT above.
+        can_full_hr_access: false,
       } : undefined;
       // ── FINANCE CAPABILITY, resolved in a SEPARATE, FAIL-CLOSED query.
       //
@@ -493,6 +496,29 @@ export function proxy(req: NextRequest) {
           user.can_view_finance_reports = !!cap?.c;
         } catch { user.can_view_finance_reports = false; }
       }
+      // ── "FULL HR ACCESS" (owner ruling #90), the finance block's twin.
+      //
+      // Separate query, fail CLOSED, `AND is_active = 1` — every reason given for
+      // the finance capability above applies word for word. In particular the
+      // column is NEVER added to the page-gate SELECT: that SELECT sits inside
+      // the fail-open catch at the end of this block, so a swallowed migration
+      // would turn into an app-wide bypass instead of a closed door. Here a
+      // missing column, a missing role or a deactivated role all mean `false`,
+      // the adminOnly gate stands, and the five HR pages stay shut.
+      //
+      // Run only for the five flagged paths (isHrFullCapPath — /hr/settings is
+      // NOT one of them, so it never even asks). getCurrentUser (auth.ts)
+      // resolves the identical rule — role-only, active role only — so the page
+      // gate and the canHrFull() API gates cannot disagree.
+      const resolveHrFull = () => {
+        if (!user || !row.role_id) return;
+        try {
+          const cap = db.prepare('SELECT can_full_hr_access AS c FROM roles WHERE id = ? AND is_active = 1')
+            .get(row.role_id) as { c?: number } | undefined;
+          user.can_full_hr_access = !!cap?.c;
+        } catch { user.can_full_hr_access = false; }
+      };
+      if (isHrFullCapPath(pathname)) resolveHrFull();
       // ── Guest Feedback ONLY: an unresolved session is a REFUSAL, not a pass.
       // Measured 2026-09-22 on this branch, port 3924: with a made-up cookie
       // value (`fnb_session=zzgc-NO-SUCH-TOKEN`) all four feedback pages
@@ -568,6 +594,12 @@ export function proxy(req: NextRequest) {
         // dashboard access who hits `/` would be told to go to... `/` again,
         // looping forever. Smart fallback: send them to the first allowed
         // path in their map (catalog order). Hit /login as final safety.
+        //
+        // firstAllowedPath may land on a "Full HR access" page, so resolve the
+        // capability first (same fail-closed query) if it was not resolved
+        // above — otherwise a role whose map holds ONLY those pages would be
+        // sent to /login. One PK lookup, and only on a refusal.
+        if (!isHrFullCapPath(pathname)) resolveHrFull();
         const fallback = firstAllowedPath(user);
         // Don't redirect to the same path we just blocked (would loop)
         if (fallback === pathname) {

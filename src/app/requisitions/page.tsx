@@ -21,7 +21,16 @@ import { packFactor, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
 // THE RULE and the shelf take, as both desks run them — ONE transcription of the
 // server's (central-debit-clamp.ts / issue-stock.ts), proved against it by
 // scripts/desk-rule-tests.ts. Never re-type any of it on this page.
-import { deskLineComplete, planDeskDebit, forecastDeskTake, type DeskTakeForecast } from '@/lib/desk-rule';
+import {
+  deskLineComplete, planDeskDebit, forecastDeskTake, type DeskTakeForecast,
+  deskGrid, deskLineBasis,
+} from '@/lib/desk-rule';
+// Party stock issued elsewhere (ruling #86a): the store's own words, ONE copy
+// shared with party-pending.ts and the store desk.
+import {
+  promiseFig, promiseFigPU, isAreShown, hasHaveShown,
+  freeIsWords, freeCellWords, apportionShown,
+} from '@/lib/party-promise-words';
 import { fmtIST } from '@/lib/format-date';
 // ROUTED LINES (rulings #45, #74): a line for an item a Direct Issue rule sends
 // straight to another department (Meat / Poultry / Seafood → Kitchen) is that
@@ -167,6 +176,18 @@ interface ReqItem {
   routed_department_id?: string | null;
   routed?: unknown;
   routed_department_name?: string | null;
+  /** PROMISED TO OTHER PARTY REQUISITIONS (owner ruling #86a; GET ?id= via
+   *  src/lib/party-pending.ts partyPromisedForRequisition): what OTHER open
+   *  party requisitions were handed of this line's material and has not left
+   *  the central books (RECIPE units), those requisitions oldest first, this
+   *  requisition's own such quantity, and what its party transfer already
+   *  moved. Read by the Process window's party-promise forecast only. */
+  promised_elsewhere_recipe?: number | null;
+  promised_elsewhere_reqs?: Array<{ req_id?: string; req_number: string; event_name?: string | null; qty_recipe?: number | null }> | null;
+  own_pending_recipe?: number | null;
+  party_moved_recipe?: number | null;
+  /** 1 for a liquor / store-mapped material (centralFlowBlock) — never a claim. */
+  central_flow_blocked?: number | null;
 }
 interface Requisition {
   id: string; req_number: string;
@@ -2366,6 +2387,11 @@ function ChefRejectModal({ req, onClose, onDone }: { req: Requisition; onClose: 
 /* ============================================================ */
 /* Store Process — heart of the workflow                         */
 /* ============================================================ */
+/** The party-promise forecast's basis (owner ruling #86a): the Process window
+ *  reads the books ONCE, when it opens, so every forecast built on them — the
+ *  ⛔ panel and the note under each named row alike — carries this caveat. */
+const PROMISED_FORECAST_BASIS = "As the store's books stood when this window opened — the store decides on its books at the click.";
+
 function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose: () => void; onDone: () => void }) {
   // Issue + (optional) PO workflow.
   //
@@ -2701,6 +2727,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
      `code` plus the req_item_id(s) it is about. */
   const [errorText, setErrorText] = useState('');
   const [errorRows, setErrorRows] = useState<Set<string>>(new Set());
+  /* A refused PARTY issue (409 'party_promised', owner ruling #86a): the
+     store's own sentence per material, in its order, and by the line(s) each
+     names — printed verbatim in the panel and under the named line. Same
+     lifetime as errorText (any edit clears it). */
+  const [promisedSrvList, setPromisedSrvList] = useState<string[]>([]);
+  const [promisedSrv, setPromisedSrv] = useState<Record<string, string>>({});
   /* The server's per-line refusal rows from a `blocked[]` answer, keyed by
      req_item_id. Rendered against the named line instead of an alert(), and
      read by the cap below — a refusal carries max_issue_qty, which is a FRESHER
@@ -2803,7 +2835,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     // box still exceeds that balance, so it clears itself the moment the number
     // is right — and the ceiling stays correct meanwhile. Dropping it would
     // walk the cap back to the stale figure and invite the same refusal twice.
-    if (errorText) { setErrorText(''); setErrorRows(new Set()); }
+    if (errorText) { setErrorText(''); setErrorRows(new Set()); setPromisedSrvList([]); setPromisedSrv({}); }
     setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
   };
 
@@ -3523,6 +3555,135 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   // move refuses the whole submit, whatever the other lines hand over.
   const partyWhole = isPartyReq && transferRuns() && overCapLines.length > 0;
   const refusedWhole = partyWhole || (overCapLines.length > 0 && handOverLines.length === 0);
+
+  /* ── ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (owner ruling #86a,
+     addendum "Yes, guard it too", 2026-10-29) ──────────────────────────────
+     store-process refuses a PARTY issue the central books cannot cover once
+     every OTHER open party requisition's handed-over, not-yet-moved stock is
+     held back — 409 'party_promised', the WHOLE submit, nothing written
+     (src/lib/party-pending.ts partyIssueShortfall, asked by the route on
+     exactly what this window posts: per material, the net change to this
+     requisition's quantity, every non-routed line, an omitted one as 0).
+     The GET this window opened with carries those claims per line
+     (promised_elsewhere_*, own_pending_recipe, party_moved_recipe), so the
+     same question is asked here BEFORE the click on the books as this window
+     read them — "does it fit" through planDeskDebit (desk-rule.ts, the desks'
+     one transcription of THE RULE), whose fits only ever ADDS to the server's,
+     so a refusal said here is one the server makes on the same books. Words
+     only, never a gate: the store decides at the click, and its own sentence
+     is printed if it refuses. Party requisitions only — an internal one, or a
+     party one no other party requisition competes with, renders as before. */
+  // The figures and the free words through party-promise-words.ts — the one
+  // copy the store's 409 and the store desk print through (round 3).
+  const promisedFig = (recipe: number, meta: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null }) =>
+    promiseFig(recipe, meta);
+  const promisedNames = (it: ReqItem | undefined, max = Infinity) => {
+    const rows = Array.isArray(it?.promised_elsewhere_reqs) ? it!.promised_elsewhere_reqs! : [];
+    const names = rows.map(c => `${c.req_number}${c.event_name ? ` (${c.event_name})` : ''}`);
+    if (names.length === 0) return 'other open party requisitions';
+    const shown = names.slice(0, max);
+    const more = names.length - shown.length;
+    const list = more > 0 ? [...shown, `${more} more`] : shown;
+    return list.length <= 1 ? list[0] : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+  };
+  const itemOf = (id: string) => (req.items || []).find(it => String(it.id) === String(id));
+  const promisedForecast: Array<{ materialId: string; lineIds: string[]; message: string; lineNote: string }> = (() => {
+    const out: Array<{ materialId: string; lineIds: string[]; message: string; lineNote: string }> = [];
+    if (!isPartyReq) return out;
+    const byMat = new Map<string, { before: number; add: number; lineIds: string[]; allZero: boolean; it: ReqItem }>();
+    for (const it of req.items || []) {
+      if (isRoutedLine(it)) continue;                    // never written by the route
+      const basis = deskLineBasis({
+        unit: it.unit ?? '', material_unit: it.material_unit,
+        material_purchase_unit: it.material_purchase_unit, material_pack_size: it.material_pack_size,
+      });
+      if (!basis) continue;                              // unit review — never a claim
+      const ln = lines.find(l => l.id === it.id);
+      const before = Number(it.quantity_issued) || 0;
+      const after = ln ? issuedOf(ln) : 0;               // an omitted line is written as 0
+      const mat = String(it.material_id || '');
+      const m = byMat.get(mat) || { before: 0, add: 0, lineIds: [], allZero: true, it };
+      m.before += before * (basis.factor || 1);
+      m.add += (after - before) * (basis.factor || 1);
+      if (before > EPSQ) m.allZero = false;
+      if (ln && after > before + EPSQ) m.lineIds.push(ln.id);
+      byMat.set(mat, m);
+    }
+    const r6 = (n: number) => { const v = Math.round((Number(n) || 0) * 1e6) / 1e6; return v === 0 ? 0 : v; };
+    for (const [mat, m] of byMat) {
+      if (m.lineIds.length === 0) continue;              // only an issue is refused
+      const it = m.it;
+      if (Number(it.central_flow_blocked || 0)) continue;            // liquor: central never holds it
+      const others = r6(Number(it.promised_elsewhere_recipe) || 0);
+      if (!(deskGrid(others) > 0)) continue;             // no other claim: the transfer's floor decides
+      const ln = lines.find(l => l.id === m.lineIds[0]);
+      if (!ln || !ln.stock_known) continue;
+      const meta = { unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
+      const moved = Math.max(0, Number(it.party_moved_recipe) || 0);
+      const ownBefore = r6(Math.max(0, m.before - moved));
+      const ask = r6(Math.max(0, m.before + m.add - moved) - ownBefore);
+      if (!(deskGrid(ask) > 0)) continue;
+      const central = Number(ln.current_stock) || 0;
+      const free = r6(central - others - ownBefore);
+      if (planDeskDebit(free, ask, meta).fits) continue;
+      const name = String(it.material_name || 'This item');
+      const held = r6(others + ownBefore);
+      // The holders split as the store's sentence splits them (largest
+      // remainder, party-promise-words.ts apportionShown — the same parts and
+      // keys party-pending.ts uses), so "N on this requisition" and the total
+      // here are the figures the store's 409 prints in this same window.
+      const ownHolds = deskGrid(ownBefore) > 0;
+      const claimRows = Array.isArray(it.promised_elsewhere_reqs) ? it.promised_elsewhere_reqs : [];
+      const otherParts = claimRows.length > 0
+        ? claimRows.map(c => ({ key: String(c.req_id || c.req_number), recipe: Number(c.qty_recipe) || 0 }))
+        : [{ key: '', recipe: others }];
+      const ap = apportionShown([...otherParts, ...(ownHolds ? [{ key: String(req.id), recipe: ownBefore }] : [])], meta);
+      const heldFig = promiseFigPU(ap.total, meta);
+      const who = `${promisedNames(it)}${ownHolds ? ` and ${promiseFigPU(ap.shown[otherParts.length], meta)} on this requisition` : ''}`;
+      const maxAdd = Math.max(0, free);
+      const freeShows = shownPurchaseQty(maxAdd, meta) > 0;
+      // "only 7.917 CASE is free" | "less than 0.001 CASE of it is free" |
+      // "none of it is free" — the In Stock note's "free …" on the same row
+      // says the same (freeCellWords, below).
+      const freeWords = freeIsWords(maxAdd, meta, { only: true });
+      const lead = deskGrid(held) <= deskGrid(central)
+        ? `${heldFig} of the store's ${promisedFig(central, meta)} ${isAreShown(ap.total)} already issued on ${who} and ${hasHaveShown(ap.total)} not left the books`
+        : `the store holds ${promisedFig(Math.max(0, central), meta)} on its books, but ${heldFig} ${isAreShown(ap.total)} already issued on ${who} and ${hasHaveShown(ap.total)} not left them`;
+      out.push({
+        materialId: mat, lineIds: m.lineIds,
+        message: `${name}: ${lead}, so ${freeWords} for this requisition — ${promisedFig(ask, meta)} cannot be issued. `
+          + (freeShows
+            ? `${m.allZero ? `Issue ${promisedFig(maxAdd, meta)} or less` : `Issue at most ${promisedFig(maxAdd, meta)} more than the line already holds`}, or receive more ${name}.`
+            : `Receive more ${name}, or Undo it there first.`),
+        lineNote: `Already issued on ${promisedNames(it, 2)} and not yet off the books — ${freeWords}. The store will refuse this whole issue.`,
+      });
+    }
+    return out;
+  })();
+  const promisedForecastByLine: Record<string, string> = {};
+  for (const f of promisedForecast) for (const id of f.lineIds) promisedForecastByLine[id] = f.lineNote;
+  /** The store's own refusal is on screen (until an edit clears it): its
+   *  figures are fresher than this window's, so the forecast stands aside. */
+  const promisedSrvShown = promisedSrvList.length > 0;
+  /** The whole submit will be (or just was) refused over party stock promised
+   *  elsewhere — the promises below about what submit does are silenced. */
+  const promisedWhole = promisedSrvShown || promisedForecast.length > 0;
+  /** The In Stock cell's note on a PARTY line (the store desk's "Show"):
+   *  what other open party requisitions hold of the books and what is free,
+   *  at the column's own precision (a figure that rounds to 0 is 0). */
+  const promisedNoteOf = (ln: Line): string | null => {
+    if (!isPartyReq || !ln.stock_known || ln.central_flow_blocked) return null;
+    const it = itemOf(ln.id);
+    if (!it) return null;
+    const meta = { unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
+    const others = Number(it.promised_elsewhere_recipe) || 0;
+    if (!(shownPurchaseQty(others, meta) > 0)) return null;
+    const free = (Number(ln.current_stock) || 0) - others - Math.max(0, Number(it.own_pending_recipe) || 0);
+    // "free 7.917 CASE" | "free less than 0.001 CASE" | "short 1 pcs" |
+    // "free 0 CASE" — the store's own words (party-promise-words.ts), so a
+    // crumb is never "free 0" here over "less than 0.001 … is free" below.
+    return `· ${promisedFig(others, meta)} promised to ${promisedNames(it, 2)} · ${freeCellWords(free, meta)}`;
+  };
   /** Lines entered as 0 that are still owed: not held, and nothing goes out on
    *  them — they stay outstanding exactly like a held line. The ⛔ banner's
    *  "Every other line is issued" must not count them (round 7 verifier:
@@ -3689,9 +3850,28 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // Keep the modal open, highlight those rows, and say the sentence — the
       // whole gesture was refused before anything was written, so it is
       // replayable after one correction.
+      // ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (409 'party_promised',
+      // owner ruling #86a): store-issue's envelope — `short[]`, one row per
+      // material with the store's own sentence and the line(s) it names
+      // (line_id / line_ids). Each sentence is kept verbatim against those
+      // lines; a row naming no line on this form still prints in the panel.
+      const promisedRows: Array<Record<string, unknown>> = String(j?.code || '') === 'party_promised' && Array.isArray(j?.short)
+        ? j.short : [];
+      const promisedMsgs: Record<string, string> = {};
+      for (const s of promisedRows) {
+        const msg = String(s?.message || '').trim();
+        const named = new Set([String(s?.req_item_id || s?.line_id || ''),
+          ...(Array.isArray(s?.line_ids) ? (s.line_ids as unknown[]).map(String) : [])]);
+        for (const rid of named) {
+          if (!rid || !lines.some(l => l.id === rid) || !msg) continue;
+          promisedMsgs[rid] = promisedMsgs[rid] && promisedMsgs[rid] !== msg ? `${promisedMsgs[rid]} ${msg}` : msg;
+        }
+      }
+      setPromisedSrvList(promisedRows.map(s => String(s?.message || '').trim()).filter(Boolean));
+      setPromisedSrv(promisedMsgs);
       const ids: string[] = Array.isArray(j?.req_item_ids)
         ? j.req_item_ids.map(String)
-        : (j?.req_item_id ? [String(j.req_item_id)] : []);
+        : (j?.req_item_id ? [String(j.req_item_id)] : Object.keys(promisedMsgs));
       // ── THE CENTRAL STORE REFUSED (the over-issue clamp) ──────────────────
       // Two spellings, ONE case: 'central_stock_short' comes from the
       // pre-flight (nothing was written) and 'CENTRAL_STOCK_SHORT' from the
@@ -4146,7 +4326,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           {errorText && (
             <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
               <div className="font-semibold">Nothing was saved — this issue was refused.</div>
-              <div className="mt-0.5">{errorText}</div>
+              {/* A party-promise refusal (ruling #86a) prints the store's
+                  sentence per material, one to a line — verbatim. */}
+              {promisedSrvList.length > 1
+                ? <ul className="mt-0.5 list-disc pl-4 space-y-0.5">{promisedSrvList.map((m, k) => <li key={k}>{m}</li>)}</ul>
+                : <div className="mt-0.5">{errorText}</div>}
               {errorRows.size > 0 && (
                 <div className="text-[10px] mt-0.5">The affected line{errorRows.size === 1 ? ' is' : 's are'} outlined in red below.</div>
               )}
@@ -4609,6 +4793,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         {movedAgainSrv && (
                           <div className="text-[9px] text-[#B8A590] font-normal font-sans">read again after the refusal — it had moved again</div>
                         )}
+                        {/* PROMISED ELSEWHERE (ruling #86a), party lines only:
+                            the store desk's "· N promised to REQ-… · free M". */}
+                        {(() => {
+                          const note = promisedNoteOf(ln);
+                          return note ? <div className="text-[9px] font-normal font-sans text-[#6B5744] leading-snug whitespace-normal">{note}</div> : null;
+                        })()}
                       </td>
                       <td className="py-1.5 px-2">
                         {/* Entered in PURCHASE units — the same unit the HOD
@@ -4671,6 +4861,20 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                   : <>Over the store&apos;s balance of <b>{fmtCapPU(cap.availPU, cap.pf)} {cap.purchaseUnit}</b> — the central store will NOT issue this line.</>)}
                           </div>
                         )}
+                        {/* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION
+                            (ruling #86a): the store's own sentence once it has
+                            refused this line (verbatim), else the forecast's
+                            note. Neither renders on a line nothing names. */}
+                        {promisedSrv[ln.id] && errorRows.has(ln.id) ? (
+                          <div className="text-[9px] text-red-800 mt-0.5 text-right font-semibold">{promisedSrv[ln.id]}</div>
+                        ) : !promisedSrvShown && promisedForecastByLine[ln.id] ? (
+                          <div className="text-[9px] text-red-800 mt-0.5 text-right font-semibold">
+                            ⛔ {promisedForecastByLine[ln.id]}{' '}
+                            {/* A forecast on the books this window read when
+                                it opened — the same caveat as the panel's. */}
+                            <span className="font-normal text-red-800/80">{PROMISED_FORECAST_BASIS}</span>
+                          </div>
+                        ) : null}
                         {/* ── THE NUMBER TO TYPE, AND A WAY TO TYPE IT ─────────
                             `max_issue_qty` has been on the wire since the floor
                             shipped and NOTHING rendered it: the sentence above
@@ -5152,6 +5356,24 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               the held one on the result panel, and a whole refusal writes
               nothing and is replayable — a dialog would be friction on every bar
               hand-over for a message already on screen. */}
+          {/* ALREADY ISSUED ON ANOTHER OPEN PARTY REQUISITION (ruling #86a) —
+              the forecast (promisedForecast), shown until the store itself
+              has answered (its sentence is then the red panel's). Not a gate:
+              the button stays live. */}
+          {promisedForecast.length > 0 && !promisedSrvShown && (
+            <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+              <div className="font-semibold">
+                ⛔ Stock already issued on another open party requisition — on submit the store will{' '}
+                <b>refuse the whole issue</b> and save nothing, the other lines included:
+              </div>
+              <ul className="text-[10px] mt-0.5 space-y-0.5 list-disc pl-4">
+                {promisedForecast.map(f => <li key={f.materialId}>{f.message}</li>)}
+              </ul>
+              <div className="text-[9px] mt-0.5 text-red-800/80">
+                {PROMISED_FORECAST_BASIS}
+              </div>
+            </div>
+          )}
           {overCapLines.length > 0 && (() => {
             const n = overCapLines.length;
             const one = n === 1;
@@ -5233,7 +5455,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               that partial issue really will be recorded and really will leave
               the requisition short. Only a quantity the server would hold back
               makes any of these false. */}
-          {refusedWhole ? null : raisePo ? (() => {
+          {/* A submit the store refuses over party stock promised elsewhere
+              (promisedWhole, ruling #86a) writes nothing either, so these
+              promises are silenced for it exactly as for refusedWhole. */}
+          {(refusedWhole || promisedWhole) ? null : raisePo ? (() => {
             const buyLines  = lines.filter(ln => buyOf(ln) > 0);
             // Same predicate as submit()'s confirm — vendor named AND rejected
             // by the mapping rule. A line with no vendor yet is a different

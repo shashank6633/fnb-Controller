@@ -15,6 +15,10 @@ export async function register(): Promise<void> {
   // six jobs ride that tick: the Google reviews pull, the parties refresh, GRN
   // kitchen-QC escalation, the WhatsApp broadcast drain, scheduled WhatsApp
   // reports and price-hike alerts. A quiet restart stopped all six silently.
+  // (More have joined since — src/lib/scheduler.ts's header is the full list —
+  // including the 30-minute HR biometric auto-sync, runSmartOfficeAutoSync,
+  // which has NO OTHER DRIVER and is armed by this same call: there is
+  // deliberately no second timer for it.)
   //
   // The external-cron backstop several of those jobs' own comments point at
   // CANNOT BE REACHED: /api/cron/refresh-parties is absent from proxy.ts's
@@ -45,7 +49,8 @@ export async function register(): Promise<void> {
   // Every job on the tick carries its own cross-process claim (a SQLite
   // transaction with an expiry for reviews, a per-row compare-and-swap for the
   // broadcast drain, qc_escalated_at per row for QC, send-ledger dedupe for
-  // reports and price-hikes, a date sentinel for task automation).
+  // reports and price-hikes, a date sentinel for task automation, a BEGIN
+  // IMMEDIATE 30-minute claim for the SmartOffice auto-sync).
   try {
     if (process.env.NEXT_RUNTIME !== 'nodejs') return; // skip edge — no better-sqlite3 there
     const { startSchedulerOnce } = await import('./lib/scheduler');

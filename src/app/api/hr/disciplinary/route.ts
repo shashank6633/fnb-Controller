@@ -1,14 +1,15 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr, isHrDisciplinaryKind } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, isHrDisciplinaryKind } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
  * HR Disciplinary Records (/api/hr/disciplinary) — Phase 6.
  * Contract: docs/HRMS_DECISIONS.md — THE MOST RESTRICTED DATA IN THE MODULE:
- * the page is adminOnly and EVERY verb here, GET included, gates on
- * canAdminHr. Nothing from this table is ever served to a non-admin, and the
+ * the page is adminOnly + hrFullCap and EVERY verb here, GET included, gates
+ * on canHrFull (admin, or a management role holding "Full HR access" — owner
+ * ruling #90). Nothing from this table is ever served to anyone else, and the
  * proxy does not protect API GETs (§2.1) so this handler is the boundary.
  *
  * GET  ?employee_id=&status=&kind=&q=&page=&pageSize=
@@ -26,7 +27,7 @@ import { reportServerError } from '@/lib/error-alerts';
  *      manager_comment / final_decision / status (open|closed).
  *      employee_id is immutable — a record never moves between people.
  *
- * DELETE ?id= → { ok }   (admin-only removal; the full row is preserved in
+ * DELETE ?id= → { ok }   (canHrFull removal; the full row is preserved in
  *      the audit event's before snapshot).
  *
  * Errors return GENERIC messages only — e.message can leak PII for HR data.
@@ -51,8 +52,8 @@ const DISCIPLINARY_SELECT = `
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -107,8 +108,8 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: any = {};
@@ -184,8 +185,8 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   let body: any = {};
@@ -268,8 +269,8 @@ export async function PATCH(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

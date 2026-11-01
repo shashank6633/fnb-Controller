@@ -5,9 +5,13 @@ import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   isIssueGestureRecorded, isIssueTokenReplayError,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
-  zeroEntriesSentence, lineShownAs, fmtLineQtyPU, issueLedgerWatermark,
+  zeroEntriesSentence, lineShownAs, fmtLineQtyPU, issueLedgerWatermark, lineFactor,
   type CentralStockShort,
 } from '@/lib/issue-stock';
+// Owner ruling #86a "refuse" (2026-10-28): party stock already handed over on
+// another open party requisition — a SEPARATE pre-check, see PROMISED TO
+// ANOTHER PARTY below.
+import { partyIssueShortfall, partyTransferTakesOlderClaims, type PartyIssueShortfall } from '@/lib/party-pending';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 import { deliveredDirectCaps } from '@/lib/po-helpers';
 import { reconcileDeliveredDirectLines } from '@/lib/po-link-lifecycle';
@@ -750,6 +754,134 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     }
 
+    // ── PROMISED TO ANOTHER PARTY (owner ruling #86a "Show + refuse", 2026-10-28) ──
+    // A PARTY line's issue records the hand-over and moves no stock: the goods
+    // leave the central books only when the requisition's store part is done,
+    // in one transfer (party-fulfillment.ts; the central floor below skips
+    // party lines — checkCentralIssue skipReason 'party'). So stock handed over
+    // on ANOTHER open party requisition is still inside current_stock, and the
+    // same last unit could be issued twice: FUEL 1 on the books, issued on
+    // REQ-2026-1388 and again on REQ-2026-1389 (production, 2026-10-28).
+    //
+    // THE REFUSAL. An 'issue' on a party line whose quantity the central books
+    // cannot cover once every OTHER open party requisition's handed-over,
+    // not-yet-moved stock is held back (src/lib/party-pending.ts
+    // partyIssueShortfall — this requisition's own not-yet-moved quantity
+    // counts too, so a part-issued line's top-up is weighed with what it
+    // already holds) is REFUSED WHOLE, nothing written: 409, code
+    // 'party_promised', `short` (one row per material, its own sentence and
+    // the cap that passes) and `blockers` (the requisitions holding it, oldest
+    // first). Only where another party holds some of it: with no other claim
+    // the party transfer's own floor decides, exactly as before.
+    //
+    // A SEPARATE PRE-CHECK. THE RULE, planCentralDebit (called, not changed),
+    // checkCentralIssue, desk-rule.ts and party-fulfillment.ts are untouched;
+    // an internal requisition never reaches this block, and on a party
+    // requisition only 'issue' entries can be refused (Defer, Undo, Reject and
+    // Unreject never are — Undo is how a claim is given back). Routed lines
+    // (refused above), store-mapped (liquor) materials and unit-review lines are
+    // never claims and never weighed. A replayed gesture is not weighed (it
+    // moves nothing; the write loop answers it 200 as always). Asked again
+    // inside the transaction.
+    type PartyPromisedRow = PartyIssueShortfall & {
+      code: 'party_promised';
+      line_id: string; req_item_id: string; line_ids: string[];
+      /** The cap in the LINE's own unit (the box adds to quantity_issued). */
+      line_unit: string; max_add_qty: number;
+    };
+    const lineOfMaterial = (materialId: string): any =>
+      allItems.find(it => String(it.material_id) === String(materialId)) || null;
+    const asPromisedRow = (sf: PartyIssueShortfall, lineIds: string[]): PartyPromisedRow => {
+      const lineId = lineIds[0] || String(lineOfMaterial(sf.material_id)?.id || '');
+      const cur = lineId ? (selLine.get(lineId, id) as any) : null;
+      const { factor } = lineFactor(cur?.line_unit, cur || {});
+      return {
+        ...sf, code: 'party_promised', line_id: lineId, req_item_id: lineId,
+        line_ids: lineIds.length ? lineIds : (lineId ? [lineId] : []),
+        line_unit: String(cur?.line_unit ?? ''),
+        max_add_qty: Math.round((sf.max_add_recipe / (factor || 1)) * 1e6) / 1e6,
+      };
+    };
+    const partyPromisedRows = (): PartyPromisedRow[] => {
+      if (!isParty) return [];
+      // The gesture's effect on each line, entry by entry, mirroring the write
+      // loop's own filters (unknown / vanished / chef-rejected / routed /
+      // store-rejected-unless-unrejected / zero or non-finite issue / replay).
+      const sim = new Map<string, { cur: any; before: number; after: number; rejected: boolean; issued: boolean }>();
+      for (const ln of lines) {
+        const lineId = String(ln?.id ?? '');
+        if (!itemMap.get(lineId)) continue;
+        let s = sim.get(lineId);
+        if (!s) {
+          const cur = selLine.get(lineId, id) as any;
+          if (!cur) continue;
+          const q0 = Number(cur.quantity_issued) || 0;
+          s = { cur, before: q0, after: q0, rejected: !!cur.store_rejected, issued: false };
+          sim.set(lineId, s);
+        }
+        if (s.cur.is_rejected || isRoutedRow(s.cur)) continue;
+        const act = String(ln?.action || '').toLowerCase();
+        if (act === 'unreject') { s.rejected = false; continue; }
+        if (s.rejected) continue;
+        if (act !== 'issue' && act !== 'undo' && act !== 'reject') continue;
+        if (isIssueGestureRecorded(db, clientToken, lineId)) continue;
+        if (act === 'issue') {
+          const q = Number(ln?.quantity);
+          if (!Number.isFinite(q) || q <= 0) continue;
+          s.after += q;
+          s.issued = true;
+        } else if (act === 'undo') {
+          s.after = 0;
+        } else {
+          // A party reject zeroes the line (updReject below; routed lines never
+          // get here).
+          s.after = 0;
+          s.rejected = true;
+        }
+      }
+      const byMat = new Map<string, { add: number; lineIds: string[] }>();
+      for (const [lineId, s] of sim) {
+        if (s.cur.is_rejected || isRoutedRow(s.cur)) continue;
+        const { factor, needsReview } = lineFactor(s.cur.line_unit, s.cur);
+        if (needsReview) continue;                 // the transfer never moves it
+        const matId = String(itemMap.get(lineId)?.material_id || '');
+        const m = byMat.get(matId) || { add: 0, lineIds: [] };
+        m.add += (s.after - s.before) * (factor || 1);
+        if (s.issued) m.lineIds.push(lineId);
+        byMat.set(matId, m);
+      }
+      const rows: PartyPromisedRow[] = [];
+      for (const [matId, m] of byMat) {
+        if (m.lineIds.length === 0) continue;      // only an Issue is refused
+        const sf = partyIssueShortfall(db, { reqId: id, materialId: matId, addRecipe: m.add });
+        if (sf) rows.push(asPromisedRow(sf, m.lineIds));
+      }
+      return rows;
+    };
+    const partyPromisedResponse = (rows: PartyPromisedRow[]) => {
+      const blockers: Array<Record<string, unknown>> = [];
+      const seen = new Set<string>();
+      for (const row of rows) {
+        for (const b of row.blockers) {
+          const k = `${b.req_id}|${row.material_id}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          blockers.push({ ...b, material_id: row.material_id, material: row.material });
+        }
+      }
+      return Response.json({
+        error: rows.map(x => x.message).join(' '),
+        code: 'party_promised',
+        short: rows,
+        blockers,
+        applied: 0,
+      }, { status: 409 });
+    };
+    if (isParty) {
+      const promisedRows = partyPromisedRows();
+      if (promisedRows.length > 0) return partyPromisedResponse(promisedRows);
+    }
+
     // ── THE CENTRAL FLOOR, ASKED BEFORE THE TRANSACTION OPENS ───────────────
     // No issue may take raw_materials.current_stock below zero. The bound that
     // makes that structural lives on the single writer (assertCentralIssue in
@@ -1043,6 +1175,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       directClosed?: ReturnType<typeof reconcileDeliveredDirectLines>['closed'];
       /** A routed line met under the lock (rulings #45/#74) — refused whole. */
       routed?: Record<string, unknown> & { message: string };
+      /** Party stock promised elsewhere, met under the lock or at the party
+       *  transfer (ruling #86a) — refused whole, 409. */
+      partyPromised?: PartyPromisedRow[];
     } = {};
     // THE SENTENCE LEADS WITH THE PURCHASE UNIT (round 9, owner rule). Every
     // figure goes through fmtLineQtyPU (issue-stock.ts): the line quantity's
@@ -1114,6 +1249,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (!cur) continue;
         gestureOut.lineChanged = lineChangedRow(ln, cur, exp);
         throw new Error('line_changed');
+      }
+      // PROMISED TO ANOTHER PARTY, AGAIN, UNDER THE LOCK (ruling #86a): the
+      // pre-flight read the claims before the transaction; another process may
+      // have issued since. Same rows, same 409, nothing written.
+      if (isParty) {
+        const again = partyPromisedRows();
+        if (again.length > 0) {
+          gestureOut.partyPromised = again;
+          throw new Error('party_promised');
+        }
       }
 
       for (let li = 0; li < lines.length; li++) {
@@ -1419,7 +1564,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // shelf holds and stays open, instead of refusing a gesture about another
       // line), and where this gesture began in the issue ledger.
       const pfOpts = { deskBeforeLineQty: deskBase, gestureIssuedIds: issuedLines, ledgerSince };
+      // ── THE OLDEST KEEPS ITS CLAIM, AT THE TRANSFER (ruling #86a with #80's
+      // default) ──────────────────────────────────────────────────────────────
+      // The transfer below moves this requisition's whole not-yet-moved
+      // quantity per material, reading only the raw central balance. Where an
+      // OLDER open party requisition was handed the same stock first and it has
+      // not left the books, the transfer would take the older party's goods and
+      // that party is then refused at its own completion (measured,
+      // b_takes_first: REQ-1389's issue completed it, its transfer took the
+      // FUEL REQ-1388 held, and REQ-1388 was refused "FUEL: the central store
+      // holds none of it"). Only an ISSUE gesture is refused here — the ruling's
+      // refusal is on pressing Issue — and only where the older claims are the
+      // reason (party-pending.ts partyTransferTakesOlderClaims: a material the
+      // books cannot cover even without them is the transfer's own floor's,
+      // unchanged). 409 'party_promised', nothing written.
+      const olderClaimsAtTransfer = () => (issuedLines.size > 0
+        ? partyTransferTakesOlderClaims(db, id).map(sf => asPromisedRow(sf, []))
+        : []);
       if (storePartDone() && r.purpose === 'party') {
+        const taken = olderClaimsAtTransfer();
+        if (taken.length > 0) {
+          gestureOut.partyPromised = taken;
+          throw new Error('party_promised');
+        }
         pf = applyPartyFulfillment(db, id, me.email, pfOpts);
         allDone = everyLineDone();
       } else if (r.purpose === 'party') {
@@ -1474,6 +1641,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           const unwind = new Error('party_transfer_left_lines_open');
           const dropped: string[] = [];
           const kept: { t: ReturnType<typeof applyPartyFulfillment> | null } = { t: null };
+          // THE OLDEST KEEPS ITS CLAIM (above), read BEFORE the try moves
+          // anything, and acted on only if the try is KEPT — a transfer that
+          // is unwound takes nothing from anyone.
+          const takenAtTry = olderClaimsAtTransfer();
           try {
             db.transaction(() => {
               const t = applyPartyFulfillment(db, id, me.email, pfOpts);
@@ -1488,6 +1659,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               // Kept iff the STORE's part is done (rulings #45/#74) — with no
               // routed line, iff every line is, exactly as before.
               if (!storePartDone()) throw unwind;
+              // Kept ⇒ the transfer stands. Re-thrown by the catch below (it
+              // is neither the unwind nor a CentralStockShort), so the whole
+              // gesture rolls back and answers 409.
+              if (takenAtTry.length > 0) {
+                gestureOut.partyPromised = takenAtTry;
+                throw new Error('party_promised');
+              }
               kept.t = t;
             })();
             pf = kept.t;
@@ -1730,6 +1908,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           blocked: [gestureOut.routed],
           applied: 0,
         }, { status: 400 });
+      }
+      // Party stock promised elsewhere (ruling #86a), met under the lock or at
+      // the transfer: the pre-flight's refusal, same envelope, nothing written.
+      if (gestureOut.partyPromised && gestureOut.partyPromised.length > 0) {
+        return partyPromisedResponse(gestureOut.partyPromised);
       }
       if (isCentralStockShort(e)) {
         console.warn('[req store-issue] central stock short:', e.message);

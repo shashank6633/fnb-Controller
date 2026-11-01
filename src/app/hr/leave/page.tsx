@@ -9,8 +9,9 @@
  *    renders its balance inline ("CL 4.5 of 12 left" — available of
  *    entitled+adjusted for the request's own (employee, type, from-year)
  *    bucket, computed by the API, never here). Approve/Reject open a modal
- *    with a REQUIRED note (decisions are admin acts — the API enforces
- *    canAdminHr and this page just surfaces its message); management can
+ *    with a REQUIRED note (decisions belong to admins and "Full HR access"
+ *    roles — the API enforces canHrFull and this page just surfaces its
+ *    message); management can
  *    cancel a still-pending request from the same modal.
  *  · Apply — managers file on behalf: employee Combobox (fed from
  *    GET /api/hr/employees?pageSize=100 — code + name, no photos), leave
@@ -19,7 +20,7 @@
  *    validates everything (span, overlap, balance) and its human message is
  *    shown verbatim.
  *  · Types — CRUD table + modal over GET/POST/PUT/DELETE /api/hr/leave/types
- *    (soft deactivate only; mutations are admin-gated server-side).
+ *    (soft deactivate only; mutations are canHrFull-gated server-side).
  *
  * Conventions copied from src/app/hr/employees/page.tsx (canonical HR page):
  * bare fetch for GETs, api()/apiJson() for mutations (CSRF), fetch-race
@@ -294,7 +295,7 @@ export default function HrLeavePage() {
       setNote('');
       fetchRequests();
     } catch (e: any) {
-      // Server messages are human (validation, "Admin access required",
+      // Server messages are human (validation, HR_FULL_DENIED,
       // "already been decided") — surface them verbatim.
       setDecideError(e?.message || 'Could not update the leave request');
     } finally {
@@ -660,7 +661,7 @@ export default function HrLeavePage() {
             <div>
               <h2 className="font-bold text-[#2D1B0E]">File leave on behalf of an employee</h2>
               <p className="text-xs text-[#8B7355] mt-0.5">
-                The request lands in the pending queue for an admin decision. Balances and overlaps
+                The request lands in the pending queue for a decision by an admin or a role with Full HR access. Balances and overlaps
                 are checked when it is filed and again at approval.
               </p>
             </div>
@@ -845,7 +846,7 @@ export default function HrLeavePage() {
             <p className="text-[11px] text-[#8B7355]">
               Entitlement seeds an employee&apos;s yearly balance the first time it is used — later
               edits apply to new balance rows only. Deactivating hides a type from pickers; history
-              keeps the label. Leave-type changes are admin-only.
+              keeps the label. Leave-type changes need an admin or a role with Full HR access.
             </p>
           </>
         )}

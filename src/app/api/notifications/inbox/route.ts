@@ -754,8 +754,10 @@ export async function GET() {
     //    count = queue size — the badge SUMS counts across items, so per-item
     //    rows would bury every other bucket. Every bucket carries the SAME
     //    predicate as the page it deep-links to (canManageHr for the mgmt
-    //    pages, canAdminHr for the admin ones): a narrower gate would hide
-    //    real work, a wider one would deep-link people into a 403. ──────────
+    //    pages; canHrFull AND canAccessPage for the five admin-tier pages a
+    //    "Full HR access" role can open — owner ruling #90): a narrower gate
+    //    would hide real work, a wider one would deep-link people into a
+    //    403. ──────────
 
     // Leave requests awaiting a decision → /hr/leave (mgmt page, canManageHr).
     try {
@@ -772,8 +774,8 @@ export async function GET() {
     }
 
     // Attendance corrections awaiting review → /hr/attendance (mgmt page,
-    // canManageHr — decisions are admin acts, but the QUEUE lives on the
-    // register page every HR manager works from).
+    // canManageHr — decisions are canHrFull acts (admin or "Full HR access"),
+    // but the QUEUE lives on the register page every HR manager works from).
     try {
       const { canManageHr } = await import('@/lib/hr');
       if (canManageHr(me)) {
@@ -787,11 +789,15 @@ export async function GET() {
       console.error('[/api/notifications/inbox] hr-corrections bucket failed:', hrCorrErr);
     }
 
-    // Salary advances awaiting a decision → /hr/payroll (admin page,
-    // canAdminHr — advance decisions and everything money-shaped are admin-only).
+    // Salary advances awaiting a decision → /hr/payroll (adminOnly + hrFullCap
+    // page). canHrFull decides the advances themselves (admin, or a "Full HR
+    // access" role — ruling #90); canAccessPage is the page the row links to,
+    // so a capability holder whose map does not tick /hr/payroll is never
+    // deep-linked into a redirect. Admins: canAccessPage is always true.
     try {
-      const { canAdminHr } = await import('@/lib/hr');
-      if (canAdminHr(me)) {
+      const { canHrFull } = await import('@/lib/hr');
+      const { canAccessPage } = await import('@/lib/page-catalog');
+      if (canHrFull(me) && canAccessPage('/hr/payroll', me)) {
         const n = one(
           `SELECT COUNT(*) AS n FROM hr_advances WHERE status = 'pending'`,
           [],
@@ -802,13 +808,15 @@ export async function GET() {
       console.error('[/api/notifications/inbox] hr-advances bucket failed:', hrAdvErr);
     }
 
-    // Employee documents expiring within 60 days → /hr/documents (admin page,
-    // canAdminHr). Threshold math mirrors GET /api/hr/documents?expiring_days=60
+    // Employee documents expiring within 60 days → /hr/documents (adminOnly +
+    // hrFullCap page; canHrFull AND canAccessPage, as for advances above).
+    // Threshold math mirrors GET /api/hr/documents?expiring_days=60
     // exactly (todayIST + 60d, '' = no expiry and never counted) so the badge
     // and the page it links to always agree.
     try {
-      const { canAdminHr } = await import('@/lib/hr');
-      if (canAdminHr(me)) {
+      const { canHrFull } = await import('@/lib/hr');
+      const { canAccessPage } = await import('@/lib/page-catalog');
+      if (canHrFull(me) && canAccessPage('/hr/documents', me)) {
         const { todayIST } = await import('@/lib/format-date');
         const base = new Date(`${todayIST()}T00:00:00Z`);
         base.setUTCDate(base.getUTCDate() + 60);

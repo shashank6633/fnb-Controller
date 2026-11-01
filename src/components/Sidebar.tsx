@@ -722,6 +722,11 @@ export default function Sidebar() {
     // is the only thing deciding whether the client-side filter can SEE it, so
     // omitting it hides the five finance rows from the very roles granted them.
     can_view_finance_reports?: boolean;
+    // Read by canAccessPage's hrFullCap exception ("Full HR access", ruling
+    // #90) — same reason as the line above: drop it and the five HR rows
+    // (Payroll, Documents, Exits, Geofences, Biometric) vanish from the nav of
+    // the very role granted them while the proxy still lets the URL through.
+    can_full_hr_access?: boolean;
   } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED } from '@/lib/hr';
 import { readHrDocument } from '@/lib/hr-files';
 import { reportServerError } from '@/lib/error-alerts';
 
@@ -10,8 +10,9 @@ import { reportServerError } from '@/lib/error-alerts';
  * Contract: docs/HRMS_DECISIONS.md D4 — the byte-serving discipline is copied
  * from /api/tasks/files/[id], with two deliberate differences:
  *
- *   1. Gate: canAdminHr, not "any signed-in user" — the /hr/documents page is
- *      adminOnly and the API re-checks (§2.1/§2.2: the proxy does not protect
+ *   1. Gate: canHrFull (admin, or a "Full HR access" role — owner ruling
+ *      #90), not "any signed-in user" — the /hr/documents page is
+ *      adminOnly + hrFullCap and the API re-checks (§2.1/§2.2: the proxy does not protect
  *      API GETs; the tier flag alone is never the boundary).
  *   2. Cache-Control: `private, no-store`, NOT the task-files 1-year immutable
  *      cache — a revoked contract or an ex-employee's Aadhaar must not live in
@@ -34,8 +35,8 @@ export async function GET(
 ) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

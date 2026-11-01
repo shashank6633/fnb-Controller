@@ -9,8 +9,10 @@
  * stored in split_json — the venue's own day is 09:30-15:00 + 18:30-01:00).
  *
  * Structure copied from the canonical CRUD page (src/app/vendors/page.tsx).
- * The page is mgmtOnly (viewing); MUTATIONS ARE ADMIN — a manager/HOD sees the
- * list but a create/edit/toggle gets the API's honest 403 message surfaced,
+ * The page is mgmtOnly (viewing); MUTATIONS ARE canHrFull (admin, or a
+ * management role holding "Full HR access" — owner ruling #90) — any other
+ * manager/HOD sees the list but a create/edit/toggle gets the API's honest 403
+ * message surfaced,
  * never a silent failure. API: /api/hr/shifts (GET { shifts }, POST/PUT
  * { shift }, all validation server-side; this page mirrors it client-side
  * only for friendlier messages).
@@ -147,7 +149,7 @@ export default function HrShiftsPage() {
     return l;
   }, [shifts, search, showInactive]);
 
-  // ── Active toggle (table) — admin-only on the server; surface 403 honestly ──
+  // ── Active toggle (table) — canHrFull on the server; surface 403 honestly ──
   const toggleActive = async (sh: HrShift, next: boolean) => {
     setTogglingId(sh.id);
     setActionError(null);
@@ -158,7 +160,7 @@ export default function HrShiftsPage() {
       });
       setShifts(prev => prev.map(s => (s.id === res.shift.id ? res.shift : s)));
     } catch (e: any) {
-      // e.message is the API's own error ('Admin role required' on 403).
+      // e.message is the API's own error (HR_FULL_DENIED on 403).
       setActionError(e?.message || 'Could not update the shift');
     } finally {
       setTogglingId(null);
@@ -227,7 +229,7 @@ export default function HrShiftsPage() {
       setEditing(null);
       load();
     } catch (e: any) {
-      // Honest server message — 'Admin role required' (403), duplicate-name 409, etc.
+      // Honest server message — HR_FULL_DENIED (403), duplicate-name 409, etc.
       setFormError(e?.message || 'Could not save the shift');
     } finally {
       setSaving(false);
@@ -248,7 +250,7 @@ export default function HrShiftsPage() {
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
               Shift templates for rosters &amp; attendance. Overnight spans (end past midnight, shown as +1d)
-              and split shifts are supported. Creating and editing needs the admin role.
+              and split shifts are supported. Creating and editing needs an admin or a role with Full HR access.
             </p>
           </div>
           <button onClick={openCreate}
@@ -268,7 +270,7 @@ export default function HrShiftsPage() {
           </div>
         )}
 
-        {/* Mutation error (e.g. a manager hitting the admin-only toggle) */}
+        {/* Mutation error (e.g. a manager without Full HR access hitting the toggle) */}
         {actionError && (
           <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm flex items-center justify-between gap-3">
             <span>{actionError}</span>
@@ -359,8 +361,8 @@ export default function HrShiftsPage() {
                             onChange={next => toggleActive(sh, next)}
                             label={`${sh.is_active ? 'Deactivate' : 'Activate'} ${sh.name}`}
                             title={sh.is_active
-                              ? 'Deactivate — hidden from pickers; roster history keeps the label (admin only)'
-                              : 'Reactivate this shift (admin only)'}
+                              ? 'Deactivate — hidden from pickers; roster history keeps the label (admins and roles with Full HR access)'
+                              : 'Reactivate this shift (admins and roles with Full HR access)'}
                           />
                         </td>
                         <td className="py-2 px-3 text-right">

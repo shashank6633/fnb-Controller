@@ -35,6 +35,13 @@
  *   - checkKitchenExpiry()         — production batches at/near expiry
  *   - runWaReportJobs()            — scheduled WhatsApp reports, each at its own
  *                                    IST time, once per day per outlet
+ *   - flushPriceHikeAlerts()       — one price-hike alert per quiet bill
+ *   - runSmartOfficeAutoSync()     — HR biometric punches from the venue's
+ *                                    SmartOffice server, every 30 min, only
+ *                                    when the connector is configured. LAST on
+ *                                    purpose: an unreachable server costs up to
+ *                                    a 15s timeout, which must never delay the
+ *                                    jobs above it.
  *
  * runWaDailyNotifications and runTaskAutomation are here because they had NO
  * DRIVER AT ALL: their only call site was POST /api/cron/refresh-parties, which
@@ -455,6 +462,32 @@ export function startSchedulerOnce(): void {
         }
       } catch (e) {
         console.error('[scheduler] price-hike alert flush failed:', e instanceof Error ? e.message : e);
+      }
+
+      // HR BIOMETRIC AUTO-SYNC (owner ruling #89(2)) — pull punches from the
+      // venue's SmartOffice server every 30 minutes. THIS IS ITS DRIVER: the
+      // manual "Sync punches" button was the only other caller.
+      //
+      // LAST IN THE TICK ON PURPOSE. SmartOffice lives on the venue LAN; when
+      // the cloud server cannot reach it (today: "Could not reach SmartOffice at
+      // http://10.99.0.2:88"), one call can take up to soFetch's 15s timeout.
+      // Placed here, that wait can never delay any job above.
+      //
+      // SAFE ON EVERY TICK AND ACROSS pm2 WORKERS. runSmartOfficeAutoSync is a
+      // silent no-op until the base URL + API key are saved, returns 'not_due'
+      // from one settings read until 30 minutes have passed since the last
+      // attempt, and claims each run in a BEGIN IMMEDIATE transaction so two
+      // workers can never pull at once. It NEVER THROWS, records every result
+      // (the failure reason verbatim) for the Biometric page, and logs only on
+      // a transition or when punches were recorded — so nothing here logs, and
+      // an unreachable server is not alarmed every half hour. Dynamically
+      // imported (grn-qc pattern) so an HR-schema fault can never break the loop.
+      try {
+        const { runSmartOfficeAutoSync } = await import('./smartoffice');
+        const { getDb } = await import('./db');
+        await runSmartOfficeAutoSync(getDb());
+      } catch (e) {
+        console.error('[scheduler] smartoffice auto-sync failed:', e instanceof Error ? e.message : e);
       }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);
