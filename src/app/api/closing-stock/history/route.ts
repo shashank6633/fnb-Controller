@@ -4,6 +4,7 @@ import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { toPurchaseQty, csvQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+import { bydeptCsv, bydeptCsvFilename } from '@/lib/closing-bydept-csv';
 import {
   CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_TAX_CSV, SEMI_GST,
   closingTaxCells, closingTaxCsv, createClosingGstResolver, storedCountValue, sumClosingTax,
@@ -79,6 +80,24 @@ import {
  * scoping, same stored-rate valuation, same purchase-unit conversion, same
  * refusal to expose system stock or variance. `view` absent or 'flat' runs the
  * deployed code path byte for byte — this addition is purely additive.
+ *
+ * ── ?view=bydept&date= — STORE vs DEPARTMENTS (owner ruling 99, 2026-11-01) ─
+ * ONE date. One row per ITEM, one column per place that counted it that day:
+ * "Store / Overall" (rows with no department_id — STORE_KEY) first, then every
+ * department that counted on that date, GROUPED under its main department
+ * (departments.parent_id; a department with no parent files under itself, as
+ * on the Dept Closing Sheet), then a Total. Raw materials and semi-finished
+ * (closing_stock_semi) come back as two separate blocks with the SAME columns,
+ * each with its own ₹ totals per column, plus the two added together.
+ *
+ * Built on the matrix's own pieces, not beside them: the same SELECT lists and
+ * row types, the same toPurchaseQty conversion, the same stored-value rule
+ * (never re-priced), the same last-write-wins on a duplicated cell, the same
+ * ROW_CAP + whole-item trim, and the same auth / department scope / outlet /
+ * search predicates above. `date` absent = the newest count date in scope.
+ * Still NO system stock and NO variance. Both tables are read in ONE request
+ * that answers whole or fails whole — never a raw-less or semi-less sheet
+ * (the 31-Oct report: a history that read zero when one half failed).
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -259,6 +278,65 @@ interface SemiMatrixRow {
   total_value: number | null;
 }
 
+/* ── view=bydept wire shapes ─────────────────────────────────────────────── */
+
+/** One column of the Store vs Departments sheet. */
+export interface BydeptColumn {
+  /** STORE_KEY for Store / Overall, otherwise the department id. */
+  key: string;
+  name: string;
+  /** The heading this column files under: its main department, or itself. */
+  group_key: string;
+  group: string;
+  is_store: boolean;
+  /** The main department's OWN count (a department with no parent). */
+  is_main: boolean;
+  is_active: boolean;
+  /** False only for the Store column on a day the store did not count. Every
+   *  department column exists BECAUSE that department counted on the date. */
+  counted: boolean;
+}
+
+/** A counted cell — the matrix cell plus the unit it was counted in, because
+ *  a SUB row's unit is the count-time snapshot and is read per row written. */
+export interface BydeptCell extends MatrixCell {
+  unit: string;
+}
+
+export interface BydeptRow {
+  /** type + id — one row per ITEM; the department is the column. */
+  key: string;
+  material_id: string | null;
+  sub_recipe_id: string | null;
+  type: 'RAW' | 'SUB';
+  material: string;
+  sku: string;
+  category: string;
+  /** PURCHASE unit for RAW; the counted yield unit for SUB. */
+  purchase_unit: string;
+  /** Every column key present. null = NOT COUNTED there; {qty:0} = COUNTED
+   *  ZERO — the same two different facts the matrix keeps apart. */
+  cells: Record<string, BydeptCell | null>;
+  /** Σ of the counted cells, in the row's one unit (same material, same unit,
+   *  so this sum is meaningful — unlike any sum ACROSS items). NULL only when a
+   *  SUB row's cells were counted in different units. */
+  total_qty: number | null;
+  /** Σ of the stored values of the counted cells; NULL when none was priced. */
+  total_value: number | null;
+  /** How many columns counted this item. */
+  counted_in: number;
+  /** Counted cells with no stored value (they add nothing to total_value). */
+  unpriced: number;
+  mixed_units: boolean;
+}
+
+export interface BydeptTotal { lines: number; value: number; unpriced: number }
+
+export interface BydeptBlockTotals {
+  by_column: Record<string, BydeptTotal>;
+  total: BydeptTotal & { items: number };
+}
+
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Shift a YYYY-MM-DD IST date by whole days. Pure UTC arithmetic on the date
@@ -320,9 +398,10 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const format = (url.searchParams.get('format') || 'json').toLowerCase() === 'csv' ? 'csv' : 'json';
     const deptParam = (url.searchParams.get('department_id') || '').trim();
-    // Anything that is not exactly 'matrix' stays on the deployed flat path —
-    // a typo must never silently change the shape of a live download.
-    const view = (url.searchParams.get('view') || '').trim().toLowerCase() === 'matrix' ? 'matrix' : 'flat';
+    // Anything that is not exactly 'matrix' or 'bydept' stays on the deployed
+    // flat path — a typo must never silently change the shape of a live download.
+    const viewParam = (url.searchParams.get('view') || '').trim().toLowerCase();
+    const view = viewParam === 'matrix' ? 'matrix' : viewParam === 'bydept' ? 'bydept' : 'flat';
     const q = (url.searchParams.get('q') || '').trim();
     // Estimated GST (rulings #77/#81) is OPT-IN: exactly `gst=1`, sent only by
     // /inventory/closing-history. Without it the flat JSON and CSV are the
@@ -336,7 +415,9 @@ export async function GET(request: Request) {
     // cycle a 30-day window holds exactly one count — nothing to compare with.
     let from = (url.searchParams.get('from') || '').trim() || shiftIsoDate(today, view === 'matrix' ? -180 : -30);
     let to = (url.searchParams.get('to') || '').trim() || today;
-    if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
+    // Store vs Departments reads ONE `date` and never from/to, so a stray
+    // malformed from/to must not fail it (it checks its own `date` below).
+    if (view !== 'bydept' && (!ISO_DATE.test(from) || !ISO_DATE.test(to))) {
       return Response.json({ error: 'from and to must be dates in YYYY-MM-DD form.' }, { status: 400 });
     }
     // An inverted range would match nothing, and an empty result reads as
@@ -716,6 +797,377 @@ export async function GET(request: Request) {
         date_cap: DATE_CAP,
         truncated,
         note: mnote,
+        generated_at: new Date().toISOString(),
+      });
+    }
+
+    /* ════════════════════════════════════════════════════════════════════════
+     * STORE vs DEPARTMENTS — one date, one row per item, one column per place
+     * that counted (owner ruling 99). Same position as the matrix and for the
+     * same reason: AFTER the auth, department-scope, outlet and search work
+     * above, so all three views agree on who may see which department.
+     * ══════════════════════════════════════════════════════════════════════ */
+    if (view === 'bydept') {
+      const dateParam = (url.searchParams.get('date') || '').trim();
+      if (dateParam && !ISO_DATE.test(dateParam)) {
+        return Response.json({ error: 'date must be a date in YYYY-MM-DD form.' }, { status: 400 });
+      }
+
+      // ── STEP 1: the count dates in scope, newest first ────────────────────
+      // The page's date picker, and the date this view opens on when none is
+      // asked for — the last REAL count, not an empty "today". NO item search
+      // here: the dates (like the columns below) say who COUNTED, which a
+      // search for one item must not narrow. Capped at today so a fat-fingered
+      // future date (the e91c64c incident) can never be the default; an
+      // explicit ?date= is honoured as asked.
+      const rawCountDates = db.prepare(`
+        SELECT DISTINCT cs.date AS date
+          FROM closing_stock cs
+         WHERE cs.date <= ?
+           AND ${OUTLET_SCOPE_CS}
+           ${deptFor('cs')}
+         ORDER BY cs.date DESC
+         LIMIT ${DATE_CAP}
+      `).all(today, outletId, ...deptParams) as { date: string }[];
+      const semiCountDates = db.prepare(`
+        SELECT DISTINCT css.date AS date
+          FROM closing_stock_semi css
+         WHERE css.date <= ?
+           AND ${OUTLET_SCOPE_CSS}
+           ${deptFor('css')}
+         ORDER BY css.date DESC
+         LIMIT ${DATE_CAP}
+      `).all(today, outletId, ...deptParams) as { date: string }[];
+      const countDateSet = new Set<string>();
+      for (const d of rawCountDates) countDateSet.add(d.date);
+      for (const d of semiCountDates) countDateSet.add(d.date);
+      const countDates = [...countDateSet].sort().reverse().slice(0, DATE_CAP);
+      const date = dateParam || countDates[0] || today;
+
+      // ── STEP 2: which places counted on that date? ────────────────────────
+      // Scope-filtered, search-free: a department that counted today but not
+      // the searched item still gets its column, full of "not counted" — which
+      // is exactly the answer to "who counted PANEER?".
+      const countedRaw = db.prepare(`
+        SELECT DISTINCT COALESCE(cs.department_id,'') AS dept_id
+          FROM closing_stock cs
+          JOIN raw_materials rm ON rm.id = cs.material_id
+         WHERE cs.date = ?
+           AND ${OUTLET_SCOPE_CS}
+           ${deptFor('cs')}
+      `).all(date, outletId, ...deptParams) as { dept_id: string }[];
+      const countedSemi = db.prepare(`
+        SELECT DISTINCT COALESCE(css.department_id,'') AS dept_id
+          FROM closing_stock_semi css
+          JOIN sub_recipes sr ON sr.id = css.sub_recipe_id
+         WHERE css.date = ?
+           AND ${OUTLET_SCOPE_CSS}
+           ${deptFor('css')}
+      `).all(date, outletId, ...deptParams) as { dept_id: string }[];
+
+      // ── STEP 3: every count on that date ──────────────────────────────────
+      // The matrix's SELECT lists exactly (so the unit and value handling below
+      // reads the same columns), keyed by one date. ORDER BY keeps one item's
+      // cells contiguous for the whole-item trim, and puts a duplicated cell in
+      // write order so the LAST write stands — the writers delete-then-insert
+      // per (date, item, department), and a sum would double a duplicate.
+      // The name sorts COLLATE NOCASE so that, if ROW_CAP ever cuts the day,
+      // the items kept are the top of the same A–Z list the page shows (which
+      // ignores case) — not a case-sensitive run where "Chicken" sorts after
+      // "COFFEE" and is cut while sorting before the last item shown.
+      const rawCells = db.prepare(`
+        SELECT cs.date                                            AS date,
+               cs.material_id                                     AS material_id,
+               COALESCE(cs.department_id,'')                      AS department_id,
+               d.name                                             AS department,
+               rm.name                                            AS material,
+               rm.sku                                             AS sku,
+               rm.category                                        AS category,
+               rm.unit                                            AS unit,
+               COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
+               rm.pack_size                                       AS pack_size,
+               cs.physical_stock                                  AS physical_stock,
+               cs.rate_per_purchase_unit                          AS rate_per_purchase_unit,
+               cs.rate_source                                     AS rate_source,
+               cs.total_value                                     AS total_value
+          FROM closing_stock cs
+          JOIN raw_materials rm ON rm.id = cs.material_id
+          LEFT JOIN departments d ON d.id = cs.department_id
+         WHERE cs.date = ?
+           AND ${OUTLET_SCOPE_CS}
+           ${deptFor('cs')}
+           ${qRaw}
+         ORDER BY rm.name COLLATE NOCASE, cs.material_id, COALESCE(cs.department_id,''), cs.created_at, cs.rowid
+         LIMIT ${ROW_CAP + 1}
+      `).all(date, outletId, ...deptParams, ...qRawParams) as RawMatrixRow[];
+
+      const semiCells = db.prepare(`
+        SELECT css.date                                           AS date,
+               css.sub_recipe_id                                  AS sub_recipe_id,
+               COALESCE(css.department_id,'')                     AS department_id,
+               d.name                                             AS department,
+               sr.name                                            AS material,
+               COALESCE(NULLIF(TRIM(sr.category),''), 'sub-recipe') AS category,
+               css.unit                                           AS unit,
+               sr.yield_unit                                      AS yield_unit,
+               css.physical_stock                                 AS physical_stock,
+               css.rate                                           AS rate,
+               css.total_value                                    AS total_value
+          FROM closing_stock_semi css
+          JOIN sub_recipes sr ON sr.id = css.sub_recipe_id
+          LEFT JOIN departments d ON d.id = css.department_id
+         WHERE css.date = ?
+           AND ${OUTLET_SCOPE_CSS}
+           ${deptFor('css')}
+           ${qSemi}
+         ORDER BY sr.name COLLATE NOCASE, css.sub_recipe_id, COALESCE(css.department_id,''), css.created_at, css.rowid
+         LIMIT ${ROW_CAP + 1}
+      `).all(date, outletId, ...deptParams, ...qSemiParams) as SemiMatrixRow[];
+
+      // A half-filled row is indistinguishable from "those departments did not
+      // count it" — so a cut item leaves whole, and `truncated` says so.
+      let truncated = false;
+      if (trimPartialGroup(rawCells, ROW_CAP, (r) => r.material_id)) truncated = true;
+      if (trimPartialGroup(semiCells, ROW_CAP, (s) => s.sub_recipe_id)) truncated = true;
+
+      // ── STEP 4: the columns ───────────────────────────────────────────────
+      // Every place in STEP 2, plus any place a cell names (belt and braces: a
+      // count saved between the two reads must get a column, never be dropped).
+      const counted = new Set<string>();
+      for (const r of countedRaw) counted.add(r.dept_id);
+      for (const r of countedSemi) counted.add(r.dept_id);
+      for (const r of rawCells) counted.add(r.department_id || '');
+      for (const s of semiCells) counted.add(s.department_id || '');
+
+      // The ONE department read, at runtime — never a hardcoded list of names.
+      const deptMeta = new Map((db.prepare(`
+        SELECT d.id, d.name, NULLIF(TRIM(COALESCE(d.parent_id,'')),'') AS parent_id,
+               p.name AS parent_name, d.is_active
+          FROM departments d
+          LEFT JOIN departments p ON p.id = d.parent_id
+      `).all() as { id: string; name: string; parent_id: string | null; parent_name: string | null; is_active: number }[])
+        .map((d) => [d.id, d]));
+
+      const columns: BydeptColumn[] = [];
+      // Store / Overall is the comparison baseline, so it is shown to everyone
+      // who may read it even on a day it did not count — a column of "not
+      // counted" is the honest answer to "Store vs Departments". A department-
+      // scoped caller cannot read it (deptClause excludes ''), so has no column.
+      const storeInScope = seesAll && (!deptParam || deptParam === STORE_KEY);
+      if (storeInScope || counted.has('')) {
+        columns.push({
+          key: STORE_KEY, name: STORE_LABEL, group_key: STORE_KEY, group: STORE_LABEL,
+          is_store: true, is_main: false, is_active: true, counted: counted.has(''),
+        });
+      }
+      const deptCols: BydeptColumn[] = [];
+      for (const id of counted) {
+        if (!id) continue;
+        const m = deptMeta.get(id);
+        // Filed under the parent only when the parent row still exists — a
+        // dangling parent_id must not invent a heading with no name.
+        const parent = m?.parent_id && m.parent_name != null ? { id: m.parent_id, name: m.parent_name } : null;
+        const name = m?.name || `Unknown department (${id.slice(0, 8)})`;
+        deptCols.push({
+          key: id, name,
+          group_key: parent ? parent.id : id,
+          group: parent ? parent.name : name,
+          is_store: false,
+          is_main: !parent,
+          is_active: m ? Number(m.is_active) === 1 : false,
+          counted: true,
+        });
+      }
+      // Groups by name; inside a group the main department's own count first,
+      // then its sections by name. Ids break ties so the order never wobbles.
+      deptCols.sort((a, b) =>
+        a.group.localeCompare(b.group) || a.group_key.localeCompare(b.group_key) ||
+        (a.is_main === b.is_main ? 0 : a.is_main ? -1 : 1) ||
+        a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+      columns.push(...deptCols);
+      const colKeys = columns.map((c) => c.key);
+      const colOf = (deptId: string | null) => deptId || STORE_KEY;
+
+      // ── STEP 5: pivot — one row per ITEM ──────────────────────────────────
+      // Identity is type + id, never the name (a bought and a made "GINGER
+      // GARLIC PASTE" are two items). Every column key is written up front so
+      // a missing count is an explicit null, not an absent property.
+      const blankCells = (): Record<string, BydeptCell | null> => {
+        const o: Record<string, BydeptCell | null> = {};
+        for (const k of colKeys) o[k] = null;
+        return o;
+      };
+      const newRow = (key: string, type: 'RAW' | 'SUB', material_id: string | null, sub_recipe_id: string | null,
+                      material: string, sku: string, category: string, purchase_unit: string): BydeptRow => ({
+        key, material_id, sub_recipe_id, type, material, sku, category, purchase_unit,
+        cells: blankCells(), total_qty: null, total_value: null, counted_in: 0, unpriced: 0, mixed_units: false,
+      });
+
+      const rawByKey = new Map<string, BydeptRow>();
+      for (const r of rawCells) {
+        const key = `RAW|${r.material_id}`;
+        let row = rawByKey.get(key);
+        if (!row) {
+          row = newRow(key, 'RAW', r.material_id, null, r.material, r.sku || '', r.category || '',
+                       r.purchase_unit || r.unit || '');
+          rawByKey.set(key, row);
+        }
+        // PURCHASE units via the shared helper — identical to the matrix cell.
+        // packFactor carries both halves of the guard; never divide by
+        // pack_size here.
+        const meta: PackMeta = { unit: r.unit, purchase_unit: r.purchase_unit, pack_size: r.pack_size };
+        // Stored rate and value only — identical to the matrix cell. Never
+        // re-priced: a count is a dated record.
+        const hasStoredRate = r.rate_per_purchase_unit != null;
+        const priced = hasStoredRate && String(r.rate_source || 'none') !== 'none';
+        row.cells[colOf(r.department_id)] = {
+          qty: toPurchaseQty(num(r.physical_stock), meta),
+          value: priced ? r2(num(r.total_value)) : null,
+          rate: priced ? r2(num(r.rate_per_purchase_unit)) : null,
+          unit: row.purchase_unit,
+        };
+      }
+
+      const semiByKey = new Map<string, BydeptRow>();
+      for (const s of semiCells) {
+        const key = `SUB|${s.sub_recipe_id}`;
+        // The count-time unit snapshot wins over the CURRENT yield_unit — the
+        // same dated-record rule as the matrix and the flat list. No pack
+        // factor: running a yield through packFactor is a category error.
+        const unit = String(s.unit || '').trim() || String(s.yield_unit || '').trim();
+        let row = semiByKey.get(key);
+        if (!row) {
+          row = newRow(key, 'SUB', null, s.sub_recipe_id, s.material, '', s.category || 'sub-recipe', unit);
+          semiByKey.set(key, row);
+        } else if (row.purchase_unit !== unit) {
+          // Two places counted it in different yield units (the unit was edited
+          // between their saves). Each cell keeps its own unit; the Total will
+          // not add kg to g.
+          row.mixed_units = true;
+        }
+        const priced = num(s.rate) > 0 || num(s.total_value) > 0;
+        row.cells[colOf(s.department_id)] = {
+          qty: num(s.physical_stock),
+          value: priced ? r2(num(s.total_value)) : null,
+          rate: priced ? r2(num(s.rate)) : null,
+          unit,
+        };
+      }
+
+      // ── STEP 6: the Total column, per row ─────────────────────────────────
+      // Adding ACROSS departments is valid because it is ONE item in ONE unit —
+      // the opposite of adding across items (2 BTL + 3 kg), which no column or
+      // footer here ever does. A RAW cell is already rounded to 3 dp by
+      // toPurchaseQty, so a RAW Total foots exactly against its printed row. A
+      // SUB cell is stored as counted; the sum is taken at full precision and
+      // rounded once (the 3-dp house rule, owner-kept), so a semi-finished count
+      // entered with MORE than 3 decimals can differ from the sum of its printed
+      // cells by under 0.001 per cell (1.0004 + 1.0004 prints 1 + 1, Total 2.001).
+      const finishRow = (row: BydeptRow) => {
+        let qty = 0, value = 0, valued = 0;
+        for (const k of colKeys) {
+          const c = row.cells[k];
+          if (!c) continue;
+          row.counted_in += 1;
+          qty += c.qty;
+          if (c.value != null) { value += c.value; valued += 1; } else row.unpriced += 1;
+        }
+        row.total_qty = row.mixed_units ? null : csvQty(qty);
+        row.total_value = valued ? r2(value) : null;
+      };
+      // A–Z in EXACTLY the order STEP 3's SQL read the cells (name COLLATE
+      // NOCASE, then id): SQLite NOCASE folds only ASCII A–Z and compares the
+      // UTF-8 bytes, which is what nocaseKey + a byte compare reproduce. So if
+      // ROW_CAP ever cuts the day, the rows shown are a true prefix of the list
+      // and no item is missing ahead of the last one shown — localeCompare
+      // could order a name with ~ { | } or a non-ASCII letter differently.
+      // (Identical to localeCompare on every name on file today.)
+      const nocaseKey = (s: string) => Buffer.from(String(s ?? '').replace(/[A-Z]/g, (c) => c.toLowerCase()), 'utf8');
+      const byName = (list: BydeptRow[]): BydeptRow[] => list
+        .map((row) => ({ row, k: nocaseKey(row.material) }))
+        .sort((a, b) => Buffer.compare(a.k, b.k) || (a.row.key < b.row.key ? -1 : a.row.key > b.row.key ? 1 : 0))
+        .map((x) => x.row);
+      const rows = byName([...rawByKey.values()]);
+      const semiRows = byName([...semiByKey.values()]);
+      for (const row of rows) finishRow(row);
+      for (const row of semiRows) finishRow(row);
+
+      // ── STEP 7: ₹ per column, per block, and both blocks together ─────────
+      // Only ₹ is totalled down a column (never quantities). The stored value
+      // per cell, summed — the same figure History already sums, never
+      // re-priced. Computed after truncation so the totals describe exactly
+      // the rows the reader can see.
+      const zeroTotal = (): BydeptTotal => ({ lines: 0, value: 0, unpriced: 0 });
+      const blockTotals = (list: BydeptRow[]): BydeptBlockTotals => {
+        const by_column: Record<string, BydeptTotal> = {};
+        for (const k of colKeys) by_column[k] = zeroTotal();
+        const total = { ...zeroTotal(), items: list.length };
+        for (const row of list) {
+          for (const k of colKeys) {
+            const c = row.cells[k];
+            if (!c) continue;
+            const t = by_column[k];
+            t.lines += 1; total.lines += 1;
+            if (c.value != null) { t.value += c.value; total.value += c.value; }
+            else { t.unpriced += 1; total.unpriced += 1; }
+          }
+        }
+        for (const k of colKeys) by_column[k].value = r2(by_column[k].value);
+        total.value = r2(total.value);
+        return { by_column, total };
+      };
+      const rawTotals = blockTotals(rows);
+      const semiTotals = blockTotals(semiRows);
+      const allTotals: BydeptBlockTotals = {
+        by_column: {},
+        total: {
+          items: rawTotals.total.items + semiTotals.total.items,
+          lines: rawTotals.total.lines + semiTotals.total.lines,
+          value: r2(rawTotals.total.value + semiTotals.total.value),
+          unpriced: rawTotals.total.unpriced + semiTotals.total.unpriced,
+        },
+      };
+      for (const k of colKeys) {
+        const a = rawTotals.by_column[k], b = semiTotals.by_column[k];
+        allTotals.by_column[k] = { lines: a.lines + b.lines, value: r2(a.value + b.value), unpriced: a.unpriced + b.unpriced };
+      }
+
+      const bnote = truncated
+        ? `Showing the first ${(rows.length + semiRows.length).toLocaleString('en-IN')} items counted on ${date} — the day holds more. Search for an item to see the rest.`
+        : null;
+
+      if (format === 'csv') {
+        // The ONE Store vs Departments CSV layout (src/lib/closing-bydept-csv.ts)
+        // — the page's Download builds the same file in the browser from the
+        // sheet on screen with this very function, so the two cannot drift.
+        const csv = bydeptCsv({
+          date, columns, rows, semi_rows: semiRows,
+          totals: { raw: rawTotals, semi: semiTotals, all: allTotals },
+          truncated, note: bnote, q,
+        });
+        return new Response(csv, {
+          headers: {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${bydeptCsvFilename(date, q)}"`,
+            'Cache-Control': 'no-store',
+            ...(truncated ? { 'X-Truncated': '1' } : {}),
+          },
+        });
+      }
+
+      return Response.json({
+        mode: 'bydept',
+        date,
+        latest_date: countDates[0] ?? null,
+        count_dates: countDates,
+        scope: seesAll ? 'all' : 'limited',
+        columns,
+        rows,
+        semi_rows: semiRows,
+        totals: { raw: rawTotals, semi: semiTotals, all: allTotals },
+        cap: ROW_CAP,
+        truncated,
+        note: bnote,
         generated_at: new Date().toISOString(),
       });
     }
