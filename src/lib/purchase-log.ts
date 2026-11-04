@@ -93,14 +93,19 @@ import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-su
  * RATES — two legitimate rates for the same line
  * ═══════════════════════════════════════════════════════════════════════════
  * GRN rate is GROSS (what the bill document says, discount in its own column).
- * purchases.unit_price is NET of the allocated discount, because
+ * purchases.unit_price is USUALLY NET of the allocated discount, because
  * updateMaterialPrice() averages SUM(qty × unit_price)/SUM(qty) and never
- * reads a discount column. The receive route therefore writes purchases
- * .discount as a LITERAL 0 on that path — a zero in the Discount column of a
- * PURCHASE row does NOT mean "no discount was given", it means the discount is
- * already inside the rate and lives, itemised, on the GRN row that shares this
- * row's link_key. The report shows both rates, labelled by source, and never
- * reconciles them silently.
+ * reads a discount column. The PO receive route always writes purchases
+ * .discount as a LITERAL 0 (the ad-hoc GRN, QC sign-off and amendment do too
+ * whenever they net) — so a zero in the Discount column of a PURCHASE row does
+ * NOT mean "no discount was given"; usually the discount is already inside the
+ * rate and lives, itemised, on the GRN row that shares this row's link_key.
+ * Some PURCHASE rows are GROSS instead: the netting fallback (a net rate ≤ 0),
+ * an amendment of a gross row and an amendment's new row for an ad-hoc line
+ * keep the gross rate and record the discount in the column; ad-hoc GRN rows
+ * written before 9b927e2 are gross with the discount on the GRN line only.
+ * The report shows both rates, labelled by source, and never reconciles them
+ * silently.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * OTHER DECISIONS, STATED SO THEY CAN BE ARGUED WITH
@@ -144,34 +149,46 @@ import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-su
  * ═══════════════════════════════════════════════════════════════════════════
  * TOTALS — WHAT MAY BE ADDED, WHAT MAY NOT, AND WHY EACH REFUSAL IS PRINTED
  * ═══════════════════════════════════════════════════════════════════════════
- * The owner asked for a total and never said which one, so BOTH are produced
- * and both are labelled, per source, and never merged into one "Total":
+ * The owner asked for a total and never said which one, so the readings are
+ * produced side by side, each labelled, per source, and never merged into one
+ * "Total". Owner ruling 98 (2026-11-01: "Tax Less Values should also show in
+ * Total Amount Column as it Final Total amount should be in the Grand Total
+ * Column") named them — Total Amount BEFORE tax, Grand Total after:
  *
  *   GOODS VALUE  = SUM(value). Goods only — before tax, before every charge.
- *   TOTAL AMOUNT = SUM(value - discount + cgst + sgst + special_excise_cess
+ *   TOTAL AMOUNT = SUM(value - discount). BEFORE tax and every charge.
+ *                  Carried per row as `total_amount`.
+ *   GRAND TOTAL  = SUM(value - discount + cgst + sgst + special_excise_cess
  *                      + compensation_cess + tcs + delivery_charges
  *                      + mrp_round_off)
  *                  i.e. the app's OWN per-line total, the identical expression
- *                  /api/grn, /api/purchases and the Purchases page already use.
- *                  Carried per row as `total_amount` so the column and the
- *                  total cannot drift, and so the footer foots the column.
+ *                  /api/grn, /api/purchases and the Purchases page already use
+ *                  (this log called it "Total Amount" until ruling 98).
+ *                  Carried per row as `grand_total`, totalled as `bill_amount`.
+ * Each is carried per row so the column and the total cannot drift, and so
+ * the footer foots the column.
  *
  * Everything above is summed WITHIN ONE SOURCE and never across sources — the
  * double-count in the block at the top of this file is unchanged by any of it.
  *
  * COLUMNS THAT GET NO TOTAL, AND THE REASON THAT SHIPS WITH EACH:
  *   • qty  — every row is in ITS OWN purchase unit. 3 CASE + 12 kg is not 15.
- *   • rate — Rs per purchase unit, and GROSS on GRN rows vs NET on PURCHASE
- *            rows. Summing rates adds prices, not money.
- *   • discount, on PURCHASE rows only — the column is a literal 0 on every row
- *            a receipt wrote (PO receive puts the reduction inside the rate at
- *            receive/route.ts:1080; the ad-hoc GRN writer binds no discount at
- *            all, grn/route.ts:438), so a total of it would read "Rs 0 discount"
- *            on bills that plainly carried one. It IS totalled on the GRN
- *            block, where both writers share one basis (gross value + the real
- *            allocated share). What each PURCHASE row does carry is still
- *            netted off inside Total Amount, and the figure netted is published
- *            as `discount_netted` so the arithmetic on screen always foots.
+ *   • rate — Rs per purchase unit, and GROSS on GRN rows vs USUALLY NET on
+ *            PURCHASE rows (see RATES). Summing rates adds prices, not money.
+ *   • discount, on PURCHASE rows only — the column is not on one basis.
+ *            Receipts usually net the discount into the rate and write 0 here
+ *            (PO receive always; ad-hoc GRN and QC sign-off whenever netting
+ *            leaves a rate above 0; an amendment only when the row it rewrites
+ *            was already net and netting still leaves a rate above 0); the
+ *            netting fallback and the amendment cases in RATES write the share
+ *            here at a gross rate; ad-hoc rows before 9b927e2 carry it nowhere
+ *            on the row unless an amendment has since rewritten them. A total
+ *            would read near "Rs 0 discount" on bills that plainly carried one.
+ *            It IS totalled on the GRN block, where every writer records gross
+ *            value + the real allocated share. What each PURCHASE row does
+ *            carry is still netted off inside Total Amount, and the figure
+ *            netted is published as `discount_netted` (the screen's "less
+ *            discount") so the arithmetic on screen always foots.
  * These refusals are DATA, not prose in a component: PURCHASE_LOG_NO_TOTAL_NOTES
  * ships on every payload so the screen and the CSV state them identically.
  *
@@ -184,7 +201,8 @@ import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-su
  *
  * TAX VALUE (GST) / TAX % APPLIED (GST) (same date, same ruling) are read off
  * the BILL DOCUMENT — the row's own CGST + SGST, except on a PURCHASE row booked
- * by a PO receive, whose GST lives only on its GRN line and is read from there
+ * by a PO receive, whose GST lives on its GRN line (only there, unless an
+ * amendment of that line later wrote it onto the row too) and is read from there
  * (tax_value / tax_percent / tax_from_grn, gst_value on the totals). That is
  * the rail the Purchase Report Summary sums, so the PURCHASE tax total equals
  * its GST for the same filters. The RATE is struck on the value GST was
@@ -193,45 +211,72 @@ import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-su
  * GRN Inward Register and this log's GRN row strike it — so the PURCHASE and
  * GRN rows of one delivery print one rate. On exactly those lines the
  * Summary's rate (received base) reads lower; tax_base_accepted /
- * gst_base_accepted_lines carry the disclosure. The eight RECORDED charge columns, Total Amount
- * and every total built on them are unchanged; on a mirror row the tax columns
- * and the recorded CGST/SGST columns therefore differ, and both renderers say why.
+ * gst_base_accepted_lines carry the disclosure. The eight RECORDED charge columns, Total Amount,
+ * Grand Total and every total built on them are unchanged; on a mirror row the tax columns
+ * and the recorded CGST/SGST columns therefore can differ (they agree once an
+ * amendment has written the GRN line's GST onto the row), and both renderers say why.
  *
- * KNOWN, DISCLOSED IMPRECISION (a writer defect, not a reporting choice): an
- * ad-hoc GRN mirrors GROSS value into `purchases` and copies no discount, so
- * Total Amount on those PURCHASE rows is high by the discount their GRN line
- * records. The GRN block states that discount in full. Fixing it means changing
- * grn/route.ts, which this report does not own.
+ * KNOWN, DISCLOSED IMPRECISION (historical, a writer defect, not a reporting
+ * choice): ad-hoc GRN rows written before grn/route.ts began netting the
+ * discount into the rate (9b927e2, 2026-08-24) mirrored GROSS value into
+ * `purchases` and copied no discount (nor any of the bill's GST or charges),
+ * so Total Amount on THOSE PURCHASE rows is high by the discount their GRN
+ * line records (8 such GRN lines on the 2026-11-01 DB copy, all dated
+ * 2026-08-07), and Grand Total is high by that discount but low by the GST
+ * and charges the row never carried — net it usually reads low (all of them
+ * do on that copy, the GST being the larger), but a large discount on a
+ * low-GST line can make it read high. Current
+ * writers either net it into the rate or, at a gross rate, record it in the
+ * column (the netting fallback and the amendment cases in RATES). The GRN
+ * block states that discount in full. Nothing has corrected those old rows
+ * in bulk; an amendment of one rewrites that one row.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * ⚠ GOODS VALUE ON PURCHASE ROWS IS NOT RELIABLY TAX-EXCLUSIVE — READ BEFORE
- *   TRUSTING A GOODS VALUE OR TOTAL AMOUNT FIGURE ON A PURCHASE ROW
+ *   TRUSTING A GOODS VALUE, TOTAL AMOUNT OR GRAND TOTAL FIGURE ON A PURCHASE ROW
  * ═══════════════════════════════════════════════════════════════════════════
  * `value` on the PURCHASE branch is `COALESCE(p.total_price, p.quantity *
  * p.unit_price)`. That column is supposed to hold the GOODS figure only. It
- * does not, for a large share of the table: the bulk inward-import path (see
- * src/app/api/inward-import/commit/route.ts:214-219, whose own comment
- * documents the fix) used to bind `total_price` from the vendor sheet's
- * TAX-INCLUSIVE total instead of quantity × rate, and no CGST/SGST split was
- * ever recorded for those rows. That binding is now fixed for NEW rows, but
- * nothing backfilled the ones already written — measured on the full table:
- * 2,165 PURCHASE rows total, 2,118 of them from that import path (April 2026),
- * SUM(total_price) = Rs 6,926,866.40 vs SUM(quantity × unit_price) =
- * Rs 6,770,245.24 — a Rs 156,621.16 gap that is tax sitting inside a column
- * labelled "goods only, before tax".
+ * does not, on some rows: the one-off bulk import of the April 2026 inward
+ * sheet (scripts/import-recaho-inward.js as of 025e0ec, run once on
+ * 2026-05-12 — every April-dated row carries its "Invoice: … · Inward: …"
+ * note and that one created_at) bound `total_price` to the sheet's TOTAL
+ * INWARD AMOUNT, which includes GST, TGBCL TCS / special excise cess, delivery
+ * and MRP round-off (the importer at src/app/api/inward-import/commit/route.ts
+ * ~256-305 now binds quantity × rate and documents that formula), and wrote no
+ * discount, tax or charge columns for those rows. Nothing backfilled them —
+ * measured on the full table: 2,165 PURCHASE rows total, 2,118 of them dated
+ * April 2026 from that import, 219 of which differ from quantity × rate (on
+ * the rest value matches quantity × rate, which does NOT prove them tax-free:
+ * db.ts's price_basis_repair_v1 set unit_price = total_price / quantity on
+ * some pack-size rows); SUM(total_price) = Rs 6,926,866.40 vs
+ * SUM(quantity × unit_price) = Rs 6,770,245.24 — a Rs 156,621.16 net gap
+ * (Rs 156,621.20 on the 221 rows that differ — those 219 plus two 2026-08
+ * rows at −0.01 each — less a few paise of rate rounding on the rest) that
+ * is almost all tax and charges sitting inside a column labelled "goods only,
+ * before tax" (Rs 116,296.09 of it on GOVERNMENT OF TELANGANA liquor lines
+ * that carry no GST at all — TGBCL TCS + special excise cess).
  *
- * Because those same rows carry cgst = sgst = 0 (never split out), TOTAL
- * AMOUNT — goods value + tax — computes to the exact SAME number as GOODS
- * VALUE for them. The two figures this report exists to keep apart are, on
- * the owner's most likely view, identical, and the tax is inside both.
+ * Because those same rows carry no discount, tax or charge of their own (0 of
+ * the 2,118 on the 2026-11-03 DB copy), TOTAL AMOUNT — value less discount,
+ * the "before tax" figure — and GRAND TOTAL — that plus tax and charges — both
+ * compute to the exact SAME number as GOODS VALUE for them. The figures this
+ * report exists to keep apart are, on the owner's most likely view, identical,
+ * and where the sheet's total included tax and charges they are inside all
+ * three: the "before tax" Total Amount holds them.
  *
- * A SECOND, separate effect on PURCHASE rows created by receiving a GRN: those
- * rows carry no GST/cess/TCS/round-off of their own (the tax lives only on
- * the GRN line, per the "RATES" section above), so TOTAL AMOUNT on a mirrored
- * PURCHASE row reads goods value only — measured on the mirrored lines in this
- * database at roughly 17.6% LOW against the true GRN bill. For those
- * deliveries the GRN block's own Total Amount is the trustworthy figure, not
- * the PURCHASE mirror.
+ * A SECOND, separate effect on PURCHASE rows created by a goods receipt: some
+ * carry little or none of the bill's GST and charges themselves. A row booked
+ * straight by a PO receive (no QC hold) records only its delivery share — no
+ * GST, cess, excise, TCS or round-off — until an amendment of its GRN line
+ * writes CGST/SGST/comp. cess onto it; ad-hoc rows before 9b927e2 carried no
+ * GST of their own either (nor the discount — see KNOWN, DISCLOSED
+ * IMPRECISION above). GRAND TOTAL on such a row does not match the GRN bill
+ * and usually reads LOW against it (an old ad-hoc row can read high, by its
+ * missing discount): on the 31 GRN-paired lines of the 2026-11-01 DB copy
+ * (20 from a PO receive, 11 older ad-hoc), 25,330.00 vs 30,732.20, roughly
+ * 17.6% low. For those deliveries read the GRN rows, not the PURCHASE
+ * mirror (the Tax Value column already reads that GST off the GRN line).
  *
  * THIS IS A DATA PROBLEM, NOT A DISPLAY BUG, and re-deriving the contaminated
  * rows is a separate, unapproved job. `goods_value_tax_suspect` /
@@ -239,8 +284,8 @@ import { getPurchaseBillSummary, type PurchaseBillRow } from './purchase-bill-su
  * `PurchaseLogTotals.goods_value_caveat` exist so this report SURFACES the
  * problem, quantified for whatever window is on screen, rather than hiding it
  * behind a total that foots to the paisa and is still wrong. Render
- * `goods_value_caveat` verbatim, prominently, wherever GOODS VALUE or TOTAL
- * AMOUNT is shown — screen and download alike.
+ * `goods_value_caveat` verbatim, prominently, wherever GOODS VALUE, TOTAL
+ * AMOUNT or GRAND TOTAL is shown — screen and download alike.
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,21 +315,37 @@ export interface PurchaseLogRow {
   /** ALREADY in purchase units — never multiplied by pack_size. */
   qty: number;
   purchase_unit: string;
-  /** ₹ per PURCHASE unit. GROSS on GRN rows, NET of discount on PURCHASE rows. */
+  /** ₹ per PURCHASE unit. GROSS on GRN rows; usually NET of discount on PURCHASE rows (gross on some — see RATES). */
   rate: number;
-  /** qty × rate. Excludes the 8 recorded-only charges below. */
+  /**
+   * The goods figure: qty × rate, except on PURCHASE rows, where it is the
+   * stored total_price — which can differ (tax inside it on old import rows, or
+   * a paisa of rate rounding; see goods_value_tax_suspect). Excludes the 8
+   * recorded-only charges below.
+   */
   value: number;
   /**
-   * THE BILL FIGURE for this line: value − discount + cgst + sgst
-   * + special_excise_cess + compensation_cess + tcs + delivery_charges
-   * + mrp_round_off — the same expression /api/grn, /api/purchases and the
-   * Purchases page use, so this report foots against them.
+   * TOTAL AMOUNT — this line BEFORE tax: value − discount (owner ruling 98).
+   * ⚠ On some PURCHASE rows (dated April 2026, from the old bulk import) value
+   * may already hold the vendor's tax and charges (never split out), and then
+   * so does this figure — see goods_value_caveat.
    *
    * null on PO rows, and null rather than 0 deliberately: purchase_order_items
-   * has no charge columns at all, so an ordered line has a goods value and no
-   * bill amount. A 0 there would assert "this order will cost nothing extra".
+   * has no charge columns at all — not even a discount — so an ordered line has
+   * a goods value and no bill amount. A 0 there would assert a bill nobody sent.
    */
   total_amount: number | null;
+  /**
+   * GRAND TOTAL — THE BILL FIGURE for this line: total_amount + cgst + sgst
+   * + special_excise_cess + compensation_cess + tcs + delivery_charges
+   * + mrp_round_off, i.e. value − discount + every recorded charge — the same
+   * expression /api/grn, /api/purchases and the Purchases page use, so this
+   * report foots against them. This log's "Total Amount" until ruling 98.
+   *
+   * null on PO rows, for the reason above. A 0 there would assert "this order
+   * will cost nothing extra".
+   */
+  grand_total: number | null;
   /** GRN rows only (units turned away at QC); null on PURCHASE/PO rows. */
   qty_rejected: number | null;
   // ── Recorded-only charges. null on PO rows (no such columns exist there).
@@ -309,7 +370,8 @@ export interface PurchaseLogRow {
    * (owner #5, ruling 93). On a GRN or an ordinary PURCHASE row that is the
    * row's own cgst + sgst. On a PURCHASE row booked by a PO receive it is the
    * paired GRN line's, because that route records the GST on the GRN line only
-   * and leaves this row's cgst/sgst at 0 — the same effective rail the Purchase
+   * and leaves this row's cgst/sgst at 0 (an amendment of the GRN line may later
+   * write them onto the row) — the same effective rail the Purchase
    * Report Summary and the Bill Summary read, so the figure equals theirs.
    * The recorded cgst / sgst fields above are NOT changed by this.
    *
@@ -340,7 +402,7 @@ export interface PurchaseLogRow {
    * own `total_bill_value` for that bill, over the same date window, so the two
    * reports print one number per bill (owner #5, ruling 93).
    *
-   * NOT a per-line figure and NOT this line's Total Amount: the SAME number is
+   * NOT a per-line figure and NOT this line's Total Amount or Grand Total: the SAME number is
    * repeated on every line of the bill — the PURCHASE row and the GRN row of one
    * delivery alike — so it must NEVER be added down the column. Nothing in this
    * file or the route totals it; PURCHASE_LOG_NO_TOTAL_NOTES says why.
@@ -422,9 +484,10 @@ export interface PurchaseLogSourceMoney {
   /** SUM(discount). null on PURCHASE — see the note; totalled on GRN. */
   discount: number | null;
   /**
-   * What was ACTUALLY deducted inside bill_amount on this source. Published
-   * even where `discount` is refused, so goods_value − discount_netted + tax
-   * + other_charges always re-adds to bill_amount on screen and in the file.
+   * What was ACTUALLY deducted inside total_amount and bill_amount on this
+   * source. Published even where `discount` is refused, so goods_value −
+   * discount_netted re-adds to total_amount and + tax + other_charges to
+   * bill_amount, on screen and in the file.
    * It is the deduction, NOT a statement of discount received.
    */
   discount_netted: number;
@@ -445,19 +508,31 @@ export interface PurchaseLogSourceMoney {
   /** special_excise_cess + compensation_cess + tcs + delivery + round-off. */
   other_charges: number | null;
   /**
-   * THE bill total: goods_value − discount_netted + tax_cgst_sgst
-   * + other_charges. null on PO (an order is not a bill).
+   * THE TOTAL AMOUNT COLUMN'S TOTAL — before tax: SUM(value − discount), i.e.
+   * goods_value − discount_netted (owner ruling 98). null on PO (an order is
+   * not a bill).
+   */
+  total_amount: number | null;
+  /**
+   * THE bill total, and THE GRAND TOTAL COLUMN'S TOTAL: goods_value −
+   * discount_netted + tax_cgst_sgst + other_charges. null on PO (an order is
+   * not a bill).
    */
   bill_amount: number | null;
   /**
-   * SUM(value) − SUM(quantity × rate) for THIS source, over this window.
-   * Should be 0 — `value` IS quantity × rate (or falls back to it) on every
-   * branch. Nonzero means the stored value disagrees with the line's own
-   * quantity × rate. The known cause, on PURCHASE, is `total_price` written
-   * by the pre-fix inward-import path (see the file header) — never 0 on its
-   * own, always the tax/charges sitting inside a "goods value" that should
-   * not contain them. Real for GRN/PO too if it ever appears there, by the
-   * same arithmetic — nothing here is source-specific except the known cause.
+   * SUM(value) − SUM(quantity × rate) for THIS source, over this window — a
+   * NET figure over every line, not only the lines counted below.
+   * Should be 0 — `value` is meant to be quantity × rate on every branch (the
+   * PURCHASE branch reads the stored total_price, falling back to quantity ×
+   * rate). Nonzero means the stored value disagrees with the line's own
+   * quantity × rate. The main known cause, on PURCHASE, is `total_price`
+   * written by the pre-fix inward-import path (see the file header) — the
+   * tax/charges sitting inside a "goods value" that should not contain them.
+   * A paisa or two either way is rate rounding instead (two 2026-08 rows on
+   * the 2026-11-01 DB copy read −0.01 each), so the live caveat names tax,
+   * charges and rate rounding and never calls the figure tax alone. Real for
+   * GRN/PO too if it ever appears there, by the same arithmetic — nothing here
+   * is source-specific except the known cause.
    */
   goods_value_tax_suspect: number;
   /** Lines behind goods_value_tax_suspect — value ≠ quantity × rate (2dp). */
@@ -484,9 +559,10 @@ export interface PurchaseLogSourceMoney {
   /**
    * THE TAX VALUE (GST) COLUMN'S TOTAL — Σ of the rows' tax_value, i.e. the
    * bill document's CGST + SGST (the paired GRN line's on a PO receipt's
-   * mirror row). It differs from tax_cgst_sgst above only on those mirror
-   * rows, whose own columns record 0; tax_cgst_sgst stays the RECORDED figure
-   * because bill_amount (Total Amount) is built from it and must keep footing.
+   * mirror row). It can differ from tax_cgst_sgst above only on those mirror
+   * rows, whose own columns usually record 0 (an amendment of the GRN line can
+   * write GST onto the row); tax_cgst_sgst stays the RECORDED figure
+   * because bill_amount (Grand Total) is built from it and must keep footing.
    * null on PO. A 0 here is "no GST anywhere in this source" and renders blank.
    */
   gst_value: number | null;
@@ -529,30 +605,28 @@ export const PURCHASE_LOG_NO_TOTAL_NOTES: PurchaseLogNoTotalNote[] = [
   {
     column: 'Rate',
     reason:
-      'No total. A rate is rupees PER purchase unit, and the same delivery carries two of them: '
-      + 'GRN rows hold the vendor’s gross rate, PURCHASE rows the rate net of the allocated '
-      + 'discount. Adding rates adds prices, not money.',
+      'No total. A rate is rupees PER purchase unit, and the same delivery can carry two of them: '
+      + 'GRN rows hold the vendor’s gross rate, PURCHASE rows usually the rate net of the '
+      + 'discount (gross on some rows). Adding rates adds prices, not money.',
   },
   {
     column: 'Discount (on PURCHASE rows)',
     reason:
-      'No total on the PURCHASE block. That column is a literal 0 on every row a receipt wrote — '
-      + 'a PO receive puts the reduction inside the rate, and the ad-hoc GRN writer copies no '
-      + 'discount at all — so a total would read ₹0 discount on bills that plainly carried one. '
-      + 'It IS totalled on the GRN block, where every row shares one basis. Whatever a PURCHASE row '
-      + 'does record is still netted off inside Total Amount, and that deduction is shown.',
+      'No total on the PURCHASE block. Receipts usually fold the bill discount into the PURCHASE '
+      + 'row’s rate and leave this column at 0; some rows can carry it in this column instead, and '
+      + 'older receipt rows may carry it nowhere (only their GRN line does). The column is not on '
+      + 'one basis, so a total would '
+      + 'mislead. It IS totalled on the GRN block, where every row shares one basis. Whatever a '
+      + 'PURCHASE row does record here is netted off inside Total Amount.',
   },
   {
     column: 'Every charge column, across sources (discount, delivery, CGST, SGST, cess, excise, TCS, round-off)',
     reason:
-      'These are BILL-level figures split across the lines of one bill, so they total correctly '
-      + 'inside a single source and only there. A GRN receipt writes the SAME allocated figure '
-      + 'onto both the GRN line and the purchases row mirroring it, so the PURCHASE block and the '
-      + 'GRN block state ONE payment twice — never add a figure from one to the same figure in '
-      + 'the other. This used to be true of Discount and Delivery alone, because those were the '
-      + 'only charges a GRN-mirrored purchases row carried; every GRN writer now mirrors all '
-      + 'eight, so the whole set is duplicated across the two blocks and the whole set is listed '
-      + 'here. Read one block or the other for a bill total, never the sum.',
+      'These can only be totalled inside a single source (Discount not even on the PURCHASE block — '
+      + 'see its note). A goods receipt can copy some or all of a bill’s charges onto the PURCHASE row '
+      + 'as well as the GRN line, so the two blocks can state ONE payment twice: never add them '
+      + 'together. A row booked straight from a PO usually carries no GST or cess of its own; for '
+      + 'such a bill read its GRN rows.',
   },
   {
     column: 'Compensation Cess',
@@ -562,17 +636,19 @@ export const PURCHASE_LOG_NO_TOTAL_NOTES: PurchaseLogNoTotalNote[] = [
       + 'so the two will not agree with each other’s rate arithmetic, and they are not meant to.',
   },
   {
-    column: 'Total Amount (on PO rows)',
+    column: 'Total Amount and Grand Total (on PO rows)',
     reason:
-      'Blank, not zero. purchase_order_items stores no charge columns at all, so an ordered line '
-      + 'has a goods value and no bill amount until the delivery is received and billed.',
+      'Blank, not zero, in both. An order stores no charge columns at all — not even a '
+      + 'discount — so an ordered line has a goods value and no bill amount, before or after tax, '
+      + 'until the delivery is received and billed.',
   },
   {
     column: 'All three sources together',
     reason:
-      'There is no grand total and there never will be. Receiving a PO writes a GRN line AND the '
-      + 'purchases row mirroring it, so PURCHASE + GRN + PO reads roughly double the real spend. '
-      + 'Spend = the PURCHASE totals. Use the Link key to see the same delivery on two rows.',
+      'There is no grand total ACROSS the three sources, and there never will be. Receiving a PO usually writes a GRN line AND a '
+      + 'purchase entry that mirrors it, so PURCHASE + GRN + PO counts those goods more than once. '
+      + 'Spend = the PURCHASE totals, though a PURCHASE Grand Total may not match the bills (see the caveat). '
+      + 'Use the Link key to see the same delivery on two rows.',
   },
   {
     column: 'Bill Grand Total',
@@ -580,8 +656,9 @@ export const PURCHASE_LOG_NO_TOTAL_NOTES: PurchaseLogNoTotalNote[] = [
       'No total, on purpose. It is the grand total of the WHOLE bill a line sits on (Subtotal − '
       + 'discount + every tax and charge — the Purchase Bill Summary’s Grand Total for that bill), '
       + 'repeated on every line of that bill and on both the PURCHASE and the GRN row of one '
-      + 'delivery, so adding the column down counts each bill once per line. For the period’s '
-      + 'grand total use Reports → Purchase Bill Summary. Blank on PO lines: an order is not a bill. '
+      + 'delivery, so adding the column down counts each bill once per line. For what the period’s '
+      + 'bills come to, bill by bill, use Reports → Purchase Bill Summary (this log’s Grand Total '
+      + 'adds only what each row records). Blank on PO lines: an order is not a bill. '
       + 'On a line with no invoice, GRN or bill number the “bill” is that vendor’s unnumbered '
       + 'purchases for the day, which the Bill Summary groups as one bill and which can span '
       + 'several vendor invoices.',
@@ -633,8 +710,8 @@ export interface PurchaseLogTotals {
   /** Why the columns that have no total have none. Render verbatim. */
   no_total_notes: PurchaseLogNoTotalNote[];
   /**
-   * ⚠ Render verbatim, prominently, wherever GOODS VALUE or TOTAL AMOUNT is
-   * shown — screen and CSV alike. Explains why GOODS VALUE on PURCHASE rows
+   * ⚠ Render verbatim, prominently, wherever GOODS VALUE, TOTAL AMOUNT or GRAND
+   * TOTAL is shown — screen and CSV alike. Explains why GOODS VALUE on PURCHASE rows
    * is not reliably tax-exclusive (see the file header), then states the
    * LIVE figure for the window actually being viewed — computed once, here,
    * so every consumer shows the identical words and the identical number
@@ -671,7 +748,7 @@ export const PURCHASE_LOG_MAX_ROWS = 50_000;
 
 const TOTALS_BASIS =
   'PURCHASE = money booked (the spend). GRN = the same money restated at gross bill rates. '
-  + 'PO = ordered, not spent. These three DO NOT add up — adding them roughly doubles the spend.';
+  + 'PO = ordered, not spent. These three DO NOT add up — adding them counts the same goods more than once.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -729,7 +806,22 @@ function grnFromNoteTail(tail: unknown): string | null {
 const n0 = (v: number | null | undefined): number => (v == null ? 0 : v);
 
 /**
- * The per-line bill figure. ONE definition, used for the row column and (as the
+ * The per-line amount BEFORE tax — the TOTAL AMOUNT column (owner ruling 98):
+ * value − discount. ONE definition, used for the row column and (as the
+ * identical SQL expression in the aggregate) for the totals, so the footer
+ * always foots the column it sits under. PO rows get null, as in
+ * lineGrandTotal() below: an order has a goods value and no bill amount.
+ */
+function lineTotalAmount(r: {
+  source: PurchaseLogSource; value: number; discount: number | null;
+}): number | null {
+  if (r.source === 'PO') return null;
+  return r2(r.value - n0(r.discount));
+}
+
+/**
+ * The per-line bill figure — the GRAND TOTAL column (this log's "Total Amount"
+ * until ruling 98). ONE definition, used for the row column and (as the
  * identical SQL expression in the aggregate) for the totals, so the footer
  * always foots the column it sits under.
  *
@@ -738,7 +830,7 @@ const n0 = (v: number | null | undefined): number => (v == null ? 0 : v);
  * PO rows get null: purchase_order_items carries no charge columns, so an order
  * has a goods value and no bill amount.
  */
-function lineTotalAmount(r: {
+function lineGrandTotal(r: {
   source: PurchaseLogSource; value: number;
   discount: number | null; cgst: number | null; sgst: number | null;
   special_excise_cess: number | null; compensation_cess: number | null;
@@ -771,6 +863,7 @@ function emptyMoney(source: PurchaseLogSource): PurchaseLogSourceMoney {
     delivery_charges: noCharges ? null : 0,
     mrp_round_off: noCharges ? null : 0,
     other_charges: noCharges ? null : 0,
+    total_amount: noCharges ? null : 0,
     bill_amount: noCharges ? null : 0,
     goods_value_tax_suspect: 0,
     goods_value_tax_suspect_lines: 0,
@@ -793,18 +886,16 @@ function emptyMoney(source: PurchaseLogSource): PurchaseLogSourceMoney {
  * one CSV caption row without wrapping into an essay.
  */
 const GOODS_VALUE_CAVEAT_HEADLINE =
-  'GOODS VALUE is NOT reliably tax-exclusive on PURCHASE rows. A large share of purchase rows '
-  + '(bulk-imported in April 2026) had the vendor’s tax-INCLUSIVE bill total written into the '
-  + 'same column this report reads as "goods value", with no CGST/SGST split recorded and no '
-  + 'backfill since. On those rows GOODS VALUE and TOTAL AMOUNT print the IDENTICAL number, and '
-  + 'that number still has tax hidden inside it — do not treat GOODS VALUE as pre-tax spend '
-  + 'without checking further. Separately, and now HISTORICAL ONLY: PURCHASE rows created by '
-  + 'receiving a GRN used to carry no GST/cess/TCS/round-off of their own, so their TOTAL AMOUNT '
-  + 'read roughly 17.6% LOW against the true GRN bill. Every GRN writer now mirrors all eight '
-  + 'charge columns — ad-hoc receipt, QC sign-off and amendment alike — so rows recorded from '
-  + 'that change onward reconcile to the paisa against their GRN, and the PURCHASE row is the '
-  + 'one to trust. OLDER GRN-mirrored rows are still thin, and they are NOT being rewritten. '
-  + 'This is a data problem, not a display bug; it is disclosed here, not fixed here.';
+  'GOODS VALUE is NOT reliably tax-exclusive on PURCHASE rows. On some rows dated April 2026, from '
+  + 'an old bulk import, the column this report reads as "goods value" holds the vendor’s line total, '
+  + 'which can include tax and charges, with no split recorded. On those rows GOODS VALUE, TOTAL '
+  + 'AMOUNT and GRAND TOTAL print the IDENTICAL number, so do not treat GOODS VALUE or TOTAL AMOUNT '
+  + 'as pre-tax spend without checking further. '
+  + 'Separately, some PURCHASE rows created by a goods receipt do not record all of the bill’s '
+  + 'discount, GST and charges (usually rows booked straight from a PO, whose GST sits on the GRN '
+  + 'line, and older receipt rows), so their TOTAL AMOUNT and GRAND TOTAL can differ from the bill, '
+  + 'the GRAND TOTAL usually reading LOW; for those deliveries read the GRN rows. Older rows have '
+  + 'not been corrected in bulk. This is a data problem, disclosed here, not fixed here.';
 
 /**
  * The live half — how much of THIS filtered window is affected, not just that
@@ -813,18 +904,20 @@ const GOODS_VALUE_CAVEAT_HEADLINE =
  * table is.
  */
 function goodsValueCaveatDetail(m: PurchaseLogSourceMoney): string {
-  if (m.lines === 0) return 'No PURCHASE lines in this window.';
+  if (m.lines === 0) return 'No PURCHASE lines in this view (these dates and filters).';
   const plural = m.lines === 1 ? '' : 's';
   if (m.goods_value_tax_suspect_lines === 0) {
-    return `In THIS window: all ${m.lines} PURCHASE line${plural} have GOODS VALUE = quantity × rate `
-      + '— no sign of the import contamination in this filter (the issue is still real elsewhere '
-      + 'in the table; it simply is not present here).';
+    return `In THIS view (these dates and filters), GOODS VALUE = quantity × rate, to the paisa, on every PURCHASE line (${m.lines} line${plural}), `
+      + 'so this check finds no sign of the import problem here.';
   }
   const amt = m.goods_value_tax_suspect.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const lp = m.goods_value_tax_suspect_lines === 1 ? '' : 's';
-  return `In THIS window: ${m.goods_value_tax_suspect_lines} of ${m.lines} PURCHASE line${lp} have a `
-    + `GOODS VALUE that does not equal quantity × rate — Rs ${amt} of tax/charges is sitting `
-    + 'inside GOODS VALUE (and therefore inside TOTAL AMOUNT too) on those lines.';
+  // `amt` is the NET difference over every PURCHASE line in the view, not the
+  // flagged lines' own figure, and it can be negative — hence "over the whole
+  // view" and "minus", never "by Rs X on those lines".
+  return `In THIS view (these dates and filters), GOODS VALUE differs from quantity × rate on ${m.goods_value_tax_suspect_lines} PURCHASE line${lp} `
+    + `out of ${m.lines}. Over the whole view, GOODS VALUE minus quantity × rate comes to Rs ${amt} `
+    + '(tax, charges or rate rounding), and that difference is inside TOTAL AMOUNT and GRAND TOTAL too.';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1249,9 +1342,10 @@ export function getPurchaseLog(
   // ── TOTALS FIRST, over the FULL filtered set ──────────────────────────────
   // Computed by the database, not by summing the (possibly capped) rows, so the
   // cap can never quietly understate the spend.
-  // `bill_amount` is SUM(<the per-row expression>), not a combination of the
-  // column sums, so it is the same arithmetic in the same order as
-  // lineTotalAmount() does per row. Anything else and the footer stops footing
+  // `total_amount` and `bill_amount` are each SUM(<the per-row expression>),
+  // not a combination of the column sums, so each is the same arithmetic in the
+  // same order as lineTotalAmount() / lineGrandTotal() do per row (the Total
+  // Amount and Grand Total columns). Anything else and the footer stops footing
   // the column above it by a paisa or two, which is exactly the kind of drift
   // that makes an owner distrust the whole report.
   // withGrnCharges: the PURCHASE branch LEFT JOINs the grn_line CTE (for the
@@ -1270,6 +1364,9 @@ export function getPurchaseLog(
            COALESCE(SUM(tcs), 0)                                     AS tcs,
            COALESCE(SUM(delivery_charges), 0)                        AS delivery_charges,
            COALESCE(SUM(mrp_round_off), 0)                           AS mrp_round_off,
+           COALESCE(SUM(
+             COALESCE(value, 0) - COALESCE(discount, 0)
+           ), 0)                                                     AS total_amount,
            COALESCE(SUM(
              COALESCE(value, 0) - COALESCE(discount, 0)
              + COALESCE(cgst, 0) + COALESCE(sgst, 0)
@@ -1377,6 +1474,7 @@ export function getPurchaseLog(
       delivery_charges: noCharges ? null : r2(a.delivery_charges),
       mrp_round_off: noCharges ? null : r2(a.mrp_round_off),
       other_charges: noCharges ? null : other,
+      total_amount: noCharges ? null : r2(a.total_amount),
       bill_amount: noCharges ? null : r2(a.bill_amount),
       // Independent of noCharges: this checks `value` against the line's own
       // qty × rate, which is meaningful on every source, not only the ones
@@ -1437,9 +1535,9 @@ export function getPurchaseLog(
     // hold the bare grn_number (or '' when the line was never received).
     const grn = src === 'PURCHASE' ? grnFromNoteTail(r.link_raw) : (String(r.link_raw || '') || null);
     const materialId2 = String(r.material_id ?? '');
-    // Charges first — total_amount is derived from these exact values, so the
-    // row's own column and the SQL total are the same arithmetic on the same
-    // numbers rather than two readings of the database.
+    // Charges first — total_amount and grand_total are derived from these exact
+    // values, so the row's own columns and the SQL totals are the same
+    // arithmetic on the same numbers rather than two readings of the database.
     const charges = {
       discount: nullNum(r.discount),
       cgst: nullNum(r.cgst),
@@ -1475,7 +1573,8 @@ export function getPurchaseLog(
       purchase_unit: String(r.purchase_unit || ''),
       rate: num(r.rate),
       value,
-      total_amount: lineTotalAmount({ source: src, value, ...charges }),
+      total_amount: lineTotalAmount({ source: src, value, discount: charges.discount }),
+      grand_total: lineGrandTotal({ source: src, value, ...charges }),
       qty_rejected: r.qty_rejected == null ? null : num(r.qty_rejected),
       ...charges,
       // Material is part of the key so the PO line, the GRN line and the
@@ -1546,7 +1645,7 @@ export function getPurchaseLog(
 // blank, with that reason.
 //
 // IT MOVES NO OTHER FIGURE. Read-only SELECTs; nothing here touches `value`,
-// `total_amount`, a charge column, a totals field or the row order.
+// `total_amount`, `grand_total`, a charge column, a totals field or the row order.
 
 /** BILL KEY — restated from purchase-bill-summary.ts:1086-1092 (billKeyExpr,
  *  with fromPoReceiptSql :1016-1021 inlined) and checked against it per bill on
@@ -1789,7 +1888,8 @@ export const PURCHASE_LOG_COLUMNS: PurchaseLogColumn[] = [
   { key: 'purchase_unit',       label: 'Purchase Unit' },
   { key: 'rate',                label: 'Rate (Rs/purchase unit)', numeric: true },
   { key: 'value',               label: 'Value (Rs)', numeric: true },
-  { key: 'total_amount',        label: 'Total Amount (Rs, incl. tax & charges)', numeric: true },
+  { key: 'total_amount',        label: 'Total Amount (Rs, before tax: value - discount)', numeric: true },
+  { key: 'grand_total',         label: 'Grand Total (Rs, incl. tax & charges)', numeric: true },
   { key: 'qty_rejected',        label: 'Qty Rejected', numeric: true },
   { key: 'discount',            label: 'Discount', numeric: true },
   { key: 'cgst',                label: 'CGST', numeric: true },
