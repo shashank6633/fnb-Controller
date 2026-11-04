@@ -18,6 +18,7 @@
  * BLANK = not counted, '0' = counted and zero — the matrix CSV's rule.
  */
 import { csvQty } from './pack-units';
+import { CLOSING_INCL_CSV, CLOSING_TAX_CSV, type ClosingTaxTotals } from './closing-tax';
 
 export interface BydeptCsvColumn { key: string; name: string; group: string }
 /** unit-lock: `qty` is ALREADY in the purchase unit (semi-finished: its yield unit). */
@@ -35,12 +36,17 @@ export interface BydeptCsvRow {
 }
 export interface BydeptCsvTotal { lines: number; value: number; unpriced: number }
 export interface BydeptCsvBlock { by_column: Record<string, BydeptCsvTotal>; total: BydeptCsvTotal & { items: number } }
+/** Estimated GST on the RAW block (ruling 107), per column and in total —
+ *  the route's sumClosingTax / addClosingTaxTotals figures, printed as sent. */
+export interface BydeptCsvTax { by_column: Record<string, ClosingTaxTotals>; total: ClosingTaxTotals }
 export interface BydeptCsvSheet {
   date: string;
   columns: BydeptCsvColumn[];
   rows: BydeptCsvRow[];
   semi_rows: BydeptCsvRow[];
   totals: { raw: BydeptCsvBlock; semi: BydeptCsvBlock; all: BydeptCsvBlock };
+  /** null / absent: a sheet from a server without the GST lines — none printed. */
+  tax?: BydeptCsvTax | null;
   truncated: boolean;
   /** The route's truncation note (present whenever `truncated`). */
   note: string | null;
@@ -128,6 +134,30 @@ export function bydeptCsv(sheet: BydeptCsvSheet): string {
   };
   lines.push('');
   footer('raw materials', sheet.totals.raw);
+  // Estimated GST, raw materials only (semi-finished never carries GST). A
+  // column with no count that has both a rate and a value at count is BLANK,
+  // never 0 — "no tax worked out" is not "₹0 tax". The Total incl. GST covers
+  // only those counts, so the third line says how many that is per column.
+  if (sheet.tax) {
+    const tx = sheet.tax;
+    const fig = (x: ClosingTaxTotals | undefined, f: 'tax' | 'total_incl_tax') => (x && x.taxed > 0 ? x[f] : '');
+    const known = (x: ClosingTaxTotals | undefined) => (x && x.items > 0 ? `${x.rated} of ${x.items}` : '');
+    lines.push([
+      cell(`${CLOSING_TAX_CSV} — raw materials`), ...pad,
+      ...colKeys.map(() => ''), '',
+      ...colKeys.map((k) => fig(tx.by_column[k], 'tax')), fig(tx.total, 'tax'),
+    ].join(','));
+    lines.push([
+      cell(`${CLOSING_INCL_CSV} — raw materials; counts with a GST rate and a value at count only`), ...pad,
+      ...colKeys.map(() => ''), '',
+      ...colKeys.map((k) => fig(tx.by_column[k], 'total_incl_tax')), fig(tx.total, 'total_incl_tax'),
+    ].join(','));
+    lines.push([
+      cell('GST rate known for (counts) — raw materials'), ...pad,
+      ...colKeys.map(() => ''), '',
+      ...colKeys.map((k) => known(tx.by_column[k])), known(tx.total),
+    ].join(','));
+  }
   footer('semi-finished', sheet.totals.semi);
   footer('all', sheet.totals.all);
   lines.push('', ['Count date', date].join(','));
