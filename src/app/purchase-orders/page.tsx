@@ -3954,7 +3954,7 @@ function ContractFlag({ materialId, vendorId, unitPrice, onMatch }: {
   );
 }
 
-function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor, onBlockedPick }: {
+function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor, onBlockedPick, isLockedOut, onLockedPick }: {
   materialId: string;
   currentVendor: string;
   onPick: (v: EligibleVendor) => void;
@@ -3966,6 +3966,17 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
    *  map) — it is just not selectable. */
   isMappedVendor?: (v: EligibleVendor) => boolean;
   onBlockedPick?: (v: EligibleVendor) => void;
+  /** VENDOR LOCK (ruling 108, New PO only): while the header's "Use <vendor>
+   *  for every line" tick is on, the line's vendor is not the buyer's to change
+   *  from here — a chip click used to rewrite it, which would silently undo the
+   *  lock. Chips for any OTHER vendor stay visible (their past rates are still
+   *  worth seeing) but greyed, and a click explains instead of switching.
+   *  Omitted everywhere else, so those screens behave exactly as before.
+   *  `unmapped` tells the explanation whether unticking is ENOUGH: a chip that
+   *  is locked out AND not mapped to the item stays blocked after unticking,
+   *  so its text has to name both steps or it promises something untrue. */
+  isLockedOut?: (v: EligibleVendor) => boolean;
+  onLockedPick?: (v: EligibleVendor, unmapped: boolean) => void;
 }) {
   const [list, setList] = useState<EligibleVendor[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3992,13 +4003,24 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
         // > 0, not != null: a ₹0 contract row means no rate was agreed, so it must
         // not show as a contract chip nor be picked as the line rate.
         const hasContract = Number(v.contract_price) > 0;
-        const blocked = !!isMappedVendor && !isMappedVendor(v);
+        // Two separate facts. The lock decides which click handler runs (a
+        // locked-out chip never reaches onPick or onBlockedPick), but the mapping
+        // is worked out on its own so a chip that is BOTH locked out and not
+        // mapped says both steps: unticking alone leaves it blocked as NOT MAPPED.
+        const lockedOut = !!isLockedOut && isLockedOut(v);
+        const unmapped = !!isMappedVendor && !isMappedVendor(v);
+        const blocked = !lockedOut && unmapped;
         return (
           <button
             key={v.vendor}
             type="button"
-            onClick={() => (blocked ? onBlockedPick?.(v) : onPick(v))}
+            onClick={() => (lockedOut ? onLockedPick?.(v, unmapped) : blocked ? onBlockedPick?.(v) : onPick(v))}
             title={[
+              lockedOut
+                ? (unmapped
+                    ? 'LOCKED and NOT MAPPED to this item — to pick this vendor for this line, untick the box under the header Vendor AND map the pair on Vendor Items'
+                    : 'LOCKED — every line uses the header vendor; untick the box under it to pick this vendor for this line')
+                : null,
               blocked ? 'NOT MAPPED to this item — map the pair on Vendor Items before ordering' : null,
               `${v.purchase_count} purchase${v.purchase_count > 1 ? 's' : ''}`,
               v.last_date ? `last ${v.last_date}` : null,
@@ -4009,7 +4031,7 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
               v.lead_time_days ? `${v.lead_time_days}d lead` : null,
             ].filter(Boolean).join(' · ')}
             className={`text-[10px] px-1.5 py-0.5 rounded border transition ${
-              blocked
+              blocked || lockedOut
                 ? 'bg-[#F7F1E9] text-[#A08B76] border-dashed border-[#D4B896] cursor-not-allowed'
                 : active
                   ? 'bg-[#af4408] text-white border-[#af4408]'
@@ -4018,7 +4040,7 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
                     : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3]'
             }`}
           >
-            {blocked && <span className="mr-0.5">🔒</span>}
+            {(blocked || lockedOut) && <span className="mr-0.5">🔒</span>}
             {v.vendor}
             {hasContract ? (
               <span className={`ml-1 font-mono font-semibold ${active ? 'text-white' : 'text-emerald-700'}`}>
@@ -4195,7 +4217,9 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' },
   ]);
   const [saving, setSaving] = useState(false);
-  // STRICT MAPPING. The header vendor is a convenience that seeds every line;
+  // STRICT MAPPING. The header vendor is a convenience — with the "same vendor
+  // on every line" tick (below) it is WRITTEN onto every line, without it a
+  // line only narrows to it and takes it once an item is picked; either way
   // the rule is enforced per LINE, in both directions, off `vm` below.
   // `showAllMaterials` no longer bypasses anything — it reveals the items that
   // are NOT mapped to the line's vendor, greyed, each with a one-click "+ map"
@@ -4203,6 +4227,15 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   // without mapping it is not possible: the save would be refused anyway.
   const [primaryVendorId, setPrimaryVendorId] = useState<string>('');
   const [primaryVendorName, setPrimaryVendorName] = useState<string>('');
+  /* RULING 108 — "Use <vendor> for every line". Most POs here are one supplier,
+     and picking that supplier again on every line was the slowest part of
+     entering one. While this is on, the header vendor is WRITTEN onto every
+     line (vendor_id + vendor — the values that are saved, not just shown), each
+     line's Vendor box is locked, and lines added later arrive already set. It
+     turns on by itself whenever a header vendor is picked; unticking hands each
+     line back to per-line editing with the vendor it has now. Only meaningful
+     with a header vendor, so clearing the header turns it off. */
+  const [sameVendorAll, setSameVendorAll] = useState(false);
   const [showAllMaterials, setShowAllMaterials] = useState(false);
   const [vendorLoadError, setVendorLoadError] = useState('');
   const [mapBusy, setMapBusy] = useState(false);
@@ -4234,6 +4267,48 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   }, [primaryVendorId, vendors]);
 
   const headerItemCount = primaryVendorId ? vm.itemCount(primaryVendorId) : 0;
+
+  /* The lock is ON only while the tick is on AND the header vendor resolves to
+     a master row — a lock with nothing to lock to must never leave the lines
+     un-editable. */
+  const headerVendor = useMemo(() => vendors.find(v => v.id === primaryVendorId), [vendors, primaryVendorId]);
+  const vendorLocked = sameVendorAll && !!headerVendor;
+
+  /** Put one vendor on EVERY line, the values the save carries. Only the vendor
+   *  moves: the material, qty and rate stay exactly as typed, so a line whose
+   *  item is not mapped to this vendor shows the pair conflict below (map it,
+   *  untick, or remove the line) instead of being silently cleared. */
+  const setEveryLineVendor = (v: { id: string; name: string }) =>
+    setItems(prev => prev.map(it =>
+      it.vendor_id === v.id && it.vendor === v.name ? it : { ...it, vendor_id: v.id, vendor: v.name }));
+
+  /** Header vendor changed. Picking one turns the lock on and moves every line
+   *  to it (ruling 108: "ticked automatically whenever a header vendor is
+   *  picked" — so switching suppliers mid-entry carries the lines across).
+   *  Clearing it turns the lock off and leaves each line as it is, editable. */
+  const pickHeaderVendor = (id: string) => {
+    setPrimaryVendorId(id);
+    const v = id ? vendors.find(x => x.id === id) : undefined;
+    if (!v) { setSameVendorAll(false); return; }
+    setSameVendorAll(true);
+    setEveryLineVendor(v);
+  };
+
+  /** The tick itself. On → every line takes the header vendor now; off → no
+   *  line changes, they just become editable per line again. */
+  const toggleSameVendorAll = (on: boolean) => {
+    setSameVendorAll(on);
+    if (on && headerVendor) setEveryLineVendor(headerVendor);
+  };
+
+  /** Chips come from purchase HISTORY, which can name a vendor the master no
+   *  longer resolves by id. Re-resolve by name so the dropdown can actually show
+   *  the pick instead of falling back to the legacy option. ONE resolution for
+   *  both the chip pick and the lock check, so they can never disagree about
+   *  which vendor a chip is. */
+  const resolveChipVendor = (v: EligibleVendor) =>
+    vendors.find(x => x.id === v.vendor_id)
+    || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
 
   /** The two lists a line's item picker gets, resolved for the vendor that line
    *  will actually be saved against (its own vendor, else the header vendor).
@@ -4282,7 +4357,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     } finally { setMapBusy(false); }
   }, [vm]);
 
-  const addLine = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
+  // Both Add line buttons (desktop top, full-width bottom) come through here, so
+  // a line added while the vendor is locked arrives already carrying it.
+  const addLine = () => setItems(prev => [...prev, {
+    uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0,
+    vendor:    vendorLocked && headerVendor ? headerVendor.name : '',
+    vendor_id: vendorLocked && headerVendor ? headerVendor.id   : '',
+  }]);
   /* material_id → the 1-based line it already sits on. Feeds the picker so a
      material that is already on this PO can't be added twice (one material =
      one line: a duplicate double-orders and, on receive, bumps stock twice). */
@@ -4418,7 +4499,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
         // here first so the buyer is not told after a round trip.
         const bad = mappingProblem(i + 1, vm, it.vendor_id, it.vendor.trim(), it.material_id,
                                    mat ? `${mat.name}${mat.sku ? ` (${mat.sku})` : ''}` : it.material_id);
-        if (bad) problems.push(bad);
+        // mappingProblem's "pick a vendor that supplies it" points at the line's
+        // Vendor box, which the header tick has locked — so name the way to
+        // unlock it. Only once the mapping has loaded: the not-loaded message is
+        // about reloading, not about the vendor.
+        if (bad) problems.push(vendorLocked && vm.ready
+          ? `${bad} This line's vendor is locked by the "Use ${it.vendor.trim()} for every line" tick under the header Vendor — untick it first to pick another vendor for this line.`
+          : bad);
       }
     });
     if (problems.length) {
@@ -4469,29 +4556,56 @@ function CreatePOModal({ materials, onClose, onCreated }: {
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
-          {/* Header vendor is OPTIONAL: it seeds the line vendors and narrows the
-              material list to that vendor's mapped items. A PO that spans several
-              vendors just leaves it blank and sets the vendor per line. */}
+          {/* Header vendor is OPTIONAL: it narrows the material list to that
+              vendor's mapped items and, with the tick under it (on by default),
+              is set on every line. A PO that spans several vendors unticks it, or
+              leaves the header blank, and sets the vendor per line. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-              Vendor <span className="text-[#8B7355] font-normal">(optional — filters the item list)</span>
-              <select value={primaryVendorId} onChange={e => setPrimaryVendorId(e.target.value)}
-                      className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
-                <option value="">Select vendor…</option>
-                {vendors.map(v => <option key={v.id} value={v.id}>{v.name}{v.payment_terms ? ` · ${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d` : ''}</option>)}
-              </select>
+            {/* A div, not one big <label>: the tick below is a control of its
+                own, and nested inside the select's label a tap on its text
+                would land on the select instead. */}
+            <div className="text-xs text-[#6B5744] flex flex-col gap-1">
+              {/* The label says it sets every line's vendor because picking one
+                  turns the tick on. The select (and the tick) are held still
+                  while a "+ map & use" is saving: on a line added while unticked
+                  (empty vendor) that click writes the vendor as it stood when
+                  clicked, so a header switch mid-save would re-tick and then
+                  leave that line on the old vendor. */}
+              <label className="flex flex-col gap-1">
+                Vendor <span className="text-[#8B7355] font-normal">(optional — sets every line&apos;s vendor and filters the item list)</span>
+                <select value={primaryVendorId} onChange={e => pickHeaderVendor(e.target.value)}
+                        disabled={mapBusy}
+                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm disabled:opacity-60">
+                  <option value="">Select vendor…</option>
+                  {vendors.map(v => <option key={v.id} value={v.id}>{v.name}{v.payment_terms ? ` · ${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d` : ''}</option>)}
+                </select>
+              </label>
+              {headerVendor && (
+                <label className="flex items-start gap-1.5 text-[11px] text-[#2D1B0E] cursor-pointer">
+                  <input type="checkbox" className="mt-0.5 shrink-0 accent-[#af4408] disabled:opacity-60" checked={sameVendorAll}
+                         disabled={mapBusy}
+                         onChange={e => toggleSameVendorAll(e.target.checked)} />
+                  <span className="flex-1 min-w-0">Use <strong>{headerVendor.name}</strong> for every line</span>
+                </label>
+              )}
               {vendorLoadError && (
                 <span className="text-[10px] text-red-600">{vendorLoadError}</span>
               )}
+              {/* Says what the lines will actually do — the old "Seeds every
+                  line." sat above an empty line still reading "Select vendor…". */}
               {primaryVendorId && (
                 <span className="text-[10px] text-[#8B7355]">
                   {!vm.ready ? 'Loading the vendor → item mapping…' :
-                   headerItemCount > 0
-                     ? <>Seeds every line. <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>)</>
-                     : <>No items mapped to {primaryVendorName} yet.</>}
+                   headerItemCount === 0
+                     // The tick is on by default, so every line is locked to a
+                     // vendor that can supply nothing — name the way out here.
+                     ? <>No items mapped to {primaryVendorName} yet.{vendorLocked ? ' Untick to set a vendor per line.' : ''}</>
+                     : vendorLocked
+                       ? <>Every line is set to {primaryVendorName} (locked); <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>). Untick to set a vendor per line.</>
+                       : <>Vendor is set per line. A line with no vendor yet lists the <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} and takes {primaryVendorName} once an item is picked (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>).</>}
                 </span>
               )}
-            </label>
+            </div>
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
               PO Date
               <input type="date" value={date} onChange={e => setDate(e.target.value)}
@@ -4715,6 +4829,18 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                             : vendors;
                           return (
                             <>
+                            {vendorLocked ? (
+                              // LOCKED by the header tick (ruling 108): shown as a
+                              // read-only chip so it cannot be mistaken for a
+                              // dropdown. It reads the LINE's own vendor — the
+                              // value the save sends — never the header's, so
+                              // what is on screen is what gets filed.
+                              <div title={`Set by the header vendor — untick “Use ${it.vendor} for every line” to change it on this line`}
+                                   className={`w-full px-1.5 py-1 border rounded text-xs flex items-center gap-1 text-[#2D1B0E] ${pairConflict ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+                                <Lock className="w-3 h-3 shrink-0 text-[#B8A590]" />
+                                <span className="truncate">{it.vendor}</span>
+                              </div>
+                            ) : (
                             <select
                               value={legacy ? '__legacy__' : (it.vendor_id || '')}
                               disabled={!vm.ready}
@@ -4736,6 +4862,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                 </option>
                               ))}
                             </select>
+                            )}
                             {it.material_id && vm.ready && (
                               offered.length === 0 ? (
                                 <div className="text-[10px] text-red-700 mt-0.5">
@@ -4757,7 +4884,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                           onClick={async () => { await mapAndUse(it.vendor_id, lineVendorName || 'this vendor', mat); }}
                                           className="underline font-medium disabled:opacity-50">map it now</button>
                                 )}
-                                {' '}or pick a mapped vendor above.
+                                {/* The vendor box is locked while the tick is on,
+                                    so "pick another vendor" has to name the way
+                                    to unlock it rather than point at a dead box. */}
+                                {vendorLocked
+                                  ? (offered.some(v => vm.isMapped(v.id, it.material_id))
+                                      ? <>{' '}{mat ? 'or untick' : 'Untick'} &quot;Use {lineVendorName || 'this vendor'} for every line&quot; to pick a mapped vendor for this line, or remove the line.</>
+                                      : <>{' '}{mat ? 'or remove the line.' : 'Map it on Vendor Items or remove the line.'}</>)
+                                  : <>{' '}or pick a mapped vendor above.</>}
                               </div>
                             )}
                             </>
@@ -4771,23 +4905,39 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                             `${v.vendor} has bought this item for you before, but the pair is not mapped, so a PO line cannot be filed against it.\n\n` +
                             `Map "${mat?.name || 'the item'}" to ${v.vendor} on Vendor Items (${VENDOR_ITEMS_HREF}), then pick them here.`
                           )}
+                          // While locked, any chip that is not the line's own
+                          // vendor is greyed and explains itself on click.
+                          isLockedOut={vendorLocked ? (v => resolveChipVendor(v)?.id !== it.vendor_id) : undefined}
+                          onLockedPick={(v, unmapped) => alert(
+                            `Every line on this PO is set to ${it.vendor} — the "Use ${it.vendor} for every line" tick under the header Vendor.\n\n` +
+                            (unmapped
+                              // Unticking alone is not enough here: the chip
+                              // would still be blocked as NOT MAPPED, so say both.
+                              ? `${v.vendor} is also not mapped to supply "${mat?.name || 'this item'}". To pick ${v.vendor} for this line, untick the box AND map the pair on Vendor Items (${VENDOR_ITEMS_HREF}).`
+                              : `Untick it to pick ${v.vendor} for this line.`)
+                          )}
                           onPick={v => {
-                            // Chips come from purchase HISTORY, which can name a
-                            // vendor the master no longer resolves. Re-resolve by
-                            // name so the dropdown can actually show the pick
-                            // instead of falling back to the legacy option.
-                            const mv = vendors.find(x => x.id === v.vendor_id)
-                                    || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
+                            const mv = resolveChipVendor(v);
+                            // Contract beats last_price beats nothing.
+                            // Always overwrite when a contract exists — that's the point.
+                            // > 0, not != null: a ₹0 contract row means no rate was
+                            // agreed and must not wipe a correctly seeded rate.
+                            const rate: Partial<POLine> = Number(v.contract_price) > 0
+                              ? { unit_price: Number(v.contract_price) }
+                              : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {});
+                            if (vendorLocked) {
+                              // NEVER switch a locked line's vendor from a chip.
+                              // Other vendors' chips are already greyed above;
+                              // this is the backstop. The line's own vendor's
+                              // chip still brings its contract / last rate.
+                              if (!mv || mv.id !== it.vendor_id) return;
+                              updateLine(i, rate);
+                              return;
+                            }
                             updateLine(i, {
                               vendor: mv ? mv.name : v.vendor,
                               vendor_id: mv ? mv.id : '',
-                              // Contract beats last_price beats nothing.
-                              // Always overwrite when a contract exists — that's the point.
-                              // > 0, not != null: a ₹0 contract row means no rate was
-                              // agreed and must not wipe a correctly seeded rate.
-                              ...(Number(v.contract_price) > 0
-                                  ? { unit_price: Number(v.contract_price) }
-                                  : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {})),
+                              ...rate,
                             });
                           }}
                         />
