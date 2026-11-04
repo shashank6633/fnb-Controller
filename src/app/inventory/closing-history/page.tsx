@@ -569,7 +569,10 @@ export default function ClosingHistoryPage() {
    */
   const pickBdDate = useCallback((d: string) => {
     setBdDate(d); setDlErr('');
-    setBydept(cur => (cur && cur.date !== (d || cur.latest_date) ? null : cur));
+    // A blank pick asks for the latest count; with no count in scope at all
+    // (latest_date null) that is the sheet already on screen — same query, so
+    // no load would follow and a dropped sheet would never come back.
+    setBydept(cur => (cur && cur.date !== (d || cur.latest_date || cur.date) ? null : cur));
   }, []);
 
   /** The exact query the table AND the download are both built from. */
@@ -665,8 +668,15 @@ export default function ClosingHistoryPage() {
   const bdShown = bdDate || bydept?.date || bdDates[0] || '';
   const rangeBlocks = rangeInverted && view !== 'bydept';
   /** Store vs Departments: nothing to download until the asked-for sheet is on
-   *  screen — the file is always the sheet the reader is looking at. */
-  const bdNoSheet = view === 'bydept' && (loading || !bydept);
+   *  screen — the file is always the sheet the reader is looking at. Nor while
+   *  the search box says something the sheet does not answer yet (the 350 ms
+   *  before a typed word is sent): a file of the old search saved under the
+   *  new text in the box would read as the answer to it. */
+  const bdNoSheet = view === 'bydept' && (loading || !bydept || q.trim() !== bydept.asked_q);
+  /** Store vs Departments with no sheet, no error and no load running yet —
+   *  the moment between dropping a sheet (a new date, the tab just opened)
+   *  and the load starting. It is a load; it shows as one, never as a blank. */
+  const bdWaiting = view === 'bydept' && !bydept && !error;
 
   /**
    * Download. Deliberately the SAME URL as the table, plus format=csv — so the
@@ -678,7 +688,7 @@ export default function ClosingHistoryPage() {
    */
   const download = async () => {
     if (rangeBlocks) { setDlErr('“From” is after “To” — swap the dates.'); return; }
-    if (view === 'bydept' && (loading || !bydept)) return;   // the button is disabled too
+    if (bdNoSheet) return;                                   // the button is disabled too
     setDlBusy(true); setDlErr('');
     try {
       if (view === 'bydept' && bydept) {
@@ -824,7 +834,7 @@ export default function ClosingHistoryPage() {
               ? 'One line per recorded count, newest first.'
               : 'One count date. Store / Overall first, then every department that counted that day under its main department, then the Total.'}
         </span>
-        {loading && <Loader2 className="w-4 h-4 animate-spin text-[#8B7355]" />}
+        {(loading || bdWaiting) && <Loader2 className="w-4 h-4 animate-spin text-[#8B7355]" />}
       </div>
 
       {/* Filters — every one of them is applied by the server, so the download
@@ -988,7 +998,7 @@ export default function ClosingHistoryPage() {
       )}
 
       {/* Table */}
-      {loading && !resp ? (
+      {(loading || bdWaiting) && !resp ? (
         <div className="bg-white border border-[#E8D5C4] rounded-lg p-8 text-center text-sm text-[#6B5744]">
           <Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading closing stock history…
         </div>
@@ -1410,9 +1420,11 @@ function BydeptSummary({ data, filtered }: { data: BydeptResp; filtered: boolean
       <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Value at count"
                    value={data.totals.all.total.lines && data.totals.all.total.unpriced < data.totals.all.total.lines
                      ? inr(data.totals.all.total.value) : EM}
-                   note={data.totals.all.total.lines && data.totals.all.total.unpriced === data.totals.all.total.lines
-                     ? 'counted, but no item has a rate — so no value'
-                     : 'valued at the rate stored when it was counted'} />
+                   note={!data.totals.all.total.lines
+                     ? (filtered ? 'no count matches the item search' : 'nothing was counted on this date')
+                     : data.totals.all.total.unpriced === data.totals.all.total.lines
+                       ? 'counted, but no item has a rate — so no value'
+                       : 'valued at the rate stored when it was counted'} />
     </>
   );
 }
@@ -1543,6 +1555,9 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
     let cols: { l: number; r: number; p: number }[] = [];
     let itemW = 0, headH = 0, bodyH = 0, below = 0, boxW = -1;
     let raf = 0, dirty = true;
+    /** The group headings (Bar, Kitchen…) and the room their own padding
+     *  leaves around the name; `shown` is the last visibility written. */
+    let grps: { el: HTMLElement; pl: number; pr: number; shown: string }[] = [];
     const last: Record<string, string> = {};
     const put = (el: HTMLElement | null, prop: string, v: string) => {
       if (!el) return;
@@ -1569,6 +1584,13 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
         const r = th.getBoundingClientRect();
         return { l: r.left - tb.left, r: r.right - tb.left, p: parseFloat(getComputedStyle(th).paddingRight) || 0 };
       }).sort((a, b) => a.l - b.l);
+      grps = Array.from(t.querySelectorAll<HTMLElement>('[data-bdgrp]')).map((el) => {
+        const cs = getComputedStyle(el);
+        const prev = grps.find((g) => g.el === el);
+        // A new sheet keeps the same heading elements: start from what the
+        // DOM holds now, so one hidden by the last sheet is shown again.
+        return { el, pl: parseFloat(cs.paddingLeft) || 0, pr: parseFloat(cs.paddingRight) || 0, shown: prev ? prev.shown : el.style.visibility };
+      });
       // What the page holds BELOW the box (the note under it, the page's own
       // bottom padding) — the docked box leaves exactly that much room, so the
       // page's last scroll position is the docked position, never past it.
@@ -1600,7 +1622,21 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
       raf = 0;
       if (dirty) measure();
       const ih = window.innerHeight;
-      const top = box.getBoundingClientRect().top;
+      const br = box.getBoundingClientRect();
+      const top = br.top;
+      // A group heading rides inside its own heading cell (sticky both ways),
+      // so it reads whole wherever that cell has room for it. Where it has not
+      // — its cell mostly under the Item column, or mostly past the box's right
+      // edge — the name would show in part ("ar" for Bar, "Kit" for Kitchen):
+      // it is hidden there instead, the rule the cut masks apply to figures.
+      // (Read before any write below, so this never forces a layout.)
+      const inL = br.left + box.clientLeft, edgeL = inL + itemW, edgeR = inL + box.clientWidth;
+      const vis = grps.map((g) => {
+        const r = g.el.getBoundingClientRect();
+        const a = r.left + g.pl, z = r.right - g.pr;     // the name itself, not its padding
+        const part = z > edgeL + 0.5 && a < edgeR - 0.5 && (a < edgeL - 0.5 || z > edgeR + 0.5);
+        return part ? 'hidden' : '';
+      });
       const dockAt = bdTopChrome(box) + 8;
       // Docked height: the window less the top chrome and what sits below the
       // box, so docked box + the note under it exactly fill the window.
@@ -1620,6 +1656,11 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
       const sl = box.scrollLeft, from = sl + itemW, to = sl + box.clientWidth;
       mask(cutLRef.current, cols.find((c) => c.l + c.p < from - 1 && from < c.r - c.p - 1));
       mask(cutRRef.current, cols.find((c) => c.l + c.p < to - 1 && to < c.r - c.p - 1));
+      grps.forEach((g, i) => {
+        if (g.shown === vis[i]) return;
+        g.shown = vis[i];
+        g.el.style.visibility = vis[i];               // keeps its room: the row never resizes for it
+      });
     };
 
     const schedule = () => { if (!raf) raf = requestAnimationFrame(place); };
@@ -1637,7 +1678,11 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
       for (const e of entries) {
         if (e.target === host) continue;
         if (e.target !== box) { remeasure(); return; }
-        const w = Math.round(e.contentRect.width);
+        // The box's CLIENT width (inside its borders and scrollbar, padding
+        // included) is the only width measure() reads. Its content width also
+        // moves when measure() writes the far-end padding-right — reacting to
+        // THAT would re-arm measure() from its own write.
+        const w = box.clientWidth;
         if (w !== boxW) { boxW = w; remeasure(); return; }
       }
       schedule();
@@ -1714,7 +1759,9 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
           counted, and the count was zero
         </span>
         <span className="text-[#8B7355]">
-          Store / Overall = counts saved with no department. Total = Store + every department, for that one item.
+          {store
+            ? 'Store / Overall = counts saved with no department. Total = Store + every department, for that one item.'
+            : 'Total = every department shown, for that one item.'}
         </span>
         <BydeptMoreColumns boxRef={boxRef} sheet={data} />
       </div>
@@ -1735,6 +1782,7 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
                   className={`sticky left-0 top-0 z-30 bg-[#FFF1E3] text-left font-semibold px-3 py-2 min-w-[120px] sm:min-w-[220px] border-r border-[#E8D5C4] ${edge}`}>
                 Item
                 <div className="text-[9px] font-normal text-[#8B7355]">raw in purchase units · semi-finished in their own unit</div>
+                <BydeptMoreColumns boxRef={boxRef} sheet={data} compact />
               </th>
               {groups.map(g => g.store ? (
                 <th key={g.key} rowSpan={two ? 2 : 1} data-bdcol=""
@@ -1747,15 +1795,19 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
               ) : (
                 <th key={g.key} colSpan={g.span}
                     className={`sticky top-0 z-20 bg-[#FFF1E3] text-center font-semibold px-3 py-1.5 border-l border-r border-[#E8D5C4] text-[#2D1B0E] ${two ? '' : edge}`}>
-                  {/* Rides along beside the sticky Item column, so a group half
-                      under it still reads whole ("Bar", never "ar"). */}
-                  <span className="sticky inline-block px-1" style={{ left: 'var(--bd-itemw, 0px)' }}>{g.name}</span>
+                  {/* Rides along beside the sticky Item column, and inside the
+                      box's right edge, so a group half under the one or half
+                      past the other still reads whole ("Bar", never "ar"); with
+                      no room for the whole name the layout effect hides it. */}
+                  <span data-bdgrp="" className="sticky inline-block px-1"
+                        style={{ left: 'var(--bd-itemw, 0px)', right: 0 }}>{g.name}</span>
                 </th>
               ))}
               <th rowSpan={two ? 2 : 1} data-bdcol=""
                   className={`sticky top-0 z-20 snap-start text-right font-semibold text-[11px] sm:text-xs px-2 sm:px-3 py-2 min-w-[96px] sm:min-w-[120px] bg-[#FBE7D3] text-[#2D1B0E] border-l border-[#E8D5C4] ${edge}`}>
                 Total
-                <div className="text-[9px] font-normal text-[#8B7355]">Store + departments</div>
+                {/* A department-limited reader has no Store column to add. */}
+                <div className="text-[9px] font-normal text-[#8B7355]">{store ? 'Store + departments' : 'departments shown'}</div>
               </th>
             </tr>
             {two && (
@@ -1808,9 +1860,12 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
  * item names, and nothing else says a dozen more sit to the right. Counts the
  * column headings not (fully) in view, live as the box scrolls or resizes. It
  * owns its state, so tracking the scroll never re-renders the big table.
+ * `compact`: the short repeat under the Item heading, which is sticky — so it
+ * is still in view once the box has docked at the top of the window and the
+ * line above the box has scrolled away (on a phone, at once).
  */
-function BydeptMoreColumns({ boxRef, sheet }: {
-  boxRef: React.RefObject<HTMLDivElement | null>; sheet: BydeptResp;
+function BydeptMoreColumns({ boxRef, sheet, compact }: {
+  boxRef: React.RefObject<HTMLDivElement | null>; sheet: BydeptResp; compact?: boolean;
 }) {
   const [hidden, setHidden] = useState(0);
   useEffect(() => {
@@ -1843,6 +1898,15 @@ function BydeptMoreColumns({ boxRef, sheet }: {
       if (raf) cancelAnimationFrame(raf);
     };
   }, [boxRef, sheet]);
+  if (compact) {
+    // Its line is always kept (a blank when nothing is hidden), so the
+    // heading never changes height as the count comes and goes.
+    return (
+      <div className="text-[9px] font-medium text-[#af4408]" aria-hidden={hidden ? undefined : true}>
+        {hidden ? `${hidden.toLocaleString('en-IN')} more column${hidden === 1 ? '' : 's'} →` : '\u00a0'}
+      </div>
+    );
+  }
   if (!hidden) return null;
   return (
     <span className="font-medium text-[#af4408]">
