@@ -467,6 +467,11 @@ export async function GET(request: Request) {
     }
     return Response.json({ items, summary });
   } catch (error: any) {
+    // Logged with the URL so a 500 here is traceable in the server log — the
+    // History detail's raw half went missing on production and this catch had
+    // left nothing behind. Same style as ./semi/route.ts. The response below is
+    // unchanged.
+    console.error('[closing-stock GET]', request.url, error);
     return Response.json({ error: error.message }, { status: 500 });
   }
 }
@@ -748,7 +753,12 @@ export async function POST(request: Request) {
         db.prepare(`
           INSERT INTO closing_stock (id, material_id, department_id, date, system_stock, physical_stock, variance, variance_value, notes, recorded_by, outlet_id, rate_per_purchase_unit, rate_source, total_value, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        `).run(id, item.material_id, deptId, dateStr, systemStock, physicalStock, variance, varianceValue, item.notes || '', item.recorded_by || '', outletId || null,
+        `).run(id, item.material_id, deptId, dateStr, systemStock, physicalStock, variance, varianceValue, item.notes || '',
+               // No client sends recorded_by, so the row used to be saved with a
+               // blank saver. Fall back to the signed-in user — the same fallback
+               // ./semi/route.ts uses on its rows and this route already uses for
+               // the approval's counted_by just below.
+               item.recorded_by || me?.email || '', outletId || null,
                valued.ratePerPurchaseUnit, valued.source, valued.totalValue);
 
         results.total_value = r2(results.total_value + valued.totalValue);

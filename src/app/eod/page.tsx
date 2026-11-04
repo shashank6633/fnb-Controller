@@ -22,6 +22,7 @@ import { api } from '@/lib/api';
 // the second half of the guard and writes a count nobody typed.
 // See src/lib/pack-units.ts and scripts/check-purchase-units.js.
 import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
+import { todayIST } from '@/lib/format-date';
 
 interface LocSummary { location: string; items: number; counted_today: number; }
 interface Item {
@@ -30,7 +31,11 @@ interface Item {
   today_count: number | null;
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+// The count date is the IST calendar day, not the UTC one. toISOString()
+// returned yesterday's date for the whole 00:00–05:30 IST window, so a count
+// saved just after midnight landed on the previous day. todayIST() is the
+// shared helper the server's date check and /inventory/closing-sheet use.
+const today = () => todayIST();
 
 export default function EODPage() {
   const [phase, setPhase] = useState<'pick-location' | 'counting' | 'done'>('pick-location');
