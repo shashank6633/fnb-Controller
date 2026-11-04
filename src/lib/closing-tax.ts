@@ -559,6 +559,9 @@ export interface ClosingGstResolverOptions {
  * two figures taxAppliedPercent() needs. Exported for the proof harness.
  */
 export function taxedPurchaseLinesSql(narrowed: boolean): string {
+  // bill_no reads purchases.bill_no only: production's purchases table has NO
+  // invoice_number column (only some old local copies carry one), and reading
+  // it failed every GST screen with "no such column: p.invoice_number".
   const cg = effectiveChargeSql('cgst', 'p', 'gl');
   const sg = effectiveChargeSql('sgst', 'p', 'gl');
   const disc = effectiveChargeSql('discount', 'p', 'gl');
@@ -573,7 +576,7 @@ export function taxedPurchaseLinesSql(narrowed: boolean): string {
            ${disc}                                        AS discount,
            ${bv}                                          AS bill_value,
            ${grnSourcedSql('gl')}                         AS from_grn,
-           COALESCE(NULLIF(TRIM(p.bill_no), ''), NULLIF(TRIM(p.invoice_number), ''), '') AS bill_no,
+           COALESCE(NULLIF(TRIM(p.bill_no), ''), '')      AS bill_no,
            COALESCE(NULLIF(TRIM(p.invoice_id), ''), '')   AS invoice_id,
            COALESCE(g.grn_number, '')                     AS grn_number
       FROM purchases p
