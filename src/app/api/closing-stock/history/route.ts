@@ -7,8 +7,8 @@ import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { bydeptCsv, bydeptCsvFilename } from '@/lib/closing-bydept-csv';
 import {
   CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_TAX_CSV, SEMI_GST,
-  closingTaxCells, closingTaxCsv, createClosingGstResolver, storedCountValue, sumClosingTax,
-  type ClosingGstSource, type ClosingTaxTotals,
+  addClosingTaxTotals, closingTaxCells, closingTaxCsv, createClosingGstResolver, storedCountValue, sumClosingTax,
+  type ClosingGstSource, type ClosingTaxSummable, type ClosingTaxTotals,
 } from '@/lib/closing-tax';
 
 /**
@@ -1004,6 +1004,10 @@ export async function GET(request: Request) {
       });
 
       const rawByKey = new Map<string, BydeptRow>();
+      /** row key | column key → the GST basis of that cell's count (the value
+       *  SAVED with it — storedCountValue, the one rule every GST surface uses).
+       *  Written in the same order as the cell, so the last write stands here too. */
+      const rawBasis = new Map<string, number | null>();
       for (const r of rawCells) {
         const key = `RAW|${r.material_id}`;
         let row = rawByKey.get(key);
@@ -1026,6 +1030,7 @@ export async function GET(request: Request) {
           rate: priced ? r2(num(r.rate_per_purchase_unit)) : null,
           unit: row.purchase_unit,
         };
+        rawBasis.set(`${key}|${colOf(r.department_id)}`, storedCountValue(r));
       }
 
       const semiByKey = new Map<string, BydeptRow>();
@@ -1132,6 +1137,35 @@ export async function GET(request: Request) {
         allTotals.by_column[k] = { lines: a.lines + b.lines, value: r2(a.value + b.value), unpriced: a.unpriced + b.unpriced };
       }
 
+      // ── STEP 8: estimated GST on the RAW block, per column (ruling 107) ──
+      // Not a new rule: the resolver, the basis and the arithmetic are the ones
+      // All entries, Closing Stock History and Closing Overview use
+      // (src/lib/closing-tax.ts) — GST % from the last bill with GST on or
+      // before THIS count date, else the item master; liquor / store items
+      // always blank; applied to the value SAVED with each count. Only counts
+      // with a rate are summed, and every footer says how many ("rate known for
+      // N of M"). Semi-finished counts are made in-house and never carry GST,
+      // so they have no tax lines. After truncation, like the ₹ totals.
+      const gstResolver = rows.length
+        ? createClosingGstResolver(db, {
+            isStoreMapped: (category) => isStoreMappedMaterial(db, category),
+            materialIds: rows.map((row) => String(row.material_id)),
+          })
+        : null;
+      const taxCells: Record<string, ClosingTaxSummable[]> = {};
+      for (const k of colKeys) taxCells[k] = [];
+      for (const row of rows) {
+        const gst = gstResolver!.forMaterial(String(row.material_id), date);
+        for (const k of colKeys) {
+          if (!row.cells[k]) continue;
+          const basis = rawBasis.get(`${row.key}|${k}`) ?? null;
+          taxCells[k].push({ value: basis, gst_pct: gst.gst_pct, ...closingTaxCells(basis, gst) });
+        }
+      }
+      const taxByColumn: Record<string, ClosingTaxTotals> = {};
+      for (const k of colKeys) taxByColumn[k] = sumClosingTax(taxCells[k]);
+      const rawTax = { by_column: taxByColumn, total: addClosingTaxTotals(colKeys.map((k) => taxByColumn[k])) };
+
       const bnote = truncated
         ? `Showing the first ${(rows.length + semiRows.length).toLocaleString('en-IN')} items counted on ${date} — the day holds more. Search for an item to see the rest.`
         : null;
@@ -1143,6 +1177,7 @@ export async function GET(request: Request) {
         const csv = bydeptCsv({
           date, columns, rows, semi_rows: semiRows,
           totals: { raw: rawTotals, semi: semiTotals, all: allTotals },
+          tax: rawTax,
           truncated, note: bnote, q,
         });
         return new Response(csv, {
@@ -1165,6 +1200,8 @@ export async function GET(request: Request) {
         rows,
         semi_rows: semiRows,
         totals: { raw: rawTotals, semi: semiTotals, all: allTotals },
+        /** Estimated GST on the raw block — per column and in total (STEP 8). */
+        tax: rawTax,
         cap: ROW_CAP,
         truncated,
         note: bnote,

@@ -225,6 +225,9 @@ interface BydeptResp {
   rows: BydeptRow[];
   semi_rows: BydeptRow[];
   totals: { raw: BydeptBlock; semi: BydeptBlock; all: BydeptBlock };
+  /** Estimated GST on the RAW block, per column and in total (ruling 107);
+   *  null from a server that does not send it — then no tax lines show. */
+  tax: { by_column: Record<string, ClosingTaxTotals>; total: ClosingTaxTotals } | null;
   truncated: boolean;
   scope?: string;
   note?: string | null;
@@ -473,6 +476,14 @@ const normaliseBydept = (payload: unknown): Omit<BydeptResp, 'asked_q'> => {
     };
   };
   const t = rec(j.totals);
+  const readTax = (v: unknown): ClosingTaxTotals => {
+    const o = rec(v);
+    return {
+      tax: num(o.tax), total_incl_tax: num(o.total_incl_tax), value_taxed: num(o.value_taxed),
+      rated: num(o.rated), taxed: num(o.taxed), items: num(o.items),
+    };
+  };
+  const tx = j.tax == null ? null : rec(j.tax);
   return {
     mode: 'bydept',
     date: str(j.date),
@@ -486,6 +497,10 @@ const normaliseBydept = (payload: unknown): Omit<BydeptResp, 'asked_q'> => {
       semi: readBydeptBlock(t.semi, keys),
       all: readBydeptBlock(t.all, keys),
     },
+    tax: tx ? {
+      by_column: Object.fromEntries(keys.map(k => [k, readTax(rec(tx.by_column)[k])])),
+      total: readTax(tx.total),
+    } : null,
     truncated: !!j.truncated,
     scope: j.scope == null ? undefined : str(j.scope),
     note: j.note == null ? null : str(j.note),
@@ -960,7 +975,7 @@ export default function ClosingHistoryPage() {
 
       {/* Summary */}
       {resp && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+        <div className={`grid grid-cols-2 ${resp.mode === 'bydept' && resp.tax ? 'md:grid-cols-3 xl:grid-cols-5' : 'md:grid-cols-4'} gap-2.5`}>
           {resp.mode === 'matrix' ? (
             <>
               <SummaryCard icon={<CalendarDays className="w-4 h-4" />} label="Count dates"
@@ -1425,6 +1440,20 @@ function BydeptSummary({ data, filtered }: { data: BydeptResp; filtered: boolean
                      : data.totals.all.total.unpriced === data.totals.all.total.lines
                        ? 'counted, but no item has a rate — so no value'
                        : 'valued at the rate stored when it was counted'} />
+      {/* Ruling 107: the raw block's estimated GST, as on the footer. It covers
+          only the counts with a GST rate and a value at count — the note says
+          which, so it is never read as "the Value card + tax". */}
+      {data.tax && (() => {
+        const tt = data.tax.total;
+        const n = closingTaxNotes(tt, 'counts', inr);
+        return (
+          <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label={CLOSING_INCL_LABEL}
+                       value={tt.taxed > 0 ? inr(tt.total_incl_tax) : EM}
+                       note={tt.taxed > 0
+                         ? `raw materials: value at count + ${inr(tt.tax)} GST · ${n.covers}`
+                         : `raw materials: ${n.rate}`} />
+        );
+      })()}
     </>
   );
 }
@@ -1830,7 +1859,7 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
             )}
           </thead>
           <BydeptBlockBody label="Raw materials" rows={rows} columns={columns} dayLabel={dayLabel}
-                           totals={totals.raw} totalLabel="Value — raw materials" filtered={filtered}
+                           totals={totals.raw} totalLabel="Value — raw materials" filtered={filtered} tax={data.tax}
                            emptyText={filtered ? 'No raw material matches the search on this date.' : 'No raw material was counted on this date.'} />
           <BydeptBlockBody label="Semi-finished (sub-recipes)" rows={semiRows} columns={columns} dayLabel={dayLabel}
                            totals={totals.semi} totalLabel="Value — semi-finished" filtered={filtered}
@@ -1915,9 +1944,10 @@ function BydeptMoreColumns({ boxRef, sheet, compact }: {
   );
 }
 
-function BydeptBlockBody({ label, rows, columns, dayLabel, totals, totalLabel, filtered, emptyText }: {
+function BydeptBlockBody({ label, rows, columns, dayLabel, totals, totalLabel, filtered, emptyText, tax }: {
   label: string; rows: BydeptRow[]; columns: BydeptColumn[]; dayLabel: string;
   totals: BydeptBlock; totalLabel: string; filtered: boolean; emptyText: string;
+  tax?: BydeptResp['tax'];
 }) {
   return (
     <tbody>
@@ -1934,7 +1964,47 @@ function BydeptBlockBody({ label, rows, columns, dayLabel, totals, totalLabel, f
         </tr>
       ) : rows.map(r => <BydeptItemRow key={r.key} r={r} columns={columns} dayLabel={dayLabel} />)}
       <BydeptTotalRow label={totalLabel} t={totals} columns={columns} filtered={filtered} />
+      {tax && <BydeptTaxRows tax={tax} columns={columns} />}
     </tbody>
+  );
+}
+
+/**
+ * Estimated GST under the raw-materials value (ruling 107): "Tax (GST, est.)"
+ * and "Total incl. GST (est.)" for Store, every department and the Total.
+ * Same labels, hover text and notes as the other GST surfaces (closing-tax.ts)
+ * — only counts with a rate AND a value at count are in either figure, and the
+ * line under each says how many. No such count in a column → an em-dash,
+ * never ₹0.
+ */
+function BydeptTaxRows({ tax, columns }: { tax: NonNullable<BydeptResp['tax']>; columns: BydeptColumn[] }) {
+  const cellFor = (x: ClosingTaxTotals | undefined, f: 'tax' | 'total_incl_tax', key: string, total?: boolean, isStore?: boolean) => {
+    const n = x ? closingTaxNotes(x, 'counts', bdInr2) : null;
+    return (
+      <td key={key} title={n?.title}
+          className={`px-2 sm:px-3 py-1.5 text-right tabular-nums text-[11px] sm:text-xs ${total ? 'bg-[#FBE7D3] border-l border-[#E8D5C4]' : isStore ? 'border-r border-[#E8D5C4]' : ''}`}>
+        {x && x.taxed > 0 ? bdInr2(x[f]) : <span className="text-[#B9A896] font-normal">{EM}</span>}
+        {n && x && x.items > 0 && (
+          <div className="text-[9px] font-normal text-[#8B7355]">{f === 'tax' ? n.short : n.incl}</div>
+        )}
+      </td>
+    );
+  };
+  const row = (f: 'tax' | 'total_incl_tax', label: string, title: string) => (
+    <tr className="border-t border-[#E8D5C4] font-semibold text-[#2D1B0E] bg-[#FFF1E3]">
+      <td className="sticky left-0 z-10 px-3 py-1.5 border-r border-[#E8D5C4] bg-[#FFF1E3]" title={title}>
+        {label}
+        <div className="text-[9px] font-normal text-[#8B7355]">raw materials · on the value at count</div>
+      </td>
+      {columns.map(c => cellFor(tax.by_column[c.key], f, c.key, false, c.is_store))}
+      {cellFor(tax.total, f, '__total__', true)}
+    </tr>
+  );
+  return (
+    <>
+      {row('tax', CLOSING_TAX_LABEL, CLOSING_TAX_TITLE)}
+      {row('total_incl_tax', CLOSING_INCL_LABEL, CLOSING_INCL_TITLE)}
+    </>
   );
 }
 
