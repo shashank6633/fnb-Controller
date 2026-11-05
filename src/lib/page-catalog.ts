@@ -556,6 +556,63 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/inventory',           label: 'Raw Materials' },
       { path: '/settings/categories', label: 'Categories' },
       { path: '/inventory/liquor-store', label: 'Liquor Store' },
+      // ── Liquor Purchase Reconciliation (docs/liquor-reconciliation-plan.md) ──
+      // The four pages phases L1/L2/L4/L5 add, registered HERE and in
+      // Sidebar.tsx's Inventory section — deliberately inside the existing
+      // Liquor Store group rather than a new sidebar section (plan decision 4).
+      // A catalog entry on its own gates a page correctly and leaves it
+      // INVISIBLE; the two lists are separate and must be edited together.
+      //
+      // All four page.tsx files are BUILT (src/app/inventory/liquor-{brand-map,
+      // wallet,withdrawals,reconciliation}/page.tsx). They were registered here
+      // before they existed, behind a temporary `unbuilt` flag that kept them
+      // out of homePathFor / firstAllowedPath so nobody was redirected onto a
+      // 404. With every page present that flag and its two skips were deleted,
+      // so these rows now resolve as landing pages like any other. Measured on
+      // a DB copy for a manager whose map is only ["/inventory/liquor-wallet"]:
+      // firstAllowedPath (the proxy's forbidden bounce) went /login → the
+      // wallet; homePathFor still answers the first page in display order that
+      // user can open (/feedback for a manager), exactly as for any other page.
+      // The HR section's rule ("only ever name pages that are BUILT") now holds
+      // here too, with no exception left in this file.
+      //
+      // Every entry is tier-flagged, and that is the real lock: canAccessPage
+      // FAILS OPEN for a legacy user whose page_access is null, and only the
+      // tier flags run before that grant.
+      // The tier flag is not the whole story either: canAccessPage's last line
+      // matches a grant BY PREFIX, so a bare '/inventory' grant carries both
+      // mgmtOnly pages here with no explicit grant anywhere (measured on the
+      // live roles: the seeded Store Manager holds '/inventory'). Each page's
+      // own routes MUST re-check server-side — isManagement() for the wallet
+      // and the reconciliation summary, admin for the brand map and the
+      // withdrawals register. This list is never the security boundary.
+      //
+      // L1 · adminOnly per the plan's "Admin UI: mapping editor + CSV import".
+      // One row here re-prices a brand for every later indent (rate-vs-master
+      // variance, landed cost, the §G rate-movement watch), so it is the same
+      // class of surface as the Station → Department map. If L1 wants the §G
+      // "accept new rate into master" one-tap to be manager-usable, that
+      // decision is made ONCE server-side and this flag revisited with it —
+      // do not let a manager write the master from a card while this page 403s.
+      { path: '/inventory/liquor-brand-map',      label: 'Liquor Brand Map (TGBCL)',   adminOnly: true },
+      // L2 · mgmtOnly: the TGBCL wallet is working capital parked with the
+      // government — deposits, challans, bank-match state and the top-up
+      // planner. Management money, not a counting surface.
+      { path: '/inventory/liquor-wallet',         label: 'Liquor Wallet (TGBCL)',      mgmtOnly: true },
+      // L4 · adminOnly per the plan ("Admin-only page"): this is the
+      // director/management personal-use ledger with amounts recoverable from
+      // named people, and it MOVES STOCK. It stays out of reach of everyone
+      // else, including a manager with an explicit grant.
+      { path: '/inventory/liquor-withdrawals',    label: 'Liquor Withdrawals',         adminOnly: true },
+      // L5 · mgmtOnly per the plan ("(mgmt/admin)"): the reconciliation summary
+      // — wallet check, per-indent value vs portal, retail excess, non-sale
+      // issues as a % of purchases.
+      { path: '/inventory/liquor-reconciliation', label: 'Liquor Reconciliation',      mgmtOnly: true },
+      // L3 (emergency wine-shop buys) deliberately has NO entry: it is a side
+      // record on the EXISTING purchase flow, a "Wine-shop buys" TAB on the
+      // Liquor Store page (where a pending claim is paid back and an unpriced
+      // buy is priced) and a card on the L5 summary, so it adds no page of its
+      // own. Do not invent one to "complete the set".
       { path: '/inventory/stock-overview', label: 'Stock Overview' },
       // Read-only board: counted stock by storage area x department. Counts are
       // still recorded on /closing-stock — this only makes them comparable.

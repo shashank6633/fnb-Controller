@@ -1848,6 +1848,37 @@ export function floorReconciliation(
     m.set(e.material_id, (m.get(e.material_id) || 0) + (Number(e.q) || 0));
   }
 
+  // [LIQUOR-RECON:BEGIN] ── liquor withdrawals are known non-sale too (L4) ──────
+  // GATED with the rest of Liquor Reconciliation ("Deploy Liqour Reconcilation").
+  // A pure insertion: a ship WITHOUT liquor deletes BEGIN..END and is left with
+  // production's floorReconciliation, byte for byte.
+  //
+  // A withdrawal (src/lib/liquor-withdrawals.ts) is a recorded, authorised
+  // non-sale issue: breakage, director/management use, staff welfare, sampling,
+  // a transfer out. In LEDGER mode it was already kept out of ACTUAL (it posts an
+  // 'adjustment', never an 'outward' pour). In PHYSICAL mode, the default, the
+  // bottle is missing from the closing count and nothing netted it, so every
+  // withdrawal read as unbilled leak — measured: one 1-BTL breakage WD on a
+  // zero-sales day gave actual 750 ml, known_non_sale 0, ₹4,299.97 of leak,
+  // while the same bottle logged in bar_empties is netted. Its quantity is added
+  // to the same per-store known-non-sale map, on the withdrawal's business date
+  // (lq_withdrawals.date, IST — the day its ledger row is also dated on), so
+  // both modes now agree that a recorded withdrawal is not a leak. ALL
+  // categories, for that reason: the ledger-mode rule already covers them all.
+  // The sqlite_master check keeps this a no-op on a database without the table.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'").get()) {
+    for (const w of db.prepare(`
+      SELECT store_id, material_id, SUM(qty_recipe_units) AS q
+      FROM lq_withdrawals
+      WHERE date >= ? AND date <= ?
+      GROUP BY store_id, material_id
+    `).all(from, to) as { store_id: string; material_id: string; q: number }[]) {
+      let m = emptiesByStore.get(w.store_id);
+      if (!m) { m = new Map(); emptiesByStore.set(w.store_id, m); }
+      m.set(w.material_id, (m.get(w.material_id) || 0) + (Number(w.q) || 0));
+    }
+  }
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
   const rows: FloorReconRow[] = [];
   let tExpQ = 0, tActQ = 0, tVarQ = 0, tExpV = 0, tActV = 0, tVarV = 0, tUnbilled = 0, tKnownQ = 0, tKnownV = 0;
 
@@ -2068,6 +2099,19 @@ export function overallReconciliation(db: Database, opts: { from: string; to: st
   for (const e of db.prepare(`SELECT material_id, SUM(qty) AS q FROM bar_empties WHERE kind IN ('breakage','spillage') AND date >= ? AND date <= ? GROUP BY material_id`).all(from, to) as any[]) {
     knownT.set(e.material_id, (knownT.get(e.material_id) || 0) + (Number(e.q) || 0));
   }
+  // [LIQUOR-RECON:BEGIN] ── liquor withdrawals are known non-sale too (L4) ──────
+  // Same rule and reason as the block in floorReconciliation above (a pure
+  // insertion; a ship WITHOUT liquor deletes BEGIN..END). Kept to the ACTIVE
+  // stores ACTUAL is summed over, so a withdrawal from a deactivated store
+  // cannot net against a movement this report never counted.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'").get()) {
+    const activeStoreIds = new Set(stores.map(s => s.id));
+    for (const w of db.prepare(`SELECT store_id, material_id, SUM(qty_recipe_units) AS q FROM lq_withdrawals WHERE date >= ? AND date <= ? GROUP BY store_id, material_id`).all(from, to) as { store_id: string; material_id: string; q: number }[]) {
+      if (!activeStoreIds.has(w.store_id)) continue;
+      knownT.set(w.material_id, (knownT.get(w.material_id) || 0) + (Number(w.q) || 0));
+    }
+  }
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
 
   // Accumulate purchase + sale-out per material and build the material universe.
   const purchaseT = new Map<string, number>();
@@ -2244,6 +2288,96 @@ export function upsertBillCharges(
     c.mrp_rounding, c.excise_turnover_tax, c.special_excise_cess, c.tcs, netIndent,
     String(args.created_by || '').trim(),
   );
+  // [LIQUOR-RECON:BEGIN] ── TGBCL wallet auto-debit (Liquor Reconciliation, L2) ──
+  // GATED: ships only when the owner says "Deploy Liqour Reconcilation". This
+  // block and the two withdrawal blocks in floorReconciliation and
+  // overallReconciliation are that module's whole footprint in this file (three
+  // [LIQUOR-RECON] blocks), each a pure
+  // insertion. A ship WITHOUT liquor deletes every line from BEGIN to END and is
+  // left with production's upsertBillCharges, byte for byte. A liquor ship onto
+  // production store-engine inserts it, unchanged, above the final return.
+  //
+  // WHY HERE: every store_bill_charges row is a TGBCL indent, this function is
+  // where net_indent_value is computed and written, and its one live caller —
+  // Goods Receipt → TGBCL Liquor Bill (liquor-grn.ts receiveLiquorGrn, owner
+  // rulings #83/#84) — runs it INSIDE its own db.transaction(). So the debit is
+  // attempted in the bill's own transaction, and there is no second door an
+  // indent could be recorded through (Liquor Store New Bill / Upload CSV, the
+  // old callers, answer 410). A GRN void re-derives the debit at ₹0 before it
+  // deletes the charges row (liquor-grn.ts voidLiquorGrn, [LIQUOR-RECON]).
+  //
+  // A REGISTER HEADER COVERS EVERY INWARD LINKED TO IT (history from the
+  // retired /procure-bulk; a GRN bill links nothing, so for it the settle below
+  // keeps the caller's figure exactly). A register upload keyed its levies on a
+  // header ref whose lines sit under each
+  // row's own inward number, and the caller sums `invoice_value` over the refs
+  // of THIS upload only — so a balance re-upload of one fixed row shrank the
+  // header's Net Indent, and the debit with it, to that row (measured: ₹6,704.08
+  // recorded for a ₹39,306.04 register). settleRegisterHeader widens the row
+  // just written to the header's own ref plus every inward number already
+  // linked to it, BEFORE the debit is derived, and never lowers it; an ordinary
+  // bill (nothing linked) keeps the caller's figure exactly. An inward number
+  // this upload brings for the first time is linked by the route only after
+  // this returns, so linkIndentMembers settles the header once more after the
+  // links (and restates this reply, held for it — holdHeaderReply). Those two
+  // are the only other writes of net_indent_value, both in liquor-wallet.ts,
+  // both inside the bill's own transaction.
+  //
+  // A WALLET PROBLEM NEVER TAKES THE BILL DOWN. autoDebitForIndent writes the
+  // debit in a SAVEPOINT nested in that transaction. On success it commits with
+  // the bill. On any wallet-side error only the wallet's own writes roll back,
+  // the bill commits, wallet_debit says action 'failed', and the gap is filed in
+  // audit_events (the wallet page's "missing" list) and error_reports. The
+  // header widening has its own SAVEPOINT on the same terms: if it fails the
+  // bill keeps the caller's figure. The one exception is SQLite abandoning the
+  // outer transaction itself (disk full, I/O error): that re-throws and the bill
+  // route answers 500, as it would anyway. See the contracts above
+  // autoDebitForIndent and settleRegisterHeader in liquor-wallet.ts.
+  //
+  // THE ROW ID IS READ BACK rather than kept from the INSERT: on the UPDATE half
+  // of the upsert the generateId() above is discarded and the ORIGINAL id
+  // stands. That id is the debit's identity (its source_ref), so the fresh one
+  // would add a SECOND debit on every re-save of the same bill.
+  //
+  // The GRN door refuses a blank indent number before it gets here, so the
+  // `if` below is taken on every real call; a blank ref is not an indent.
+  //
+  // require(), not a top-of-file import, so that this module's whole footprint
+  // stays inside the two markers. The specifier is a literal, so the bundler and
+  // the type-checker still resolve it statically (the same pattern as db.ts's
+  // lazy require of this file).
+  {
+    const invoiceRef = String(args.invoice_ref || '').trim();
+    if (invoiceRef) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { autoDebitForIndent, settleRegisterHeader, holdHeaderReply } = require('./liquor-wallet') as typeof import('./liquor-wallet');
+      const stored = db.prepare(
+        'SELECT id FROM store_bill_charges WHERE store_id = ? AND invoice_ref = ?',
+      ).get(args.store_id, invoiceRef) as { id: string } | undefined;
+      const header = stored?.id ? settleRegisterHeader(db, { charges_id: stored.id, created_by: args.created_by }) : null;
+      const headerInvoice = header ? header.invoice_value : invoiceValue;
+      const headerNet = header ? header.net_indent_value : netIndent;
+      const wallet = stored?.id
+        ? autoDebitForIndent(db, {
+          source_ref: stored.id,
+          reference: invoiceRef,
+          date: String(args.date || '').trim(),
+          net_indent_value: headerNet,
+          store_id: args.store_id,
+          supplier: String(args.supplier || '').trim(),
+          created_by: String(args.created_by || '').trim(),
+        })
+        : null;
+      // Built as a variable, not returned as a literal: the declared return type
+      // is production's, and these two extra keys ride along at runtime into the
+      // bill response (bill_charges.id / bill_charges.wallet_debit). The figures
+      // are the header's as recorded — the caller's own unless it was widened.
+      const withDebit = { id: stored?.id || '', invoice_value: headerInvoice, net_indent_value: headerNet, wallet_debit: wallet, ...c };
+      if (stored?.id) holdHeaderReply(stored.id, withDebit);
+      return withDebit;
+    }
+  }
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
   return { invoice_value: invoiceValue, net_indent_value: netIndent, ...c };
 }
 

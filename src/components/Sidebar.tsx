@@ -35,6 +35,7 @@ import {
   History,
   Inbox,
   Boxes,
+  PackageMinus,
   Layers,
   ArrowLeftRight,
   ArrowRightLeft,
@@ -314,6 +315,20 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
       { kind: "link", label: "Categories",         href: "/settings/categories", icon: Boxes },
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
+      // ── Liquor Purchase Reconciliation (docs/liquor-reconciliation-plan.md) ──
+      // Grouped directly under Liquor Store rather than given their own sidebar
+      // section (plan decision 4). Each row MUST also exist in
+      // src/lib/page-catalog.ts and vice versa: this file keeps its own nav
+      // tree, so a page registered only in the catalog is correctly gated and
+      // completely invisible — that is what once hid 8 pages including
+      // /variance-approvals. canAccessPage filters these rows per user, so the
+      // adminOnly / mgmtOnly flags set in the catalog hide them automatically.
+      // All four pages are built (src/app/inventory/liquor-*/page.tsx), so every
+      // row here opens a real page; none of them is a placeholder any more.
+      { kind: "link", label: "Liquor Brand Map",   href: "/inventory/liquor-brand-map", icon: Link2 },
+      { kind: "link", label: "Liquor Wallet",      href: "/inventory/liquor-wallet", icon: Wallet },
+      { kind: "link", label: "Liquor Withdrawals", href: "/inventory/liquor-withdrawals", icon: PackageMinus },
+      { kind: "link", label: "Liquor Reconciliation", href: "/inventory/liquor-reconciliation", icon: Scale },
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Closing Overview",   href: "/inventory/closing-overview", icon: ClipboardCheck },
       // Renamed from "Dept Closing Sheet" (ruling 110, 2026-11-05) — same label

@@ -414,6 +414,46 @@ export async function DELETE(request: Request) {
     const db = getDb();
     const w = db.prepare('SELECT * FROM wastages WHERE id = ?').get(id) as any;
     if (!w) return Response.json({ error: 'Not found' }, { status: 404 });
+    // [LIQUOR-RECON:BEGIN] ── record-only copy of a liquor withdrawal ──────────
+    // GATED: ships only when the owner says "Deploy Liqour Reconcilation". This
+    // block is that module's ONLY footprint in this file, and it is a pure
+    // insertion. A ship WITHOUT liquor deletes every line from BEGIN to END; a
+    // liquor ship onto production's route inserts it, unchanged, right after the
+    // 404 above.
+    //
+    // REFUSED BEFORE EITHER RAIL. A breakage withdrawal can co-write this table
+    // for visibility; its stock left the Liquor Store ledger, and this rail never
+    // debited central for it. The central branch below would credit
+    // current_stock for stock central never lost (measured on a DB copy:
+    // 100 PIPERS 4020 -> 4770 ml), with the Liquor Store deduction still standing
+    // and the withdrawal pointing at a deleted row. Unwinding instead would mean
+    // voiding a withdrawal that can carry money billed to a named person, which
+    // has no approved flow, so the delete is refused and nothing is written.
+    //
+    // The register table only exists once that module has booted. Where it does
+    // not, no withdrawal can have co-written a row and DELETE behaves exactly as
+    // it always has. Checked by table name rather than try/catch, so a real fault
+    // in the lookup still fails loudly instead of reading as "not co-written".
+    // Read OUTSIDE the delete transaction on purpose: the link is written when
+    // the withdrawal and its wastage row are inserted together and is never
+    // updated afterwards, so it cannot change between this read and the delete.
+    {
+      const hasRegister = db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'",
+      ).get();
+      const coWritten = hasRegister
+        ? db.prepare('SELECT ref FROM lq_withdrawals WHERE wastage_id = ? LIMIT 1')
+          .get(id) as { ref: string } | undefined
+        : undefined;
+      if (coWritten) {
+        const coWrittenRef = String(coWritten.ref || 'a liquor withdrawal');
+        return Response.json({
+          error: `This entry is the record-only copy of liquor withdrawal ${coWrittenRef}. Its stock left the Liquor Store, not Central, so deleting it here would credit Central with stock it never lost. Nothing was changed. It stays for as long as the withdrawal does; if the breakage was entered in error, correct the Liquor Store stock with an adjustment that cites ${coWrittenRef}.`,
+          withdrawal_ref: coWrittenRef,
+        }, { status: 409 });
+      }
+    }
+    // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
     // WHICH RAIL IS READ OFF THE STORED ROW, NEVER OFF THE REQUEST. A caller
     // who could name the department here would have central's deduction
     // reversed into a department's ledger — grams appearing on a shelf that
