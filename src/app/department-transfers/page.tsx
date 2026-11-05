@@ -1542,7 +1542,7 @@ export default function DepartmentTransfersPage() {
                             </div>
                             {negative && (
                               <div className="text-[10px] text-red-700 mt-0.5">
-                                Ledger shows {showPU(m, h.available)} {puOf(m)} — more has left than arrived. Count it on the Dept Closing Sheet.
+                                Ledger shows {showPU(m, h.available)} {puOf(m)} — more has left than arrived. Count it on Closing Stock — All Departments.
                               </div>
                             )}
                           </div>
@@ -1654,7 +1654,7 @@ export default function DepartmentTransfersPage() {
         the central store, never counted twice. If it did not arrive as sent, the receiver <strong>flags a dispute</strong>:
         that records it and tells the sender, and moves nothing. The correction is a <strong>send-back</strong>, one tap from
         the disputed transfer. <strong>Not counted · up to</strong> means the sender never counted that item, so the figure is
-        its ledger (everything received minus everything used or sent) — a count on the Dept Closing Sheet firms it up.
+        its ledger (everything received minus everything used or sent) — a count on Closing Stock — All Departments firms it up.
         {showToSendTab && viewDept && (
           <> <strong>To send</strong> lists the approved requisition lines Direct Issue routes to {clean(viewDept.name)}; a
             Send there is the same one-step transfer, and it counts as handed over on that requisition line.</>

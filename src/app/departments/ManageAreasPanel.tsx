@@ -153,7 +153,7 @@ export default function ManageAreasPanel({ data, onChanged, onClose }: {
           <div>
             <h2 className="font-bold text-[#2D1B0E]">Manage Areas</h2>
             <p className="text-xs text-[#6B5744] max-w-2xl">
-              Each department can belong to one area, and Closing Stock totals each day’s counts by area.
+              Each department can belong to one area, and Closing Stock — One Department totals each day’s counts by area.
               Renaming an area changes its name everywhere; the departments in it stay in it.
               An area that departments still use can only be switched off, not deleted.
             </p>

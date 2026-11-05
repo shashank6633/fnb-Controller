@@ -625,8 +625,8 @@ function belowZeroResponse(
       `That would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`
     : `This cutover would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`;
   const recount = (lead: string) =>
-    `${lead} ${nameList} again, dated today (${ctx.today}), in Inventory → Closing Stock — a count taken now starts ` +
-    `${depts.length === 1 ? 'its' : 'their'} books from the shelf, so nothing booked before it can drop out — ` +
+    `${lead} ${nameList} again, dated today (${ctx.today}), in Inventory → Closing Stock — One Department (a count taken now starts ` +
+    `${depts.length === 1 ? 'its' : 'their'} books from the shelf, so nothing booked before it can drop out) ` +
     `and run this cutover again`;
   let atShelf: string;
   if (depts.length === 1) {
@@ -952,7 +952,7 @@ export async function POST(request: Request) {
       `).all(departmentId, cutoverDate) as Array<{ id: string; material_id: string; physical_stock: number; notes: string | null; created_at: string }>;
       if (rows.length === 0) {
         return Response.json(
-          { error: `No closing count recorded for ${dept.name} on ${cutoverDate}. Record the count first (Inventory → Closing Stock), or send lines[].` },
+          { error: `No closing count recorded for ${dept.name} on ${cutoverDate}. Record the count first (Inventory → Closing Stock — One Department), or send lines[].` },
           { status: 400 },
         );
       }

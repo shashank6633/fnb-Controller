@@ -565,7 +565,10 @@ export const PAGE_CATALOG: PageSection[] = [
       // own staff must be able to record their counts. The API scopes a
       // non-privileged user to their own + granted departments, and blind-count
       // (system stock / variance) stays admin-only server-side.
-      { path: '/inventory/closing-sheet', label: 'Department Closing Sheet' },
+      // Renamed from "Department Closing Sheet" (ruling 110, 2026-11-05) so the
+      // menu says what it does. Path unchanged, so page access is unchanged.
+      // Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/inventory/closing-sheet', label: 'Closing Stock — All Departments' },
       { path: '/inventory/transfers', label: 'Store Transfers' },
       // THE MOVEMENT REGISTER (owner's eight fields, 2026-09-10). Every stock
       // movement on every rail, filterable by store / department / type / date,
@@ -605,7 +608,9 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
-      { path: '/closing-stock',       label: 'Closing Stock' },
+      // Renamed from "Closing Stock" (ruling 110, 2026-11-05). Path unchanged.
+      // Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/closing-stock',       label: 'Closing Stock — One Department' },
       { path: '/variance-approvals',  label: 'Variance Approvals', adminOnly: true },
       // Sits beside Variance Approvals because it is the same problem one level
       // up: an approval decides whether ONE count corrects stock, a cutover

@@ -315,7 +315,9 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Closing Overview",   href: "/inventory/closing-overview", icon: ClipboardCheck },
-      { kind: "link", label: "Dept Closing Sheet", href: "/inventory/closing-sheet", icon: ClipboardList },
+      // Renamed from "Dept Closing Sheet" (ruling 110, 2026-11-05) — same label
+      // as its src/lib/page-catalog.ts twin. Path unchanged.
+      { kind: "link", label: "Closing Stock — All Departments", href: "/inventory/closing-sheet", icon: ClipboardList },
       // Sits directly under the entry sheet on purpose: one ENTERS a count, this
       // one REVIEWS past counts side by side. Split apart in the list, a counter
       // looking for "last month's figure" lands on the entry sheet and overwrites
@@ -348,7 +350,9 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },
-      { kind: "link", label: "Closing Stock",      href: "/closing-stock",      icon: ClipboardCheck },
+      // Renamed from "Closing Stock" (ruling 110, 2026-11-05) — same label as
+      // its src/lib/page-catalog.ts twin. Path unchanged.
+      { kind: "link", label: "Closing Stock — One Department", href: "/closing-stock", icon: ClipboardCheck },
       // Sits directly under Closing Stock because it is the second half of that
       // flow, not a separate feature: a count whose physical figure differs from
       // system stock does NOT move stock — it parks a PENDING row here for an

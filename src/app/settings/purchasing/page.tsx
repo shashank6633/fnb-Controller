@@ -343,14 +343,14 @@ export default function PurchasingSettingsPage() {
                   <ClipboardList className="w-4 h-4 text-[#af4408]" /> Bulk closing sheet — all raw materials
                 </p>
                 <p className="text-sm text-[#8B7355] mt-0.5">
-                  Controls the <b>Download blank template</b> and upload on the Department Closing Sheet.
+                  Controls the <b>Download blank template</b> and upload on Closing Stock — All Departments.
                   <b> On</b> gives the store every raw material, because the store walks the whole building
                   and an item missing from the sheet is an item nobody counts.
                   <b> Off</b> narrows each department&rsquo;s columns to the items it has ever requested —
                   fewer rows on the walk, but anything never requested cannot be counted.
                 </p>
                 <p className="text-sm text-[#8B7355] mt-1.5">
-                  This is the <b>bulk sheet only</b>. The on-screen Department Closing Sheet stays
+                  This is the <b>bulk sheet only</b>. The on-screen sheet (Closing Stock — All Departments) stays
                   department-scoped either way, and liquor is always excluded — it is counted in its own store.
                 </p>
               </div>

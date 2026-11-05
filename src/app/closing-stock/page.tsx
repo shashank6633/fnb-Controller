@@ -2533,7 +2533,7 @@ export default function ClosingStockByLocationPage() {
       <div className="flex items-center gap-3">
         <MapPin className="text-[#af4408]" size={24} />
         <div className="flex-1">
-          <h1 className="text-xl font-semibold text-[#2D1B0E]">Closing Stock by Location</h1>
+          <h1 className="text-xl font-semibold text-[#2D1B0E]">Closing Stock — One Department</h1>
           <p className="text-xs text-[#8B7355]">
             Pick a storage area, count the items there, save in one go. Set <code>storage_location</code> per material via{' '}
             <a href="/inventory" className="text-[#af4408] underline">Raw Materials</a>.
