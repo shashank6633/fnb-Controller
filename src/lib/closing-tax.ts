@@ -52,12 +52,22 @@
  *      tax-applied.ts header), which is exactly why every row says which of the
  *      two it is: "last bill with GST 12 Oct 2026" or "Master GST %".
  *   3. BLANK — never 0. A 0% would claim the item is GST-free; a blank says
- *      this report has no rate for it. Totals sum only the rows WITH a rate
- *      (and a value at count) and say "rate known for N of M items". EVERY
- *      note printed with a total — on all three surfaces and in the Closing
- *      Overview board CSV — comes from closingTaxNotes() below, which tells
- *      apart "no rate at all", "rates known but no value saved at count" and
- *      "some taxed", so a note never denies a rate the GST % column shows.
+ *      this report has no rate for it. The TAX total sums only the rows WITH a
+ *      rate (and a value at count) and says "rate known for N of M items". EVERY
+ *      note printed with a total — on all four surfaces and in their CSVs —
+ *      comes from closingTaxNotes() below, which tells apart "no rate at all",
+ *      "rates known but no value saved at count" and "some taxed", so a note
+ *      never denies a rate the GST % column shows.
+ *
+ * TOTAL INCL. GST = VALUE + TAX (owner ruling 109, 5 Nov 2026). The owner read
+ * a Total incl. GST that was SMALLER than the value beside it ("Total Value
+ * Plus Tax is equal to Total Incl Tax right") — it then summed only the counts
+ * that had a GST rate. Now it is the FULL value at count + the known tax:
+ * a count with no GST rate is included AT ITS VALUE, with no GST added. Per
+ * row, per column, per card, per total and in every CSV, a printed Total incl.
+ * GST is exactly the value printed beside it + the tax printed beside it (a
+ * blank tax = 0), worked from the same rounded figures the screen prints
+ * (closingIncl / closingTaxOnValue below), so they foot to the paisa.
  *
  * ALWAYS BLANK, whatever a bill or the master says:
  *   · LIQUOR / STORE-MAPPED materials — their duty is excise / cess / TCS on the
@@ -71,7 +81,7 @@
  * THE MONEY — ON THE VALUE SAVED WITH THE COUNT, ON EVERY SURFACE
  * ───────────────────────────────────────────────────────────────────────────
  *   Tax            = value at count × GST % ÷ 100   (r2)
- *   Total incl. tax = value at count + Tax          (r2)
+ *   Total incl. tax = value at count + Tax          (r2; no GST rate → the value)
  * "Value at count" is the STORED closing_stock.total_value — the count-time
  * rate × qty written when the count was saved — read through
  * storedCountValue() below, the ONE definition all three surfaces use:
@@ -154,7 +164,17 @@ export const CLOSING_TAX_TITLE =
   + 'closing stock, so this is an estimate, not tax actually charged. GST only — cesses are not included. '
   + 'Blank where there is no rate, or no value was saved with the count.';
 export const CLOSING_INCL_TITLE =
-  'Value at count + estimated GST. Blank where there is no GST rate (or no value saved with the count).';
+  'Value at count + estimated GST — the value saved with the count plus the Tax beside it. A count with no GST '
+  + 'rate is included at its value at count, with no GST added. Blank only where there is no value at count.';
+/**
+ * Closing Stock History only: its Total incl. GST is built on the TOTAL VALUE
+ * that tab prints, which for a count saved before values were stored is an
+ * "est." figure worked out at today's price (no GST is added to it).
+ */
+export const CLOSING_INCL_HISTORY_TITLE =
+  'Total Value + estimated GST — the Total Value beside it plus the Tax beside it. A row with no GST rate, or '
+  + 'with no value saved at count (an "est." Total Value worked out at today\'s price), is included at its '
+  + 'Total Value, with no GST added. Blank only where there is no Total Value.';
 
 /**
  * CSV headings. Appended AFTER every existing column, never inserted.
@@ -164,7 +184,10 @@ export const CLOSING_INCL_TITLE =
 export const CLOSING_GST_PCT_CSV = 'GST % (last bill with GST on/before count date; else master; blank = no rate)';
 export const CLOSING_GST_SOURCE_CSV = 'GST % Source';
 export const CLOSING_TAX_CSV = 'Tax INR (GST est. = value at count x GST % / 100)';
-export const CLOSING_INCL_CSV = 'Total incl. GST INR (est. = value at count + GST)';
+export const CLOSING_INCL_CSV = 'Total incl. GST INR (est. = value at count + GST; no GST rate = value at count)';
+/** Closing Stock History CSV only (see CLOSING_INCL_HISTORY_TITLE): its basis is the Total Value column. */
+export const CLOSING_INCL_HISTORY_CSV =
+  'Total incl. GST INR (est. = Total Value + GST; no GST rate or no value saved at count = Total Value with no GST added)';
 /** Closing Overview CSVs only (see CLOSING_COUNT_VALUE_LABEL). */
 export const CLOSING_COUNT_VALUE_CSV = 'Value at count INR (saved with the count; the GST basis)';
 
@@ -195,7 +218,8 @@ export interface ClosingGst {
 export interface ClosingTaxCells {
   /** value × pct ÷ 100, or null when there is no rate or no value. */
   tax: number | null;
-  /** value + tax, or null when tax is null. */
+  /** value + tax (ruling 109) — the value alone when there is no GST rate;
+   *  null only when there is no value at count. */
   total_incl_tax: number | null;
 }
 
@@ -227,7 +251,7 @@ export const SEMI_GST: ClosingGst = Object.freeze({
   gst_bill_date: null,
   gst_note: 'semi-finished — no GST rate',
   gst_title: 'Semi-finished (sub-recipe) stock is made in-house and never billed, so it carries no GST rate. '
-    + 'Left blank, and not in the tax totals.',
+    + 'Left blank: no GST is added for it, and Total incl. GST counts it at its value where one was saved.',
 }) as ClosingGst;
 
 const LIQUOR_GST: ClosingGst = Object.freeze({
@@ -253,7 +277,8 @@ const NONE_GST: ClosingGst = Object.freeze({
   gst_bill_date: null,
   gst_note: 'no GST rate on record',
   gst_title: 'No bill dated on or before this count recorded GST for this material, and its item master has no '
-    + 'GST %. Left blank (never 0%), and not in the tax totals.',
+    + 'GST %. Left blank (never 0%): no GST is added for it, and Total incl. GST counts it at its value '
+    + 'where one was saved.',
 }) as ClosingGst;
 
 function masterGst(pct: number): ClosingGst {
@@ -293,23 +318,39 @@ export function storedCountValue(row: {
 
 /**
  * Tax and Total incl. tax for one row, from its value at count
- * (storedCountValue). null in → null out: no rate, or no value saved with the
- * count, is a BLANK, never ₹0.
+ * (storedCountValue). No value saved with the count → both BLANK, never ₹0.
+ * No GST rate → Tax BLANK (never ₹0) and Total incl. = the value itself: the
+ * count is included at its value with no GST added (ruling 109), so a
+ * Total incl. column foots against the Value + Tax columns beside it.
  */
 export function closingTaxCells(
   value: number | null | undefined,
   gst: Pick<ClosingGst, 'gst_pct'> | null | undefined,
 ): ClosingTaxCells {
   const pct = gst?.gst_pct;
-  if (pct == null || value == null || !Number.isFinite(Number(value))) {
+  if (value == null || !Number.isFinite(Number(value))) {
     return { tax: null, total_incl_tax: null };
   }
   const v = r2(Number(value));
+  if (pct == null) return { tax: null, total_incl_tax: v };
   const tax = r2((v * Number(pct)) / 100);
   return { tax, total_incl_tax: r2(v + tax) };
 }
 
-/** A row any surface can total: its value, its rate and its two tax cells. */
+/**
+ * Total incl. GST for a PRINTED value and a PRINTED tax (a blank tax = 0):
+ * both rounded to the paisa first, exactly as the screen prints them, so the
+ * three printed figures always add up (ruling 109).
+ */
+export function closingIncl(value: number | null | undefined, tax: number | null | undefined): number {
+  return r2(r2(Number(value) || 0) + r2(Number(tax) || 0));
+}
+
+/**
+ * A row any surface can total. `value` is the value THIS SURFACE PRINTS for
+ * the row (null = none printed) — the figure its Total incl. GST is built on;
+ * `tax` the row's tax (null = blank); `gst_pct` its rate (null = none).
+ */
 export interface ClosingTaxSummable {
   value?: number | null;
   gst_pct?: number | null;
@@ -318,55 +359,107 @@ export interface ClosingTaxSummable {
 }
 
 export interface ClosingTaxTotals {
-  /** Σ tax over the rows that HAVE a tax figure. */
+  /** Σ tax over the rows that HAVE a tax figure (rate known AND a value at count). */
   tax: number;
-  /** Σ (value at count + tax) over the same rows — NOT the whole sheet's value. */
+  /** value + tax (ruling 109): the FULL value below plus the known tax. */
   total_incl_tax: number;
-  /** Σ value at count over the same rows, so the footer can say what it covers. */
+  /** Σ value over EVERY row with a value — with or without a GST rate. The
+   *  figure Total incl. GST is built on; a surface that prints a value total
+   *  of its own re-bases onto it with closingTaxOnValue(). */
+  value: number;
+  /** Σ value of the rows WITH a tax figure — what the Tax is worked out on. */
   value_taxed: number;
   /** Rows whose GST rate is known (gst_pct present). */
   rated: number;
-  /** Rows in the totals (rate known AND a value at count to apply it to). */
+  /** Rows with a tax figure (rate known AND a value at count to apply it to). */
   taxed: number;
   /** All rows considered (the M in "N of M"). */
   items: number;
+  /** Rows with a value (in `value`). */
+  valued: number;
+  /** Rows with a value but NO tax — included in Total incl. at their value, no GST added. */
+  at_value: number;
+  /** …of those, the ones that DO have a GST rate (no value was saved with the
+   *  count, so the value is not one the rate may be applied to). */
+  at_value_rated: number;
 }
+
+const ZERO_TOTALS: ClosingTaxTotals = Object.freeze({
+  tax: 0, total_incl_tax: 0, value: 0, value_taxed: 0,
+  rated: 0, taxed: 0, items: 0, valued: 0, at_value: 0, at_value_rated: 0,
+}) as ClosingTaxTotals;
+
+const finiteOrNull = (v: unknown): number | null =>
+  v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v);
 
 /**
- * Totals for a footer. THE RULE: only rows with a rate are summed, and the
- * footer says how many. Summed from the same per-row figures the column
- * prints, so a footer always foots its own column.
+ * Totals for a footer. Tax: only rows with a tax figure are summed, and the
+ * footer says how many ("rate known for N of M"). Total incl. GST: the value
+ * of EVERY row that has one + that tax (ruling 109). Summed from the same
+ * per-row figures the columns print, so a footer foots its own columns.
  */
 export function sumClosingTax(rows: readonly ClosingTaxSummable[]): ClosingTaxTotals {
-  let tax = 0, incl = 0, val = 0, rated = 0, taxed = 0;
+  let tax = 0, val = 0, valTaxed = 0, rated = 0, taxed = 0, valued = 0, atValue = 0, atValueRated = 0;
   for (const r of rows) {
-    if (r?.gst_pct != null) rated += 1;
-    if (r?.tax == null || r?.total_incl_tax == null) continue;
-    taxed += 1;
-    tax += Number(r.tax) || 0;
-    incl += Number(r.total_incl_tax) || 0;
-    val += (Number(r.total_incl_tax) || 0) - (Number(r.tax) || 0);
+    const hasRate = r?.gst_pct != null;
+    if (hasRate) rated += 1;
+    const v = finiteOrNull(r?.value);
+    const t = finiteOrNull(r?.tax);
+    if (v != null) { valued += 1; val += v; }
+    if (t != null) {
+      taxed += 1;
+      tax += t;
+      valTaxed += v ?? 0;
+    } else if (v != null) {
+      atValue += 1;
+      if (hasRate) atValueRated += 1;
+    }
   }
-  return { tax: r2(tax), total_incl_tax: r2(incl), value_taxed: r2(val), rated, taxed, items: rows.length };
+  const value = r2(val), taxR = r2(tax);
+  return {
+    tax: taxR, total_incl_tax: closingIncl(value, taxR), value, value_taxed: r2(valTaxed),
+    rated, taxed, items: rows.length, valued, at_value: atValue, at_value_rated: atValueRated,
+  };
 }
 
-/** Add a set of already-computed totals together (board cells → department → grand total). */
+/** Add a set of already-computed totals together (board cells → department →
+ *  grand total). Total incl. is re-worked from the summed value + summed tax —
+ *  never a sum of parts — so it foots the two figures printed beside it. */
 export function addClosingTaxTotals(parts: readonly (Partial<ClosingTaxTotals> | null | undefined)[]): ClosingTaxTotals {
-  const out: ClosingTaxTotals = { tax: 0, total_incl_tax: 0, value_taxed: 0, rated: 0, taxed: 0, items: 0 };
+  const out: ClosingTaxTotals = { ...ZERO_TOTALS };
   for (const p of parts) {
     if (!p) continue;
     out.tax += Number(p.tax) || 0;
-    out.total_incl_tax += Number(p.total_incl_tax) || 0;
+    out.value += Number(p.value) || 0;
     out.value_taxed += Number(p.value_taxed) || 0;
     out.rated += Number(p.rated) || 0;
     out.taxed += Number(p.taxed) || 0;
     out.items += Number(p.items) || 0;
+    out.valued += Number(p.valued) || 0;
+    out.at_value += Number(p.at_value) || 0;
+    out.at_value_rated += Number(p.at_value_rated) || 0;
   }
   out.tax = r2(out.tax);
-  out.total_incl_tax = r2(out.total_incl_tax);
+  out.value = r2(out.value);
   out.value_taxed = r2(out.value_taxed);
+  out.total_incl_tax = closingIncl(out.value, out.tax);
   return out;
 }
+
+/**
+ * Re-base a set of totals onto the VALUE A SURFACE PRINTS beside them (a
+ * column footer, a card): Total incl. GST = that printed value + the printed
+ * tax, to the paisa. The counts are kept — they describe the rows.
+ */
+export function closingTaxOnValue(t: ClosingTaxTotals, value: number | null | undefined): ClosingTaxTotals {
+  const v = r2(Number(value) || 0);
+  return { ...t, value: v, total_incl_tax: closingIncl(v, t.tax) };
+}
+
+/** Is a Total incl. GST printed for these totals? Only where the value beside
+ *  it is a figure — at least one row has a value. Otherwise it is a dash. */
+export const closingInclShown = (t: Pick<ClosingTaxTotals, 'valued'> | null | undefined): boolean =>
+  !!t && (Number(t.valued) || 0) > 0;
 
 /* ───────────────────────────── THE TOTALS NOTES ──────────────────────────── */
 
@@ -392,13 +485,16 @@ export interface ClosingTaxNotes {
   situation: ClosingTaxSituation;
   /** The line under (or beside) the Tax total — "rate known for N of M …" and what that means here. */
   rate: string;
-  /** The line under the Total incl. total, which sits beside the Tax total's line. */
+  /** The line under the Total incl. total: what it is built of — "GST added for N of M counts ·
+   *  K with no GST rate included at value" (ruling 109). */
   incl: string;
-  /** Like `incl`, but names its rows — for a figure with no Tax line beside it (a summary card). */
+  /** The same as `incl` (it names its rows) — for a summary card. Kept as its own field for callers. */
   covers: string;
-  /** Compact form for a tight cell (the Closing Overview board footers). */
+  /** Compact Tax-line form for a tight cell (the Closing Overview board footers). */
   short: string;
-  /** Hover text: what both totals cover, and why each excluded row is out. */
+  /** Compact `incl` for the same tight cells. */
+  incl_short: string;
+  /** Hover text: how the Tax and the Total incl. GST are each made up. */
   title: string;
 }
 
@@ -411,51 +507,106 @@ export function closingTaxSituation(t: Pick<ClosingTaxTotals, 'rated' | 'taxed' 
 }
 
 /**
- * THE ONE SOURCE of every note printed with the GST totals, on all three
- * surfaces and in the Closing Overview board CSV: the Tax-total line, the
- * Total-incl. line, the summary-card lines, the board-footer lines and their
- * hover text. Each case says what is actually true —
- *   no rate at all     "rate known for 0 of 3 items, so no tax is shown"
- *   rates, no value    "rate known for 3 of 3 items, but none has a value
+ * THE ONE SOURCE of every note printed with the GST totals, on all four
+ * surfaces and in their CSVs: the Tax-total line, the Total-incl. line, the
+ * summary-card lines, the board-footer lines and their hover text. Each case
+ * says what is actually true —
+ *   Tax line           "rate known for 9 of 13 items (2 with no value saved
+ *                       at count are not in the tax figure)" / "rate known for 0 of
+ *                       3 items, so no tax is shown" / "… but none has a value
  *                       saved at count, so no tax is shown"
- *   some taxed         "rate known for 9 of 13 items (2 with no value saved
- *                       at count are not in the total)" / "those 7 only"
- * — so no note can deny a rate the GST % column prints, or claim a tax
+ *   Total incl. line   "GST added for 7 of 13 items · 4 with no GST rate
+ *                       included at value · 2 with no value" / "no GST rate
+ *                       known — value at count, no GST added"
+ * — so no note can deny a rate the GST % column prints, or claim a figure
  * covers rows it does not. Pass the totals (sumClosingTax /
- * addClosingTaxTotals), the surface's noun, and its rupee formatter (used in
- * the hover text only).
+ * addClosingTaxTotals / closingTaxOnValue), the surface's noun, and its rupee
+ * formatter (used in the hover text only). `valueWord` names the value the
+ * Total incl. GST is built on where it is not purely the value at count
+ * (Closing Stock History: "Total Value", which can hold an "est." figure).
  */
 export function closingTaxNotes(
-  t: Pick<ClosingTaxTotals, 'rated' | 'taxed' | 'items'> & Partial<Pick<ClosingTaxTotals, 'tax' | 'total_incl_tax' | 'value_taxed'>>,
+  t: Pick<ClosingTaxTotals, 'rated' | 'taxed' | 'items'>
+    & Partial<Pick<ClosingTaxTotals, 'tax' | 'total_incl_tax' | 'value' | 'value_taxed' | 'valued' | 'at_value' | 'at_value_rated'>>,
   noun: ClosingTaxNoun = 'items',
   fmt: (v: number) => string = (v) => String(r2(v)),
+  valueWord = 'value at count',
 ): ClosingTaxNotes {
   const items = Math.max(0, Number(t?.items) || 0);
   const taxed = Math.max(0, Number(t?.taxed) || 0);
   const rated = Math.max(0, Number(t?.rated) || 0);
+  // Included at value, no GST added — split by whether a GST rate is known.
+  const atValue = Math.max(0, Number(t?.at_value) || 0);
+  const atValueRated = Math.min(atValue, Math.max(0, Number(t?.at_value_rated) || 0));
+  const atValueNoRate = atValue - atValueRated;
+  // In neither figure: no tax and no value.
+  const unvalued = Math.max(0, items - taxed - atValue);
   const one = NOUN_ONE[noun] || noun;
-  const of = (n: number) => `${n} ${n === 1 ? one : noun}`;          // "1 item" / "3 items"
+  const N = (n: number) => n.toLocaleString('en-IN');
+  const of = (n: number) => `${N(n)} ${n === 1 ? one : noun}`;          // "1 item" / "1,331 items"
   const are = (n: number) => (n === 1 ? 'is' : 'are');
   const have = (n: number) => (n === 1 ? 'has' : 'have');
   const situation = closingTaxSituation({ rated, taxed, items });
-  const known = `rate known for ${rated} of ${of(items)}`;
+  const known = `rate known for ${N(rated)} of ${of(items)}`;
 
   if (situation === 'empty') {
     const s = `no ${noun}`;
-    return { situation, rate: s, incl: s, covers: s, short: s, title: `No ${noun} — nothing to estimate GST on.` };
+    return { situation, rate: s, incl: s, covers: s, short: s, incl_short: s, title: `No ${noun} — nothing to estimate GST on.` };
   }
 
+  /* ── the Total incl. GST line (ruling 109): value + tax, every row with a
+   *    value included — those with no GST rate at their value, no GST added. */
+  const parts = [
+    atValueNoRate > 0 ? `${N(atValueNoRate)} with no GST rate included at value` : '',
+    atValueRated > 0 ? `${N(atValueRated)} with no value saved at count included at the value shown, no GST` : '',
+    unvalued > 0 ? `${N(unvalued)} with no value` : '',
+  ].filter(Boolean);
+  const shortParts = [
+    atValueNoRate > 0 ? `${N(atValueNoRate)} no GST rate, at value` : '',
+    atValueRated > 0 ? `${N(atValueRated)} not saved at count, at value` : '',
+    unvalued > 0 ? `${N(unvalued)} no value` : '',
+  ].filter(Boolean);
+  let incl: string, inclShort: string;
+  if (taxed > 0) {
+    incl = [`GST added for ${N(taxed)} of ${of(items)}`, ...parts].join(' · ');
+    inclShort = [`GST on ${N(taxed)} of ${N(items)}`, ...shortParts].join(' · ');
+  } else if (atValue > 0) {
+    if (rated === 0) {
+      incl = [`no GST rate known — ${valueWord}, no GST added`, ...(unvalued > 0 ? [`${N(unvalued)} with no value`] : [])].join(' · ');
+      inclShort = ['no GST rate · value only', ...(unvalued > 0 ? [`${N(unvalued)} no value`] : [])].join(' · ');
+    } else {
+      incl = ['no GST added', ...parts].join(' · ');
+      inclShort = ['no GST added', ...shortParts].join(' · ');
+    }
+  } else {
+    incl = items === 1 ? `the ${one} has no value` : `no ${one} has a value`;
+    inclShort = 'no value';
+  }
+
+  /* ── the hover text: how each of the two figures is made up ─────────────── */
+  // No tax worked out → no "+ ₹0" (a ₹0 reads as GST-free): the value alone.
+  const inclTitle = atValue > 0 || taxed > 0
+    ? (taxed > 0
+      ? `Total incl. GST = the ${valueWord} ${fmt(Number(t?.value) || 0)} + the tax ${fmt(Number(t?.tax) || 0)}`
+        + ` = ${fmt(Number(t?.total_incl_tax) || 0)}.`
+      : `Total incl. GST = the ${valueWord} ${fmt(Number(t?.total_incl_tax) || 0)}, with no GST added.`)
+      + (atValueNoRate > 0 ? ` ${N(atValueNoRate)} with no GST rate ${are(atValueNoRate)} included at value, with no GST added.` : '')
+      + (atValueRated > 0 ? ` ${N(atValueRated)} with a GST rate but no value saved at count ${are(atValueRated)} included at`
+        + ' the value shown, with no GST added — a rate is applied only to the value saved with the count.' : '')
+      + (unvalued > 0 ? ` ${N(unvalued)} ${have(unvalued)} no value and ${are(unvalued)} in neither figure.` : '')
+    : `Total incl. GST is blank: ${items === 1 ? `the ${one} has no value` : `none of the ${N(items)} ${noun} has a value`}.`;
+  const rateWhere = ' A rate comes from the latest bill with GST on or before the count date, else the item '
+    + "master's GST %; liquor / store and semi-finished items never carry one.";
+
   if (situation === 'no_rate') {
-    const none = `no ${one} has a GST rate`;
     return {
       situation,
       rate: `${known}, so no tax is shown`,
-      incl: none,
-      covers: none,
+      incl, covers: incl,
       short: `${known} · no tax`,
-      title: `${items === 1 ? `The 1 ${one} has no GST rate` : `None of the ${items} ${noun} has a GST rate`}, so no tax is `
-        + 'estimated and both totals are blank. A rate comes from the latest bill with GST on or before the '
-        + "count date, else the item master's GST %; liquor / store and semi-finished items never carry one.",
+      incl_short: inclShort,
+      title: `Tax: ${items === 1 ? `the 1 ${one} has no GST rate` : `none of the ${N(items)} ${noun} has a GST rate`}, so no tax is `
+        + `estimated and the Tax is blank.${rateWhere} ${inclTitle}`,
     };
   }
 
@@ -464,10 +615,7 @@ export function closingTaxNotes(
     // value saved with its count, so there is nothing to apply them to.
     const which = rated === 1
       ? 'it has no value'
-      : rated === items ? 'none has a value' : `none of those ${rated} has a value`;
-    const withRate = rated === 1
-      ? `the 1 ${one} with a GST rate has no value saved at count`
-      : `none of the ${rated} ${noun} with a GST rate has a value saved at count`;
+      : rated === items ? 'none has a value' : `none of those ${N(rated)} has a value`;
     const noRate = items - rated;
     // The compact board-footer form names WHICH rows have no value, like
     // `which` above: when some rows have no rate, one of THOSE may well have a
@@ -476,17 +624,18 @@ export function closingTaxNotes(
       ? 'none with a value at count'
       : rated === 1
         ? 'the 1 with a GST rate has no value at count'
-        : `none of the ${rated} with a GST rate has a value at count`;
+        : `none of the ${N(rated)} with a GST rate has a value at count`;
     return {
       situation,
       rate: `${known}, but ${which} saved at count, so no tax is shown`,
-      incl: withRate,
-      covers: withRate,
+      incl, covers: incl,
       short: `${known} · ${shortWhich} · no tax`,
-      title: `GST rate known for ${rated} of ${of(items)}, but ${which} saved with the count, so no tax is `
-        + 'estimated and both totals are blank. Tax is applied only to the value saved with the count — never to '
+      incl_short: inclShort,
+      title: `Tax: GST rate known for ${N(rated)} of ${of(items)}, but ${which} saved with the count, so no tax is `
+        + 'estimated and the Tax is blank. Tax is applied only to the value saved with the count — never to '
         + 'a value worked out today, which a later bill could move.'
-        + (noRate > 0 ? ` The other ${noRate} ${have(noRate)} no GST rate.` : ''),
+        + (noRate > 0 ? ` The other ${N(noRate)} ${have(noRate)} no GST rate.` : '')
+        + ` ${inclTitle}`,
     };
   }
 
@@ -494,24 +643,24 @@ export function closingTaxNotes(
   const noValue = Math.max(0, rated - taxed);
   const noRate = Math.max(0, items - rated);
   const out = [
-    noRate > 0 ? `${noRate} with no GST rate` : '',
-    noValue > 0 ? `${noValue} with a GST rate but no value saved at count` : '',
+    noRate > 0 ? `${N(noRate)} with no GST rate` : '',
+    noValue > 0 ? `${N(noValue)} with a GST rate but no value saved at count` : '',
   ].filter(Boolean);
   return {
     situation,
     rate: noValue > 0
-      ? `${known} (${noValue} with no value saved at count ${are(noValue)} not in the total)`
+      ? `${known} (${N(noValue)} with no value saved at count ${are(noValue)} not in the tax figure)`
       : known,
-    incl: taxed === 1 ? 'that 1 only' : `those ${taxed} only`,
-    covers: taxed === 1 ? `that 1 ${one} only` : `those ${taxed} ${noun} only`,
-    short: noValue > 0 ? `${known} · ${noValue} with no value at count not in total` : known,
-    title: (taxed === items
-      ? (items === 1
-        ? `Covers the 1 ${one}, which has a GST rate and a value saved at count: `
-        : `Covers all ${items} ${noun} — each has a GST rate and a value saved at count: `)
-      : `Covers only the ${taxed} of ${of(items)} with a GST rate and a value saved at count: `)
-      + `value at count ${fmt(Number(t?.value_taxed) || 0)} + estimated GST ${fmt(Number(t?.tax) || 0)}.`
-      + (out.length ? ` Not in this total: ${out.join('; ')}.` : ''),
+    incl, covers: incl,
+    short: noValue > 0 ? `${known} · ${N(noValue)} with no value at count not in tax` : known,
+    incl_short: inclShort,
+    title: 'Tax: estimated GST on '
+      + (taxed === items
+        ? (items === 1 ? `the 1 ${one}, which has a GST rate and a value saved at count` : `all ${N(items)} ${noun} — each has a GST rate and a value saved at count`)
+        : `the ${N(taxed)} of ${of(items)} with a GST rate and a value saved at count`)
+      + ` (their value at count ${fmt(Number(t?.value_taxed) || 0)}) = ${fmt(Number(t?.tax) || 0)}.`
+      + (out.length ? ` No tax on: ${out.join('; ')}.` : '')
+      + ` ${inclTitle}`,
   };
 }
 

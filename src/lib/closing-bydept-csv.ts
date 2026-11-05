@@ -18,7 +18,7 @@
  * BLANK = not counted, '0' = counted and zero — the matrix CSV's rule.
  */
 import { csvQty } from './pack-units';
-import { CLOSING_INCL_CSV, CLOSING_TAX_CSV, type ClosingTaxTotals } from './closing-tax';
+import { CLOSING_INCL_CSV, CLOSING_TAX_CSV, closingInclShown, type ClosingTaxTotals } from './closing-tax';
 
 export interface BydeptCsvColumn { key: string; name: string; group: string }
 /** unit-lock: `qty` is ALREADY in the purchase unit (semi-finished: its yield unit). */
@@ -37,7 +37,8 @@ export interface BydeptCsvRow {
 export interface BydeptCsvTotal { lines: number; value: number; unpriced: number }
 export interface BydeptCsvBlock { by_column: Record<string, BydeptCsvTotal>; total: BydeptCsvTotal & { items: number } }
 /** Estimated GST on the RAW block (ruling 107), per column and in total —
- *  the route's sumClosingTax / addClosingTaxTotals figures, printed as sent. */
+ *  the route's sumClosingTax / addClosingTaxTotals figures, printed as sent.
+ *  Its total_incl_tax is the raw Value line + the Tax line (ruling 109). */
 export interface BydeptCsvTax { by_column: Record<string, ClosingTaxTotals>; total: ClosingTaxTotals }
 export interface BydeptCsvSheet {
   date: string;
@@ -135,22 +136,25 @@ export function bydeptCsv(sheet: BydeptCsvSheet): string {
   lines.push('');
   footer('raw materials', sheet.totals.raw);
   // Estimated GST, raw materials only (semi-finished never carries GST). A
-  // column with no count that has both a rate and a value at count is BLANK,
-  // never 0 — "no tax worked out" is not "₹0 tax". The Total incl. GST covers
-  // only those counts, so the third line says how many that is per column.
+  // column with no count that has both a rate and a value at count has a
+  // BLANK tax, never 0 — "no tax worked out" is not "₹0 tax". Total incl. GST
+  // (ruling 109) = the raw Value line above + the Tax line (blank = 0): counts
+  // with no GST rate are in at their value. Blank only where the Value line
+  // has no priced count. The third line says how many counts carry a rate.
   if (sheet.tax) {
     const tx = sheet.tax;
-    const fig = (x: ClosingTaxTotals | undefined, f: 'tax' | 'total_incl_tax') => (x && x.taxed > 0 ? x[f] : '');
+    const taxFig = (x: ClosingTaxTotals | undefined) => (x && x.taxed > 0 ? x.tax : '');
+    const inclFig = (x: ClosingTaxTotals | undefined) => (closingInclShown(x) ? x!.total_incl_tax : '');
     const known = (x: ClosingTaxTotals | undefined) => (x && x.items > 0 ? `${x.rated} of ${x.items}` : '');
     lines.push([
       cell(`${CLOSING_TAX_CSV} — raw materials`), ...pad,
       ...colKeys.map(() => ''), '',
-      ...colKeys.map((k) => fig(tx.by_column[k], 'tax')), fig(tx.total, 'tax'),
+      ...colKeys.map((k) => taxFig(tx.by_column[k])), taxFig(tx.total),
     ].join(','));
     lines.push([
-      cell(`${CLOSING_INCL_CSV} — raw materials; counts with a GST rate and a value at count only`), ...pad,
+      cell(`${CLOSING_INCL_CSV} — raw materials; = the raw-materials Value line + the Tax line`), ...pad,
       ...colKeys.map(() => ''), '',
-      ...colKeys.map((k) => fig(tx.by_column[k], 'total_incl_tax')), fig(tx.total, 'total_incl_tax'),
+      ...colKeys.map((k) => inclFig(tx.by_column[k])), inclFig(tx.total),
     ].join(','));
     lines.push([
       cell('GST rate known for (counts) — raw materials'), ...pad,

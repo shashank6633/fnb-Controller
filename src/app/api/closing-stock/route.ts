@@ -1,5 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
-import { allowedDeptIds, canSeeAllDeptStock } from '@/lib/dept-stock';
+import { allowedDeptIds, allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
   DEPT_REQUESTED_ITEM_SQL, NOT_STORE_MAPPED_SQL, deptRequestedParams, selectedDeptSet,
 } from '@/lib/dept-requested-items';
@@ -350,12 +350,18 @@ export async function GET(request: Request) {
           materialIds: valuedItems.map(i => String(i.material_id)),
         })
       : null;
+    const bases: (number | null)[] = [];
     const items = valuedItems.map(i => {
       const g = gstResolver!.forMaterial(String(i.material_id), String(i.date));
       const basis = i.rate_is_stored ? storedCountValue(i) : null;
+      bases.push(basis);
       return { ...i, ...g, ...closingTaxCells(basis, g) };
     });
-    const closingTax = sumClosingTax(items);
+    // Tax over the rows with a rate; Total incl. GST = Σ value at count of
+    // every row that has one + that tax (ruling 109). The History tab prints
+    // its own figures from the rows (its Total Value can hold an "est." value
+    // worked out today, which is in its Total incl. at that value, no GST).
+    const closingTax = sumClosingTax(items.map((i, k) => ({ value: bases[k], gst_pct: i.gst_pct, tax: i.tax })));
 
     // Per-area rollup of the physical closing VALUE (physical_stock × average_price).
     // Built from the SAME date/range window as `items` but WITHOUT the department_id
@@ -433,8 +439,9 @@ export async function GET(request: Request) {
       total_closing_value: r2((items as any[]).reduce((s, i) => s + (Number(i.total_value) || 0), 0)),
       unvalued_items: (items as any[]).filter(i => i.rate_source === 'none').length,
       derived_rate_items: (items as any[]).filter(i => !i.rate_is_stored).length,
-      // Estimated GST over the rows WITH a rate only (closing-tax.ts):
-      // { tax, total_incl_tax, value_taxed, rated, taxed, items }.
+      // Estimated GST (closing-tax.ts): tax over the rows WITH a rate; total
+      // incl. = value at count + tax. { tax, total_incl_tax, value,
+      // value_taxed, rated, taxed, items, valued, at_value, at_value_rated }.
       closing_tax: closingTax,
     };
 
@@ -508,6 +515,15 @@ export async function POST(request: Request) {
     // is set, this is the sentence that describes the system.
     const authMod = await import('@/lib/auth');
     const me = await authMod.getCurrentUser();
+    // NO SESSION, NO COUNT (ruling 111) — a BACK-UP check only. src/proxy.ts
+    // step 2c already looks every POST's session up in the sessions table and
+    // answers an unknown or expired one with 401 "Sign in required", so in
+    // normal running this line never fires. It matters only if that proxy
+    // check ever errors and lets the request through (its catch falls open):
+    // then `me` is null here, and the department guard below needs a user.
+    if (!me) {
+      return Response.json({ error: 'You are not signed in. Sign in again, then save your counts.' }, { status: 401 });
+    }
     const isAdmin = me?.role === 'admin';
     // Tag every saved count with the current outlet so outlet-scoped reads (e.g.
     // the Variance Report) see it immediately — without this the row is written
@@ -527,6 +543,14 @@ export async function POST(request: Request) {
       return s === '' || s === '__store__' ? null : s;
     };
     const topDeptId = normDept(body.department_id);
+    // The department a line is WRITTEN to: its own department_id when it
+    // carries one, else the top-level one. ONE expression, used by the scope
+    // guard below AND by the write loop, so the department that is checked is
+    // always the department that is saved.
+    const effectiveDept = (item: unknown): string | null => {
+      const own = (item as { department_id?: unknown } | null | undefined)?.department_id;
+      return own !== undefined ? normDept(own) : topDeptId;
+    };
 
     if (!date || !items || !Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'date and items array are required' }, { status: 400 });
@@ -560,6 +584,60 @@ export async function POST(request: Request) {
     const checked = checkClosingDate(date);
     if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
     const dateStr = checked.date;
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * WHO MAY COUNT WHICH DEPARTMENT — ONCE FOR THE WHOLE SUBMIT (ruling 111)
+     * ══════════════════════════════════════════════════════════════════════
+     * "Block like the sheet." Until this guard the route checked nothing about
+     * departments, so a Tandoor user could save a count into Bar. That is not
+     * harmless: a DEPARTMENT count re-anchors that department's balance the
+     * moment it is saved.
+     *
+     * "STORE OPEN, DEPTS LOCKED" (owner's amendment to ruling 111, 2026-11-05):
+     *   · Store / Overall (a line with no department) stays OPEN to every
+     *     signed-in user, exactly as before this guard. End-of-Day (/eod) and
+     *     the Dashboard's Daily Inventory Tracking box post that way for
+     *     department staff too, and page access already decides who reaches
+     *     them. Do NOT gate Store / Overall here on privilege or on the user
+     *     having no department.
+     *   · DEPARTMENT lines — same scope as the Department Closing Sheet
+     *     (./dept-sheet POST): canSeeAllDeptStock (Admin, Manager, HOD, Store
+     *     Manager) may count any department, unchanged; everyone else only
+     *     their own department + its sections + the departments granted in
+     *     Users → Department Visibility (allowedDeptSetExpanded).
+     *
+     * ONE difference from the sheet, on purpose: the sheet skips an
+     * out-of-scope line and saves the rest; this refuses the WHOLE submit, so
+     * not one row is written and the counter is told which departments are
+     * theirs. Checked on every line (blank ones included — a request that names
+     * a department its user may not count is refused whatever it carries),
+     * before the zero-pattern guard and before the transaction opens.
+     * ────────────────────────────────────────────────────────────────────── */
+    if (!canSeeAllDeptStock(me)) {
+      const scope = allowedDeptSetExpanded(db, me);
+      const inScope = new Set(scope);
+      const refused: string[] = [];
+      for (const item of items as unknown[]) {
+        const d = effectiveDept(item);
+        if (d === null) continue; // Store / Overall — open to every signed-in user
+        if (!inScope.has(d) && !refused.includes(d)) refused.push(d);
+      }
+      if (refused.length > 0) {
+        // Inner runs of spaces collapsed too: real names such as "Akan  Indian"
+        // carry a double space that would otherwise print as typed.
+        const names = new Map(
+          (db.prepare('SELECT id, name FROM departments').all() as { id: string; name: string }[])
+            .map(d => [d.id, String(d.name || '').replace(/\s+/g, ' ').trim() || d.id]),
+        );
+        const label = (d: string) => names.get(d) ?? `an unknown department (${d})`;
+        const mine = scope.map(label);
+        const notAllowed = refused.map(label).join(', ');
+        const error = mine.length > 0
+          ? `You can save department closing counts only for: ${mine.join(', ')}. Not allowed: ${notAllowed}. Nothing was saved.`
+          : `Your login is not set up to save a closing count for any department — ask an admin to check your department. Not allowed: ${notAllowed}. Nothing was saved.`;
+        return Response.json({ error, allowed: mine, not_allowed: refused.map(label) }, { status: 403 });
+      }
+    }
 
     /* ══════════════════════════════════════════════════════════════════════
      * THE COUNT IS READ ONCE, BEFORE ANYTHING IS WRITTEN (2026-08)
@@ -683,7 +761,8 @@ export async function POST(request: Request) {
         if (pc.kind === 'not_counted') { results.not_counted++; continue; }
 
         // Per-item department_id overrides the top-level one when present.
-        const deptId = item.department_id !== undefined ? normDept(item.department_id) : topDeptId;
+        // Same helper the scope guard above checked (ruling 111).
+        const deptId = effectiveDept(item);
 
         const material = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(item.material_id) as any;
         if (!material) {

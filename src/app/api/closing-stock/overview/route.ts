@@ -28,7 +28,8 @@ import { allDeptIds, switchedOffStillHeld } from '@/lib/count-list-active';
  *
  * ESTIMATED GST (owner #4, rulings #77/#78/#81 — src/lib/closing-tax.ts).
  * Every board cell, row total and the grand totals carry `closing_tax`
- * ({ tax, total_incl_tax, value_taxed, rated, taxed, items }); every counted
+ * ({ tax, total_incl_tax, value, value_taxed, rated, taxed, items, valued,
+ * at_value, at_value_rated }); every counted
  * drill-down item carries value_at_count / gst_pct / gst_source / gst_note /
  * gst_title / tax / total_incl_tax.
  * The rate is resolved at the board's COUNT DATE, and the tax is applied to
@@ -38,10 +39,13 @@ import { allDeptIds, switchedOffStillHeld } from '@/lib/count-list-active';
  * It is NOT applied to this board's own physical_value (physical_stock ×
  * TODAY's average_price — the existing formula, untouched): that figure moves
  * when a later bill moves the average price, and the brief forbids a later
- * bill re-pricing an older count. So `value_taxed` (Σ value at count of the
- * taxed rows) and `value_at_count` are shipped beside the tax, and the page
- * prints them, so "value at count + GST = Total incl. GST" foots on screen.
- * Only rows with a rate AND a value at count are summed. Same visibility as
+ * bill re-pricing an older count. So `value` (Σ value at count of EVERY
+ * count that has one), `value_taxed` (Σ value at count of the taxed rows) and
+ * `value_at_count` are shipped beside the tax, and the page prints them, so
+ * "value at count + GST = Total incl. GST" foots on screen. The Tax sums only
+ * rows with a rate AND a value at count; Total incl. GST (ruling 109) is the
+ * FULL value at count + that tax — a count with no GST rate is included at
+ * its value, no GST added. Same visibility as
  * physical_value (everyone past the gate); the stored total_value is cost
  * data GET /api/closing-stock already ships to every caller.
  */
@@ -199,14 +203,17 @@ export async function GET(request: Request) {
 
     // Estimated GST per (location, department) cell, folded exactly like (a).
     const gst = taxRows.length ? gstResolverFor(db, taxRows.map(r => String(r.material_id))) : null;
-    const taxCellRows = new Map<string, { gst_pct: number | null; tax: number | null; total_incl_tax: number | null }[]>();
+    const taxCellRows = new Map<string, { value: number | null; gst_pct: number | null; tax: number | null; total_incl_tax: number | null }[]>();
     for (const r of taxRows) {
       const key = knownKeys.has(r.dept_key) ? r.dept_key : STORE_KEY;
       const g = gst!.forMaterial(String(r.material_id), date);
       const cellKey = `${r.location}\u0000${key}`;
       let list = taxCellRows.get(cellKey);
       if (!list) { list = []; taxCellRows.set(cellKey, list); }
-      list.push({ gst_pct: g.gst_pct, ...closingTaxCells(storedCountValue(r), g) });
+      // `value` = the value at count — what the drill-down prints as "Value at
+      // count", and what this cell's Total incl. GST is built on.
+      const valueAtCount = storedCountValue(r);
+      list.push({ value: valueAtCount, gst_pct: g.gst_pct, ...closingTaxCells(valueAtCount, g) });
     }
     const taxFor = (location: string, key: string): ClosingTaxTotals =>
       sumClosingTax(taxCellRows.get(`${location}\u0000${key}`) || []);
@@ -268,8 +275,8 @@ export async function GET(request: Request) {
             variance_value: isAdmin ? paise(c.variance_value) : null,
             shortage: isAdmin ? c.shortage : null,
             excess: isAdmin ? c.excess : null,
-            // On each count's value at count (value_taxed says how much);
-            // shown to the same readers as physical_value.
+            // On each count's value at count (`value` / value_taxed say how
+            // much); shown to the same readers as physical_value.
             closing_tax: cellTax,
           };
         }
@@ -475,9 +482,13 @@ function itemsMode(
     physical_value: paise(counted.reduce((s, r) => s + r.physical_stock * r.average_price, 0)),
     system_value: isAdmin ? paise(counted.reduce((s, r) => s + r.system_stock * r.average_price, 0)) : null,
     variance_value: isAdmin ? paise(counted.reduce((s, r) => s + (r.variance_value || 0), 0)) : null,
-    // Counted rows only (uncounted fillers have no value); rows with a rate
-    // AND a value at count summed (value_taxed = Σ their value at count).
-    closing_tax: sumClosingTax(items.filter(i => i.counted)),
+    // Counted rows only (uncounted fillers have no value). Tax: rows with a
+    // rate AND a value at count (value_taxed = Σ their value at count). Total
+    // incl. GST: Σ value at count of every counted row that has one + that tax
+    // — `value` here is the VALUE AT COUNT, never the board's `value` above.
+    closing_tax: sumClosingTax(items.filter(i => i.counted).map(i => ({
+      value: i.value_at_count, gst_pct: i.gst_pct, tax: i.tax,
+    }))),
   };
 
   return Response.json({
