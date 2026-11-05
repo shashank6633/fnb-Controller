@@ -239,7 +239,7 @@ export async function POST(request: Request) {
         const parts = [
           result.stockRefusal ? result.stockRefusal.message : '',
           result.depotSource === 'unknown'
-            ? 'Depot landed cost is unknown for this brand (not mapped in the TGBCL Brand Map, and no depot rate was supplied) — '
+            ? 'Depot landed cost is unknown for this item (no TGBCL indent of it with a rate paid is recorded by this date, the TGBCL Brand Map gives no priced pack for it, and no depot rate was supplied) — '
               + 'the excess was recorded as 0 and is excluded from the "price of running out" total. '
               + `Supply it later with PATCH /api/liquor/retail/${result.flagId} { "depot_landed_per_bottle": … } and the excess is computed then.`
             : '',

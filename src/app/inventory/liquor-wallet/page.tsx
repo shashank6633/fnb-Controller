@@ -1051,8 +1051,9 @@ function IntegrityPanel(
           <div className="text-[11px] mt-1">
             The bill these debits were written for is no longer recorded — its Goods Receipt was voided and the debit
             could not be removed with it (a void normally removes it). If the indent will be entered again on Goods
-            Receipt, leave it: the new bill takes this debit over. If it will not, and the TGBCL portal did not charge
-            it, take it out with an <b>Adjustment</b> — one or the other, never both.
+            Receipt with a date on or after the wallet&apos;s opening, leave it: the new bill takes this debit over. If it
+            will not — or it is entered dated before the opening, which already includes it — and the TGBCL portal did
+            not charge it, take it out with an <b>Adjustment</b> — one or the other, never both.
           </div>
         </div>
       )}

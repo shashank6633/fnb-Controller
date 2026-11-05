@@ -184,9 +184,12 @@ function landedUnitCostFromIndent(
 
 /** The basis of an L1 figure, in English — one sentence, used by the audit
  *  event, the POST reply and the form's preview, so all three say the same. */
-function l1BasisText(db: Database.Database, l1: L1Landed, storeId: string): string {
+function l1BasisText(db: Database.Database, l1: L1Landed, storeId: string, asOf: string): string {
+  // "by <date>", not "ever": the line search is AS OF the withdrawal date, so a
+  // backdated withdrawal is priced at the master even when the pack was
+  // indented later — and the sentence must not claim it never was.
   if (l1.basis === 'master_only' || !l1.lineStoreId) {
-    return 'TGBCL Brand Map master rate — no indent has been recorded for this item, so no levies';
+    return `TGBCL Brand Map master rate — no indent of this item is recorded on or before ${asOf || 'that date'}, so no levies`;
   }
   const at = l1.lineStoreId === storeId ? '' : ` at ${getStoreById(db, l1.lineStoreId)?.name || 'another store'}`;
   const rate = l1.rateSource === 'master'
@@ -254,12 +257,12 @@ export function resolveLandedUnitCost(
     return { value: Number(ex), source: 'manual', detail: 'typed by the admin' };
   }
   const l1 = landedUnitCostFromL1(db, { materialId: args.materialId, mat: args.mat, asOf: args.asOf, billRef: args.billRef, storeId: args.storeId });
-  if (l1 !== null) return { value: l1.value, source: 'l1_landed', detail: l1BasisText(db, l1.l1, args.storeId) };
+  if (l1 !== null) return { value: l1.value, source: 'l1_landed', detail: l1BasisText(db, l1.l1, args.storeId, args.asOf) };
   const ind = landedUnitCostFromIndent(db, { materialId: args.materialId, mat: args.mat, asOf: args.asOf, billRef: args.billRef, storeId: args.storeId });
   if (ind !== null) {
     return {
       value: ind.value, source: 'indent_landed',
-      detail: `${l1BasisText(db, ind.l1, args.storeId)}; priced without the Brand Map, which has no single pack for this item`,
+      detail: `${l1BasisText(db, ind.l1, args.storeId, args.asOf)}; priced without the Brand Map, which has no single pack for this item`,
     };
   }
   const storeAvg = storeAvgUnitCost(db, args.storeId, args.materialId);

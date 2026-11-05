@@ -765,7 +765,10 @@ export function insertWalletTxn(
   // A deposit's challan number stays optional on purpose — a challan can be
   // recorded before its number comes back — which is why this is scoped to the
   // one type whose identity IS its reference.
-  if (type === 'indent_debit' && !reference) {
+  // `indentIdentityKey`, not only `.trim()`: a reference of zero-width
+  // characters survives trim() yet keys to '' — the same empty identity the
+  // CHECK exists to refuse.
+  if (type === 'indent_debit' && (!reference || !indentIdentityKey(reference))) {
     throw new WalletWriteError(
       'blank_reference',
       'An indent debit must name its indent. Two blank-reference debits both slipped past the '
@@ -816,12 +819,31 @@ export function insertWalletTxn(
     `).get(indentIdentityKey(reference)) as { id: string; date: string; amount: number; reference: string; source_ref: string } | undefined;
     if (dup) {
       const sameCase = dup.reference === reference;
+      // THE REMEDY DEPENDS ON WHAT THE EXISTING ROW IS. "Correct it with an
+      // adjustment" is right for none of the three once a bill is entered or
+      // re-entered: the debit then follows that bill's Net Indent, and an
+      // adjustment as well counts the difference twice with every integrity
+      // list empty (measured on an orphan a failed void removal left behind).
+      const billLive = dup.source_ref
+        ? !!db.prepare('SELECT 1 FROM store_bill_charges WHERE id = ?').get(dup.source_ref)
+        : false;
+      const remedy = !dup.source_ref
+        ? ' A second debit would double the spend. If its amount is wrong, correct it with an Adjustment — unless'
+          + ' this indent\'s bill is still to be entered on Goods Receipt: that bill takes this debit over at its'
+          + ' Net Indent, and an Adjustment as well would count the difference twice.'
+        : billLive
+          ? ' — that row was created automatically from the indent\'s recorded bill and follows it. A second debit would'
+            + ' double the spend. If the bill\'s figures are wrong, void that Goods Receipt and enter it again (the debit'
+            + ' follows); if TGBCL charged a different amount from the Net Indent, record the difference as an Adjustment.'
+          : ' — it was written for a bill of this indent whose Goods Receipt was voided, and the void could not remove'
+            + ' it. If the indent will be entered again on Goods Receipt, leave it: the new bill takes it over and sets'
+            + ' its amount. If it will not, and the TGBCL portal did not charge it, take it out with an Adjustment —'
+            + ' one or the other, never both.';
       throw new WalletWriteError(
         'debit_exists',
-        `Indent "${reference}" is already debited (₹${r2(dup.amount).toFixed(2)} on ${dup.date})`
+        `Indent "${reference}" is already debited (₹${r2(-dup.amount).toFixed(2)} on ${dup.date})`
         + (sameCase ? '' : ` — recorded as "${dup.reference}"; indent numbers are matched ignoring case and spaces, as Goods Receipt matches them`)
-        + (dup.source_ref ? ' — that row was created automatically from the recorded indent.' : '.')
-        + ' A second debit would double the spend. Correct the amount with an adjustment.',
+        + (dup.source_ref ? remedy : '.' + remedy),
         409,
       );
     }
@@ -921,11 +943,12 @@ export const LQ_AUTO_DEBIT_FAILED_EVENT = 'liquor_wallet.auto_debit_failed';
  * Called from upsertBillCharges() in src/lib/store-engine.ts, which is where a
  * Net Indent is written and which is itself called inside the indent's own
  * db.transaction() (Goods Receipt → TGBCL Liquor Bill, liquor-grn.ts; before
- * 2026-10-29 the retired /procure-bill and /procure-bulk); from a GRN void with
- * a Net Indent of ₹0, which removes the debit (voidLiquorGrn) — and, for a register
+ * 2026-10-29 the retired /procure-bill and /procure-bulk) — and, for a register
  * header, from linkIndentMembers in that same transaction, when linking the
  * upload's inward numbers widened the header (settleRegisterHeader, the only
- * other writer of a Net Indent). Also from retryAutoDebit, the heal path.
+ * other writer of a Net Indent). Also from retryAutoDebit, the heal path. A GRN
+ * void does NOT come here: it calls removeDebitForVoidedIndent, which removes
+ * the bill's debit whoever typed it.
  *
  * ── THE DECISION (2026-10-14): A WALLET-SIDE PROBLEM NEVER BLOCKS A BILL ──────
  * The TGBCL bill save is a DEPLOYED stock flow: it puts bottles on the Liquor
@@ -1000,7 +1023,8 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
 }
 
 /**
- * A VOIDED BILL TAKES ITS DEBIT WITH IT — whoever first typed it.
+ * A VOIDED BILL TAKES ITS DEBIT WITH IT — whoever first typed it, including a
+ * hand-typed row that stood in for it without being adopted (see below).
  *
  * Called by voidLiquorGrn (liquor-grn.ts [LIQUOR-RECON]) inside the void's own
  * transaction, before the charges row the debit is keyed on is deleted. Unlike
@@ -1030,12 +1054,35 @@ export function removeDebitForVoidedIndent(db: Database, args: {
   const outerTxn = db.inTransaction;
   try {
     return db.transaction((): AutoDebitResult | null => {
-      const row = db.prepare(`
+      let row = db.prepare(`
         SELECT id, date, amount, remarks FROM lq_wallet_txns WHERE type = 'indent_debit' AND source_ref = ?
       `).get(sourceRef) as { id: string; date: string; amount: number; remarks: string } | undefined;
+      // A HAND ROW STANDING IN FOR THIS BILL GOES TOO. When the bill's own
+      // auto-debit failed and someone then typed the debit by hand, the row was
+      // never adopted (source_ref ''), yet indentIntegrity counts it as this
+      // bill's debit (HAND_STANDS_IN). Left behind by the void it was a debit for
+      // an indent no longer recorded that NO integrity list shows (orphans need a
+      // source_ref). Only while no OTHER recorded bill — another store's, under
+      // the same number — is left for it to stand in for.
+      let standIn = false;
+      const key = indentIdentityKey(reference);
+      if (!row && key) {
+        useIndentKeyFn(db);
+        const otherBill = db.prepare(`
+          SELECT 1 FROM store_bill_charges WHERE id <> ? AND lq_indent_key(invoice_ref) = ? LIMIT 1
+        `).get(sourceRef, key);
+        if (!otherBill) {
+          row = db.prepare(`
+            SELECT id, date, amount, remarks FROM lq_wallet_txns
+             WHERE type = 'indent_debit' AND COALESCE(source_ref, '') = '' AND lq_indent_key(reference) = ?
+             LIMIT 1
+          `).get(key) as typeof row;
+          standIn = !!row;
+        }
+      }
       if (!row) return null;
       db.prepare('DELETE FROM lq_wallet_txns WHERE id = ?').run(row.id);
-      const wasTyped = String(row.remarks || '').includes(ADOPTED_MARK);
+      const wasTyped = standIn || String(row.remarks || '').includes(ADOPTED_MARK);
       logAuditEvent(db, {
         event_type: 'liquor_wallet.auto_debit_removed',
         entity_type: 'lq_wallet_txns',
@@ -1043,15 +1090,18 @@ export function removeDebitForVoidedIndent(db: Database, args: {
         actor_email: String(args.created_by || '').trim(),
         before: { amount: row.amount, date: row.date, reference, source_ref: sourceRef, remarks: row.remarks },
         note: `TGBCL wallet: debit for indent ${reference} (₹${r2(-row.amount).toFixed(2)}) removed — its bill ${args.voided_doc || ''} was voided`
-          + (wasTyped ? '; it had first been typed by hand, and what was typed is in this event' : ''),
+          + (standIn ? '; it was typed by hand for this indent, and what was typed is in this event'
+            : wasTyped ? '; it had first been typed by hand, and what was typed is in this event' : ''),
       });
       return {
         action: 'removed',
         id: null,
         amount: 0,
-        note: wasTyped
-          ? 'Its TGBCL wallet debit was removed with it (it had first been typed by hand; what was typed is kept in the audit trail).'
-          : 'Its TGBCL wallet debit was removed with it.',
+        note: standIn
+          ? 'Its TGBCL wallet debit — typed by hand for this indent — was removed with it (what was typed is kept in the audit trail).'
+          : wasTyped
+            ? 'Its TGBCL wallet debit was removed with it (it had first been typed by hand; what was typed is kept in the audit trail).'
+            : 'Its TGBCL wallet debit was removed with it.',
       };
     })();
   } catch (e: any) {
@@ -1243,9 +1293,9 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
   //     the INSERT would hit uq_lq_wallet_indent_debit and the indent would be
   //     left with no debit of its own.
   //   · source_ref set, its charges row GONE → the debit a VOIDED bill of this
-  //     indent left behind: a hand-typed row the voided bill had adopted (the
-  //     void keeps those — voidLiquorGrn), or a machine row whose removal at the
-  //     void failed. Void and re-enter is THE correction for a liquor bill
+  //     indent left behind — machine-written or adopted from a hand-typed row —
+  //     because its removal at the void failed (a void normally removes it:
+  //     removeDebitForVoidedIndent). Void and re-enter is THE correction for a liquor bill
   //     (Goods Receipt refuses to amend its indent or lines), so the re-entered
   //     bill takes that row over instead of being refused by a bill that no
   //     longer exists — otherwise the wallet keeps the old figure, the new bill

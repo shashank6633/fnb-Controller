@@ -4,6 +4,7 @@ import { materialStoreId, getStoreById, postLedger } from '@/lib/store-engine';
 import {
   LQ_REIMBURSEMENT_STATUS,
   landedCostPerBottleExplained,
+  landedFromIndentLine,
   type LqReimbursementStatus,
 } from '@/lib/liquor-recon';
 import { CASH_CATEGORY } from '@/lib/cash-purchase';
@@ -247,12 +248,34 @@ export function resolveDepotLanded(
   // principle. Reporting such a row as source 'landed' while retailExcessSummary
   // buckets it as unknown (its test is `depot > 0`) would make the record path
   // and the report path disagree about what the row is. One test, both places.
+  const ov = Number(args.override);
+  const typed = Number.isFinite(ov) && ov > 0 ? r2(ov) : null;
   if (explained.value && Number.isFinite(explained.value.landedPerBottle) && explained.value.landedPerBottle > 0) {
+    // NO INDENT BY THIS DATE + A TYPED FIGURE → THE TYPED FIGURE. The master
+    // fallback is TGBCL's ₹ per BOTTLE, and the form tells the operator to type
+    // the ₹ per purchase unit instead when a unit of the item is not a single
+    // bottle. Throwing that figure away for the master (measured: ₹950 typed,
+    // ₹800 used, excess ₹300 not ₹150, nothing said) made the form's advice a
+    // lie. A rate PAID on a recorded indent still wins over anything typed.
+    if (typed != null && explained.value.basis === 'master_only') {
+      return { perBottle: typed, source: 'override', detail: 'manual depot rate (no TGBCL indent of this item is recorded by this date, so the Brand Map master was not used)' };
+    }
     return { perBottle: r2(explained.value.landedPerBottle), source: 'landed', detail: explained.value.basis };
   }
-  const ov = Number(args.override);
-  if (Number.isFinite(ov) && ov > 0) {
-    return { perBottle: r2(ov), source: 'override', detail: `manual depot rate (L1: ${explained.reason})` };
+  // NO SINGLE BRAND MAP PACK, BUT INDENTED → THE INDENT LINE ALONE, exactly as
+  // a withdrawal is priced (resolveLandedUnitCost's 'indent_landed'). The line
+  // carries its own rate paid and its own share of the levies; neither needs
+  // the Brand Map. Without this the same bottle was ₹85.30 landed on a
+  // withdrawal and "unknown" on a wine-shop buy, and dropped out of §E.
+  let ind: ReturnType<typeof landedFromIndentLine> = null;
+  try {
+    ind = landedFromIndentLine(db, { materialId: args.materialId, storeId: args.storeId || undefined, asOf: args.asOf || undefined });
+  } catch { ind = null; }
+  if (ind && Number.isFinite(ind.landedPerBottle) && ind.landedPerBottle > 0) {
+    return { perBottle: r2(ind.landedPerBottle), source: 'landed', detail: 'latest_indent' };
+  }
+  if (typed != null) {
+    return { perBottle: typed, source: 'override', detail: `manual depot rate (L1: ${explained.reason})` };
   }
   return { perBottle: null, source: 'unknown', detail: explained.reason };
 }

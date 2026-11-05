@@ -699,7 +699,7 @@ function NewWithdrawalForm({ stores, categories, basisList, onClose, onSaved }: 
           )}
           {/* WHICH landed cost, in the server's words: rate paid + levies on
               the latest indent (and at which store, for a floor bar stocked by
-              transfer), the Brand Map master for an item never indented, or a
+              transfer), the Brand Map master for an item not indented by the date, or a
               plain store average when there is no landed cost at all. */}
           {landedPerBottle === '' && autoNow && autoNow.per_recipe_unit > 0 && (
             <span className="basis-full text-[11px] text-[#8B7355]">
