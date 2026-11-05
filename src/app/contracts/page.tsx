@@ -325,6 +325,7 @@ export default function ContractsPage() {
                 ) : (
                   <MaterialTypeahead
                     materials={materials as any} purchaseBasis
+                    inactive="hide"
                     value={editing.material_id || ''}
                     onPick={(id) => {
                       const m = materialById.get(id);
@@ -532,6 +533,10 @@ function QuickCreateMaterial({ existingMaterials, onClose, onCreated, onPickedEx
           </label>
           <MaterialTypeahead
             materials={existingMaterials as any} purchaseBasis
+            // Not offered for a new contract — but a search that only matches a
+            // switched-off item SAYS so (MaterialTypeahead), so nobody concludes
+            // it is missing and creates a duplicate below.
+            inactive="hide"
             value=""
             onPick={(id: string) => {
               const m = existingMaterials.find(x => x.id === id);

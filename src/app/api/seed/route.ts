@@ -1,6 +1,5 @@
 import { getDb, generateId, updateMaterialPrice, recalculateSubRecipeCost, recalculateRecipeCost, deductInventoryForSale } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
-import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 
 export async function POST() {
   try {
@@ -100,17 +99,10 @@ export async function POST() {
           UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
         `).run(p.qty, matId);
 
-        // MOVEMENT RECORD: seeded demo data. The actor is honestly 'system:seed'
-        // — no person made this purchase — and the vendor is the seed's own.
-        postCentralTxn(db, {
-          materialId: matId,
-          type: 'purchase',
-          quantity: p.qty,
-          referenceId: purchaseId,
-          notes: `Purchase from ${p.vendor}`,
-          counterparty: vendorParty(p.vendor),
-          actor: 'system:seed',
-        });
+        db.prepare(`
+          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
+          VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
+        `).run(generateId(), matId, p.qty, purchaseId, `Purchase from ${p.vendor}`);
       }
 
       // Update all material prices

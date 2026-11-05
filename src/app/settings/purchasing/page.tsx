@@ -19,14 +19,20 @@ import { ShoppingCart, Send, Loader2, AlertTriangle, ShieldCheck, ClipboardList,
  * The zero-rate gate is deliberately NOT part of this switch (see below).
  *
  * The other toggle is `po_send_to_vendor`. AKAN raises ONE combined internal
- * PO that spans several vendors and never sends it out, so the default is OFF and
- * the PO stays an internal approval/costing document. Turning it ON exposes the
- * per-vendor send action on an approved PO.
+ * PO that spans several vendors, so the default is OFF and the PO stays an
+ * internal approval/costing document. It USED TO BE INERT — it saved and showed
+ * a toast, and nothing read it. Since ruling #70 (2026-10-23) it is real: ON
+ * shows, on every APPROVED PO, a per-vendor "Vendor copy" (print,
+ * /purchase-orders/<id>/print?vendor=<id>) and "PDF" (download,
+ * /api/purchase-orders/<id>/vendor-pdf?vendor=<id>). The reader is the PO page
+ * (via GET /api/purchase-orders/vendor-view → send_to_vendor). Nothing is sent
+ * automatically: WhatsApp/email sending is NOT built yet (ruling #70: "WhatsApp
+ * later"), and this card must not say otherwise.
  *
  * Why the split matters: a PO can legitimately carry lines from several vendors,
  * and one sheet listing them all would show vendor A the rates negotiated with
- * vendor B. So the send action never sends a combined sheet — it produces one
- * document per vendor, carrying only that vendor's lines.
+ * vendor B. So a vendor copy is never the combined sheet — it carries only that
+ * vendor's lines, with rates, and that vendor's own address/GSTIN block.
  *
  * THE THIRD CARD USED TO BE A SWITCH, AND IS NOW A STATUS LINE. It reported the
  * old deduct-at-issue settings key — the on/off gate for WHERE a gram left stock.
@@ -163,7 +169,7 @@ export default function PurchasingSettingsPage() {
     try {
       const r = await api('/api/settings', { method: 'PUT', body: { key: 'po_send_to_vendor', value: on ? '1' : '0' } });
       if (!r.ok) { setSendToVendor(prev); flash(false, (await r.json().catch(() => ({}))).error || 'Failed to save'); }
-      else flash(true, on ? 'Send to vendor enabled' : 'Send to vendor disabled');
+      else flash(true, on ? 'Vendor copies now shown on approved POs' : 'Vendor copies hidden');
     } catch { setSendToVendor(prev); flash(false, 'Failed to save'); }
     setSaving(false);
   };
@@ -292,34 +298,37 @@ export default function PurchasingSettingsPage() {
               <div>
                 <p className="font-semibold text-[#2D1B0E] flex items-center gap-1.5"><Send className="w-4 h-4 text-[#af4408]" /> Send PO to vendor</p>
                 <p className="text-sm text-[#8B7355] mt-0.5">
-                  Show a <b>Send to Vendor</b> action on an approved PO. Off by default — the PO stays an
-                  internal approval and costing document.
+                  On: every <b>approved</b> PO shows a <b>Vendor copy</b> (print) and a <b>PDF</b> (download) for
+                  each vendor on it, in the PO&apos;s detail on Purchase Orders. Off by default — the PO stays an
+                  internal approval and costing document and no vendor copy is offered.
                 </p>
                 <p className="text-sm text-[#8B7355] mt-1.5">
-                  A PO may carry lines from several vendors. When it does, the send action produces
-                  <b> one document per vendor</b> with only that vendor&apos;s lines — a combined sheet would
-                  show one vendor the rates you negotiated with another.
+                  A PO may carry lines from several vendors. Each vendor copy carries <b>only that vendor&apos;s
+                  lines</b>, with the rates, and that vendor&apos;s own address and GSTIN — never another vendor&apos;s
+                  items or rates, and never which department asked for what. The Print button on the PO list is
+                  the internal sheet and is not for vendors.
+                </p>
+                <p className="text-sm text-[#8B7355] mt-1.5">
+                  Nothing is sent for you yet: print the copy or download the PDF and share it yourself.
+                  Sending straight to the vendor on WhatsApp is planned, not built.
                 </p>
               </div>
               <Toggle checked={sendToVendor} onChange={(v) => save(v)} disabled={!canEdit || saving} label="Send PO to vendor" className="mt-1 shrink-0" />
             </div>
 
-            {sendToVendor && reachable && reachable.withContact === 0 && (
-              <div className="flex items-start gap-2 p-5 bg-amber-50">
-                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
-                <p className="text-sm text-amber-800">
-                  None of your <b>{reachable.total}</b> active vendors has a phone number or email on file, so
-                  a PO can only be printed or downloaded and shared by hand. Add contact details under{' '}
-                  <a href="/vendors" className="underline">Vendors</a> to send directly.
-                </p>
-              </div>
-            )}
-            {sendToVendor && reachable && reachable.withContact > 0 && reachable.withContact < reachable.total && (
-              <div className="flex items-start gap-2 p-5 bg-amber-50">
-                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
-                <p className="text-sm text-amber-800">
-                  Only <b>{reachable.withContact}</b> of <b>{reachable.total}</b> active vendors has contact
-                  details. The rest can only be printed or downloaded.
+            {/* Contact coverage, stated as what it is FOR. There is no direct
+                send yet, so a missing phone/email does not stop anything today —
+                it only matters for sharing the copy by hand now and for the
+                WhatsApp send later. Saying "add contacts to send directly" would
+                promise a feature that does not exist. */}
+            {sendToVendor && reachable && reachable.total > 0 && reachable.withContact < reachable.total && (
+              <div className="flex items-start gap-2 p-5 bg-[#FDF6EE]">
+                <Info className="w-4 h-4 text-[#8B7355] mt-0.5 shrink-0" />
+                <p className="text-sm text-[#8B7355]">
+                  <b>{reachable.withContact}</b> of <b>{reachable.total}</b> active vendors {reachable.withContact === 1 ? 'has' : 'have'} a
+                  phone number or email on file. Vendor copies print and download either way; contact details
+                  help you share them, and will be needed when WhatsApp sending is added. Add them under{' '}
+                  <a href="/vendors" className="underline">Vendors</a>.
                 </p>
               </div>
             )}

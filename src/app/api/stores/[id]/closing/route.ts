@@ -1,11 +1,14 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
+import {
+  getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories,
+  unmigratedCentralQty, migrateCentralToStore, logCentralMigration, type CentralMigration,
+} from '@/lib/store-engine';
 import {
   recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard,
 } from '@/lib/variance-approval';
 import { checkClosingDate, CLOSING_DATE_RE } from '@/lib/closing-date';
-import type { PackMeta } from '@/lib/pack-units';
+import { displayQty, type PackMeta } from '@/lib/pack-units';
 
 /**
  * /api/stores/[id]/closing — INDEPENDENT store closing stock (Phase C, spec F6).
@@ -14,6 +17,11 @@ import type { PackMeta } from '@/lib/pack-units';
  * never moves stock (no ledger row), so closing can't distort the store's
  * ledger-derived quantities. Completely separate from the central
  * /closing-stock module (different table, different APIs, zero overlap).
+ * ONE EXCEPTION (ruling 37): a counted item this store owns that still sits in
+ * CENTRAL, never migrated, is first moved in — the migrate route's own
+ * movement (store 'opening' + central → 0 + central 'adjustment') — so the
+ * count is taken against that balance instead of against 0. The counted
+ * DIFFERENCE still never moves stock here. See the transaction in POST.
  *
  * GET  ?date=YYYY-MM-DD   (can_view)  → that day's saved counts + summary +
  *                                       system as-of qty for every material
@@ -279,6 +287,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       pack: PackMeta;
       system_qty: number; physical_qty: number; variance: number;
       variance_value: number; avg_cost: number; note: string;
+      /** > 0 = the item still sits in CENTRAL, never moved into this store:
+       *  the save moves it first (ruling 37). See the transaction below. */
+      central_qty: number;
     }[] = [];
     const seen = new Set<string>();
     /** Lines whose count cell was BLANK — recorded, never written. */
@@ -335,6 +346,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         material_id: materialId, name: mat.name, unit: mat.unit, pack: mat,
         system_qty, physical_qty: physical, variance, variance_value, avg_cost,
         note: itemNote,
+        central_qty: unmigratedCentralQty(db, storeId, materialId),
       });
     }
 
@@ -373,8 +385,84 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         created_at     = datetime('now')
     `);
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * AN ITEM STILL IN CENTRAL IS MOVED IN FIRST, THEN COUNTED (ruling 37)
+     * ══════════════════════════════════════════════════════════════════════
+     * A store-mapped item that was never migrated has NO store ledger, so its
+     * system figure here read 0 and the whole shelf became the variance —
+     * while raw_materials.current_stock still held the same bottles. Approving
+     * that variance put them on the book twice. MEASURED on the live book:
+     * ABSOLUT (750ML), central 27,000 ml, counted 27,000 → approve → central
+     * 27,000 + LIQUOR STORE 27,000 = 54,000 ml for a 27,000 ml shelf.
+     *
+     * So, for each counted line whose item this store OWNS and that was never
+     * migrated into it (unmigratedCentralQty — never a floor, never an item
+     * already moved once; an item that picked up other store history first,
+     * e.g. a procure-bill before its first count, still counts as never
+     * migrated), the save first makes the SAME movement POST
+     * /stores/[id]/migrate makes: an 'opening' row on this store for the whole
+     * central balance at average_price, central → 0, and the central
+     * 'adjustment' row (migrateCentralToStore, guard 'never-migrated'). Only
+     * then is the system figure read — from the ledger, so it now includes that
+     * opening — and the count recorded against it: shelf = balance → variance
+     * 0; shelf 26,250 → variance −750, held. The opening is stamped inside the
+     * count date's as-of window, so a backdated count reads it too, and so does
+     * every re-count after it — EXCEPT when Central moved after the count date
+     * (a transfer, an issue): today's balance is then not the one that day's
+     * shelf was on, so the move is refused for that sheet (move_errors) and a
+     * count dated today makes it.
+     *
+     * THE MOVE IS NOT PART OF THE VARIANCE. Rejecting the count's difference
+     * later leaves the book on the store (it was the store's stock all along,
+     * just on the wrong rail); only the counted difference waits for review.
+     *
+     * NEVER BLOCKS THE COUNT. The move runs in its own SAVEPOINT. If it fails
+     * or is refused, it is rolled back whole, the count saves exactly as it did
+     * before this change, and the approval queue refuses to approve that row
+     * while the item still sits in Central (varianceApprovalBlock), so the
+     * bottles still cannot double. Once the item HAS been moved, a row whose
+     * figure was read without the moved balance — dated before the move, or
+     * saved before it — is refused there too (migratedAfterCountBlock).
+     * An item already migrated, or with nothing in Central, is untouched: no
+     * move, the same figures, rows and response as before (the only addition
+     * is one read-only check per line). */
+    const migrated: CentralMigration[] = [];
+    const moveErrors: string[] = [];
+
     const txn = db.transaction(() => {
       for (const p of prepared) {
+        if (p.central_qty > 0) {
+          try {
+            // The move and the read it feeds are ONE savepoint: if the as-of
+            // figure does not come back carrying the moved balance (it always
+            // should — see the re-stamp in migrateCentralToStore), the move is
+            // rolled back rather than recorded against a count that missed it.
+            const done = db.transaction(() => {
+              const moved = migrateCentralToStore(db, {
+                storeId, materialId: p.material_id, actor: user.email, countDate: date,
+                guard: 'never-migrated',
+              });
+              if (!moved) return null;
+              const s = asOfStats(db, storeId, p.material_id, date);
+              if (Math.abs(s.system_qty - (p.system_qty + moved.qty)) > 1e-6) {
+                // Purchase unit leads, the exact recipe figure is the hint
+                // (owner's purchase-unit display rule): "36 BTL = 27,000 ml".
+                const shown = displayQty(moved.qty, p.pack);
+                throw new Error(`the moved balance (${[shown.primary, shown.hint].filter(Boolean).join(' ')}) did not land inside the ${date} count`);
+              }
+              return { moved, s };
+            })();
+            if (done) {
+              migrated.push(done.moved);
+              p.system_qty = done.s.system_qty;
+              p.avg_cost = done.s.avg_cost;
+              p.variance = Math.round((p.physical_qty - done.s.system_qty) * 1000) / 1000;
+              p.variance_value = Math.round(p.variance * done.s.avg_cost * 100) / 100;
+            }
+          } catch (e: any) {
+            moveErrors.push(`${p.name}: ${e?.message || 'could not be moved from Central'}`);
+          }
+        }
         upsert.run(
           generateId(), storeId, p.material_id, date,
           p.system_qty, p.physical_qty, p.variance, p.variance_value,
@@ -413,6 +501,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
     });
     txn();
+
+    // The migrate route's own audit row per moved item, after the transaction
+    // as the route does it, naming the count that made the move.
+    for (const m of migrated) {
+      logCentralMigration(db, store, m, user.email, `closing count ${date}`);
+    }
 
     /* ══════════════════════════════════════════════════════════════════════
      * THE COUNT DIGEST — fired here, at the boundary of this upload.
@@ -483,11 +577,22 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       auto_applied_count: autoAppliedCount,
       not_counted: notCounted,
       batch_id: batchId,
+      // ── Ruling 37, present ONLY when this save moved something (or tried
+      // to), so a sheet of already-migrated items answers byte-for-byte as it
+      // always has. `moved_from_central` = lines whose Central balance was
+      // moved into this store before they were counted; `move_errors` = moves
+      // that failed and were rolled back (the count saved regardless).
+      ...(migrated.length ? { moved_from_central: migrated.length } : {}),
+      ...(moveErrors.length ? { move_errors: moveErrors } : {}),
     };
     const safeSummary = postIsAdmin ? summary : {
       ...summary,
       shortage_count: null, excess_count: null, match_count: null,
       total_variance_value: null, pending_count: null,
+      // A move happens only when Central held stock, and its size is the
+      // system figure — a blind-count oracle like the rest of this list.
+      ...(migrated.length ? { moved_from_central: null } : {}),
+      ...(moveErrors.length ? { move_errors: null } : {}),
       // Blinded for the same reason pending_count is, and more sharply: with a
       // bar configured, `applied_count` answers "was my count within ₹X of the
       // system figure?" per save, which bisects system_qty in a few re-saves.
@@ -509,12 +614,20 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           system_qty: p.system_qty, physical_qty: p.physical_qty,
           variance: p.variance, variance_value: p.variance_value,
         })),
+        ...(migrated.length ? {
+          moved_from_central_detail: migrated.map(m => ({
+            material_id: m.material_id, material: m.material, qty: m.qty, unit: m.unit,
+            value: m.value, ledger_id: m.ledger_id,
+          })),
+        } : {}),
       },
       note: `${store.name}: closing count ${date} — ${prepared.length} item(s) counted`
         + (notCounted ? `, ${notCounted} left blank (not counted)` : '')
         + `, variance ₹${summary.total_variance_value}`
         + (pendingCount ? ` (${pendingCount} held for approval)` : '')
-        + (appliedCount ? ` (${appliedCount} applied at count time${autoAppliedCount ? `, ${autoAppliedCount} under the bar` : ''})` : ''),
+        + (appliedCount ? ` (${appliedCount} applied at count time${autoAppliedCount ? `, ${autoAppliedCount} under the bar` : ''})` : '')
+        + (migrated.length ? ` (${migrated.length} moved from Central into ${store.name} before counting)` : '')
+        + (moveErrors.length ? ` (${moveErrors.length} could not be moved from Central: ${moveErrors.join('; ')})` : ''),
     });
 
     // `results` is the bluntest leak of the three: per item it carried

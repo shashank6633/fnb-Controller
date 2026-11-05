@@ -5,8 +5,9 @@
  *
  * A mobile-first screen the kitchen uses to point the (back) camera at a
  * production-batch label and instantly pull up that batch's freshness/FIFO
- * status. Built on @zxing/browser (BrowserMultiFormatReader) reading
- * Code128 / Code39 / EAN13 / QR straight off a live <video> stream.
+ * status. Reads the label's QR / Code128 off a live full-HD <video> stream with
+ * the browser's own BarcodeDetector where it exists (Chrome/Android), else
+ * @zxing/browser (BrowserMultiFormatReader); a handheld scanner works too.
  *
  * Flow per decode:
  *   1. debounce duplicate reads (~2s) so one label doesn't fire repeatedly
@@ -257,24 +258,68 @@ export default function KitchenScanPage() {
   // ── camera start/stop ─────────────────────────────────────────────────
   const startScan = useCallback(async () => {
     setCameraError(null);
-    if (!videoRef.current) return;
+    const video = videoRef.current;
+    if (!video) return;
+    // A sharp picture is what makes reads fast: at the browser's default 640x480 a
+    // 13 mm label QR is a handful of pixels. Ask for full HD and continuous
+    // autofocus; a camera that cannot do either just ignores the request.
+    const VIDEO: MediaTrackConstraints = {
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      advanced: [{ focusMode: 'continuous' } as any],
+    };
     try {
-      if (!readerRef.current) {
-        const hints = new Map<DecodeHintType, unknown>();
-        hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-          BarcodeFormat.CODE_128,
-          BarcodeFormat.CODE_39,
-          BarcodeFormat.EAN_13,
-          BarcodeFormat.QR_CODE,
-        ]);
-        readerRef.current = new BrowserMultiFormatReader(hints as any);
+      // 1) The phone's own barcode reader (Chrome on Android, and others that ship
+      //    it) is far faster and steadier than decoding in JavaScript.
+      const BD = (window as any).BarcodeDetector;
+      let nativeOk = false;
+      if (BD?.getSupportedFormats) {
+        try {
+          const fm: string[] = await BD.getSupportedFormats();
+          nativeOk = fm.includes('qr_code') && fm.includes('code_128');
+        } catch { nativeOk = false; }
       }
-      const controls = await readerRef.current.decodeFromConstraints(
-        { video: { facingMode: { ideal: 'environment' } } },
-        videoRef.current,
-        (res) => { if (res) processScan(res.getText(), { fromCamera: true }); },
-      );
-      controlsRef.current = controls;
+      if (nativeOk) {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: VIDEO });
+        video.srcObject = stream;
+        await video.play();
+        const detector = new BD({ formats: ['qr_code', 'code_128'] });
+        let stopped = false;
+        let timer = 0;
+        const tick = async () => {
+          if (stopped) return;
+          try {
+            if (video.readyState >= 2) {
+              const hit = ((await detector.detect(video)) as Array<{ rawValue?: string }>).find(c => c.rawValue);
+              if (hit?.rawValue) processScan(hit.rawValue, { fromCamera: true });
+            }
+          } catch { /* an unreadable frame is skipped */ }
+          if (!stopped) timer = window.setTimeout(tick, 80);
+        };
+        tick();
+        controlsRef.current = {
+          stop: () => {
+            stopped = true;
+            window.clearTimeout(timer);
+            stream.getTracks().forEach(t => t.stop());
+            video.srcObject = null;
+          },
+        };
+      } else {
+        // 2) Everywhere else (e.g. Safari): ZXing, looking only for the two symbols
+        //    the label prints, and trying ~10× a second instead of its default 2×.
+        if (!readerRef.current) {
+          const hints = new Map<DecodeHintType, unknown>();
+          hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128]);
+          readerRef.current = new BrowserMultiFormatReader(hints as any, { delayBetweenScanAttempts: 100, delayBetweenScanSuccess: 300 });
+        }
+        controlsRef.current = await readerRef.current.decodeFromConstraints(
+          { video: VIDEO },
+          video,
+          (res) => { if (res) processScan(res.getText(), { fromCamera: true }); },
+        );
+      }
       setScanning(true);
       // torch capability is only known once the track is live
       setTimeout(detectTorch, 300);
@@ -295,6 +340,29 @@ export default function KitchenScanPage() {
 
   // Stop the camera on unmount.
   useEffect(() => () => { try { controlsRef.current?.stop(); } catch {} }, []);
+
+  // A handheld USB/Bluetooth scanner "types" the code in a fast burst and presses
+  // Enter. Catch that anywhere on the page, so nothing needs clicking first — but
+  // never take keys from a box someone is typing into (that box handles its own).
+  useEffect(() => {
+    let buf = '';
+    let last = 0;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      const now = Date.now();
+      if (now - last > 60) buf = '';   // human typing is slower than a scanner burst
+      last = now;
+      if (e.key === 'Enter') {
+        if (buf.length >= 6) { e.preventDefault(); processScan(buf); }
+        buf = '';
+      } else if (e.key.length === 1) {
+        buf += e.key;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [processScan]);
 
   const onManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -434,6 +502,9 @@ export default function KitchenScanPage() {
             <Search className="w-4 h-4" /> Look up
           </button>
         </form>
+        <p className="text-[11px] text-[#8B7355]">
+          Handheld scanner? Just scan the label — it is read straight away, no need to click anything first.
+        </p>
 
         {lookupError && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{lookupError}</div>

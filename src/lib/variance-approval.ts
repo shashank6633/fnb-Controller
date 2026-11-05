@@ -40,7 +40,10 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
 import { qcHoldBlockForCount } from '@/lib/grn-qc';
-import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
+import {
+  postLedger, isStoreMappedMaterial, unmigratedCentralQty, getStoreById, centralMigrationStamp,
+  centralMovementAfter,
+} from '@/lib/store-engine';
 import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
 import { packFactor, type PackMeta } from '@/lib/pack-units';
 // The digest (section 6) values EVERY figure through this ladder — last
@@ -1371,8 +1374,11 @@ export interface DecisionResult { ok: boolean; error?: string; applied?: boolean
  * only one: the central cutover floor — see centralCutoverBlock() below. Before
  * a cutover is committed that returns null and they are never blocked, which is
  * what this comment used to say outright and is no longer the whole truth.
- * Liquor rows are still never blocked here: they post a delta to the store
- * ledger, which no central cutover touches.
+ * Liquor rows are still never blocked by the cutover: they post a delta to the
+ * store ledger, which no central cutover touches. Their refusals here are the
+ * two Central-migration floors of ruling 37: an item still in Central that was
+ * never moved into its store (unmigratedLiquorBlock), and a count whose system
+ * figure was read before the item was moved in (migratedAfterCountBlock).
  */
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1440,6 +1446,169 @@ export function centralCutoverBlock(
   );
 }
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ THE UNMIGRATED-ITEM FLOOR (ruling 37) — liquor rows only.                ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * A liquor item that still sits in CENTRAL (raw_materials.current_stock > 0)
+ * and has never had a single row on the store's ledger was counted against a
+ * store book of 0, so the row's variance is the whole shelf. The liquor branch
+ * of approveVariance() posts that variance onto the store while central still
+ * holds the same bottles — measured: ABSOLUT, 27,000 ml shelf → central 27,000
+ * + LIQUOR STORE 27,000.
+ *
+ * The count route now moves the central balance into the store BEFORE it
+ * counts (migrateCentralToStore), so a count saved through it never produces
+ * such a row. This refusal is the floor under that, for the ways one can
+ * still exist: a row saved before the fix, a count whose move failed and was
+ * rolled back, and a backdated count whose move was refused because Central
+ * moved after its date (the count saves regardless — it must never be refused).
+ * "Never moved" is unmigratedCentralQty()'s test: no 'central-migration'
+ * opening on that store, so an item that picked up OTHER store history first (a
+ * procure-bill before its first count) is caught too.
+ *
+ * Refuse rather than "move, then apply a recomputed delta": the row's frozen
+ * system figure and variance describe a book that did not exist, and applying
+ * anything but that variance would leave the queue and every report showing
+ * one difference while the stock moved by another. Counting the item again
+ * ON THE SAME DATE fixes it in place — the re-count moves the balance first and
+ * re-writes (or, on a match, clears) this same pending row through
+ * upsertVarianceApproval(). A count on a LATER date moves the balance too, and
+ * then this row is refused by migratedAfterCountBlock() instead, for good.
+ *
+ * Null on every row whose item was migrated into that store, holds nothing in
+ * central, or is not owned by that store.
+ */
+export function unmigratedLiquorBlock(db: Database.Database, row: VarianceKeyRow): string | null {
+  if (String(row.source) !== 'liquor') return null;
+  const storeId = norm(row.store_id);
+  const matId = norm(row.material_id);
+  const central = unmigratedCentralQty(db, storeId, matId);
+  if (!(central > 0)) return null;
+  const mat = db.prepare(
+    `SELECT name, unit, purchase_unit, pack_size, case_size FROM raw_materials WHERE id = ?`,
+  ).get(matId) as (PackMeta & { name?: string; unit?: string; purchase_unit?: string }) | undefined;
+  const storeName = getStoreById(db, storeId)?.name || 'the store';
+  const pf = packFactor((mat || {}) as PackMeta);
+  const unit = norm(mat?.unit);
+  const pu = norm(mat?.purchase_unit) || unit;
+  const held = pf > 1
+    ? `${Math.round((central / pf) * 1000) / 1000} ${pu} (${central} ${unit})`
+    : `${central} ${unit}`;
+  const dated = norm(row.date).slice(0, 10);
+  const why =
+    `"${norm(mat?.name) || 'This item'}" still holds ${held} in Central stock and was never moved into ` +
+    `${storeName}. This count was taken against a ${storeName} book that did not include that balance, so ` +
+    `approving it would put the same bottles on the book twice — once in Central and again in ${storeName}. `;
+  // A same-date re-count can only make the move while Central has not moved
+  // since that date — the backdated refusal in migrateCentralToStore(). Say
+  // which way out actually works, rather than send the admin round a loop.
+  const sinceThen = /^\d{4}-\d{2}-\d{2}$/.test(dated) ? centralMovementAfter(db, matId, dated) : { n: 0, latest: '' };
+  if (sinceThen.n > 0) {
+    return (
+      why +
+      `Central stock of this item has moved since ${dated}, so a re-count of that date cannot move the balance ` +
+      `either. Count the item tonight — that moves the Central balance into ${storeName} and works the ` +
+      `difference out against it — and reject this row. Nothing moves until then.`
+    );
+  }
+  return (
+    why +
+    `Count the item again on the same date${dated ? ` (${dated})` : ''}: saving a count now moves the Central ` +
+    `balance into ${storeName} first and works the difference out against it, which replaces this row. ` +
+    `A count on a later date (tonight) also moves it, but this row can then only be rejected. ` +
+    `Or reject it now — nothing moves.`
+  );
+}
+
+/** 'YYYY-MM-DD HH:MM:SS' UTC → 'YYYY-MM-DD HH:MM:SS IST', for refusal sentences.
+ *  To the second: a count saved a few seconds before a Migrate click is the case
+ *  being explained, and two equal minutes would read as a contradiction. */
+function istStamp(utc: string): string {
+  const t = Date.parse(`${utc.slice(0, 19).replace(' ', 'T')}Z`);
+  if (!Number.isFinite(t)) return utc;
+  return `${new Date(t + 5.5 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ')} IST`;
+}
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ THE MIGRATION FLOOR (ruling 37, second half) — liquor rows only.         ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * Once an item HAS been moved from Central into its store (the Migrate button,
+ * or a count that moved it first), unmigratedLiquorBlock() stops firing — and
+ * every liquor row whose frozen system figure was read WITHOUT that moved
+ * balance becomes approvable. Its variance holds the whole moved balance, and
+ * the liquor branch of approveVariance() posts it onto a store that already
+ * holds it. MEASURED by the verifier on fresh live-book copies, each one
+ * central 0 + LIQUOR STORE 54,000 for a 27,000 ml shelf of ABSOLUT:
+ *   · an older paper sheet typed AFTER tonight's matching count (system 0,
+ *     variance +27,000) — a matching count writes no approval row, so nothing
+ *     superseded it;
+ *   · a pending row saved before the fix, dated before the first count after
+ *     deploy;
+ *   · a pending row saved before an admin pressed Migrate (production does this
+ *     today — it is the go-live-day case).
+ *
+ * Two tests, either refuses (both fail closed):
+ *   1. DATED BEFORE THE MOVE — row.date < the opening's booked_date. The count's
+ *      as-of window (`date(created_at) <= date(count date)`) cannot hold the
+ *      opening, so its system figure never included the balance — whenever the
+ *      row was saved. On that date the bottles were on the Central book.
+ *   2. SAVED BEFORE THE MOVE — row.created_at < moved_at. The frozen figure was
+ *      read before the balance arrived, whatever date it is for. A row with no
+ *      readable save instant cannot be shown to postdate the move: refused.
+ *
+ * Refuse, never recompute — the same reasoning as unmigratedLiquorBlock(). A
+ * count saved through the route AFTER the move (the ordinary case, including
+ * the count that made the move: its row is written after the move, inside the
+ * same transaction) passes both tests, so a migrated item's every-night count
+ * is untouched. Null on every row of an item that was never migrated.
+ */
+export function migratedAfterCountBlock(db: Database.Database, row: VarianceKeyRow): string | null {
+  if (String(row.source) !== 'liquor') return null;
+  const storeId = norm(row.store_id);
+  const matId = norm(row.material_id);
+  if (!storeId || !matId) return null;
+  const mig = centralMigrationStamp(db, storeId, matId);
+  if (!mig) return null;
+
+  const rowDate = norm(row.date).slice(0, 10);
+  const rawSaved = norm(row.created_at);
+  const saved = /^\d{4}-\d{2}-\d{2}$/.test(rawSaved) ? `${rawSaved} 00:00:00` : rawSaved.slice(0, 19).replace('T', ' ');
+  const datedBefore = !rowDate || (!!mig.booked_date && rowDate < mig.booked_date);
+  const savedBefore = !saved || (!!mig.moved_at && saved < mig.moved_at);
+  if (!datedBefore && !savedBefore) return null;
+
+  const name = norm((db.prepare(`SELECT name FROM raw_materials WHERE id = ?`).get(matId) as
+    { name?: string } | undefined)?.name) || 'This item';
+  const storeName = getStoreById(db, storeId)?.name || 'the store';
+  const movedOn = mig.booked_date || 'its migration date';
+  if (datedBefore) {
+    return (
+      `This count is dated ${rowDate || '(no date)'}, before "${name}" was moved from Central into ${storeName} ` +
+      `(the moved balance is on ${storeName}'s book from ${movedOn}). On ${rowDate || 'that date'} those bottles ` +
+      `were still on the Central book, so this count was compared with a ${storeName} book that did not hold ` +
+      `them, and its difference includes them: approving it would put the same bottles on the book a second ` +
+      `time. Approve a count dated ${movedOn} or later instead (count the item tonight if there is none), and ` +
+      `reject this one — nothing moves.`
+    );
+  }
+  return (
+    `This count was saved ${saved ? istStamp(saved) : 'at an unknown time'}, before "${name}" was moved from ` +
+    `Central into ${storeName} (${mig.moved_at ? istStamp(mig.moved_at) : 'later'}). Its system figure was read ` +
+    `before that balance reached ${storeName}, so its difference includes it: approving it would put the same ` +
+    `bottles on the book a second time. Count the item again on the same date (${rowDate}) — the new count ` +
+    `reads the moved balance and replaces this row — or reject it; rejecting moves nothing.`
+  );
+}
+
+/** Both liquor floors of ruling 37, in order: still in Central, then moved after the count. */
+function liquorCentralBlock(db: Database.Database, row: VarianceKeyRow): string | null {
+  return unmigratedLiquorBlock(db, row) ?? migratedAfterCountBlock(db, row);
+}
+
 export function varianceApprovalBlock(
   db: Database.Database,
   row: VarianceKeyRow,
@@ -1456,6 +1625,11 @@ export function varianceApprovalBlock(
   const superseding = precomputed ? precomputed.superseding : findSupersedingCount(db, row);
   if (superseding) return supersededMessage(superseding);
 
+  // Liquor rows: only the two Central-migration floors of ruling 37 — the item
+  // still sits in Central, or it was moved in after this count's figure was
+  // read. Null for every count of a never-migrated-and-empty item and for every
+  // count taken after a migration, which is what this returned for them before.
+  if (String(row.source) === 'liquor') return liquorCentralBlock(db, row);
   if (String(row.source) !== 'central') return null;
   const deptId = norm(row.department_id);
   if (!deptId) {
@@ -1616,6 +1790,12 @@ export function approveVariance(
 
   const apply = db.transaction(() => {
     if (row.source === 'liquor') {
+      // THE TWO CENTRAL-MIGRATION FLOORS, belt-and-braces inside the
+      // transaction, as the central branch keeps its cutover floor:
+      // varianceApprovalBlock() above already refused these, and a throw here
+      // rolls the approval back.
+      const migrationFloor = liquorCentralBlock(db, row as VarianceKeyRow);
+      if (migrationFloor) throw new Error(migrationFloor);
       // Reconcile the store ledger to the physical count as of the count date.
       const ledgerId = postLedger(db, {
         store_id: row.store_id,

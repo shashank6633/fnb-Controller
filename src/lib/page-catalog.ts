@@ -51,6 +51,12 @@ export interface CatalogUser {
    *  every read is `user.can_view_finance_reports && entry.financeCap` — which
    *  is what makes it structurally incapable of opening an unflagged page. */
   can_view_finance_reports?: boolean;
+  /** `roles.can_full_hr_access` for the assigned, ACTIVE role ("Full HR access
+   *  (all HR pages except HR Settings)", owner ruling #90). Read by ONE gate:
+   *  the adminOnly test, and only through hrFullCapOpens() — which also needs
+   *  the page's own `hrFullCap` flag, a Manager-tier or HOD user, and the page
+   *  ticked by its exact path. Absent/false ⇒ nothing changes anywhere. */
+  can_full_hr_access?: boolean;
 }
 
 export interface PageEntry {
@@ -99,9 +105,34 @@ export interface PageEntry {
   /**
    * When true, ONLY an Admin (role === 'admin') may see/open this page —
    * stricter than mgmtOnly/hodOnly. Used for admin-only consoles like the App
-   * Errors page. Non-admins are blocked even with an explicit page_access grant.
+   * Errors page. Non-admins are blocked even with an explicit page_access grant
+   * — with ONE exception, `hrFullCap` below, carried by five HR rows only.
    */
   adminOnly?: boolean;
+  /**
+   * THE ONE EXCEPTION TO adminOnly (owner ruling #90, 2026-10-29: "Full HR
+   * access (all HR pages except HR Settings)"). On a row that is ALSO adminOnly,
+   * a user may open the page without being an admin when ALL of these hold —
+   * hrFullCapOpens() is the only reader:
+   *   1. their assigned, active role carries `can_full_hr_access` (Settings →
+   *      Roles), resolved fail-CLOSED in BOTH getCurrentUser and proxy.ts;
+   *   2. they are management for HR: Manager tier or HOD (canManageHr). A
+   *      staff-tier role with the tick gets nothing;
+   *   3. their effective page map names THIS row's path EXACTLY. The capability
+   *      lifts the tier, it never grants a page: a null / [] / garbled map
+   *      ("all pages") does not open these, and neither does a bare '/hr'
+   *      prefix grant.
+   *
+   * Carried by exactly FIVE rows: /hr/geofences, /hr/biometric, /hr/payroll,
+   * /hr/documents, /hr/exits. /hr/settings is deliberately NOT flagged — it
+   * stays admin-only, and so does every non-HR admin page. As with financeCap
+   * the set lives in ONE place: HR_FULL_CAP_PATHS is derived from these flags.
+   *
+   * PREFIX LAW APPLIES: bestEntry() is longest-prefix, so a detail route under
+   * a flagged row inherits it. A new child a capability holder must NOT see
+   * needs its own adminOnly row WITHOUT this flag.
+   */
+  hrFullCap?: boolean;
   /**
    * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
    * THIS page, even when the map never names it.
@@ -606,6 +637,28 @@ export const PAGE_CATALOG: PageSection[] = [
       // own nav list ([[project_fnb_sidebar_catalog_drift]]).
       { path: '/inventory/movements', label: 'Stock Movements' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
+      // DEPARTMENT → DEPARTMENT TRANSFER (owner decision, 2026-10-14): Kitchen
+      // receives a Direct Issue delivery (Meat / POULTRY / SEAFOOD rules) into
+      // its own department ledger, then hands stock on to its sub-kitchens —
+      // Akan Tandoori, Akan Main Kitchen, … — which hold every routed-category
+      // requisition line but cannot see their parent's stock. One transfer is a
+      // debit on the sender's department ledger and a credit on the receiver's,
+      // in one transaction; central stock is never touched.
+      //
+      // Deliberately NO tier flag. hodOnly / mgmtOnly run BEFORE the null-map
+      // grant, so either one would lock out exactly the people who use this
+      // daily — a sub-kitchen cook sending or receiving a hand-over. As on every
+      // row here the flag is not the security boundary: /api/department-
+      // transfers authorises send / receive itself, by department membership.
+      //
+      // A ROLE WITH AN EXPLICIT page_access LIST WILL NOT SEE THIS PAGE until
+      // the owner ticks it in Settings → Roles (e.g. the Head Chef and Staff
+      // roles carry explicit lists). That is the owner's call — this row only
+      // makes it tickable.
+      //
+      // Twin of the Sidebar.tsx row with the same href, character for character
+      // ([[project_fnb_sidebar_catalog_drift]]). Change one, change both.
+      { path: '/department-transfers', label: 'Department Transfers' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },
@@ -859,25 +912,147 @@ export const PAGE_CATALOG: PageSection[] = [
       // live on one page; geofences and the biometric mapping/import are the
       // config surfaces behind attendance and stay adminOnly like /hr/settings.
       { path: '/hr/attendance', label: 'Attendance',           mgmtOnly: true },
-      { path: '/hr/geofences',  label: 'Geofences',            adminOnly: true },
-      { path: '/hr/biometric',  label: 'Biometric & Import',   adminOnly: true },
+      // hrFullCap (ruling #90): a Manager/HOD role holding "Full HR access" may
+      // also open these two — with the page ticked. See PageEntry.hrFullCap.
+      { path: '/hr/geofences',  label: 'Geofences',            adminOnly: true, hrFullCap: true },
+      { path: '/hr/biometric',  label: 'Biometric & Import',   adminOnly: true, hrFullCap: true },
       // Phases 3-7 (owner ordered all phases 2026-08-16). Money, identity and
       // disciplinary surfaces are adminOnly — the only flag that holds against
       // the NULL-page_access fail-open; team-facing operations are mgmtOnly.
       { path: '/hr/shifts',      label: 'Shifts',               mgmtOnly: true },
       { path: '/hr/roster',      label: 'Roster',               mgmtOnly: true },
       { path: '/hr/leave',       label: 'Leave',                mgmtOnly: true },
-      { path: '/hr/payroll',     label: 'Payroll & Advances',   adminOnly: true },
-      { path: '/hr/documents',   label: 'Employee Documents',   adminOnly: true },
+      { path: '/hr/payroll',     label: 'Payroll & Advances',   adminOnly: true, hrFullCap: true },
+      { path: '/hr/documents',   label: 'Employee Documents',   adminOnly: true, hrFullCap: true },
       { path: '/hr/sops',        label: 'SOP Library',          mgmtOnly: true },
       { path: '/hr/training',    label: 'Training',             mgmtOnly: true },
       { path: '/hr/tests',       label: 'Knowledge Tests',      mgmtOnly: true },
       { path: '/hr/performance', label: 'Performance',          mgmtOnly: true },
       { path: '/hr/assets',      label: 'Employee Assets',      mgmtOnly: true },
       { path: '/hr/recruitment', label: 'Recruitment',          mgmtOnly: true },
-      { path: '/hr/exits',       label: 'Disciplinary & Exits', adminOnly: true },
+      { path: '/hr/exits',       label: 'Disciplinary & Exits', adminOnly: true, hrFullCap: true },
       { path: '/hr/reports',     label: 'HR Reports',           mgmtOnly: true },
+      // NO hrFullCap, deliberately (ruling #90): HR Settings — designations, the
+      // attendance engine and roster-policy knobs — stays ADMIN ONLY.
       { path: '/hr/settings',  label: 'HR Settings',  adminOnly: true },
+    ],
+  },
+  {
+    // FSSAI Compliance — food-safety records. Additive module; the twin section
+    // lives in src/components/Sidebar.tsx and BOTH must be edited together. A
+    // catalog-only page is correctly gated and completely INVISIBLE (that drift
+    // once hid 8 pages including /variance-approvals and read as a stock bug);
+    // a sidebar-only page is visible and can never be granted or revoked.
+    //
+    // Placed after HR and before Admin because homePathFor() and
+    // firstAllowedPath() sweep this array in DECLARATION ORDER — a
+    // compliance-only user lands on /fssai, and no existing user's landing page
+    // moves, since nothing ahead of HR changes.
+    //
+    // NO hodOnly ANYWHERE IN THIS SECTION, deliberately. hodOnly excludes
+    // MANAGERS (canAccessPage: the mgmtOnly line admits a manager, the hodOnly
+    // line above it does not), and there is no FSSAI surface where "HODs but not
+    // the Floor Manager" is the right set. It is also the only flag an admin can
+    // switch OFF at runtime with no deploy (settings key hod_only_overrides, read
+    // in proxy.ts), so it cannot hold a compliance gate.
+    //
+    // The 16 unflagged rows follow the /grn/qc precedent in this same file (the
+    // owner's own words there: NOT HOD-only, because "at 6am with a truck
+    // waiting that guarantees workarounds"). A flag that stops a porter filling
+    // in a hygiene check has broken the module. Per-record scoping — own
+    // department, own record — is the ROUTE's job: canAccessPage fails open four
+    // ways and page_access is NULL on 8 of 9 live users, so this catalog is
+    // visibility and grantability, never security.
+    //
+    // §7 Q8 (PROVISIONAL DEFAULT, owner has not ruled): Staff / Manager / Admin
+    // only for v1. §20 names Maintenance, Supervisor and F&B Controller roles
+    // that DO NOT EXIST in the live roles table, and FSSAI must never create a
+    // role — that is the owner's production config. §7 Q10 (PROVISIONAL): staff
+    // see their own department; cross-department packs are management, which is
+    // what the four mgmtOnly rows below encode.
+    label: 'FSSAI Compliance',
+    pages: [
+      { path: '/fssai',                    label: 'Dashboard' },
+      { path: '/fssai/receiving',          label: 'Receiving/Receivables Quality Check' },
+      { path: '/fssai/fifo',               label: 'FIFO & Expiry Management' },
+      { path: '/fssai/cold-rooms',         label: 'Cold Room Climate Control' },
+      { path: '/fssai/temperature',        label: 'Temperature Logs' },
+      { path: '/fssai/food-quality',       label: 'Food Quality Checks' },
+      { path: '/fssai/pest-control',       label: 'Pest Control Logs' },
+      { path: '/fssai/cleaning',           label: 'Cleaning & Sanitation' },
+      { path: '/fssai/hygiene',            label: 'Personal Hygiene' },
+      { path: '/fssai/storage',            label: 'Food Storage Checks' },
+      { path: '/fssai/kitchen-safety',     label: 'Kitchen Safety Checks' },
+      { path: '/fssai/water-ice',          label: 'Water & Ice Checks' },
+      { path: '/fssai/oil-quality',        label: 'Oil Quality Checks' },
+      // WASTE HANDOVER LOG — one line per handover of wet / dry / other waste to
+      // GHMC or an authorised collector (Hyderabad audit line #114, audit-file
+      // record 14). UNFLAGGED on purpose, like the rows above it: the porter at
+      // the back door files it. The route scopes each record itself.
+      { path: '/fssai/waste',              label: 'Waste Handover Log' },
+      { path: '/fssai/corrective-actions', label: 'Corrective Actions' },
+      { path: '/fssai/checklists',         label: 'FSSAI Checklists' },
+      // Management surfaces. mgmtOnly (admin | manager | HOD), NOT adminOnly:
+      // VERIFY RECORDS (P3). mgmtOnly because verifying IS a management act (§7 Q3
+      // provisional: any management may verify, but never the person who recorded
+      // it — that second half is enforced per row by the route, since a manager
+      // who ran the check himself must not sign it off). A staff member reaches
+      // their own submitted records through the checklist screens, not here.
+      { path: '/fssai/verification',       label: 'Verify Records',           mgmtOnly: true },
+      // adminOnly would mean the owner must be physically present before anyone
+      // could produce the licence or the inspection pack to an inspector.
+      { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },
+      { path: '/fssai/documents',          label: 'Documents & Certificates', mgmtOnly: true },
+      // FOOD HANDLERS — the food-handler register and, for each person, the
+      // medical, training and FoSTaC certificates (Hyderabad audit lines #55,
+      // #56, #106, #107; audit-file records 6 and 7). mgmtOnly, the SAME tier as
+      // Documents & Certificates: bestEntry()'s longest prefix already gave it
+      // that gate from /fssai/documents; the row is here so it is VISIBLE and can
+      // be granted on its own, and it states the flag rather than leaving a
+      // reader to re-derive it. The API gates itself with isManagement().
+      { path: '/fssai/documents/food-handlers', label: 'Food Handlers',     mgmtOnly: true },
+      { path: '/fssai/reports',            label: 'Reports & Downloads',      mgmtOnly: true },
+      // RECORD CHANGES & VOIDS — the owner's §19 surface: who changed a
+      // compliance record, from what to what, and the reason they gave for
+      // voiding it. Reads fssai_audit_log plus the voided_* columns on every
+      // record table.
+      //
+      // mgmtOnly, the SAME set as Verify Records, and for the same reason: this
+      // screen is a list of the moments somebody's record was overridden. It is
+      // not a staff surface, and it is not adminOnly either — a manager must be
+      // able to show an inspector what changed without the owner present, which
+      // is the whole point of keeping the trail.
+      { path: '/fssai/audit-log',          label: 'Record Changes & Voids',   mgmtOnly: true },
+      // Temperature standards, frequencies and template authoring live here. A
+      // wrong value here does not announce itself — it surfaces weeks later as a
+      // record an inspector rejects. Same reasoning as /hr/settings and
+      // /settings/qc-categories above.
+      { path: '/fssai/settings',           label: 'Settings',                 adminOnly: true },
+      // EQUIPMENT & COLD UNITS — the register of cold rooms, chillers, freezers,
+      // fryers and water filters, each with the safe range the owner sets for it.
+      // MEASURED: fssai_equipment holds 0 rows, so today an equipment-targeted
+      // checklist can only run if an admin types the unit onto the schedule by
+      // hand, and the only cold units that exist anywhere in this app are four
+      // free-text strings on production_batches.storage_location.
+      //
+      // It carries adminOnly EXPLICITLY even though bestEntry()'s longest-prefix
+      // rule would hand it down from /fssai/settings anyway. Two reasons, both
+      // practical: the Page Access matrix is built from this array, so an entry
+      // that is not here can never be granted or revoked on its own; and a reader
+      // of this file should not have to re-derive a tier gate from prefix
+      // arithmetic. A safe range is the number every temperature verdict in the
+      // module is judged against — owner §5, "never hard-coded" — so a wrong
+      // value here silently re-grades the whole file.
+      { path: '/fssai/settings/equipment', label: 'Equipment & Cold Units',   adminOnly: true },
+      { path: '/fssai/inspection-mode',    label: 'Inspection Mode',          mgmtOnly: true },
+      // AUDIT FILE — the Hyderabad authority's "Records You Should Keep Ready in
+      // One Audit File": all 20, each PRESENT / EXPIRING / MISSING, plus the one
+      // PDF of the whole file. mgmtOnly, the SAME set as Inspection Mode and for
+      // the same reason: a manager must be able to produce the file during a
+      // visit without the owner, and the page names every gap in plain words, so
+      // it is not a staff surface. /api/fssai/audit-file* gate themselves with
+      // isManagement() as well — this row is visibility, never security.
+      { path: '/fssai/audit-file',         label: 'Audit File',               mgmtOnly: true },
     ],
   },
   {
@@ -1090,6 +1265,40 @@ export function financeCapOpens(user: CatalogUser | null, pathname: string): boo
  *  so a sixth flagged row cannot disagree with the API allowlist. */
 export const FINANCE_CAP_PATHS: string[] =
   PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.financeCap).map(p => p.path);
+/** Is `pathname` under a catalog entry that "Full HR access" may open? Same
+ *  bestEntry() longest-prefix walk as isAdminOnlyPath, so the two always judge
+ *  the SAME row — /hr/settings resolves to its own unflagged row, never to
+ *  /hr's. proxy.ts uses this to decide when to resolve the capability at all. */
+export function isHrFullCapPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.hrFullCap;
+}
+/**
+ * Can this user open `pathname` because they hold "Full HR access"? THE ONLY
+ * PLACE the capability is read for pages. Every condition is required, and
+ * every one fails closed (see PageEntry.hrFullCap):
+ *   1. `can_full_hr_access === true` (strict — absent / null / 1 never grant);
+ *   2. Manager tier or HOD — a staff-tier role with the tick gets nothing;
+ *   3. the matched entry carries `hrFullCap` (so /hr/settings and every
+ *      non-HR admin page can never be opened by it);
+ *   4. the effective page map is a parseable array naming that entry's path
+ *      EXACTLY (after trim). A null / [] / garbled map, or a bare '/hr' prefix
+ *      grant, does NOT count — the capability lifts the admin tier, it never
+ *      grants a page the role has not ticked.
+ */
+export function hrFullCapOpens(user: CatalogUser | null, pathname: string): boolean {
+  if (!user || user.can_full_hr_access !== true) return false;
+  if (!(user.role === 'manager' || user.is_head_chef)) return false;
+  const entry = bestEntry(pathname);
+  if (!entry?.hrFullCap) return false;
+  if (!user.page_access) return false;
+  let map: unknown;
+  try { map = JSON.parse(user.page_access); } catch { return false; }
+  if (!Array.isArray(map) || map.length === 0) return false;
+  return map.some(p => typeof p === 'string' && p.trim() === entry.path);
+}
+/** The "Full HR access" pages, DERIVED from the catalog rather than retyped. */
+export const HR_FULL_CAP_PATHS: string[] =
+  PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.hrFullCap).map(p => p.path);
 /** Is `pathname` under an admin-only catalog entry (role === 'admin' only)? */
 export function isAdminOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.adminOnly;
@@ -1317,7 +1526,10 @@ export function firstAllowedPath(user: CatalogUser | null): string {
         && !(p.hodOnly && !user.is_head_chef)
         && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
              && !(p.financeCap && user.can_view_finance_reports))
-        && !(p.adminOnly && user.role !== 'admin')
+        // hrFullCap WIDENS the adminOnly test exactly as financeCap widens
+        // mgmtOnly above — omit it and a role whose map holds only the five
+        // HR-capability pages lands on '/login' and bounces (ruling #90).
+        && !(p.adminOnly && user.role !== 'admin' && !hrFullCapOpens(user, p.path))
         && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
     }
   }
@@ -1360,7 +1572,11 @@ export function canAccessPage(
   // whatever their page_access map says — runs before the null-map grant so
   // legacy full-access staff can't reach it either. (Admins already returned
   // true above, so this only ever affects non-admins.)
-  if (isAdminOnlyPath(pathname)) return false;
+  // hrFullCapOpens() is the ONE exception to adminOnly (ruling #90): it needs
+  // the role's "Full HR access" tick AND Manager/HOD AND this page's hrFullCap
+  // flag AND the page ticked by its exact path — so it opens only the five
+  // flagged HR rows, never /hr/settings, never any other admin page.
+  if (isAdminOnlyPath(pathname) && !hrFullCapOpens(user, pathname)) return false;
 
   // GRE-gated pages (the Guest Feedback floor pages): a non-admin must either
   // be management or carry the ASSIGNED named GRE role. Runs here, before the
@@ -1370,15 +1586,8 @@ export function canAccessPage(
   // opened these pages to all 8 null-map users instead of closing them.
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
 
-  // Guest Feedback governs its own door — see `feedbackListedInMap()` for the
-  // measurement and the rule. Reaching this line means the flag gates above
-  // already said YES (greOnly for pages 1-3, mgmtOnly for analytics), so the
-  // only thing left to ask is whether the owner has expressed an opinion about
-  // this module in the role's list. He cannot have, on any role written before
-  // the module existed, and "absent" must not read as "denied" — a Floor
-  // Manager was getting 403 on the page while the API served them the board.
-  // A list that DOES mention the module falls through and is honoured exactly.
-  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
+  // Owner, 2026-10-28: Guest Feedback follows the role's ticks like every other
+  // page — the module no longer opens its own door for a list that never mentions it.
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;
@@ -1417,25 +1626,37 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
- * the whole module. Re-measured 2026-10-14 over the current catalog (178 paths,
- * counted by running this rule over PAGE_CATALOG): 14 parents carry 83 such
- * grants:
- *   /hr +18, /crm-calls +16, /tasks +14, /inventory +13, /reports +6,
- *   /feedback +3, /kitchen-production +3, /boh +2, /grn +2,
- *   /bill-submissions +2, /dine-in/kitchen +1, /grn/qc +1, /vendors +1,
- *   /settings/integrations +1
- * (Earlier figures — 8 parents / 43 grants when this was written in 425f092,
- * then 10 / 69 on 2026-08-28 — predate rows added since; re-run the rule rather
- * than trusting a figure here. This count is RAW reach, i.e. what the prefix
- * rule alone hands over. THREE of /inventory's thirteen children are adminOnly
- * — liquor-brand-map, liquor-withdrawals and central-cutover — and the tier
- * gate stops those first, so what a MANAGER actually gains from a bare
- * '/inventory' grant is +10, not +13. Four of the thirteen are the gated
- * liquor-reconciliation rows; without them /inventory is +9 and the total is
- * 79 over 174 paths. Every other parent in the list is counted raw the same
- * way.)
+ * the whole module. Across the catalog 16 parents carry 103 such grants:
+ *   /fssai +23, /hr +18, /crm-calls +16, /tasks +14, /inventory +9,
+ *   /reports +6, /feedback +3, /kitchen-production +3, /boh +2, /grn +2,
+ *   /bill-submissions +2, /dine-in/kitchen +1, /grn/qc +1,
+ *   /settings/integrations +1, /vendors +1, /fssai/settings +1
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
+ *
+ * THESE NUMBERS ARE MEASURED, AND THEY GO STALE SILENTLY — this figure has now
+ * been wrong three times. It read "8 parents carry 43 such grants" and was
+ * already wrong before the FSSAI section existed: re-measured it was 10 / 69,
+ * because /hr (+18) and /grn (+1) were never added to the list and /crm-calls
+ * (16, not 10) and /inventory (8, not 7) had grown. It was then written as
+ * 11 / 88 for a "20-row" FSSAI section that was in fact 21 rows. Re-measured
+ * against this array on 2026-10-06, after the record modules added
+ * 'Record Changes & Voids' and 'Equipment & Cold Units', it is
+ * **12 parents / 92 grants** — and /fssai/settings is a NEW KIND of entry in
+ * this list: a catalog parent that is itself the child of another one, so
+ * /fssai/settings/equipment inherits from it and not from /fssai. Re-measured
+ * again on 2026-10-14 when 'Audit File' (/fssai/audit-file) was added: it was
+ * already 16 / 102 before that row (/boh, /feedback, /bill-submissions and
+ * /grn/qc had arrived, /grn and /inventory had grown), and that row makes it
+ * 16 parents / 103 grants. Re-measured the same day when 'Waste Handover Log'
+ * (/fssai/waste) and 'Food Handlers' (/fssai/documents/food-handlers) were
+ * added: 16 / 103 without them (confirmed), **17 parents / 106 grants** with
+ * them — /fssai +2 (now 25) and /fssai/documents a NEW parent (+1). Neither row
+ * changes who can open either path (both resolved to the same tier before).
+ * FSSAI remains
+ * the single largest carrier. Nothing recomputes this comment, so any section
+ * added here must re-measure it. The live figure is whatever
+ * GET /api/admin/page-access-impact reports, not whatever this comment says.
  *
  * WHY IT IS NOT ENFORCED YET
  * Switching the proxy to this function TIGHTENS access. Any role configured
@@ -1524,12 +1745,14 @@ export function canAccessPageStrict(
   // ever open the flagged rows, never mgmtOnly as a class.
   if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
       && !financeCapOpens(user, pathname)) return false;
-  if (isAdminOnlyPath(pathname)) return false;
+  // hrFullCapOpens(): the ONE exception to adminOnly — see canAccessPage.
+  if (isAdminOnlyPath(pathname) && !hrFullCapOpens(user, pathname)) return false;
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
   // Kept in sync with canAccessPage deliberately: this function is MEASURED,
   // not wired up, and the day it is wired up the feedback module must not
   // silently go back to 403ing every management role whose list predates it.
-  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
+  // Owner, 2026-10-28: Guest Feedback follows the role's ticks like every other
+  // page — the module no longer opens its own door for a list that never mentions it.
   if (!user.page_access) return true;
 
   let allowed: string[];

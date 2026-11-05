@@ -1,6 +1,12 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
 import { deptOnHandBulk, postDeptLedger } from '@/lib/dept-ledger';
+// THE CENTRAL FLOOR FOR AN UNATTENDED PATH. A reset is "unattended" in the sense
+// the ruling means: the admin asked for records to be cleared, not for one
+// material's incomplete purchase history to abort the whole gesture. So the
+// unwind debit is CLAMPED and the shortfall RECORDED. See that module's header
+// and THE CENTRAL FLOOR ON THE PURCHASE UNWIND below.
+import { clampCentralDelta, recordCentralDebitClamp, type CentralDeltaClamp } from '@/lib/central-debit-clamp';
 
 /**
  * Admin-only data reset.
@@ -56,13 +62,13 @@ import { deptOnHandBulk, postDeptLedger } from '@/lib/dept-ledger';
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-
-  // FIELD 8 — the responsible user for every ledger row this reset writes.
-  // postDeptLedger REFUSES a blank actor and is deliberately un-caught below, so
-  // omitting this rolls the WHOLE reset back the moment any department still
-  // holds stock. requireRole already resolved the session; the admin who pressed
-  // Reset is the responsible party for the flatten rows it posts.
-  const resetActor = String(auth.user.email || '').trim() || 'system:admin-reset';
+  // THE RESPONSIBLE USER for every department movement this reset posts
+  // (zeroDepartmentRail below). postDeptLedger REFUSES a blank user, and that
+  // throw rolled back every `stock_only` reset whose departments held stock
+  // (500 "a responsible user is required"). The SESSION admin's email — never a
+  // client-supplied name — with a `system:` actor only as the fallback, exactly
+  // as the staff-meal routes resolve their itemActor.
+  const resetActor = String(auth.user?.email || '').trim() || 'system:admin-reset';
 
   const body = await req.json().catch(() => ({}));
   if (body?.confirm !== 'RESET') {
@@ -96,6 +102,11 @@ export async function POST(req: Request) {
     dateRange ? { sql: ` AND ${col} BETWEEN ? AND ?`, params: [from, to] } : { sql: '', params: [] };
 
   const deleted: Record<string, number> = {};
+  /* Unwind debits the central floor would not let through in full — see THE
+   * CENTRAL FLOOR ON THE PURCHASE UNWIND below. Declared out here so the one
+   * audit row can name every clamped material of the run, and so the response
+   * can say how many there were. */
+  const resetClamps: CentralDeltaClamp[] = [];
 
   const txn = db.transaction(() => {
     // Delay FK enforcement to commit-time so child/parent delete order is forgiving.
@@ -195,6 +206,7 @@ export async function POST(req: Request) {
           source,
           referenceId: 'admin-reset',
           notes: note,
+          // Required by postDeptLedger; see resetActor at the top of POST.
           user: resetActor,
         });
         posted += 1;
@@ -341,7 +353,21 @@ export async function POST(req: Request) {
         // Epsilon, not `!== 0`: a fully department-attributed sale lands on ~1e-16
         // across two floating-point legs, and `!== 0` would post a meaningless
         // sub-nanogram credit to central.
-        if (!(Math.abs(centralShare) > 1e-9)) continue;
+        //
+        // AND > 0 ONLY — A CREDIT-BACK NEVER DEBITS. This used to be
+        // `Math.abs(centralShare) > 1e-9`, which let a NEGATIVE centralShare
+        // through to `current_stock + ?`: MEASURED on a copy, a material forced
+        // to 0 whose non-central attribution exceeded its recorded deductions
+        // went 0 → −60 and the reset answered 200. A negative share means the
+        // attribution legs above claim more than the sale rows deducted — a
+        // ledger divergence, not stock central owes anyone — so it is skipped
+        // and left visible, never absorbed by silently docking the store. This
+        // is the party credit-back's own guard further down
+        // (`!(net > 1e-9)`), applied to the one credit-back the census missed.
+        // HONEST CAVEAT: that divergent precondition is not constructible from
+        // today's book; this is defence in depth, the same way sales DELETE's
+        // restore leg was closed.
+        if (!(centralShare > 1e-9)) continue;
         creditStmt.run(centralShare, row.material_id);
         creditedMaterials += 1;
       }
@@ -429,15 +455,85 @@ export async function POST(req: Request) {
       `).all(outletId, outletId, ...dc.params) as any[];
       const debitStmt = db.prepare(`
         UPDATE raw_materials
-        SET current_stock = current_stock - ?, updated_at = datetime('now')
+        SET current_stock = current_stock + ?, updated_at = datetime('now')
         WHERE id = ?
       `);
+      /* ── THE CENTRAL FLOOR ON THE PURCHASE UNWIND ──────────────────────────
+       * THE WHOLESALE RESET IS SAFE AND THE DATE-RANGED ONE IS NOT, which is
+       * exactly backwards from where you would look. With no date range the
+       * branch below re-baselines current_stock to 0 wholesale and sets
+       * stockRebaselined, so this debit lands on a column that is about to be
+       * zeroed anyway. WITH a range (`dateRange`, the From/To inputs on
+       * /admin/reset) that re-baseline is deliberately skipped — the header says
+       * so — so this debit lands on a LIVE balance, with no balance read of any
+       * kind in front of it.
+       *
+       * MEASURED on a copy of the live book before this clamp: a probe material
+       * at current_stock 0 carrying a 300-qty purchase dated 2001-01-02, scope
+       * "purchases" with From/To spanning that date, confirm "RESET" →
+       * HTTP 200 and current_stock 0 → −300. Admin-only, but admin-only is not
+       * a floor.
+       *
+       * WHY IT HAPPENS AT ALL: this debit reverses the RECEIPT and nothing else.
+       * The goods were received, then issued out to a kitchen, then cooked — so
+       * the gram is long gone from central by legitimate means, and unwinding
+       * only the inbound half of its life takes it off a shelf that no longer
+       * holds it. That is not a bug in the arithmetic (the receipt really did
+       * add 300); it is the arithmetic being asked a question the surviving rows
+       * cannot answer. The deeper the date range reaches, the more certain it is.
+       *
+       * ── IT CLAMPS; IT DOES NOT REFUSE, AND THAT IS THE OWNER'S RULING ─────
+       * Refusing would abort the WHOLE reset — every scope, every table, all of
+       * it — over one material whose history is incomplete, and leave the admin
+       * with a sentence about a material he was not asking about. A reset that
+       * clears what it was asked to clear and leaves a floored balance plus a
+       * named shortfall is strictly better than one that cannot run. This is the
+       * same judgement src/lib/central-debit-clamp.ts states in full and the one
+       * src/lib/po-requisition-fulfil.ts already applies on the cascade.
+       *
+       * NOTE THE SIGN FLIP IN THE STATEMENT: it is `current_stock + ?` now, and
+       * the caller passes a NEGATIVE delta. That is the only shape
+       * clampCentralDelta speaks, so the figure that is weighed and the figure
+       * that is written are one value. net_qty is the SUM of the purchase rows'
+       * inventory_transactions quantities, which are already in RECIPE units
+       * (the receiving routes convert with packFactor before writing them), so
+       * no conversion happens here or in the clamp.
+       *
+       * A NET-NEGATIVE net_qty (the one back-corrected purchase row in the live
+       * book) unwinds to a CREDIT, and a credit is never clamped — see the
+       * clamp's own header. Byte-identical to today on every such row.
+       */
       let debitedMaterials = 0;
       for (const row of debitRows) {
-        debitStmt.run(row.net_qty, row.material_id);
+        const clamp = clampCentralDelta(db, {
+          materialId: String(row.material_id),
+          deltaRecipe: -(Number(row.net_qty) || 0),
+        });
+        /* ── THE CLAMP ALWAYS RUNS; THE REPORT ONLY RUNS WHEN IT MEANS SOMETHING
+         * The clamp is unconditional because it is the FLOOR, and a floor that
+         * is skipped on a branch is how an inert guard is born — the
+         * re-baseline below even says in its own comment "If either condition
+         * is ever loosened…", which is precisely the kind of change that would
+         * expose this debit again.
+         *
+         * BUT THE SHORTFALL IS ONLY REPORTED ON A DATE-RANGED RESET. With no
+         * range the branch ~120 lines below sets `current_stock = 0` across
+         * every material and sets stockRebaselined, so the balance ends at zero
+         * whatever this debit did and the clamp is moot by construction. It
+         * would nonetheless BITE on most materials — a receipt's full inbound
+         * quantity is normally far larger than what is still on the shelf — and
+         * reporting that would hand the owner a long "could not be debited"
+         * list on an ordinary full wipe, where nothing was lost and nothing is
+         * actionable. A floor's record must mean "look at this", or it trains
+         * him to ignore the one that matters. */
+        if (clamp.clamped && dateRange) resetClamps.push(clamp);
+        debitStmt.run(clamp.deltaToWrite, row.material_id);
         debitedMaterials += 1;
       }
       deleted.materials_debited_back = debitedMaterials;
+      // Surfaced in the response as well as in audit_events, so the admin sees
+      // it on the screen he is standing at and not only in the log.
+      if (resetClamps.length > 0) deleted.materials_clamped_at_zero = resetClamps.length;
 
       deleted.inventory_transactions_purchases = db.prepare(`
         DELETE FROM inventory_transactions
@@ -476,6 +572,21 @@ export async function POST(req: Request) {
           WHERE linked_po_id IN (${poSelect})
         `).run(outletId, ...pDc.params).changes;
       } catch {}
+      // Merged POs (rulings #63-#70): the requisition links and the vendor
+      // short-closes go with their PO. Both tables also CASCADE from
+      // purchase_orders, so this is the explicit, counted form of what the
+      // DELETE below would do anyway. The requisitions themselves survive —
+      // a merge never writes to them.
+      try {
+        deleted.po_requisition_lines = db.prepare(`
+          DELETE FROM po_requisition_lines WHERE po_id IN (${poSelect})
+        `).run(outletId, ...pDc.params).changes;
+      } catch { deleted.po_requisition_lines_skipped = 0; }
+      try {
+        deleted.po_vendor_closures = db.prepare(`
+          DELETE FROM po_vendor_closures WHERE po_id IN (${poSelect})
+        `).run(outletId, ...pDc.params).changes;
+      } catch { deleted.po_vendor_closures_skipped = 0; }
       // FK ON DELETE CASCADE handles purchase_order_items
       deleted.purchase_orders = db.prepare(`
         DELETE FROM purchase_orders WHERE outlet_id = ? ${pDc.sql}
@@ -627,6 +738,19 @@ export async function POST(req: Request) {
             }
           } catch { deleted[`${r.table}_skipped`] = -1; }
         }
+        // The loop above just deleted EVERY department ledger row (MATERIAL_REFS
+        // 'department_material_transactions' is an unscoped DELETE here), which
+        // includes every transfer_out / transfer_in pair. The transfer DOCUMENTS
+        // describe those pairs and hold no balance, so they go with them — the
+        // same three tables, same order, as the phase-1 full wipe below. Left
+        // behind, every line fails the pair check (line_missing_legs) and
+        // "Transfers in" lists goods that are on no ledger. Measured before this
+        // block (xfer-r3-ledger r3-prove G1): 28 documents / 28 lines / 2
+        // disputes survived an inventory_all with 0 ledger rows left.
+        for (const t of ['department_transfer_disputes', 'department_transfer_lines', 'department_transfers']) {
+          if (!tableExists(t)) { deleted[`${t}_skipped`] = -1; continue; }
+          deleted[t] = db.prepare(`DELETE FROM ${t}`).run().changes;
+        }
         // Recipe/sub-recipe costs are meaningless now (ingredients gone) — zero them.
         try { db.prepare(`UPDATE recipes SET total_cost = 0, food_cost_percent = 0, updated_at = datetime('now')`).run(); } catch {}
         try { db.prepare(`UPDATE sub_recipes SET total_cost = 0, cost_per_unit = 0, updated_at = datetime('now')`).run(); } catch {}
@@ -725,7 +849,14 @@ export async function POST(req: Request) {
           `);
           let reqCredited = 0;
           for (const row of reqCreditRows) {
-            if (!row.material_id || !Number(row.net_qty)) continue;
+            // > 0 ONLY, the party credit-back's guard below and the sales
+            // credit-back's above. `!Number(net_qty)` let a NEGATIVE net through
+            // to `current_stock + ?`, i.e. a credit-back that debits. By the
+            // ledger's own invariant (issue-stock.ts: SUM(delta_recipe_qty) per
+            // line is never negative) no live material sums below zero, so this
+            // is defence in depth — but a divergent ledger must stay visible, not
+            // be absorbed by docking the store below zero.
+            if (!row.material_id || !(Number(row.net_qty) > 1e-9)) continue;
             reqCreditStmt.run(Number(row.net_qty), row.material_id);
             reqCredited += 1;
           }
@@ -802,6 +933,17 @@ export async function POST(req: Request) {
       // the same thing as zero.
       safeDel('department_material_transactions');
       safeDel('department_materials');
+      // The department-to-department transfer DOCUMENTS go with the ledger
+      // they describe. Every line's reference_id names a transfer_out /
+      // transfer_in pair that was just deleted above; left behind, every line
+      // would fail the pair check (/api/department-ledger/check →
+      // line_missing_legs) and "Transfers in" would list goods that are on no
+      // ledger. They hold no balance, so deleting them moves nothing. Full wipes
+      // only — here and inventory_all above, the two places the whole ledger is
+      // deleted.
+      safeDel('department_transfer_disputes');
+      safeDel('department_transfer_lines');
+      safeDel('department_transfers');
       // The unmapped-station skip log. Every row points at an order_item this
       // cleanup deletes; left behind it keeps a warning banner up about stations
       // and orders nobody can open any more.
@@ -810,6 +952,11 @@ export async function POST(req: Request) {
       // orphan every row against a req_item_id that no longer exists AND let a
       // later cancel/reject guard refuse on a requisition that is gone.
       safeDel('requisition_issue_ledger');
+      // Merged-PO links name requisition lines that go on the next two lines
+      // (and their PO lines go with purchase_order_items below, which would
+      // cascade them anyway). Deleted first and counted, never left pointing
+      // at requisitions that no longer exist.
+      safeDel('po_requisition_lines');
       safeDel('requisition_items');
       safeDel('requisitions');
       safeDel('wastages');
@@ -874,9 +1021,42 @@ export async function POST(req: Request) {
     after: { scopes, wipe_master: wipeMaster, from, to, deleted },
     note: `Reset scopes: ${scopes.join(', ')}${dateRange ? ` (${from} → ${to})` : ' (full)'}`,
   });
+  /* ── AND, ON ITS OWN ROW, WHAT THE FLOOR WOULD NOT UNWIND ────────────────
+   * AFTER the commit, deliberately, unlike grn-qc.ts's — this route's own
+   * 'admin.reset' row is written out here too, after txn(), because a failed
+   * reset returns 500 with `partial` and logs nothing. A clamp that never
+   * committed must not be reported as though it had. Writes nothing when no
+   * clamp bit, so an ordinary reset is byte-identical to before. */
+  recordCentralDebitClamp(db, {
+    eventType: 'admin.reset.central_short',
+    entityType: 'system',
+    entityId: outletId,
+    actorEmail: auth.user?.email || 'admin',
+    outletId,
+    clamps: resetClamps,
+    note: `Reset scopes: ${scopes.join(', ')}${dateRange ? ` (${from} → ${to})` : ' (full)'}`
+      + ` — the purchase unwind was clamped at the central floor`,
+  });
   return Response.json({
     success: true,
     outlet_id: outletId,
     deleted,
+    /* The shortfall, on the screen the admin is standing at. Present only when
+     * the clamp bit, so the response shape is unchanged on an ordinary reset. */
+    ...(resetClamps.length > 0 ? {
+      central_floor_clamped: resetClamps.map(c => ({
+        material_id: c.materialId,
+        material_name: c.materialName,
+        on_hand_before: c.stockRecipe,
+        wanted_debit: Math.round(-c.wantedDelta * 1e6) / 1e6,
+        debited: Math.round(-c.deltaToWrite * 1e6) / 1e6,
+        short_by: c.shortRecipe,
+      })),
+      central_floor_note:
+        `${resetClamps.length} material(s) had more purchase quantity unwound than the central store still holds `
+        + `(the goods had already been issued out and consumed, so only the receipt could be reversed). `
+        + `Their balances were floored at zero instead of going negative; the detail is in the audit log `
+        + `under 'admin.reset.central_short'.`,
+    } : {}),
   });
 }

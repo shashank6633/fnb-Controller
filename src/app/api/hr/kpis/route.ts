@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, type HrKpi } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, type HrKpi } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -13,12 +13,12 @@ import { reportServerError } from '@/lib/error-alerts';
  * GET    /api/hr/kpis?include_inactive=1 → { kpis }
  *          Management tier (admin | manager | HOD). The proxy does NOT guard
  *          API GETs — this check is the security boundary (HRMS §2.1).
- * POST   /api/hr/kpis { name, weight? } → { kpi }. Admin only.
+ * POST   /api/hr/kpis { name, weight? } → { kpi }. Admin or "Full HR access" (canHrFull).
  *          409 on a duplicate name — hr_kpis.name is UNIQUE COLLATE NOCASE,
  *          pre-checked for a human message and backstopped by the constraint.
- * PUT    /api/hr/kpis { id, name?, weight?, is_active? } → { kpi }. Admin only.
+ * PUT    /api/hr/kpis { id, name?, weight?, is_active? } → { kpi }. Admin or "Full HR access" (canHrFull).
  * DELETE /api/hr/kpis?id=   (id also accepted in a JSON body)
- *          → { ok: true }. Admin only. SOFT delete (is_active = 0) — old
+ *          → { ok: true }. Admin or "Full HR access" (canHrFull). SOFT delete (is_active = 0) — old
  *          reviews keep scoring against the row; only pickers hide it.
  *
  * Error bodies are GENERIC on 500 (never e.message — HR data must not leak
@@ -65,7 +65,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -124,7 +124,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }
@@ -193,7 +193,7 @@ export async function PUT(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   // House style is ?id= (vendors, hr/designations); DELETE { id } accepted too.
   const url = new URL(request.url);

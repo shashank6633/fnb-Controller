@@ -12,9 +12,11 @@
  * and fetched as a blob here — never an <a href> ending in an asset
  * extension (proxy path rules).
  *
- * Payroll Register is admin-gated at the API (salary data, contract §2.2):
- * a manager opening that tab gets a plain admin-only lock message; the other
- * tabs keep working for them.
+ * Payroll Register is canHrFull-gated at the API (salary data, contract §2.2;
+ * admin, or a "Full HR access" role — owner ruling #90): any other manager
+ * opening that tab gets a plain lock message; the other tabs keep working for
+ * them. The lock is detected by a 403 whose message matches /admin/i, so the
+ * API's refusal keeps the word "admin".
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -194,7 +196,7 @@ export default function HrReportsPage() {
           ) : adminLocked ? (
             <div className="p-8 text-center text-[#6B5744]">
               <Lock className="w-8 h-8 mx-auto mb-2 text-[#af4408]" />
-              <p className="text-sm">{def.label} is admin-only.</p>
+              <p className="text-sm">{def.label} is limited to admins and roles with Full HR access.</p>
             </div>
           ) : rows.length === 0 ? (
             <div className="p-6 text-center text-[#8B7355] text-sm">

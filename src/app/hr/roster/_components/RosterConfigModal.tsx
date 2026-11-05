@@ -71,8 +71,9 @@ interface Props {
   departmentId: string;
   departmentLabel: string;
   initialTab: 'coverage' | 'map';
-  /** False when the signed-in user is not an HR admin — the API refuses the
-   *  write regardless; this only stops offering a button that cannot work. */
+  /** False when the signed-in user fails canHrFull (not an admin, and no
+   *  "Full HR access" role) — the API refuses the write regardless; this only
+   *  stops offering a button that cannot work. */
   canWrite: boolean;
   onClose: () => void;
   /** Called after a successful save so readiness re-measures. */
@@ -84,7 +85,7 @@ const numCls = 'w-16 px-1.5 py-1 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]
 
 function niceErr(e: unknown, fallback: string): string {
   const msg = e instanceof Error ? e.message : '';
-  if (/403|forbidden/i.test(msg)) return 'HR admin access is required to change this.';
+  if (/403|forbidden/i.test(msg)) return 'Changing this needs an admin or a role with Full HR access.';
   if (/401|unauthor/i.test(msg)) return 'Your session has expired — sign in again.';
   return msg && !/^HTTP \d+$/.test(msg) ? msg : fallback;
 }
@@ -327,7 +328,7 @@ export default function RosterConfigModal({
           )}
           {!canWrite && (
             <div className="rounded-lg border border-amber-200 bg-amber-50 text-amber-900 px-3 py-2 text-sm">
-              You can read this configuration but not change it — HR admin access is required.
+              You can read this configuration but not change it — changes need an admin or a role with Full HR access.
             </div>
           )}
 

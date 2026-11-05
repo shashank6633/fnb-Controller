@@ -21,6 +21,15 @@
  * columns stay VISIBLE and print "—" with the reason in the tooltip — hiding
  * them silently would make an admin and a counter disagree about what the
  * report even contains.
+ *
+ * Estimated GST (owner #4, rulings #77/#78/#81 — src/lib/closing-tax.ts): the
+ * route sends `closing_tax` per cell / row / grand total and GST fields per
+ * drill-down item. This page prints and SUMS those figures only — it never
+ * resolves a rate. Tax and Total incl. GST sum only rows WITH a rate and say
+ * "rate known for N of M". The GST is on each count's VALUE AT COUNT (the
+ * value saved with the count — the same figure and tax the two history
+ * screens show), NOT on this board's Value column (today's average price ×
+ * qty), so every GST figure prints its value at count beside it and says so.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -34,6 +43,14 @@ import Toggle from '@/components/Toggle';
 import Qty from '@/components/Qty';
 import { csvQty, dualQty, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST, fmtIST } from '@/lib/format-date';
+import {
+  CLOSING_COUNT_VALUE_CSV, CLOSING_COUNT_VALUE_LABEL, CLOSING_COUNT_VALUE_TITLE,
+  CLOSING_GST_PCT_CSV, CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
+  CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_INCL_LABEL, CLOSING_INCL_TITLE,
+  CLOSING_TAX_CSV, CLOSING_TAX_LABEL, CLOSING_TAX_TITLE,
+  addClosingTaxTotals, closingTaxCsv, closingTaxNotes, fmtClosingGstPct,
+  sumClosingTax, type ClosingTaxTotals,
+} from '@/lib/closing-tax';
 
 /* ── Types (the /api/closing-stock/overview contract) ──────────────────── */
 
@@ -53,6 +70,8 @@ interface Cell {
   excess: number | null;
   /** Optional per-cell denominator; older payloads fall back to row.total_items. */
   total?: number | null;
+  /** Estimated GST over this cell's counts (rows with a rate only). */
+  closing_tax?: ClosingTaxTotals | null;
 }
 
 interface BoardRow {
@@ -65,6 +84,7 @@ interface BoardRow {
     physical_value: number;
     system_value: number | null;
     variance_value: number | null;
+    closing_tax?: ClosingTaxTotals | null;
   };
 }
 
@@ -103,6 +123,14 @@ interface ItemRow {
   purchase_unit?: string | null;
   pack_size?: number | null;
   case_size?: number | null;
+  /** The value SAVED with the count — the GST basis. null = none saved. */
+  value_at_count?: number | null;
+  /** Estimated GST — null = BLANK, never 0. */
+  gst_pct?: number | null;
+  gst_note?: string | null;
+  gst_title?: string | null;
+  tax?: number | null;
+  total_incl_tax?: number | null;
 }
 
 interface ItemsSummary {
@@ -110,12 +138,15 @@ interface ItemsSummary {
   physical_value?: number | null;
   system_value?: number | null;
   variance_value?: number | null;
+  closing_tax?: ClosingTaxTotals | null;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
 const inr = (v: number, dp = 0) =>
   '₹' + (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
+/** ₹ to paise — for the GST figures and their footers. */
+const inr2 = (v: number) => inr(v, 2);
 const n = (v: unknown) => Number(v) || 0;
 /** null/undefined survive as null — a blind-count blank is NOT a zero. */
 const nz = (v: unknown): number | null =>
@@ -148,6 +179,14 @@ const itemName = (r: ItemRow) => r.material_name || r.name || 'Unnamed material'
 const itemDept = (r: ItemRow) => r.department_name || '—';
 const isCounted = (r: ItemRow) =>
   r.counted !== false && r.physical_stock !== null && r.physical_stock !== undefined;
+
+/** Hover text for a blank Tax / Total incl. GST cell — why it is blank. */
+const taxBlankWhy = (r: ItemRow): string => {
+  if (!isCounted(r)) return 'Not counted — nothing to tax.';
+  if (nz(r.gst_pct) === null) return r.gst_title || 'No GST rate for this item — left blank, never ₹0.';
+  return 'No value was saved with this count — nothing to apply the GST rate to (the Value column is today\'s '
+    + 'average price, not this count\'s value).';
+};
 
 /* ── Page ──────────────────────────────────────────────────────────────── */
 
@@ -257,6 +296,9 @@ export default function ClosingOverviewPage() {
       uncounted: Math.max(0, items_ - counted),
       value,
       variance: sawVariance ? variance : null,
+      // Grand total of the estimated GST over the FILTERED areas — summed
+      // from the same per-row figures the department footers use.
+      tax: addClosingTaxTotals(filtered.map(r => r.total?.closing_tax)),
     };
   }, [filtered]);
 
@@ -278,6 +320,26 @@ export default function ClosingOverviewPage() {
       prev && prev.location === location && prev.deptKey === deptKey ? null : { location, deptKey });
   };
 
+  /** Drill-down GST footer: COUNTED rows only (uncounted fillers carry no value). */
+  const itemsTax = useMemo(() => sumClosingTax(items.filter(isCounted).map(r => ({
+    gst_pct: nz(r.gst_pct), tax: nz(r.tax), total_incl_tax: nz(r.total_incl_tax),
+  }))), [items]);
+  /** Every note printed with a GST total on this page comes from the ONE helper
+   *  (closing-tax.ts closingTaxNotes), so each states the true case: no rate /
+   *  rates but no value saved at count / some taxed. */
+  const itemsTaxNotes = closingTaxNotes(itemsTax, 'counted items', inr2);
+  const summaryTaxNotes = closingTaxNotes(summary.tax, 'counts', inr2);
+  /** Σ value at count over the counted rows that have one (the column's own total). */
+  const itemsValueAtCount = useMemo(() => {
+    let sum = 0, rows_ = 0;
+    for (const r of items) {
+      const v = isCounted(r) ? nz(r.value_at_count) : null;
+      if (v === null) continue;
+      sum += v; rows_ += 1;
+    }
+    return { sum: Math.round(sum * 100) / 100, rows: rows_ };
+  }, [items]);
+
   const drillDeptName = useMemo(() => {
     if (!drill?.deptKey) return 'All departments';
     return departments.find(d => d.key === drill.deptKey)?.name || drill.deptKey;
@@ -296,10 +358,22 @@ export default function ClosingOverviewPage() {
   };
 
   const exportBoard = () => {
+    // Estimated GST columns are APPENDED after 'Total Variance' — every
+    // existing column keeps its position. A cell with no rated count is BLANK,
+    // never 0; "rate known" says how many counts each area's figures cover.
+    // The GST is on each count's VALUE AT COUNT, not on the "— Value" columns
+    // (today's average price), so the area's value at count of the taxed
+    // counts is its own column: it + Total Tax = Total incl. GST.
+    const taxCell = (t: ClosingTaxTotals | null | undefined, k: 'tax' | 'total_incl_tax' | 'value_taxed') =>
+      t && n(t.taxed) > 0 ? closingTaxCsv(t[k]) : '';
     const header = [
       'Storage Area', 'Items', 'Counted', 'Uncounted',
       ...departments.flatMap(d => [`${d.name} — Counted`, `${d.name} — Value`]),
       'Total Counted', 'Total Value', 'Total Variance',
+      ...departments.flatMap(d => [`${d.name} — ${CLOSING_TAX_CSV}`, `${d.name} — ${CLOSING_INCL_CSV}`]),
+      `Total ${CLOSING_TAX_CSV}`, `${CLOSING_INCL_CSV} — all departments`,
+      `${CLOSING_COUNT_VALUE_CSV} — counts with a GST rate, all departments`,
+      'GST note — all departments (rate known for N of M counts; what the GST figures cover)',
     ];
     const body: (string | number)[][] = filtered.map(r => [
       locLabel(r.location), n(r.total_items), n(r.counted_items),
@@ -310,6 +384,16 @@ export default function ClosingOverviewPage() {
       }),
       n(r.total?.counted), n(r.total?.physical_value),
       nz(r.total?.variance_value) ?? '',
+      ...departments.flatMap(d => {
+        const t = r.by_dept?.[d.key]?.closing_tax;
+        return [taxCell(t, 'tax'), taxCell(t, 'total_incl_tax')];
+      }),
+      taxCell(r.total?.closing_tax, 'tax'), taxCell(r.total?.closing_tax, 'total_incl_tax'),
+      taxCell(r.total?.closing_tax, 'value_taxed'),
+      // The same note the screen prints (closingTaxNotes): rate known for N of
+      // M, and whether the GST covers all of them, some, or — rates known but
+      // no value saved at count — none. Blank for an area with no counts.
+      n(r.total?.closing_tax?.items) > 0 ? closingTaxNotes(r.total!.closing_tax!, 'counts').rate : '',
     ]);
     download(Papa.unparse([header, ...body]), `closing-overview-${date}.csv`);
   };
@@ -323,6 +407,11 @@ export default function ClosingOverviewPage() {
       'Purchase Unit', 'Counted Qty', 'System Qty', 'Variance Qty',
       'Recipe Unit', 'Counted Qty (recipe)', 'System Qty (recipe)', 'Variance Qty (recipe)',
       'Value', 'Variance Value',
+      // Estimated GST — APPENDED; blank (never 0) where there is no rate.
+      // Its basis (value at count) leads, because 'Value' above is a
+      // different figure (today's average price × qty).
+      CLOSING_COUNT_VALUE_CSV,
+      CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_TAX_CSV, CLOSING_INCL_CSV,
     ];
     const body: (string | number)[][] = items.map(r => {
       const meta = packMeta(r);
@@ -343,6 +432,11 @@ export default function ClosingOverviewPage() {
         varq === null ? '' : csvQty(varq),
         val ?? '',
         nz(r.variance_value) ?? '',
+        closingTaxCsv(isCounted(r) ? nz(r.value_at_count) : null),
+        closingTaxCsv(nz(r.gst_pct)),
+        r.gst_note || '',
+        closingTaxCsv(nz(r.tax)),
+        closingTaxCsv(nz(r.total_incl_tax)),
       ];
     });
     const slug = locParam(drill.location).replace(/[^a-z0-9]+/gi, '-').toLowerCase();
@@ -426,7 +520,7 @@ export default function ClosingOverviewPage() {
       )}
 
       {/* Summary cards */}
-      <div className={`grid grid-cols-2 md:grid-cols-3 gap-2.5 ${summary.variance !== null ? 'lg:grid-cols-5' : 'lg:grid-cols-4'}`}>
+      <div className={`grid grid-cols-2 md:grid-cols-3 gap-2.5 ${summary.variance !== null ? 'lg:grid-cols-7' : 'lg:grid-cols-6'}`}>
         <SummaryCard icon={<Warehouse className="w-4 h-4" />} label="Areas" value={summary.areas.toLocaleString('en-IN')} />
         <SummaryCard icon={<Layers className="w-4 h-4" />} label="Items counted"
                      value={`${summary.counted.toLocaleString('en-IN')} / ${summary.items.toLocaleString('en-IN')}`} />
@@ -434,6 +528,21 @@ export default function ClosingOverviewPage() {
                      value={summary.uncounted.toLocaleString('en-IN')}
                      tone={summary.uncounted > 0 ? 'warn' : 'muted'} />
         <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Counted value" value={inr(summary.value)} />
+        {/* Estimated GST grand total — rows with a rate only, and it says so.
+            On the VALUE AT COUNT, not the "Counted value" card beside it
+            (today's average price) — each card says which figure it is on. */}
+        <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label={CLOSING_TAX_LABEL}
+                     value={summary.tax.taxed > 0 ? inr(summary.tax.tax) : '—'}
+                     note={summary.tax.taxed > 0
+                       ? `on value at count ${inr(summary.tax.value_taxed)} · ${summaryTaxNotes.rate}`
+                       : summaryTaxNotes.rate}
+                     title={`${CLOSING_TAX_TITLE} ${summaryTaxNotes.title}`} />
+        <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label={CLOSING_INCL_LABEL}
+                     value={summary.tax.taxed > 0 ? inr(summary.tax.total_incl_tax) : '—'}
+                     note={summary.tax.taxed > 0
+                       ? `value at count + GST · ${summaryTaxNotes.covers}`
+                       : summaryTaxNotes.covers}
+                     title={summaryTaxNotes.title} />
         {summary.variance !== null && (
           <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Variance"
                        value={inr(summary.variance)} tone={summary.variance < 0 ? 'warn' : 'muted'} />
@@ -568,10 +677,12 @@ export default function ClosingOverviewPage() {
                       if (!c) continue;
                       counted += n(c.counted); value += n(c.physical_value);
                     }
+                    const dTax = addClosingTaxTotals(filtered.map(r => r.by_dept?.[d.key]?.closing_tax));
                     return (
                       <td key={d.key} className="px-3 py-2 text-right tabular-nums">
                         <div className="text-xs">{counted.toLocaleString('en-IN')}</div>
                         <div className="text-[11px] font-normal text-[#8B7355]">{inr(value)}</div>
+                        <FooterTax t={dTax} />
                       </td>
                     );
                   })}
@@ -580,6 +691,7 @@ export default function ClosingOverviewPage() {
                       {summary.counted.toLocaleString('en-IN')} / {summary.items.toLocaleString('en-IN')}
                     </div>
                     <div className="text-[11px] font-normal text-[#af4408]">{inr(summary.value)}</div>
+                    <FooterTax t={summary.tax} />
                   </td>
                 </tr>
               </tfoot>
@@ -708,6 +820,17 @@ export default function ClosingOverviewPage() {
                     <th className="text-right font-semibold px-3 py-2 min-w-[100px]">System</th>
                     <th className="text-right font-semibold px-3 py-2 min-w-[100px]">Variance</th>
                     <th className="text-right font-semibold px-3 py-2 min-w-[90px] bg-[#FBE7D3]">Value</th>
+                    {/* The GST basis: the value saved with the count. */}
+                    <th className="text-right font-semibold px-3 py-2 min-w-[100px]" title={CLOSING_COUNT_VALUE_TITLE}>
+                      {CLOSING_COUNT_VALUE_LABEL}
+                      <div className="text-[9px] font-normal text-[#8B7355]">saved with the count · GST basis</div>
+                    </th>
+                    <th className="text-right font-semibold px-3 py-2 min-w-[100px]" title={CLOSING_GST_PCT_TITLE}>
+                      {CLOSING_GST_PCT_LABEL}
+                      <div className="text-[9px] font-normal text-[#8B7355]">{CLOSING_GST_PCT_SUB}</div>
+                    </th>
+                    <th className="text-right font-semibold px-3 py-2 min-w-[90px]" title={CLOSING_TAX_TITLE}>{CLOSING_TAX_LABEL}</th>
+                    <th className="text-right font-semibold px-3 py-2 min-w-[100px]" title={CLOSING_INCL_TITLE}>{CLOSING_INCL_LABEL}</th>
                     <th className="px-2 py-2 w-8" />
                   </tr>
                 </thead>
@@ -747,6 +870,29 @@ export default function ClosingOverviewPage() {
                         <td className="px-3 py-2 text-right tabular-nums bg-[#FEF6EE] text-[#2D1B0E]">
                           {val === null ? <span className="text-[#B9A896]">—</span> : inr(val)}
                         </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-[#2D1B0E]">
+                          {nz(r.value_at_count) === null
+                            ? <span className="text-[#B9A896]"
+                                    title={done ? 'No value was saved with this count — no GST is estimated on it.' : 'Not counted — nothing to tax.'}>—</span>
+                            : inr2(n(r.value_at_count))}
+                        </td>
+                        {/* Estimated GST; the rate says where it came from. */}
+                        <td className="px-3 py-2 text-right tabular-nums" title={r.gst_title || undefined}>
+                          {nz(r.gst_pct) === null
+                            ? <span className="text-[#B9A896]">—</span>
+                            : <span className="text-[#2D1B0E]">{fmtClosingGstPct(nz(r.gst_pct))}</span>}
+                          {r.gst_note && <div className="text-[9px] text-[#B8A590]">{r.gst_note}</div>}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-[#2D1B0E]">
+                          {nz(r.tax) === null
+                            ? <span className="text-[#B9A896]" title={taxBlankWhy(r)}>—</span>
+                            : inr2(n(r.tax))}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-[#2D1B0E]">
+                          {nz(r.total_incl_tax) === null
+                            ? <span className="text-[#B9A896]" title={taxBlankWhy(r)}>—</span>
+                            : inr2(n(r.total_incl_tax))}
+                        </td>
                         <td className="px-2 py-2 text-right">
                           <Link href={recordHref(date, drill.location, r.department_id || drill.deptKey)}
                                 title="Open this area in the record flow"
@@ -771,6 +917,22 @@ export default function ClosingOverviewPage() {
                     <td className="px-3 py-2 text-right text-xs text-[#B9A896]">—</td>
                     <td className="px-3 py-2 text-right tabular-nums bg-[#FBE7D3]">
                       {inr(nz(itemsSummary?.physical_value) ?? items.reduce((a, r) => a + n(r.value), 0))}
+                    </td>
+                    {/* Value at count: every counted row that has one (like
+                        the Value total). GST % does not add up; Tax / Total
+                        incl. sum ONLY the counted rows with a rate — summed
+                        from these rows. */}
+                    <td className="px-3 py-2 text-right tabular-nums" title={CLOSING_COUNT_VALUE_TITLE}>
+                      {itemsValueAtCount.rows > 0 ? inr2(itemsValueAtCount.sum) : <span className="text-[#B9A896] font-normal">—</span>}
+                    </td>
+                    <td className="px-3 py-2 text-right text-xs text-[#B9A896]" title="A GST % cannot be added across materials.">—</td>
+                    <td className="px-3 py-2 text-right tabular-nums" title={`${CLOSING_TAX_TITLE} ${itemsTaxNotes.title}`}>
+                      {itemsTax.taxed > 0 ? inr2(itemsTax.tax) : <span className="text-[#B9A896] font-normal">—</span>}
+                      <div className="text-[9px] font-normal text-[#8B7355]">{itemsTaxNotes.rate}</div>
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums" title={itemsTaxNotes.title}>
+                      {itemsTax.taxed > 0 ? inr2(itemsTax.total_incl_tax) : <span className="text-[#B9A896] font-normal">—</span>}
+                      <div className="text-[9px] font-normal text-[#8B7355]">{itemsTaxNotes.incl}</div>
                     </td>
                     <td className="px-2 py-2" />
                   </tr>
@@ -844,15 +1006,45 @@ function CellButton({ cell, denom, onClick, active, strong, label }: {
   );
 }
 
-function SummaryCard({ icon, label, value, tone = 'muted' }: {
+function SummaryCard({ icon, label, value, tone = 'muted', note, title }: {
   icon: React.ReactNode; label: string; value: string; tone?: 'muted' | 'warn';
+  /** Optional small line under the figure (the GST cards say what they cover). */
+  note?: string; title?: string;
 }) {
   return (
-    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3" title={title}>
       <div className={`flex items-center gap-1.5 text-[11px] font-medium ${tone === 'warn' ? 'text-amber-700' : 'text-[#8B7355]'}`}>
         {icon} {label}
       </div>
       <div className="mt-1 text-lg font-bold text-[#2D1B0E] tabular-nums">{value}</div>
+      {note && <div className="text-[9px] text-[#B9A896] leading-tight mt-0.5">{note}</div>}
+    </div>
+  );
+}
+
+/**
+ * Estimated GST lines under a board footer figure (per department, and the
+ * grand total). Only counts WITH a rate AND a value at count are in either
+ * figure; the note (closingTaxNotes — the same helper as every other GST
+ * note) says how many and why the rest are out, and a footer with nothing
+ * taxed prints a dash, never ₹0. The GST is on the value AT COUNT of those
+ * counts — printed here — not on the Value figure above it (today's average
+ * price), so the lines foot: value at count + GST = incl. GST.
+ */
+function FooterTax({ t }: { t: ClosingTaxTotals }) {
+  if (n(t.items) === 0) return null;
+  const notes = closingTaxNotes(t, 'counts', inr2);
+  return (
+    <div className="mt-0.5 text-[10px] font-normal text-[#6B5744] leading-tight"
+         title={`${CLOSING_TAX_TITLE} ${notes.title}`}>
+      {n(t.taxed) > 0 ? (
+        <>
+          <div>GST {inr(t.tax)}</div>
+          <div className="text-[9px] text-[#8B7355]">on {inr(t.value_taxed)} at count</div>
+          <div>incl. GST {inr(t.total_incl_tax)}</div>
+        </>
+      ) : <div className="text-[#B9A896]">GST —</div>}
+      <div className="text-[9px] text-[#B9A896]">{notes.short}</div>
     </div>
   );
 }

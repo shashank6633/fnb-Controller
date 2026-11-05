@@ -487,6 +487,9 @@ export default function DirectIssuePage() {
                 <div className="flex-1 min-w-0">
                   <MaterialTypeahead
                     materials={materials}
+                    // New rule = a new entry: a switched-off material (Raw
+                    // Materials → Active, ruling #78) is not offered.
+                    inactive="hide"
                     value={addMat}
                     onPick={id => setAddMat(id)}
                     excludeIds={[...itemRuleMatIds, ...newItems.map(n => n.material_id)]}

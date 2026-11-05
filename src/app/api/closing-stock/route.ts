@@ -3,13 +3,15 @@ import { allowedDeptIds, canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
   DEPT_REQUESTED_ITEM_SQL, NOT_STORE_MAPPED_SQL, deptRequestedParams, selectedDeptSet,
 } from '@/lib/dept-requested-items';
-import { materialStoreId, getStoreById } from '@/lib/store-engine';
+import { materialStoreId, getStoreById, isStoreMappedMaterial } from '@/lib/store-engine';
+import { closingTaxCells, createClosingGstResolver, storedCountValue, sumClosingTax } from '@/lib/closing-tax';
 import {
   recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard, type CountInput,
 } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { checkClosingDate } from '@/lib/closing-date';
+import { readDepartmentAreas, areaLabelMap, areaLabelFor } from '@/lib/department-areas';
 
 /**
  * VALUATION ON THE CLOSING SHEET (2026-07-30)
@@ -131,6 +133,33 @@ export async function GET(request: Request) {
      * computed or returned on this path at all. average_price is COST data
      * (same treatment as the rest of this route) and ships to everyone.
      * ────────────────────────────────────────────────────────────────────── */
+    /* ══════════════════════════════════════════════════════════════════════
+     * store_keep=1&date= — SWITCHED-OFF ITEMS ON THE STORE / OVERALL SHEET
+     * ══════════════════════════════════════════════════════════════════════
+     * The Record Closing Stock sheet with no department chosen lists the
+     * central catalogue (GET /api/inventory, which carries is_active but is
+     * deliberately never filtered by it). Owner #6 / ruling 78: a switched-off
+     * item stays on a count list only while it still holds stock. This answers
+     * which switched-off ids the Store / Overall sheet keeps on `date` —
+     * central balance non-zero, or a Store / Overall count already saved that
+     * day (storeOverallKeepIds, src/lib/count-list-active.ts: the same two arms
+     * ../by-location applies to a Store / Overall area screen). The page drops
+     * every other switched-off row from the sheet, its CSV template and its
+     * upload. Purely additive; nothing here writes; ids only (no stock figure
+     * leaves the server, so blind counts are untouched).
+     * ────────────────────────────────────────────────────────────────────── */
+    if (url.searchParams.get('store_keep') === '1') {
+      if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+      const d = String(date || '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return Response.json({ error: 'date (YYYY-MM-DD) is required' }, { status: 400 });
+      const { storeOverallKeepIds, switchedOffIds } = await import('@/lib/count-list-active');
+      return Response.json({
+        date: d,
+        switched_off: switchedOffIds(db).length,
+        keep_ids: storeOverallKeepIds(db, d),
+      });
+    }
+
     if (url.searchParams.get('dept_items') === '1') {
       if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
       const wanted = (departmentId || '').trim();
@@ -148,17 +177,40 @@ export async function GET(request: Request) {
         return Response.json({ error: 'Not allowed for this department' }, { status: 403 });
       }
       const deptSet = selectedDeptSet(db, dept.id);
+      // is_active rides along so the sheet can tag a switched-off row
+      // "Inactive" (it is listed only while held — see below); the GET
+      // /api/inventory rows the Store / Overall sheet uses already carry it.
       const COLS = `rm.id, rm.sku, rm.name, rm.category, rm.super_category, rm.unit,
              COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS purchase_unit,
              COALESCE(rm.pack_size, 1) AS pack_size, COALESCE(rm.case_size, 1) AS case_size,
              rm.current_stock, rm.average_price, rm.reorder_level,
-             rm.storage_location, rm.closing_cadence, rm.shelf_life_days`;
+             rm.storage_location, rm.closing_cadence, rm.shelf_life_days,
+             COALESCE(rm.is_active, 1) AS is_active`;
+      /* SWITCHED-OFF ITEMS (owner #6 / ruling 78, src/lib/count-list-active.ts):
+         a switched-off material stays on this department's count list — and
+         in the search below — while the department's books (a MAIN one with
+         its subs) still hold a non-zero balance of it, and drops off at zero.
+         Nothing switched off → the first arm is true for every row → both
+         lists are exactly what they were. */
+      const { switchedOffStillHeld } = await import('@/lib/count-list-active');
+      /* …or while it already has a count saved for THIS department on the
+         sheet's date (?date=YYYY-MM-DD, sent by the Record sheet), so a count to
+         zero does not drop it off the sheet it was counted on — the same rule
+         the area count screen (by-location) applies. No date → no such arm. */
+      const keepDate = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get('date') || '') ? url.searchParams.get('date') as string : '';
+      const ACTIVE_OR_HELD = keepDate
+        ? `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?))
+            OR rm.id IN (SELECT kc.material_id FROM closing_stock kc
+                         WHERE kc.date = ? AND kc.department_id IN (SELECT value FROM json_each(?))))`
+        : `(COALESCE(rm.is_active, 1) = 1 OR rm.id IN (SELECT value FROM json_each(?)))`;
+      const heldJson = JSON.stringify(switchedOffStillHeld(db, { deptIds: deptSet }));
+      const keepParams: unknown[] = keepDate ? [heldJson, keepDate, JSON.stringify(deptSet)] : [heldJson];
       const rows = deptSet.length === 0 ? [] : db.prepare(`
         SELECT ${COLS}
         FROM raw_materials rm
-        WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL}
+        WHERE ${NOT_STORE_MAPPED_SQL} AND ${DEPT_REQUESTED_ITEM_SQL} AND ${ACTIVE_OR_HELD}
         ORDER BY rm.category, rm.name
-      `).all(...deptRequestedParams(deptSet)) as any[];
+      `).all(...deptRequestedParams(deptSet), ...keepParams) as any[];
 
       /* THE ESCAPE HATCH (requirement 3). The first time a department holds
          something new the list cannot know about it yet, and a counter who
@@ -177,9 +229,10 @@ export async function GET(request: Request) {
           WHERE ${NOT_STORE_MAPPED_SQL}
             AND NOT (${DEPT_REQUESTED_ITEM_SQL})
             AND (rm.name LIKE ? OR COALESCE(rm.sku,'') LIKE ?)
+            AND ${ACTIVE_OR_HELD}
           ORDER BY rm.name
           LIMIT 50
-        `).all(...deptRequestedParams(deptSet), like, like) as any[];
+        `).all(...deptRequestedParams(deptSet), like, like, ...keepParams) as any[];
       }
       const blind = (r: any) => (isAdmin ? r : { ...r, current_stock: null });
       return Response.json({
@@ -278,7 +331,31 @@ export async function GET(request: Request) {
     // rate_source / total_value are the RESOLVED figures: the stored snapshot
     // when the row has one, derived only for pre-migration rows (which carry
     // rate_is_stored:false so nobody mistakes a re-derived number for history).
-    const items = rawItems.map(i => ({ ...i, ...valueRow(db, i, rates) }));
+    const valuedItems = rawItems.map(i => ({ ...i, ...valueRow(db, i, rates) }));
+
+    // ESTIMATED GST on the counted value (owner #4, rulings #77/#78/#81 — see
+    // src/lib/closing-tax.ts). Additive fields on every item: gst_pct /
+    // gst_source / gst_bill_date / gst_note / gst_title / tax / total_incl_tax.
+    // The rate is resolved at EACH ROW'S OWN COUNT DATE, so a later bill never
+    // re-prices an older count. The tax is applied ONLY to the value SAVED
+    // with the count (storedCountValue on the row's stored columns). A
+    // pre-migration row (rate_is_stored:false) carries a total_value that
+    // valueRow() works out TODAY from today's last purchase / average price;
+    // taxing that would let a bill entered later move this count's tax, so it
+    // gets none — blank, the same as on /api/closing-stock/history. Same
+    // visibility as total_value: cost data, shipped to every caller below.
+    const gstResolver = valuedItems.length
+      ? createClosingGstResolver(db, {
+          isStoreMapped: (category) => isStoreMappedMaterial(db, category),
+          materialIds: valuedItems.map(i => String(i.material_id)),
+        })
+      : null;
+    const items = valuedItems.map(i => {
+      const g = gstResolver!.forMaterial(String(i.material_id), String(i.date));
+      const basis = i.rate_is_stored ? storedCountValue(i) : null;
+      return { ...i, ...g, ...closingTaxCells(basis, g) };
+    });
+    const closingTax = sumClosingTax(items);
 
     // Per-area rollup of the physical closing VALUE (physical_stock × average_price).
     // Built from the SAME date/range window as `items` but WITHOUT the department_id
@@ -326,8 +403,12 @@ export async function GET(request: Request) {
       closingValueByArea.set(r.area, r2((closingValueByArea.get(r.area) || 0) + v.total_value));
     }
 
+    // Names from Manage Areas (Settings → Departments); a key with no entry in
+    // the list is shown as itself, '__store__' as "Store / Overall".
+    const areaNames = areaLabelMap(readDepartmentAreas(db).areas);
     const by_area = areaRows.map(r => ({
       area: r.area,
+      label: areaLabelFor(areaNames, r.area),
       physical_value: r.physical_value || 0,
       system_value: r.system_value || 0,
       variance_value: r.variance_value || 0,
@@ -352,6 +433,9 @@ export async function GET(request: Request) {
       total_closing_value: r2((items as any[]).reduce((s, i) => s + (Number(i.total_value) || 0), 0)),
       unvalued_items: (items as any[]).filter(i => i.rate_source === 'none').length,
       derived_rate_items: (items as any[]).filter(i => !i.rate_is_stored).length,
+      // Estimated GST over the rows WITH a rate only (closing-tax.ts):
+      // { tax, total_incl_tax, value_taxed, rated, taxed, items }.
+      closing_tax: closingTax,
     };
 
     // Blind count: strip the system figure + variance from every payload for
@@ -376,11 +460,18 @@ export async function GET(request: Request) {
         total_closing_value: summary.total_closing_value,
         unvalued_items: summary.unvalued_items,
         derived_rate_items: summary.derived_rate_items,
+        // Derived from total_value only, so it follows total_value's visibility.
+        closing_tax: summary.closing_tax,
       };
       return Response.json({ items: safeItems, summary: safeSummary });
     }
     return Response.json({ items, summary });
   } catch (error: any) {
+    // Logged with the URL so a 500 here is traceable in the server log — the
+    // History detail's raw half went missing on production and this catch had
+    // left nothing behind. Same style as ./semi/route.ts. The response below is
+    // unchanged.
+    console.error('[closing-stock GET]', request.url, error);
     return Response.json({ error: error.message }, { status: 500 });
   }
 }
@@ -662,7 +753,12 @@ export async function POST(request: Request) {
         db.prepare(`
           INSERT INTO closing_stock (id, material_id, department_id, date, system_stock, physical_stock, variance, variance_value, notes, recorded_by, outlet_id, rate_per_purchase_unit, rate_source, total_value, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        `).run(id, item.material_id, deptId, dateStr, systemStock, physicalStock, variance, varianceValue, item.notes || '', item.recorded_by || '', outletId || null,
+        `).run(id, item.material_id, deptId, dateStr, systemStock, physicalStock, variance, varianceValue, item.notes || '',
+               // No client sends recorded_by, so the row used to be saved with a
+               // blank saver. Fall back to the signed-in user — the same fallback
+               // ./semi/route.ts uses on its rows and this route already uses for
+               // the approval's counted_by just below.
+               item.recorded_by || me?.email || '', outletId || null,
                valued.ratePerPurchaseUnit, valued.source, valued.totalValue);
 
         results.total_value = r2(results.total_value + valued.totalValue);

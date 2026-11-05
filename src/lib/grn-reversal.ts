@@ -18,6 +18,7 @@ import {
 // calls it too. Never throws, by contract.
 import { raiseDeviationAlert } from './po-deviation-alert';
 import { postCentralTxn, vendorParty } from '@/lib/movement-record';
+import { planCentralDebit, sweepCentralCrumbs } from './central-debit-clamp';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -381,7 +382,18 @@ export function assertNoNegativeStock(
     const newIn = Number(replacement.get(m.material_id) ?? 0);
     const delta = r6(m.qty - newIn);
     if (opts.onlyWhenDebiting && delta <= EPS) continue;
-    if (r6(cur - delta) < -EPS) {
+    // A NET DEBIT ASKS THE ONE RULE — planCentralDebit, the 6-dp-grid answer
+    // every central floor in the app gets (src/lib/central-debit-clamp.ts).
+    // `r6(cur − delta) < −EPS` accepted a landing as low as −5e-7 (r6 rounds it
+    // to −0) and the unwind then wrote it: a void of everything left −4e-7. The
+    // grid accepts the same "everything" void, and the caller sweeps the crumb
+    // to exactly 0 once its legs have all run (sweepCentralCrumbs). A net CREDIT
+    // (delta ≤ 0, which only the void reaches — the amendment skips it above)
+    // keeps the original test byte-for-byte, so that path is unchanged.
+    const blockedHere = delta > EPS
+      ? !planCentralDebit(cur, delta).fits
+      : r6(cur - delta) < -EPS;
+    if (blockedHere) {
       blocked.push({
         material_id: m.material_id, material_name: m.material_name,
         on_hand: r6(cur), recorded_in: r6(m.qty), new_in: r6(newIn),
@@ -1861,6 +1873,13 @@ export function amendGrnLines(
         }
       }
 
+      // THE CRUMB, ONCE THIS LINE'S LEGS HAVE ALL RUN. assertNoNegativeStock
+      // judged the NET of the reversal and the re-booking on the 6-dp grid; a
+      // correction of "everything on the shelf" can still land a sub-grid hair
+      // below zero across the two statements. sweepCentralCrumbs sets exactly
+      // that hair — and nothing at or past one grid step — to 0
+      // (src/lib/central-debit-clamp.ts). A no-op on every ordinary amendment.
+      sweepCentralCrumbs(db, [materialId]);
       const onHandAfter = Number((db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(materialId) as any)?.current_stock);
       const afterLine = wantsRemove ? null : {
         ...line, quantity_received: nextReceived, quantity_accepted: nextAccepted,

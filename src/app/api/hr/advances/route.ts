@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canManageHr, canAdminHr, isHrAdvanceStatus } from '@/lib/hr';
+import { canManageHr, canHrFull, HR_FULL_DENIED, isHrAdvanceStatus } from '@/lib/hr';
 import { notifyHrEmployee } from '@/lib/hr-notify';
 import { reportServerError } from '@/lib/error-alerts';
 import { todayIST } from '@/lib/format-date';
@@ -22,7 +22,8 @@ import { todayIST } from '@/lib/format-date';
  *      Creates a 'pending' request. canManageHr — managers raise requests on
  *      behalf of staff (employees may have no login at all, contract D1).
  *
- * PATCH { id, action, ... } → { advance }        — ALL decisions canAdminHr.
+ * PATCH { id, action, ... } → { advance }        — ALL decisions canHrFull
+ *      (admin, or a management role holding "Full HR access" — ruling #90).
  *      action 'approve'  { approved_amount, installment_amount }:
  *        pending → approved, and generates the recovery schedule in the SAME
  *        transaction: ceil(approved/installment) hr_advance_installments rows
@@ -100,10 +101,11 @@ function loadAdvance(db: any, id: string): any {
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // Money list — /hr/payroll (the only UI) is adminOnly in the catalog, so
-  // reads are admin too. POST below stays canManageHr (raise on behalf).
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  // Money list — /hr/payroll (the only UI) is adminOnly + hrFullCap in the
+  // catalog, so reads are canHrFull too. POST below stays canManageHr (raise
+  // on behalf).
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -246,10 +248,10 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  // ALL advance decisions (approve/reject/disburse/close) are ADMIN acts —
+  // ALL advance decisions (approve/reject/disburse/close) are canHrFull acts (admin or "Full HR access") —
   // this is money (HRMS_DECISIONS §2.2).
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

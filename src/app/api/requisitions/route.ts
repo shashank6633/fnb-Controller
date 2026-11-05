@@ -1,8 +1,18 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
-import { requisitionHasMovedStock } from '@/lib/issue-stock';
-import { duplicateLineError } from '@/lib/po-helpers';
+import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
+import { duplicateLineError, requisitionLinePoState } from '@/lib/po-helpers';
+import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
+import { centralFlowBlock } from '@/lib/store-engine';
+// Ruling #86a "Show": what other open party requisitions hold of central.
+import { partyPromisedForRequisition } from '@/lib/party-pending';
+// ROUTED REQUISITION LINES (owner rulings #45 + #74) — the readers only. The
+// state of a routed line (who sends it, what was sent on which transfer, THE
+// RULE's verdict, the one sentence) is built ONCE, there, for every screen.
+import { routedLineState, routedOwingCounts, type RoutedLineState } from '@/lib/routed-requisitions';
+// PUT only (rulings #45/#74): re-stamp the lines an admin edit replaces at chef_approved.
+import { stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -55,6 +65,59 @@ const ESTIMATED_VALUE_SQL = `(SELECT COALESCE(SUM(
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
                 WHERE ri.req_id = r.id)`;
 
+/**
+ * lines_owing BY THE ISSUE DESKS' OWN RULE (round 7).
+ *
+ * The list's lines_owing is a bare SQL `quantity_issued < approved`. Both issue
+ * routes now close a line by issue-stock.ts lineIssueComplete — THE RULE
+ * (central-debit-clamp.ts issuedCoversAsk) — which adds one arm this SQL does
+ * not spell: a take emptied the central shelf and what remains owing is below
+ * one printed step, remembered on the line as shelf_emptied_qty (round 8; it
+ * must be selected below, or the rule reads the first arm only). THREE MANGO
+ * approved 14.843 kg, the whole 14,842.5 g shelf taken and recorded as 14.8425
+ * kg, is COMPLETE on both desks — but this count kept it owing, so the list row's hover read
+ * "1 line(s) handed over, 2 still owed" with only SALT owed, and the Part chip
+ * (isPartIssued) would stay lit on a requisition whose every other line was
+ * done. Measured by the round-7 verifier (md_r1_detail).
+ *
+ * So the rows the SQL calls owing are re-read here, ONLY the lines that rule
+ * can close (something issued, less than approved, not rejected — the SQL's own
+ * exclusions), and each one lineIssueComplete calls complete is taken off the
+ * count. The SQL arm is untouched, so every line it calls complete stays
+ * complete, and a requisition with no such line keeps its figure exactly.
+ * Mutates `rows` in place. Census at round 7: 0 live lines change.
+ */
+function uncountShownFigureCloses(
+  db: ReturnType<typeof getDb>,
+  rows: Array<{ id: unknown; lines_owing?: unknown }>,
+): void {
+  const owing = rows.filter(r => (Number(r?.lines_owing) || 0) > 0);
+  if (owing.length === 0) return;
+  const byId = new Map(owing.map(r => [String(r.id), r] as const));
+  const ids = [...byId.keys()];
+  const CHUNK = 500;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    const lines = db.prepare(`
+      SELECT ri.req_id, ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested,
+             ri.shelf_emptied_qty,
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+       WHERE ri.req_id IN (${part.map(() => '?').join(',')})
+         AND COALESCE(ri.is_rejected, 0) = 0
+         AND COALESCE(ri.store_rejected, 0) = 0
+         AND COALESCE(ri.quantity_issued, 0) > 0
+         AND COALESCE(ri.quantity_issued, 0)
+             < COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0)
+    `).all(...part) as Array<LineCompletenessRow & { req_id: string }>;
+    for (const l of lines) {
+      if (!lineIssueComplete(l)) continue;
+      const r = byId.get(String(l.req_id));
+      if (r) r.lines_owing = Math.max(0, (Number(r.lines_owing) || 0) - 1);
+    }
+  }
+}
+
 function nextReqNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   const year = isoDate.slice(0, 4);
   const lastRow = db.prepare(`
@@ -91,9 +154,19 @@ export async function GET(request: Request) {
     const { sql: visSql, params: visParams, me: visMe } = await visibilityFilter();
 
     if (id) {
+      // party_transferred (round 8b): has the party transfer already moved any
+      // of this requisition's goods? Both issue desks forecast a party
+      // gesture's take as the transfer (desk-rule.ts forecastDeskPartyTransfer).
+      // Since round 9 a later run moves only what the lines hold above what
+      // already moved (each item's party_moved_recipe, below), so the desks
+      // forecast THAT — a top-up can take, and can refuse. Same probe as
+      // party-fulfillment.ts's guard.
       const r = db.prepare(`
         SELECT r.*, d.name AS department_name, d.code AS department_code,
-               po.po_number AS linked_po_number, po.status AS linked_po_status
+               po.po_number AS linked_po_number, po.status AS linked_po_status,
+               CASE WHEN EXISTS (SELECT 1 FROM inventory_transactions it
+                                  WHERE it.reference_id = r.id AND it.type IN (${PARTY_TRANSFER_TYPES_SQL}))
+                    THEN 1 ELSE 0 END AS party_transferred
         FROM requisitions r
         JOIN departments d ON d.id = r.department_id
         LEFT JOIN purchase_orders po ON po.id = r.linked_po_id
@@ -152,13 +225,151 @@ export async function GET(request: Request) {
         LEFT JOIN departments d ON d.id = ri.department_id
         WHERE ri.req_id = ?
         ORDER BY d.name, rm.name
-      `).all(id);
+      `).all(id) as any[];
+      // central_flow_blocked (round 8b): a liquor / store-mapped material moves
+      // on its store's ledger and the central floor NEVER applies to it
+      // (issue-stock.ts checkCentralIssue: skipReason 'store_mapped', the same
+      // store-engine.ts centralFlowBlock call). Both issue desks forecast the
+      // central take before the click (desk-rule.ts) and could not tell such a
+      // line apart — so a split over a bar bottle read "the line closes, so
+      // nothing is deferred" and the server kept the defer (round-8 fuzz,
+      // 100 PIPERS). The flag lets a desk say nothing it cannot know.
+      for (const it of items) {
+        let blocked = false;
+        try { blocked = centralFlowBlock(db, String(it.material_id)) !== null; } catch { blocked = false; }
+        it.central_flow_blocked = blocked ? 1 : 0;
+      }
+      // party_moved_recipe (round 9): what the party transfer has ALREADY moved
+      // off the central shelf for this line's MATERIAL on this requisition,
+      // RECIPE units. The transfer is no longer one-shot — a later call moves
+      // what a line holds above this (party-fulfillment.ts, "A SECOND CALL
+      // MOVES ONLY WHAT HAS NOT MOVED") — so a desk forecasting it needs the
+      // figure, not just the yes/no of party_transferred. Per material, as the
+      // transfer reads it (its party rows summed by material_id); the desk
+      // hands it to that material's lines exactly as the transfer does
+      // (desk-rule.ts forecastDeskPartyTransfer). One line per material in
+      // practice — duplicateLineError refuses a second. 0 until a transfer runs.
+      const movedPool = new Map<string, number>();
+      if (Number(r.party_transferred || 0)) {
+        for (const row of db.prepare(`
+          SELECT material_id, COALESCE(SUM(-quantity), 0) AS moved
+            FROM inventory_transactions
+           WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
+           GROUP BY material_id
+        `).all(id) as any[]) movedPool.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
+      }
+      for (const it of items) it.party_moved_recipe = movedPool.get(String(it.material_id)) || 0;
+      // PROMISED TO OTHER PARTIES (owner ruling #86a "Show", 2026-10-28 — the
+      // FUEL incident). ADDITIVE — no field above changes; current_stock stays
+      // the raw central figure. A party line's goods leave the central books
+      // only when its requisition's store part is done (party-fulfillment.ts),
+      // so what other OPEN party requisitions were handed over and has not yet
+      // moved is still inside current_stock (src/lib/party-pending.ts says
+      // exactly what counts: routed lines, store-mapped materials and
+      // unit-review lines never do). Per line, by material:
+      //   promised_elsewhere_purchase / _recipe  held by OTHER open party requisitions
+      //   promised_elsewhere_reqs                [{ req_number, event_name, qty_purchase, ... }], oldest first
+      //   free_purchase / free_recipe            central − promised elsewhere, SIGNED
+      //                                          (below 0 = the books are already short by that much)
+      //   own_pending_purchase / _recipe         THIS requisition's own handed-over, not-yet-moved quantity
+      //   own_claim_short_purchase / _recipe     of that, what the books cannot cover once the OLDER
+      //                                          parties' claims are honoured (ruling #80) — 0 when covered
+      // Purchase figures are 6-dp (÷ packFactor); the desk formats them.
+      try {
+        const promised = partyPromisedForRequisition(db, String(id), items.map(it => String(it.material_id)));
+        for (const it of items) {
+          const v = promised.get(String(it.material_id));
+          if (!v) continue;
+          it.promised_elsewhere_purchase = v.promised_elsewhere_purchase;
+          it.promised_elsewhere_recipe = v.promised_elsewhere_recipe;
+          it.promised_elsewhere_reqs = v.promised_elsewhere_reqs;
+          it.free_purchase = v.free_purchase;
+          it.free_recipe = v.free_recipe;
+          it.own_pending_purchase = v.own_pending_purchase;
+          it.own_pending_recipe = v.own_pending_recipe;
+          it.own_claim_short_purchase = v.own_claim_short_purchase;
+          it.own_claim_short_recipe = v.own_claim_short_recipe;
+        }
+      } catch (pErr) {
+        console.error('[/api/requisitions GET] party promised figures failed:', pErr);
+      }
+      // MERGED PO STATE, per line (owner rulings #63-#70). ADDITIVE — no field
+      // above changes. One batched read (po-helpers.ts requisitionLinePoState):
+      //   on_po            { po_id, po_number, vendor_name, vendor_id, status,
+      //                      merged, source, qty_purchase } | null — the live PO
+      //                      buying for this line (a merged PO's link row, or the
+      //                      "Also raise a vendor PO" tick's line). Never a
+      //                      cancelled PO.
+      //   arrived          { grn_number, at, qty_purchase } | null — this line's
+      //                      whole share is covered by ACCEPTED goods on a live,
+      //                      not-held receipt (VALUE), shares taken in creation
+      //                      order. The line stays open: the store still issues
+      //                      it from the desk (ruling #64).
+      //   arrived_partial  { grn_number, at, qty_purchase, of_qty_purchase } | null
+      //   delivered_direct bool — a Direct Issue rule sent the goods straight to
+      //                      the rule's department (ruling #68)
+      //   vendor_closed    bool (+ vendor_closed_reason) — the vendor was
+      //                      short-closed before this line came (ruling #69)
+      //   also_on_po       [] normally; a second live PO for the same line
+      // Quantities are PURCHASE units. Read-only: nothing here is written.
+      const poState = requisitionLinePoState(db, items.map(it => String(it.id)));
+      for (const it of items) {
+        const st = poState.get(String(it.id));
+        it.on_po = st?.on_po ?? null;
+        it.arrived = st?.arrived ?? null;
+        it.arrived_partial = st?.arrived_partial ?? null;
+        it.delivered_direct = st?.delivered_direct ?? false;
+        // Where the Direct Issue delivery went (the rule's department — often
+        // not the asking one) and the bill it came on. Null unless delivered_direct.
+        it.delivered_direct_dept_name = st?.delivered_direct_dept_name ?? null;
+        it.delivered_direct_grn = st?.delivered_direct_grn ?? null;
+        // Ruling #73: how much came direct, what is still issuable, and who closed it.
+        it.delivered_direct_qty_purchase = (st as any)?.delivered_direct_qty_purchase ?? null;
+        it.delivered_direct_partial = (st as any)?.delivered_direct_partial ?? null;
+        it.delivered_direct_closed_by = (st as any)?.delivered_direct_closed_by ?? null;
+        it.vendor_closed = st?.vendor_closed ?? false;
+        it.vendor_closed_reason = st?.vendor_closed_reason ?? null;
+        it.also_on_po = st?.also_on_po ?? [];
+      }
+      // ROUTED LINE STATE, per line (owner rulings #45 + #74). ADDITIVE — no
+      // field above changes; a line the store serves gets `routed: null` and
+      // `routed_department_name: null`, and on a database without the routed
+      // columns every line does (routed-schema.ts, fail-to-store).
+      //   routed   RoutedLineState (src/lib/routed-requisitions.ts): the
+      //            department that SENDS it (a Direct Issue rule routes its item
+      //            there, so the central store never holds it), the asking
+      //            department, the rule's label, approved / sent / owed in the
+      //            LINE unit and in PURCHASE units, THE RULE's verdict
+      //            (complete), closed (rejected), and `sends` — every
+      //            department transfer that FULFILS the line (transfer_no, at,
+      //            by, sent / net after any send-back, open dispute) — plus the
+      //            one server sentence every screen prints verbatim.
+      //   routed_department_name  the sender's name, flat, for a list cell.
+      // quantity_issued on a routed line is what those transfers still leave
+      // with the asking department — written only by the routed writer, never
+      // by a store desk — so it is the Issued figure every other reader
+      // (THE RULE, the party P&L's partyReqSplit) already reads.
+      let routedLinesOwing = 0;
+      let routedState = new Map<string, RoutedLineState>();
+      try {
+        routedState = routedLineState(db, items.map(it => String(it.id)));
+      } catch (rErr) {
+        console.error('[/api/requisitions GET] routed line state failed:', rErr);
+      }
+      for (const it of items) {
+        const rs = routedState.get(String(it.id)) ?? null;
+        it.routed = rs;
+        it.routed_department_name = rs ? rs.department.name : null;
+        if (rs && !rs.complete && !rs.closed) routedLinesOwing++;
+      }
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw
       // view-only even though the API would let them act.)
       const can_approve_chef = visMe ? (canApproveAsChef(visMe) || isMainDeptHead(db, visMe, r.department_id)) : false;
-      return Response.json({ requisition: { ...r, items, can_approve_chef } });
+      // routed_lines_owing: ROUTED lines (above) still owed by THE RULE — the
+      // sending department's work on this requisition, not the store's.
+      return Response.json({ requisition: { ...r, items, can_approve_chef, routed_lines_owing: routedLinesOwing } });
     }
 
     const status       = url.searchParams.get('status');
@@ -281,6 +492,25 @@ export async function GET(request: Request) {
       WHERE ${where.join(' AND ')}
       ORDER BY r.date DESC, r.created_at DESC
     `).all(...params);
+    // lines_owing by the issue desks' own rule — see uncountShownFigureCloses.
+    uncountShownFigureCloses(db, rows as Array<{ id: unknown; lines_owing?: unknown }>);
+    // lines_routed_owing (owner rulings #45 + #74), ADDITIVE: of the lines
+    // above, how many are ROUTED — a Direct Issue rule sends their item to
+    // another department, which hands them over by department transfer — and
+    // still owed by THE RULE (lineIssueComplete, computed in JS by
+    // routed-requisitions.ts routedOwingCounts). lines_owing is unchanged: it
+    // is what the asking department is still owed, whoever sends it; the
+    // store's own share is lines_owing − lines_routed_owing. 0 on every
+    // requisition with no routed line, and on a database without the column.
+    let routedOwing = new Map<string, number>();
+    try {
+      routedOwing = routedOwingCounts(db, (rows as Array<{ id: unknown }>).map(r => String(r.id)));
+    } catch (rErr) {
+      console.error('[/api/requisitions GET] routed owing counts failed:', rErr);
+    }
+    for (const r of rows as Array<{ id: unknown; lines_routed_owing?: number }>) {
+      r.lines_routed_owing = routedOwing.get(String(r.id)) || 0;
+    }
 
     const me = await getCurrentUser();
     // Per-requisition approve permission: only the head of THAT requisition's
@@ -403,7 +633,7 @@ export async function POST(request: Request) {
     // Sheet-origin keys persisted on the requisition so the list page can
     // re-fetch live Column P data even after the sheet row updates later.
     const fpId           = (b.fp_id           || '').toString().trim();
-    const partyUniqueId  = (b.party_unique_id || '').toString().trim();
+    let   partyUniqueId  = (b.party_unique_id || '').toString().trim();
 
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
@@ -459,9 +689,22 @@ export async function POST(request: Request) {
           const cache = db.prepare(`SELECT value FROM settings WHERE key = 'upcoming_parties_cache'`).get() as { value: string } | undefined;
           if (cache) {
             const sheetParties = (JSON.parse(cache.value).parties || []) as any[];
-            const match = sheetParties.find(p =>
-              (b.party_unique_id && p.party_unique_id === b.party_unique_id) ||
-              (b.fp_id && p.fp_id === b.fp_id)
+            // THE F&P IT IS RAISED FROM WINS (owner ruling 43, 2026-10-15). One
+            // AKAN id can sit on two F&P rows (two functions of one booking), so
+            // matching the id FIRST stamped a raise from the SECOND F&P with the
+            // FIRST one's name and date — and claimPartyRequisitions, which then
+            // let the date pick the row when an id was on several, costed it on
+            // the wrong F&P, and that F&P's 409 gate never fired. (It now takes
+            // the fp_id first, then the date; a requisition whose F&P no longer
+            // carries its id is costed on neither and listed, ruling 52.) So the row
+            // carrying the raise's fp_id is taken, id included — what an admin's
+            // raise from that row stores. Only a raise whose fp_id the cache
+            // does not hold falls back to the id. An id on ONE F&P, raised from
+            // it, matches the very same row either way.
+            const byFp = b.fp_id ? sheetParties.find(p => p.fp_id === b.fp_id) : undefined;
+            if (byFp) partyUniqueId = (byFp.party_unique_id || '').toString().trim();
+            const match = byFp || sheetParties.find(p =>
+              b.party_unique_id && p.party_unique_id === b.party_unique_id
             );
             if (match) {
               // Force-overwrite client values with sheet truth.
@@ -719,6 +962,12 @@ export async function PUT(request: Request) {
           const deptId = it.department_id || prev?.department_id || r.department_id;
           ins.run(generateId(), id, it.material_id, qty, unit, it.notes || '', deptId);
         }
+        // ROUTED LINES (rulings #45/#74): an admin edit of a chef-APPROVED
+        // requisition replaces its lines with new ones, so they are stamped
+        // again by the approval's own rule (routed-requisitions.ts). No routed
+        // line can have been sent at this status — the first Send moves the
+        // requisition on — so nothing a department sent is lost here.
+        if (r.status === 'chef_approved') stampRequisitionRouting(db, id, me.email);
       }
     });
     txn();

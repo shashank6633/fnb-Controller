@@ -45,10 +45,15 @@
  * · Bills received before the recorded start date. Stated at the top of the
  *   screen in the server's own words, so nobody hunts for last month's bills.
  * · Liquor / TGBCL. Measured on the live data: 62 purchase rows in store-routed
- *   categories, ZERO with a goods receipt behind them — liquor inward runs on
- *   its own rail (Inventory → Liquor Store). Said on the face of the page rather
- *   than left to be discovered, because a register that looks complete and is
- *   not is worse than one that admits its edge.
+ *   categories, ZERO with a goods receipt behind them — liquor inward ran on
+ *   its own rail (Inventory → Liquor Store). From the liquor-on-GRN switch-over
+ *   (owner rulings #83/#84) a TGBCL bill is entered on Goods Receipt → TGBCL
+ *   Liquor Bill and DOES carry a GRN header (goods_receipt_notes.store_dest_id
+ *   set, no lines), but its bottles post to the store location's own ledger, so
+ *   bill-handover.ts keeps it out of this register (leak count, unrecorded list
+ *   and create all refuse it). Said on the face of the page rather than left to
+ *   be discovered, because a register that looks complete and is not is worse
+ *   than one that admits its edge.
  *
  * ── GATING ────────────────────────────────────────────────────────────────
  * Every API route self-gates (src/proxy.ts guards PAGES, not APIs, and
@@ -1160,9 +1165,8 @@ export default function BillSubmissionsPage() {
           behind it.
         </p>
         <p>
-          <b>Liquor / TGBCL bills are not in this register.</b> Liquor inward runs on a separate rail
-          (Inventory → Liquor Store) and never produces a goods receipt, so none of it appears here.
-          This register covers central-store vendor bills only.
+          <b>Liquor / TGBCL bills are not in this register.</b> They are entered on Goods Receipt →
+          TGBCL Liquor Bill and post to LIQUOR STORE; this register covers central-store vendor bills only.
         </p>
         <p>
           <b>Accounts confirm on their own view</b> of this same register. The person who recorded or

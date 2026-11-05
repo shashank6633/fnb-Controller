@@ -6,9 +6,11 @@ import type { SessionUser } from './auth';
 // either would be free to disagree with the screen it is supposed to explain.
 // No cycle: store-engine -> db.ts -> dept-ledger, and none of the three imports
 // this file (db.ts reaches store-engine through a deferred require).
-import { deptKey, deptOnHandBulk } from './dept-ledger';
-import type { DeptOnHandResult } from './dept-ledger';
-import { consolidatedStock, listStores } from './store-engine';
+import { deptKey, deptOnHandBulk, deptSendableBulk } from './dept-ledger';
+import type { DeptOnHandResult, DeptReleaseBasis } from './dept-ledger';
+import { consolidatedStock, listStores, isStoreMappedMaterial } from './store-engine';
+// The one recipe→purchase conversion (a leaf module). Display only, below.
+import { packFactor } from './pack-units';
 
 /**
  * Department Stock — LEDGER-BACKED, anchored on a physical count.
@@ -52,7 +54,12 @@ import { consolidatedStock, listStores } from './store-engine';
  * deptSet: the department itself plus, when it is a MAIN department
  * (parent_id IS NULL), all of its sub-departments — a main-dept view rolls up
  * everything anchored/moved under it, each sub-dept measured from its OWN
- * anchor before the roll-up sums them.
+ * anchor before the roll-up sums them. It rolls DOWNWARD only — a child never
+ * sees its parent's stock. The way stock moves from a parent (Kitchen, where
+ * Direct Issue deliveries land) to a child is a department TRANSFER: a
+ * transfer_out on one ledger and a transfer_in on the other (dept-ledger.ts).
+ * Every sum below covers ALL types, so both legs count with no special case;
+ * a parent→child transfer nets to zero on the parent's roll-up.
  *
  * TIME BASIS. Every writer of this ledger uses datetime('now') → UTC
  * 'YYYY-MM-DD HH:MM:SS'. closing_stock.date is an IST business date. All
@@ -117,7 +124,11 @@ export interface DeptStockRow {
    *  read it; label it "net movement". */
   issued_since: number;
   /** The same window split by sign, so a screen can say "in 5 kg, out 3 kg"
-   *  instead of showing a net figure that hides both legs. */
+   *  instead of showing a net figure that hides both legs.
+   *  DEPARTMENT TRANSFERS: a transfer between two depts of the SAME roll-up
+   *  (Kitchen → Akan Tandoori, viewed as Kitchen) appears once on each side and
+   *  nets to zero in issued_since / on_hand — correct for the holding, but it
+   *  inflates both of these legs. They are not company inflow/outflow figures. */
   in_since: number;
   out_since: number;
   /** anchor_qty + issued_since. NULL when never_counted — never 0. */
@@ -484,7 +495,14 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
   // anchor back but CANNOT pull pre-cutover movement into the balance.
   // Unanchored pairs still get a window (the floor alone) so the screen can
   // show what moved; their on_hand stays null regardless.
-  const windowSpecs: Array<{ d: string; m: string; a: string }> = [];
+  //
+  // TRANSFER LEGS ARE THE ONE EXCEPTION TO THE FLOOR — the rule is defined and
+  // argued once, on dept-ledger.ts deptOnHand ("A TRANSFER PAIR IS NEVER
+  // SPLIT"): a transfer_out / transfer_in row is bounded only by its own pair's
+  // ANCHOR (`x` below, '' when never counted), never by the cutover floor, so
+  // a floor stamped after a transfer cannot drop one leg and keep the other.
+  // It adds nothing for any other movement type.
+  const windowSpecs: Array<{ d: string; m: string; a: string; x: string }> = [];
   const windowStartByPair = new Map<string, string>();
   const pairKey = (d: string, m: string) => `${d}::${m}`;
   const registerWindow = (d: string, m: string) => {
@@ -493,7 +511,7 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
     const anc = anchorsByMat.get(m)?.get(d);
     const start = anc ? (anc.at > floorTs ? anc.at : floorTs) : floorTs;
     windowStartByPair.set(k, start);
-    windowSpecs.push({ d, m, a: start });
+    windowSpecs.push({ d, m, a: start, x: anc ? anc.at : '' });
   };
   for (const [matId, byDept] of anchorsByMat) for (const d of byDept.keys()) registerWindow(d, matId);
   for (const [matId, a] of acc) for (const d of a.movedDepts) registerWindow(d, matId);
@@ -502,8 +520,9 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
     // Strictly `>`: the `opening` row IS the anchor, so it must not also be
     // counted as a movement on top of itself.
     const moveRows = db.prepare(`
-      WITH anchors(department_id, material_id, anchor_at) AS (
-        SELECT json_extract(j.value, '$.d'), json_extract(j.value, '$.m'), json_extract(j.value, '$.a')
+      WITH anchors(department_id, material_id, anchor_at, leg_at) AS (
+        SELECT json_extract(j.value, '$.d'), json_extract(j.value, '$.m'), json_extract(j.value, '$.a'),
+               json_extract(j.value, '$.x')
         FROM json_each(?) j
       )
       SELECT dmt.department_id, dmt.material_id,
@@ -514,6 +533,7 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
       JOIN anchors a
         ON a.department_id = dmt.department_id AND a.material_id = dmt.material_id
       WHERE ${LEDGER_TS_SQL} > a.anchor_at
+         OR (dmt.type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > a.leg_at)
       GROUP BY dmt.department_id, dmt.material_id
     `).all(JSON.stringify(windowSpecs)) as any[];
     for (const r of moveRows) {
@@ -667,6 +687,151 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
       anchored_mixed: mixed,
     },
   };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WHAT ONE DEPARTMENT CAN HAND ON — the sender's side of a transfer.
+ *
+ * NOT computeDeptStock(). That function rolls a MAIN department up over its
+ * children, so "Kitchen" there means Kitchen + Akan Tandoori + Akan Main
+ * Kitchen + …, and Kitchen's OWN holding — the stock it can actually hand
+ * over — is visible nowhere. This reads exactly ONE department, no roll-up:
+ * Kitchen must never be offered Akan Tandoori's stock to send.
+ *
+ * The figure is deptSendable() from dept-ledger.ts — the SAME function the
+ * send check calls per line, so the screen cannot offer a quantity the server
+ * will refuse, or hide one it would accept:
+ *   counted        → the anchored balance, capped by the count plus every
+ *                    movement since it when the cutover floor hides some
+ *   never counted  → the all-time signed ledger sum (NOT zero, NOT refused;
+ *                    Kitchen is in practice never counted) — and an UPPER
+ *                    BOUND: the app cannot see stock cooked here when the
+ *                    department's sales are booked to another department.
+ * ONE STEP: there is no pending state, so nothing is "promised" — a send moves
+ * the stock the moment it is written.
+ *
+ * HONEST ABOUT WHAT THE APP CANNOT SEE. `department.usage_booked_here` says
+ * whether any till station books recipe consumption to THIS department
+ * (station_departments — the owner's mapping, read here, never edited). When
+ * it is false and a row is `upper_bound`, nothing the kitchen cooks from that
+ * stock ever reaches this ledger: the figure is "up to", and the screen must
+ * say so and point at a count.
+ *
+ * Store-mapped (liquor) materials are left out: they live on the store rail
+ * and the writer refuses them.
+ *
+ * UNITS: every recipe figure here is RECIPE units (the stored basis);
+ * `transferable_purchase` is the same figure in PURCHASE units rounded DOWN to
+ * 3 decimals, so the screen leads with the purchase unit (owner rule) and a
+ * figure it offers always converts back to no more than the server accepts.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+export interface DeptTransferableRow {
+  material_id: string;
+  name: string;
+  category: string;
+  unit: string;
+  purchase_unit: string;
+  pack_size: number;
+  /** packFactor() — recipe units per purchase unit (1 = no real conversion). */
+  pack_factor: number;
+  basis: DeptReleaseBasis;
+  /** Anchored balance, RECIPE units; NULL when never counted (never 0). */
+  on_hand: number | null;
+  /** All-time signed ledger sum, RECIPE units. */
+  ledger_sum: number;
+  /** deptSendable().available — RECIPE units; may be ≤ 0 (a problem to show). */
+  available: number;
+  /** MAX(0, available), RECIPE units — the most a send may ask for. */
+  transferable: number;
+  /** `transferable` in PURCHASE units, rounded DOWN to 3 decimals. */
+  transferable_purchase: number;
+  /** Never counted: the app cannot vouch for this figure — it is "up to". */
+  upper_bound: boolean;
+  /** Counted, count older than the cutover: the count plus every movement since
+   *  it (the floor ignored). NULL when it cannot differ from on_hand. */
+  since_anchor: number | null;
+}
+
+export interface DeptTransferableDept {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  /** TRUE when at least one ACTIVE till station books recipe consumption to
+   *  this department. FALSE = cooking here is invisible to its ledger. */
+  usage_booked_here: boolean;
+  /** The active stations mapped to it (the owner's mapping), for the label. */
+  stations: string[];
+}
+
+/** Floor to 3 decimals, tolerant of float dust (2.9999999999 is 3, 2.9996 is 2.999). */
+function floor3(n: number): number {
+  const v = Math.floor((Number(n) || 0) * 1000 + 1e-6) / 1000;
+  return v === 0 ? 0 : v;
+}
+
+/** The sender's own sendable stock. Null for an unknown department. */
+export function deptTransferableStock(
+  db: Database.Database, deptId: string,
+): { department: DeptTransferableDept; rows: DeptTransferableRow[] } | null {
+  const d = db.prepare('SELECT id, name, parent_id FROM departments WHERE id = ?').get(String(deptId || '')) as
+    { id: string; name: string; parent_id: string | null } | undefined;
+  if (!d) return null;
+
+  let stations: string[] = [];
+  try {
+    stations = (db.prepare(`
+      SELECT station FROM station_departments
+       WHERE department_id = ? AND COALESCE(is_active, 1) = 1 ORDER BY station
+    `).all(d.id) as Array<{ station: string }>).map((r) => String(r.station));
+  } catch { stations = []; }
+  const department: DeptTransferableDept = { ...d, usage_booked_here: stations.length > 0, stations };
+
+  const sendable = deptSendableBulk(db, d.id);
+  const ids = [...sendable.keys()];
+  if (ids.length === 0) return { department, rows: [] };
+
+  const metas = db.prepare(`
+    SELECT id, name, category, unit, purchase_unit, pack_size FROM raw_materials
+     WHERE id IN (SELECT value FROM json_each(?))
+  `).all(JSON.stringify(ids)) as Array<{
+    id: string; name: string; category: string | null; unit: string | null;
+    purchase_unit: string | null; pack_size: number | null;
+  }>;
+
+  const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
+  const rows: DeptTransferableRow[] = [];
+  for (const m of metas) {
+    if (isStoreMappedMaterial(db, m.id)) continue;
+    const s = sendable.get(m.id);
+    if (!s) continue;
+    const available = r6(s.available);
+    // Nothing to send — not a row anyone can act on. A NEGATIVE figure stays:
+    // it is a problem the screen must show (and the send check refuses).
+    if (Math.abs(available) < 1e-9) continue;
+    const meta = { unit: m.unit, purchase_unit: m.purchase_unit, pack_size: m.pack_size };
+    const pf = packFactor(meta);
+    const transferable = Math.max(0, available);
+    rows.push({
+      material_id: m.id,
+      name: m.name,
+      category: m.category || '',
+      unit: String(m.unit || ''),
+      purchase_unit: String(m.purchase_unit || m.unit || ''),
+      pack_size: Number(m.pack_size) || 1,
+      pack_factor: pf,
+      basis: s.basis,
+      on_hand: s.onHand,
+      ledger_sum: r6(s.ledgerSum),
+      available,
+      transferable,
+      transferable_purchase: floor3(transferable / pf),
+      upper_bound: s.upperBound,
+      since_anchor: s.sinceAnchor,
+    });
+  }
+  rows.sort((x, y) => x.category.localeCompare(y.category) || x.name.localeCompare(y.name));
+  return { department, rows };
 }
 
 /* ════════════════════════════════════════════════════════════════════════════

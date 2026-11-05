@@ -96,38 +96,33 @@ export function buildBillPdf(
     : (order.payment_method && order.payment_method !== 'split' ? [{ method: order.payment_method, amount: grand }] : []);
 
   /**
-   * ── ONE PAGE, GUARANTEED — WHY THIS IS RENDERED TWICE ────────────────────
+   * ── ONE PAGE, SIZED TO ITS CONTENT — WHY THIS IS RENDERED TWICE ──────────
    *
-   * The owner's requirement is "BILL PDF IN A single page". A thermal receipt
+   * The owner's requirement (approved 2026-10-14): the bill PDF is one page,
+   * trimmed to its measured length, with the same content. A thermal receipt
    * has no natural page count: the page IS the roll, so one page means one
    * page sized to its own contents.
    *
-   * This used to be a GUESS: `height = 300 + items.length * 26 + (footer?60:0)`,
-   * with a 44-character cap on item names to stop a long name wrapping and
-   * "blow[ing] the fixed page height". Neither half held. pdfkit adds a page
-   * BY ITSELF the moment text passes `page.height - margins.bottom`
-   * (pdfkit.js:375 maxY()), and there is no addPage() here to grep for, so
-   * every overflow shipped silently. MEASURED over HTTP against a booted
-   * server on the owner's own live bill_design (2026-09-19):
-   *
-   *   1 item + service charge + discount + 2 tenders  → 2 pages
-   *   5 items whose names are 60 / 67 / 100 chars     → 4 pages
-   *   and with the branding fields filled in (brand + company + address +
-   *   contact + email + FSSAI — ordinary use of Settings → Bill Design):
-   *   1 item → 10 pages, the same 5 long names → 12 pages, a 2-item bill on
-   *   hold → 4 pages.
-   *
-   * The 300pt base simply did not cover a branded header plus an eight-row
-   * totals block; the per-item slack (26 budgeted vs ~21.4 spent) paid the
-   * difference until the header grew or a name wrapped. A bigger magic number
-   * would only move the cliff.
+   * This used to be a GUESS: `height = 300 + items.length * 26 + (footer?60:0)`.
+   * pdfkit adds a page BY ITSELF the moment text passes
+   * `page.height - margins.bottom` (there is no addPage() here to grep for), so
+   * a guess that came up short shipped as a second page, and one that came up
+   * long shipped as blank paper. MEASURED on the guessed height (2026-10-14,
+   * same inputs through both versions of this file):
+   *   · 1 item + service charge + discount + 2 tenders → 2 pages of 326pt
+   *   · the same 1 item with the Bill Design branding fields filled → 2 pages
+   *   · a 40-item open bill → 1 page of 1,400pt holding 927pt of content
+   *   · the live database's settled / held / open bills → 1 page, 57-110pt of
+   *     blank paper under the last line (now ~14pt: the margin plus 2pt)
    *
    * So the height is MEASURED instead of budgeted: draw() runs once on a page
-   * tall enough that nothing can overflow, doc.y afterwards is the true bottom
-   * of the content, and the real document is then drawn at exactly that
-   * height. Identical inputs, identical code path, so the second pass lays out
-   * byte-for-byte the same — and the name cap no longer has to hold the page
-   * together (a wrapped name now makes the page taller, never a second page).
+   * tall enough that nothing overflows, doc.y afterwards is the true bottom of
+   * the content, and the delivered document is drawn again at exactly that
+   * height. Identical inputs and the identical draw(), so the second pass
+   * draws the same strings in the same fonts at the same x positions (proved
+   * call-for-call against the guessed-height version) — only the page height
+   * changes, and a wrapped header line makes the page taller, never a second
+   * page.
    */
   const draw = (doc: Doc) => {
 
@@ -217,22 +212,25 @@ export function buildBillPdf(
   };  // ── end draw()
 
   /* ── PASS 1: MEASURE ───────────────────────────────────────────────────────
-   * Draw onto a page tall enough that nothing can overflow, so doc.y at the end
-   * is the real content bottom rather than wherever an automatic page break left
-   * the cursor. The bound is deliberately loose: a 44-char name wraps to at most
-   * ~4 lines (~44pt) in a 103pt-wide column at 8pt, so 90pt per item on top of
-   * 1,500pt of chrome (branding, header, totals, tenders, footer) is roughly
-   * double what the widest bill in this database spends. It is still CHECKED
-   * rather than assumed — pdfkit emits 'pageAdded' when it breaks, and the
-   * constructor's own first page happens before the listener is attached, so any
-   * event here means the bound was too small and probe.y is not the content
-   * bottom. Then measure again, bigger. Measuring documents are discarded; only
-   * the final cursor is used. */
+   * Draw onto a page tall enough that nothing overflows, so doc.y at the end is
+   * the real content bottom rather than wherever an automatic page break left
+   * the cursor. The first bound is deliberately loose (1,500pt of chrome plus
+   * 90pt per item and 24pt per tender — a 44-char name wraps to at most ~4
+   * lines at 8pt), but it is CHECKED, never assumed: pdfkit emits 'pageAdded'
+   * when it breaks, and the constructor's own first page happens before the
+   * listener is attached, so any event here means the bound was too small and
+   * probe.y is not the content bottom. Then measure again at 4x the bound,
+   * until it fits. Only an unbounded settings field (an address or footer
+   * thousands of characters long) ever needs a retry; measuring documents are
+   * discarded and only the final cursor is used.
+   *
+   * The retries are CAPPED rather than open-ended so a pathological input fails
+   * loudly instead of looping: 4^7 x the first bound is over twenty-five million
+   * points. Running out throws — the route answers 500 — because handing back a
+   * paginated bill would break the one-page rule silently. */
   let contentBottom = 0;
-  let bound = 0;
-  for (const factor of [1, 4, 16]) {
-    bound = factor * (1500 + items.length * 90 + tenders.length * 24);
-    const probe = newDoc(bound);
+  for (let attempt = 0, factor = 1; attempt < 8 && contentBottom === 0; attempt++, factor *= 4) {
+    const probe = newDoc(factor * (1500 + items.length * 90 + tenders.length * 24));
     probe.on('data', () => {});        // drain, so nothing buffers for a reader that never comes
     probe.on('error', () => {});       // a measure-pass error must not become an unhandled event
     let overflowed = false;
@@ -240,23 +238,14 @@ export function buildBillPdf(
     draw(probe);
     contentBottom = overflowed ? 0 : probe.y;
     probe.end();
-    if (contentBottom > 0) break;
   }
+  if (!(contentBottom > 0)) throw new Error('Bill is too long to render on a single page');
 
   /* ── PASS 2: RENDER at the measured height ────────────────────────────────
    * +2 of slack under the bottom margin: pdfkit breaks a line when
    * `y + lineHeight > page.height - margins.bottom`, and landing exactly on
-   * that boundary should not depend on float equality.
-   *
-   * NEVER PAGINATE. If even the x16 bound overflowed (contentBottom 0 — no bill
-   * in this database comes within 2x of the first bound), fall back to that
-   * bound: a page taller than it needs is still ONE page, which is the
-   * requirement. Note that 14,400pt is the PDF format's own maximum page side
-   * (200in) and a bill of ~1,100+ lines exceeds it; the previous fixed-budget
-   * height did too (measured: a 1,200-item bill asked for 31,500pt), so this is
-   * not a new limit and no real order is near it — the largest order in this
-   * database has 8 items, and a 700-item bill measures 9,389pt. */
-  const height = Math.max(60, Math.ceil((contentBottom > 0 ? contentBottom + M + 2 : bound)));
+   * that boundary should not depend on float equality. */
+  const height = Math.max(60, Math.ceil(contentBottom + M + 2));
 
   const doc = newDoc(height);
   const chunks: Buffer[] = [];

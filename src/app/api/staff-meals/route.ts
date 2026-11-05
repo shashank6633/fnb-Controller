@@ -1,6 +1,4 @@
 import { getDb, generateId } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
-import { postCentralTxn } from '@/lib/movement-record';
 
 export async function GET(request: Request) {
   try {
@@ -130,12 +128,6 @@ export async function PUT(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
-    // FIELD 8 of the movement record — the responsible user, FROM THE SESSION.
-    // This handler moved stock without ever naming who did it. The route is
-    // gated by src/proxy.ts, so a session exists; the `system:` fallback is the
-    // honest label if one ever does not, and it reads as a machine actor on the
-    // movements register rather than as a blank.
-    const mealActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
@@ -149,17 +141,10 @@ export async function DELETE(request: Request) {
         if (netRemoved > 0) {
           db.prepare('UPDATE raw_materials SET current_stock = current_stock + ? WHERE id = ?')
             .run(netRemoved, item.material_id);
-          postCentralTxn(db, {
-            materialId: item.material_id,
-            type: 'adjustment',
-            quantity: netRemoved,
-            referenceId: item.id,
-            notes: `Staff meal deleted — stock restored`,
-            // The undo of a staff-meal issue: goods come back FROM the
-            // staff-meal sink into central.
-            counterparty: { kind: 'staff_meal', name: 'Staff meal (deleted)' },
-            actor: mealActor,
-          });
+          db.prepare(`
+            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
+            VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
+          `).run(generateId(), item.material_id, netRemoved, item.id, `Staff meal deleted — stock restored`);
         }
       }
     }

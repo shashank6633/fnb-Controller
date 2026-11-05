@@ -47,7 +47,17 @@ import { hydrateUnitRegistry } from '@/lib/recipe-cost';
 // carve-out declared in the pack-units header: a sub-recipe is batch-produced in
 // bulk, so the chef reasons in kg / L / BTL, not in grams. Display + entry only —
 // nothing stored or costed changes. Never re-derive the pack rule locally.
-import { packFactor, toPurchaseQty, purchasePrice, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+// …but the RATE on a sub-recipe line is never derived here: it is the
+// closing-valuation figure the server served, so it matches /closing-stock.
+import {
+  servedRate, hasBasis, rateSourceLabel, rateTitle, buildRateIndex,
+  type ServedRateFields, type ValuedRate,
+} from './sub-recipe-rate';
+// The ONE "is this raw material switched off?" rule every picker shares (Raw
+// Materials → Active, owner ruling #78): a recipe picker is a NEW entry, so a
+// switched-off material is not offered — a line already holding one keeps it.
+import { offeredInPicker, isSwitchedOff, notOfferedNote } from '@/components/MaterialTypeahead';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,6 +81,11 @@ interface Ingredient {
   material_unit?: string;
   purchase_unit?: string;
   pack_size?: number;
+  // ₹/PURCHASE-unit rate /api/sub-recipes resolves through closing-valuation
+  // (rate_per_purchase_unit / rate_source / rate_as_of). Sub-recipe rows only.
+  rate_per_purchase_unit?: ServedRateFields['rate_per_purchase_unit'];
+  rate_source?: ServedRateFields['rate_source'];
+  rate_as_of?: ServedRateFields['rate_as_of'];
 }
 
 interface SubRecipeRef {
@@ -378,8 +393,10 @@ function subLineDisplay(ing: Ingredient, mat?: RawMaterial) {
     purchaseUnit,
     hint,
     title: `As entered: ${entered} · recipe basis: ${fmtQtyNum(qtyRecipe)} ${matUnit}`,
-    /** ₹/purchase-unit — display only. Line cost still runs off ₹/recipe-unit. */
-    rate: purchasePrice(price, meta),
+    /** ₹/purchase-unit as /closing-stock values it (the row's served figure —
+     *  never average_price × pack). null = none served. Display only: line cost
+     *  still runs off ₹/recipe-unit. */
+    rate: servedRate(ing),
     qtyPurchase: toPurchaseQty(qtyRecipe, meta),
     effCost: computeIngredientCost({
       ...ing,
@@ -685,6 +702,26 @@ export default function RecipesPage() {
       console.error('Failed to fetch materials', e);
     }
   }, []);
+
+  // ₹/PURCHASE-unit rates for the SUB-RECIPE editor's picker and freshly added
+  // lines, which have no /api/sub-recipes row to carry one yet. Same
+  // closing-valuation ladder (see ./sub-recipe-rate.ts). Fetched each time the
+  // editor opens — never on page load, so the main-recipe screens are untouched.
+  // A failed fetch leaves those cells as an em-dash, never the naive figure.
+  const [valuationCatalog, setValuationCatalog] = useState<Record<string, ServedRateFields> | null>(null);
+  useEffect(() => {
+    if (!showSubRecipeModal) return;
+    let cancelled = false;
+    fetch('/api/closing-stock/rates')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled && d?.rates) setValuationCatalog(d.rates); })
+      .catch((e) => console.error('Failed to fetch material rates', e));
+    return () => { cancelled = true; };
+  }, [showSubRecipeModal]);
+  const subRateByMaterial = useMemo(
+    () => buildRateIndex(subRecipes, valuationCatalog),
+    [subRecipes, valuationCatalog],
+  );
 
   const fetchMenuItems = useCallback(async () => {
     try {
@@ -2145,11 +2182,16 @@ export default function RecipesPage() {
     const purchaseBasis = opts?.purchaseBasis === true;
     return list.map((ing, idx) => {
       const rowMat = purchaseBasis ? materials.find((m) => m.id === ing.material_id) : undefined;
-      // Rate is what the chef is buying at — ₹/purchase-unit. Display only:
-      // the cost beside it still comes from computeIngredientCost, which runs
-      // ₹/recipe-unit exactly like the server engine.
+      // Rate is what the chef is buying at — ₹/purchase-unit, the closing-
+      // valuation figure /closing-stock values this material at (never
+      // average_price × pack). Display only: the cost beside it still comes from
+      // computeIngredientCost, which runs ₹/recipe-unit exactly like the server.
+      const rowValued = rowMat ? subRateByMaterial.get(rowMat.id) : undefined;
+      const rowPu = rowMat ? (rowMat.purchase_unit || rowMat.unit) : '';
       const rowRate = rowMat
-        ? `${formatCurrency(purchasePrice(rowMat.average_price || 0, rowMat))}/${rowMat.purchase_unit || rowMat.unit}`
+        ? (hasBasis(rowValued)
+            ? `${formatCurrency(rowValued.rate)}/${rowPu}${rateSourceLabel(rowValued) ? ` · ${rateSourceLabel(rowValued)}` : ''}`
+            : `—/${rowPu}`)
         : null;
       return (
       <div key={idx} className="grid grid-cols-12 gap-2 items-end mb-2">
@@ -2160,6 +2202,7 @@ export default function RecipesPage() {
             value={ing.material_id}
             materials={materials}
             purchaseBasis={purchaseBasis}
+            rates={purchaseBasis ? subRateByMaterial : undefined}
             onChange={(id) => {
               // Auto-set the recipe unit to the material's stock unit (the
               // unit recipes are denominated in for that material). Saves the
@@ -2187,7 +2230,7 @@ export default function RecipesPage() {
             }}
           />
           {purchaseBasis && rowRate && (
-            <div className="text-[9px] text-[#B8A590] mt-0.5 truncate">{rowRate}</div>
+            <div className="text-[9px] text-[#B8A590] mt-0.5 truncate" title={rateTitle(rowValued ?? null, rowPu)}>{rowRate}</div>
           )}
         </div>
         {/* Qty */}
@@ -2665,9 +2708,18 @@ export default function RecipesPage() {
                         <td className="py-2 px-2 text-[#8B7355]">{d.purchaseUnit}</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.yield_percent}%</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.wastage_percent}%</td>
-                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums">
-                          {formatCurrency(d.rate)}
-                          <span className="text-[9px] text-[#B8A590]">/{d.purchaseUnit}</span>
+                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums" title={rateTitle(d.rate, d.purchaseUnit)}>
+                          {hasBasis(d.rate) ? (
+                            <>
+                              {formatCurrency(d.rate.rate)}
+                              <span className="text-[9px] text-[#B8A590]">/{d.purchaseUnit}</span>
+                              {rateSourceLabel(d.rate) && (
+                                <div className="text-[9px] text-[#B8A590]">{rateSourceLabel(d.rate)}</div>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-[#B8A590]">—</span>
+                          )}
                         </td>
                         <td className="py-2 px-2 text-right font-medium text-[#2D1B0E] tabular-nums">{formatCurrency(d.effCost)}</td>
                       </tr>
@@ -5332,6 +5384,17 @@ function DirectItemsPanel({
   const [addMatId, setAddMatId] = useState('');
   const [addMatText, setAddMatText] = useState('');
   const [adding, setAdding] = useState(false);
+  /** What "Add Direct Item" offers: switched-off materials are left out (a new
+   *  link is a new entry, ruling #78). Existing links keep resolving from the
+   *  full `materials` list everywhere else in this panel. */
+  const addOffered = useMemo(() => materials.filter(m => offeredInPicker(m, 'hide')), [materials]);
+  /** The typed text is exactly a switched-off material's name — named on screen
+   *  instead of the bare "pick a material from the list". */
+  const addTypedOff = useMemo(() => {
+    const t = addMatText.trim().toLowerCase();
+    if (!t) return null;
+    return materials.find(m => !offeredInPicker(m, 'hide') && m.name.trim().toLowerCase() === t) || null;
+  }, [materials, addMatText]);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -5500,17 +5563,21 @@ function DirectItemsPanel({
           </label>
           <label className="text-xs text-[#6B5744] flex flex-col gap-1">
             Raw material
+            {/* A new direct item is a NEW entry (ruling #78): the list it picks
+                from — and the typed-name match that fills addMatId — use the
+                OFFERED materials only, so typing a switched-off item's exact
+                name leaves Save disabled and says why. */}
             <input list="di-mat-list" value={addMatText}
                    onChange={e => {
                      const v = e.target.value;
                      setAddMatText(v);
-                     const m = materials.find(x => x.name.toLowerCase() === v.toLowerCase());
+                     const m = addOffered.find(x => x.name.toLowerCase() === v.toLowerCase());
                      setAddMatId(m?.id || '');
                    }}
                    placeholder="type to search materials..."
                    className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm w-64" />
             <datalist id="di-mat-list">
-              {materials.map(m => <option key={m.id} value={m.name} />)}
+              {addOffered.map(m => <option key={m.id} value={m.name} />)}
             </datalist>
           </label>
           <button onClick={addDirectItem} disabled={adding || !addName.trim() || !addMatId}
@@ -5519,7 +5586,11 @@ function DirectItemsPanel({
           </button>
           <button onClick={() => { setShowAdd(false); setAddName(''); setAddMatId(''); setAddMatText(''); }}
                   className="text-sm text-[#6B5744] hover:bg-[#FFF1E3] px-3 py-2 rounded-lg">Cancel</button>
-          {addMatText && !addMatId && <span className="text-[11px] text-amber-700 self-center">pick a material from the list</span>}
+          {addMatText && !addMatId && (addTypedOff
+            ? <span className="text-[11px] text-amber-800 self-center">
+                <b>{addTypedOff.name}</b> is switched off in Raw Materials — not offered for a new direct item. Pick another material, or ask an admin to switch it back on.
+              </span>
+            : <span className="text-[11px] text-amber-700 self-center">pick a material from the list</span>)}
         </div>
       )}
 
@@ -5676,6 +5747,15 @@ function DirectItemCell({
   // Determine the primary pill: what the user is currently linked to OR the suggestion
   const primaryMat = linkedMat ?? (item.matched ? { id: item.matched.material_id, name: item.matched.material_name } : null);
   const primaryIsSuggestion = primaryMat && item.matched && primaryMat.id === item.matched.material_id;
+  // What a pill click would link to — and whether that is a NEW link to a
+  // material switched off in Raw Materials (ruling #78: not offered for new
+  // entries). Re-saving the link the item already has is not new, so it passes.
+  const linkTarget = primaryMat ? (item.matched?.material_id || primaryMat.id) : '';
+  const targetOff = !!linkTarget && linkTarget !== linkedId
+    && isSwitchedOff(materials.find(m => m.id === linkTarget));
+  const suggestionOffered = !!item.matched
+    && (item.matched.material_id === linkedId
+        || !isSwitchedOff(materials.find(m => m.id === item.matched!.material_id)));
 
   if (!primaryMat) {
     // No suggestion and not linked — show manual link + dismiss options
@@ -5706,7 +5786,8 @@ function DirectItemCell({
             className="text-[10px] bg-white border border-[#E8D5C4] rounded px-1 py-0.5 max-w-[240px]"
           >
             <option value="">— Pick a raw material —</option>
-            {materials.map(m => (
+            {/* A new link is a new entry: switched-off materials are not offered. */}
+            {materials.filter(m => offeredInPicker(m, 'hide')).map(m => (
               <option key={m.id} value={m.id}>{m.name}</option>
             ))}
           </select>
@@ -5720,10 +5801,11 @@ function DirectItemCell({
       {/* ONE big pill — click to link.  When linked, it's green and click does nothing (use unlink). */}
       <button
         type="button"
-        onClick={() => { if (!linkedId || !primaryIsSuggestion) onLink(item.matched?.material_id || primaryMat.id); }}
-        disabled={isSaving || isFinalized}
+        onClick={() => { if (targetOff) return; if (!linkedId || !primaryIsSuggestion) onLink(item.matched?.material_id || primaryMat.id); }}
+        disabled={isSaving || isFinalized || targetOff}
         title={
           isFinalized ? 'Already linked — click unlink below to dismiss' :
+          targetOff ? 'The suggested material is switched off in Raw Materials — not offered for a new link. Use "change" to pick another, or ask an admin to switch it back on.' :
           linkedMat ? 'Click to re-link to the suggested material' :
           'Click to link this sold item to this raw material'
         }
@@ -5739,6 +5821,12 @@ function DirectItemCell({
           isFinalized ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> :
           <Link2 className="w-3.5 h-3.5 shrink-0" />}
         <span className="truncate">{primaryMat.name}</span>
+        {isSwitchedOff(materials.find(m => m.id === primaryMat.id)) && (
+          <span title="Switched off in Raw Materials"
+                className="text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px shrink-0">
+            Inactive
+          </span>
+        )}
       </button>
 
       {/* Meta + action row */}
@@ -5766,7 +5854,9 @@ function DirectItemCell({
           </button>
         ) : (
           <>
-            <span className="text-[#8B7355] italic">Click pill to link</span>
+            {targetOff
+              ? <span className="text-amber-800 italic">Suggestion switched off — use change to pick another</span>
+              : <span className="text-[#8B7355] italic">Click pill to link</span>}
             <span className="text-[#E8D5C4]">·</span>
             <button onClick={onUnlink} disabled={isSaving}
                     className="text-rose-600 hover:text-rose-700 underline disabled:opacity-40"
@@ -5795,12 +5885,18 @@ function DirectItemCell({
           className="text-[10px] bg-white border border-[#E8D5C4] rounded px-1 py-0.5 max-w-[240px]"
         >
           <option value="">— Pick a different raw material —</option>
-          {item.matched && (
+          {/* The suggestion is offered only while it is switched on (or is
+              already this item's link) — same rule as the list below. */}
+          {item.matched && suggestionOffered && (
             <option value={item.matched.material_id}>✓ Suggested: {item.matched.material_name}</option>
           )}
           <optgroup label="All materials">
-            {materials.filter(m => !item.matched || m.id !== item.matched.material_id).map(m => (
-              <option key={m.id} value={m.id}>{m.name}</option>
+            {/* Switched-off materials are not offered for a new link; the one
+                this item is linked to now always stays, so the select never
+                blanks its own value. */}
+            {materials.filter(m => (!item.matched || m.id !== item.matched.material_id)
+                                   && (offeredInPicker(m, 'hide') || m.id === linkedId)).map(m => (
+              <option key={m.id} value={m.id}>{m.name}{isSwitchedOff(m) ? ' (inactive)' : ''}</option>
             ))}
           </optgroup>
         </select>
@@ -5871,13 +5967,17 @@ function MaterialPicker({
   materials,
   onChange,
   purchaseBasis = false,
+  rates,
 }: {
   value: string;
   materials: Array<{ id: string; name: string; unit: string; average_price: number; sku?: string; category?: string;
-                     purchase_unit?: string; pack_size?: number }>;
+                     purchase_unit?: string; pack_size?: number; is_active?: number | null }>;
   onChange: (id: string) => void;
   /** Sub-recipe rows: list the PURCHASE unit and ₹/purchase-unit, not ₹/g. */
   purchaseBasis?: boolean;
+  /** Purchase basis only: material_id → the closing-valuation ₹/purchase-unit
+   *  rate (./sub-recipe-rate.ts). Absent = em-dash, never a local derivation. */
+  rates?: Map<string, ValuedRate>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -5917,21 +6017,33 @@ function MaterialPicker({
     };
   }, [open]);
 
+  /** What this picker OFFERS: switched-off materials are left out (a recipe
+   *  line is a new entry). `selected` above still resolves from the full list. */
+  const offered = useMemo(() => materials.filter(m => offeredInPicker(m, 'hide')), [materials]);
+  const tokenHit = (m: { name: string; sku?: string }, raw: string) => {
+    if (!raw) return true;
+    const hay = [
+      m.name, m.sku, (m as any).category, (m as any).unit,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return raw.split(/\s+/).filter(Boolean).every(t => hay.includes(t));
+  };
+  /** Switched-off materials the search would have matched — named in the panel
+   *  so "No matches" is never said about an item that exists but is off. */
+  const offMatches = useMemo(() => {
+    const raw = query.toLowerCase().trim();
+    return materials.filter(m => !offeredInPicker(m, 'hide') && tokenHit(m, raw))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [materials, query]);
   const filtered = useMemo(() => {
-    let list = materials;
+    let list = offered;
     if (onlyPurchased) list = list.filter(m => m.average_price > 0);
     const raw = query.toLowerCase().trim();
     if (raw) {
       // Tokenized substring match — same rules as MaterialTypeahead. Every
       // token (whitespace-separated) must appear somewhere in name/sku/
       // category/unit. Order-independent, so "oil 1l" matches "Sunflower Oil 1L".
-      const tokens = raw.split(/\s+/).filter(Boolean);
-      list = list.filter(m => {
-        const hay = [
-          m.name, m.sku, (m as any).category, (m as any).unit,
-        ].filter(Boolean).join(' ').toLowerCase();
-        return tokens.every(t => hay.includes(t));
-      });
+      list = list.filter(m => tokenHit(m, raw));
     }
     // Sort: bucket by relevance, then alphabetic.
     list = [...list].sort((a, b) => {
@@ -5952,7 +6064,8 @@ function MaterialPicker({
       return an.localeCompare(bn);
     });
     return list;  // no cap — the panel scrolls, search narrows
-  }, [materials, query, onlyPurchased]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offered, query, onlyPurchased]);
 
   return (
     <div className="relative">
@@ -5967,6 +6080,12 @@ function MaterialPicker({
             <>
               <span className="text-[10px] font-mono text-[#8B7355] mr-1">{selected.sku || ''}</span>
               {selected.name}
+              {isSwitchedOff(selected) && (
+                <span title="Switched off in Raw Materials — not offered for new recipe lines"
+                      className="ml-1 text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                  Inactive
+                </span>
+              )}
             </>
           ) : (
             <span className="text-[#8B7355]">Select…</span>
@@ -5997,12 +6116,26 @@ function MaterialPicker({
               Show only materials with purchase history (price &gt; ₹0)
             </label>
             <div className="text-[10px] text-[#8B7355] px-1 mb-1">
-              {filtered.length} of {materials.length} materials
+              {filtered.length} of {offered.length} materials
+              {offMatches.length > 0 && (
+                <span className="text-gray-500" title="Switched off in Raw Materials. An admin can switch an item back on there.">
+                  {' · '}{query.trim()
+                    ? <>switched off, not offered: <b className="text-[#6B5744]">{offMatches.slice(0, 3).map(m => m.name).join(', ')}{offMatches.length > 3 ? ` +${offMatches.length - 3} more` : ''}</b></>
+                    : notOfferedNote(offMatches.length, 'hide')}
+                </span>
+              )}
             </div>
             <div className="space-y-0.5">
               {filtered.length === 0 ? (
-                <div className="text-xs text-[#8B7355] text-center py-4">No matches</div>
-              ) : filtered.map(m => (
+                <div className="text-xs text-[#8B7355] text-center py-4">
+                  {offMatches.length > 0 && query.trim() ? 'No active material matches' : 'No matches'}
+                </div>
+              ) : filtered.map(m => {
+                // Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
+                // ₹0.18/g reads as a rounding error), and the closing-valuation
+                // figure — the one /closing-stock values this material at.
+                const valued = purchaseBasis ? rates?.get(m.id) : undefined;
+                return (
                 <button
                   type="button"
                   key={m.id}
@@ -6014,14 +6147,21 @@ function MaterialPicker({
                   <span className="text-[10px] text-[#6B5744] shrink-0">
                     {purchaseBasis ? (m.purchase_unit || m.unit) : m.unit}
                   </span>
+                  {purchaseBasis ? (
+                    <span
+                      className={`text-[10px] font-mono shrink-0 ${hasBasis(valued) ? 'text-[#6B5744]' : 'text-red-500'}`}
+                      title={rateTitle(valued ?? null, m.purchase_unit || m.unit)}
+                    >
+                      {hasBasis(valued) ? `₹${valued.rate.toFixed(2)}` : '—'}
+                    </span>
+                  ) : (
                   <span className={`text-[10px] font-mono shrink-0 ${m.average_price > 0 ? 'text-[#6B5744]' : 'text-red-500'}`}>
-                    {/* Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
-                        ₹0.18/g reads as a rounding error). purchasePrice() also
-                        tolerates a null average_price, which .toFixed() does not. */}
-                    ₹{(purchaseBasis ? purchasePrice(m.average_price, m) : m.average_price).toFixed(2)}
+                    ₹{m.average_price.toFixed(2)}
                   </span>
+                  )}
                 </button>
-              ))}
+                );
+              })}
             </div>
           </div>
         </>,

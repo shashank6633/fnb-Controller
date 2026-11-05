@@ -23,6 +23,11 @@
  *                                    (BOH, expected date). Placed ABOVE
  *                                    refreshUpcomingParties so a Sheets failure
  *                                    can never starve the money chase.
+ *   - runFssaiScheduledJobs()      — FSSAI: corrective-action escalation ladder,
+ *                                    12-month photo-retention sweep (guarded,
+ *                                    once per IST day, always leaves an
+ *                                    fssai_retention_runs row), missed-check
+ *                                    reminders for the previous day
  *   - refreshUpcomingParties() + refreshPartyBookings()
  *   - checkDeferDueSoon()          — deferred requisition items coming due
  *   - sweepRecordingRetention()    — call recordings past the admin's window
@@ -30,6 +35,13 @@
  *   - checkKitchenExpiry()         — production batches at/near expiry
  *   - runWaReportJobs()            — scheduled WhatsApp reports, each at its own
  *                                    IST time, once per day per outlet
+ *   - flushPriceHikeAlerts()       — one price-hike alert per quiet bill
+ *   - runSmartOfficeAutoSync()     — HR biometric punches from the venue's
+ *                                    SmartOffice server, every 30 min, only
+ *                                    when the connector is configured. LAST on
+ *                                    purpose: an unreachable server costs up to
+ *                                    a 15s timeout, which must never delay the
+ *                                    jobs above it.
  *
  * runWaDailyNotifications and runTaskAutomation are here because they had NO
  * DRIVER AT ALL: their only call site was POST /api/cron/refresh-parties, which
@@ -218,6 +230,34 @@ export function startSchedulerOnce(): void {
         }
       } catch (e) {
         console.error('[scheduler] boh reminders failed:', e instanceof Error ? e.message : e);
+      }
+
+      // FSSAI FOOD SAFETY — the three jobs that had MANUAL CALLERS ONLY until
+      // this block: the corrective-action escalation ladder (it ran only when
+      // somebody opened the queue or pressed "Chase now"), the owner's 12-month
+      // photo-retention sweep (§7 Q13 — only an admin's button ever ran it), and
+      // missed-check reminders (nothing at all). src/lib/fssai-jobs.ts says what
+      // each does and guards; this is only the driver, the same in-process tick
+      // every job above rides, armed at boot from instrumentation.ts register().
+      // No /api/cron route: proxy.ts would 401 a token-only POST before it.
+      //
+      // ABOVE refreshUpcomingParties for the same reason as BOH: a Sheets failure
+      // must never decide whether a late food-safety fix gets chased.
+      //
+      // SAFE ON EVERY TICK AND ACROSS pm2 WORKERS. The chase is throttled and
+      // claims each message on notifications' UNIQUE index; the retention sweep
+      // claims its IST day atomically in settings, refuses (and records the
+      // refusal in fssai_retention_runs) unless it can prove every image it
+      // would drop is at least 12 months old; the reminders run once per IST day
+      // for the previous day and claim that day on the same UNIQUE index.
+      try {
+        const { runFssaiScheduledJobs, fssaiJobsLogLine } = await import('./fssai-jobs');
+        const { getDb } = await import('./db');
+        const fj = await runFssaiScheduledJobs(getDb());
+        const line = fssaiJobsLogLine(fj);
+        if (line) console.log(`[scheduler] fssai @ IST ${istHour()}h: ${line}`);
+      } catch (e) {
+        console.error('[scheduler] fssai jobs failed:', e instanceof Error ? e.message : e);
       }
 
       // GUARDED — AND THAT IS THE ENTIRE POINT OF THIS try.
@@ -422,6 +462,32 @@ export function startSchedulerOnce(): void {
         }
       } catch (e) {
         console.error('[scheduler] price-hike alert flush failed:', e instanceof Error ? e.message : e);
+      }
+
+      // HR BIOMETRIC AUTO-SYNC (owner ruling #89(2)) — pull punches from the
+      // venue's SmartOffice server every 30 minutes. THIS IS ITS DRIVER: the
+      // manual "Sync punches" button was the only other caller.
+      //
+      // LAST IN THE TICK ON PURPOSE. SmartOffice lives on the venue LAN; when
+      // the cloud server cannot reach it (today: "Could not reach SmartOffice at
+      // http://10.99.0.2:88"), one call can take up to soFetch's 15s timeout.
+      // Placed here, that wait can never delay any job above.
+      //
+      // SAFE ON EVERY TICK AND ACROSS pm2 WORKERS. runSmartOfficeAutoSync is a
+      // silent no-op until the base URL + API key are saved, returns 'not_due'
+      // from one settings read until 30 minutes have passed since the last
+      // attempt, and claims each run in a BEGIN IMMEDIATE transaction so two
+      // workers can never pull at once. It NEVER THROWS, records every result
+      // (the failure reason verbatim) for the Biometric page, and logs only on
+      // a transition or when punches were recorded — so nothing here logs, and
+      // an unreachable server is not alarmed every half hour. Dynamically
+      // imported (grn-qc pattern) so an HR-schema fault can never break the loop.
+      try {
+        const { runSmartOfficeAutoSync } = await import('./smartoffice');
+        const { getDb } = await import('./db');
+        await runSmartOfficeAutoSync(getDb());
+      } catch (e) {
+        console.error('[scheduler] smartoffice auto-sync failed:', e instanceof Error ? e.message : e);
       }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);

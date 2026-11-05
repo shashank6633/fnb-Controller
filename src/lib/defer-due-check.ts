@@ -30,6 +30,8 @@
  * arithmetic that would assume a UTC epoch for these bare strings.
  */
 import { getDb, generateId } from './db';
+import { lineIssueComplete } from './issue-stock';
+import { routedColSql } from './routed-schema';
 
 const LOOKAHEAD_MS = 4 * 60 * 60 * 1000;   // 4 hours
 const DEFER_DUE_KIND = 'defer_due_soon';
@@ -52,6 +54,9 @@ interface DeferRow {
   deferred_until: string;
   unit: string | null;
   material_unit: string | null;
+  material_purchase_unit: string | null;
+  material_pack_size: number | null;
+  shelf_emptied_qty: number | null;
 }
 
 /** Effective qty owed on a line: chef-approved override if set, else requested. */
@@ -82,9 +87,10 @@ export async function checkDeferDueSoon(triggeredBy: string = 'cron'): Promise<D
     // parse deferred_until the same way the UI wrote it (bare local datetime).
     const rows = db.prepare(`
       SELECT ri.id, ri.req_id, ri.quantity_requested, ri.chef_approved_qty,
-             ri.quantity_issued, ri.deferred_until,
+             ri.quantity_issued, ri.deferred_until, ri.shelf_emptied_qty,
              ri.unit AS unit,
              rm.name AS material_name, rm.unit AS material_unit,
+             rm.purchase_unit AS material_purchase_unit, rm.pack_size AS material_pack_size,
              d.name AS department_name
       FROM requisition_items ri
       JOIN raw_materials rm ON rm.id = ri.material_id
@@ -95,6 +101,10 @@ export async function checkDeferDueSoon(triggeredBy: string = 'cron'): Promise<D
         AND ri.deferred_until != ''
         AND COALESCE(ri.is_rejected, 0) = 0
         AND COALESCE(ri.store_rejected, 0) = 0
+        -- A ROUTED line (rulings #45/#74) is its Direct Issue department's to
+        -- send; the store has nothing to "issue now" on it. '' = '' on a
+        -- database without the column.
+        AND ${routedColSql(db)} = ''
     `).all() as DeferRow[];
 
     const now = new Date();
@@ -114,6 +124,16 @@ export async function checkDeferDueSoon(triggeredBy: string = 'cron'): Promise<D
         const eff = effectiveQty(r);
         const got = Number(r.quantity_issued) || 0;
         if (got >= eff && eff > 0) continue;
+        // THE RULE (round 8, issue-stock.ts lineIssueComplete): a line a take
+        // closed by the shelf owes nothing the store can issue — no "Issue now"
+        // alert for it (round-7 verifier: 0.000600000000000378 kg, on a line
+        // both desks print as Outstanding 0).
+        if (lineIssueComplete({
+          quantity_issued: r.quantity_issued, chef_approved_qty: r.chef_approved_qty,
+          quantity_requested: r.quantity_requested, shelf_emptied_qty: r.shelf_emptied_qty,
+          line_unit: r.unit, unit: r.material_unit,
+          purchase_unit: r.material_purchase_unit, pack_size: r.material_pack_size,
+        })) continue;
 
         const dueMs = Date.parse(r.deferred_until);
         if (!Number.isFinite(dueMs)) continue;

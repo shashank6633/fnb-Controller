@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAdminHr, isHrDocType } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, isHrDocType } from '@/lib/hr';
 import { storeHrDocument, HR_DOC_MAX_BYTES } from '@/lib/hr-files';
 import { reportServerError } from '@/lib/error-alerts';
 import { todayIST } from '@/lib/format-date';
@@ -37,9 +37,10 @@ import { todayIST } from '@/lib/format-date';
  *      Audited as hr.document.delete recording filename + type + size —
  *      NEVER the bytes.
  *
- * Whole gate: canAdminHr on every verb — the /hr/documents catalog page is
- * adminOnly, and the API re-checks because the flag alone is never the
- * boundary (§2.2). Errors return GENERIC messages only (e.message can leak
+ * Whole gate: canHrFull on every verb (admin, or a management role holding
+ * "Full HR access" — owner ruling #90) — the /hr/documents catalog page is
+ * adminOnly + hrFullCap, and the API re-checks because the flag alone is
+ * never the boundary (§2.2). Errors return GENERIC messages only (e.message can leak
  * schema/PII for HR data).
  */
 export const dynamic = 'force-dynamic';
@@ -80,8 +81,8 @@ const DOC_META_SELECT = `
 export async function GET(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -166,8 +167,8 @@ function parseDataUri(uri: string): Decoded | null {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -351,8 +352,8 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {
@@ -415,8 +416,8 @@ export async function PATCH(request: Request) {
 export async function DELETE(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) {
-    return Response.json({ error: 'Admin access required' }, { status: 403 });
+  if (!canHrFull(me)) {
+    return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
   }
 
   try {

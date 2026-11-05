@@ -44,7 +44,10 @@ export async function GET(request: Request) {
     const category      = url.searchParams.get('category') || '';
     const search        = (url.searchParams.get('q') || '').toLowerCase();
 
-    const where: string[] = ['rm.reorder_level > 0'];
+    // A switched-off material (is_active = 0, owner #6 / ruling 78) is not bought
+    // any more, so "what needs buying" never lists it — include_ok or not. Same
+    // filter as Smart Reorder (crm-analyst-data.ts activeMaterials); NULL = on.
+    const where: string[] = ['rm.reorder_level > 0', 'COALESCE(rm.is_active, 1) = 1'];
     const params: any[] = [];
     if (!includeOk) where.push('rm.current_stock < rm.reorder_level');
     if (category)   { where.push('rm.category = ?'); params.push(category); }
@@ -144,6 +147,7 @@ export async function GET(request: Request) {
     const allCats = (db.prepare(`
       SELECT DISTINCT category FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1
         AND category IS NOT NULL AND category != ''
       ORDER BY category ASC
     `).all() as any[]).map(r => r.category);

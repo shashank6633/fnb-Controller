@@ -17,7 +17,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Scissors, Plus, Loader2, X, Save, AlertTriangle, CheckCircle2, BarChart3, Trash2,
 } from 'lucide-react';
-import MaterialTypeahead from '@/components/MaterialTypeahead';
+import MaterialTypeahead, { offeredInPicker } from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
@@ -591,6 +591,16 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   // owner for not tagging when the real problem is that nothing loaded.
   const noCutsTagged = materials.length > 0 && taggedCuts.length === 0;
   const cutPool = (showAllCuts || noCutsTagged) ? materials : taggedCuts;
+  // The cut picker is mounted inactive="hide" (ruling #78: a new cut line is a
+  // new entry), so the header counts what it actually OFFERS — "listing all 952"
+  // beside a picker offering 944 would be untrue. Switched-off ones are named
+  // as a count; the picker itself names them on a search.
+  const offeredCount = (list: typeof materials) => list.filter(m => offeredInPicker(m, 'hide')).length;
+  const allOffered = offeredCount(materials);
+  const allOff = materials.length - allOffered;
+  const taggedOffered = offeredCount(taggedCuts);
+  const taggedOff = taggedCuts.length - taggedOffered;
+  const offSuffix = (n: number) => (n > 0 ? ` (${n} switched off, not offered)` : '');
 
   const load = async () => {
     setLoadError(null);
@@ -795,8 +805,8 @@ function BatchDetailModal({ batchId, materials, onClose }: {
                 {materials.length === 0
                   ? '— item list still loading'
                   : noCutsTagged
-                    ? `— nothing marked yet, listing all ${materials.length} items`
-                    : `— ${taggedCuts.length} item${taggedCuts.length === 1 ? '' : 's'} can be a cut${showAllCuts ? `, listing all ${materials.length}` : ''}`}
+                    ? `— nothing marked yet, listing all ${allOffered} items${offSuffix(allOff)}`
+                    : `— ${taggedOffered} item${taggedOffered === 1 ? '' : 's'} can be a cut${offSuffix(taggedOff)}${showAllCuts ? `, listing all ${allOffered}${offSuffix(allOff)}` : ''}`}
               </span>
             )}
           </h3>
@@ -941,6 +951,7 @@ function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, pic
              (incl. liquor + party pages behind deploy gates), so the component
              itself is untouched — the FILTER is applied to what we hand it. */
           <MaterialTypeahead materials={pickList as any} value={line.material_id}
+                             inactive="hide"
                              onPick={(id: string) => onUpdate({ material_id: id })}
                              excludeIds={excludeIds.filter(x => x !== line.material_id) as string[]} />
         )}

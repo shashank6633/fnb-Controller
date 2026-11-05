@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { canAdminHr, canManageHr, maskAccountNumber, type HrBankAccount } from '@/lib/hr';
+import { canHrFull, HR_FULL_DENIED, canManageHr, maskAccountNumber, type HrBankAccount } from '@/lib/hr';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -14,25 +14,26 @@ import { reportServerError } from '@/lib/error-alerts';
  *          → { rows, total, page, pageSize, can_view_full }
  *        Management tier may LIST (the employee profile shows bank state),
  *        but account_number is masked server-side via maskAccountNumber
- *        unless the caller is canAdminHr — the full number NEVER rides the
- *        wire to a non-admin, so no client can "unmask" it. Rows LEFT JOIN
+ *        unless the caller is canHrFull (admin, or a "Full HR access" role —
+ *        owner ruling #90) — the full number NEVER rides the wire to anyone
+ *        else, so no client can "unmask" it. Rows LEFT JOIN
  *        hr_employees for employee_name/employee_code (dangling employee_id
  *        degrades to blank, never drops the row).
  * POST   { employee_id, account_number, ifsc, bank_name?, account_holder?,
  *          branch?, account_type? } → { account }
- *        Admin only. employee_id must exist (400), account_number non-empty
+ *        Admin or "Full HR access" (canHrFull). employee_id must exist (400), account_number non-empty
  *        (spaces stripped), IFSC must match the RBI shape
  *        (4 letters + '0' + 6 alphanumerics, case-insensitive; stored
  *        uppercase). Duplicate active account number for the same employee
  *        → 409. New rows start verify_status='unverified'.
  * PUT    { id, ...fields } → { account }
- *        Admin only. Same field validation as POST. Changing account_number
+ *        Admin or "Full HR access" (canHrFull). Same field validation as POST. Changing account_number
  *        or ifsc RESETS verification (verify_status='unverified',
  *        verified_by/verified_at cleared) — a verified flag must never
  *        survive a number edit. employee_id is NOT updatable: a bank row
  *        belongs to one person forever; add a new row instead.
  * PATCH  { id, action: 'verify' | 'reject' } → { account }
- *        Admin only. Sets verify_status ('verified'|'rejected'),
+ *        Admin or "Full HR access" (canHrFull). Sets verify_status ('verified'|'rejected'),
  *        verified_by = me.email, verified_at = now.
  *
  * Audit: hr.bank.create / hr.bank.update / hr.bank.verify / hr.bank.reject —
@@ -63,7 +64,7 @@ type BankRow = HrBankAccount & {
 };
 
 /** Wire shape: the full account number leaves the server ONLY when full=true
- *  (canAdminHr). Masking happens HERE, server-side — never on the client. */
+ *  (canHrFull). Masking happens HERE, server-side — never on the client. */
 function serialize(row: BankRow, full: boolean): BankRow {
   return {
     ...row,
@@ -128,9 +129,10 @@ export async function GET(request: Request) {
       )
       .all(...params, pageSize, (page - 1) * pageSize) as BankRow[];
 
-    // The tier decides what leaves the server: admin = full, everyone else =
-    // masked. can_view_full lets the page label the column honestly.
-    const full = canAdminHr(me);
+    // canHrFull decides what leaves the server: admin or a "Full HR access"
+    // role = full, everyone else = masked. can_view_full lets the page label
+    // the column honestly.
+    const full = canHrFull(me);
     return Response.json({
       rows: raw.map((r) => serialize(r, full)),
       total: totalRow.n,
@@ -148,7 +150,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled by field checks below */ }
@@ -247,7 +249,7 @@ export async function POST(request: Request) {
 export async function PUT(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }
@@ -350,7 +352,7 @@ export async function PUT(request: Request) {
 export async function PATCH(request: Request) {
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-  if (!canAdminHr(me)) return Response.json({ error: 'Admin role required' }, { status: 403 });
+  if (!canHrFull(me)) return Response.json({ error: HR_FULL_DENIED }, { status: 403 });
 
   let body: any = {};
   try { body = await request.json(); } catch { /* handled below */ }

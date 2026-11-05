@@ -42,12 +42,21 @@ import {
 // never add a runtime import to it.
 import { vendorIdentityKey, normalizeVendorName } from '@/lib/vendor-mapping';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
+// The ONE "is this raw material switched off?" rule every picker shares
+// (Raw Materials → Active, owner ruling #78). Pure functions on a row.
+import { offeredInPicker, isSwitchedOff, notOfferedNote } from '@/components/MaterialTypeahead';
 import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 // TYPE-ONLY: the change-set a pending_reapproval row carries (computed server-
 // side by the list API from the po.edit audit trail). @/lib/po-diff has NO
 // runtime imports (its Database import is `import type`), and this import is
 // itself type-only, so nothing of it reaches the client bundle.
 import type { PoReapprovalChanges, PoQtyChange, PoRateChange, PoVendorChange } from '@/lib/po-diff';
+// THE per-vendor split of a PO (rulings #63-#70) — the receive route's own
+// grouping, shared with the print page and the vendor PDF. No runtime imports.
+import {
+  groupPoLinesByVendor, vendorNameKey, linkArrivals, closureForGroup, vendorProgress, vendorGroupState,
+  type PoVendorGroup, type PoVendorViewPayload, type PoVendorClosure, type PoReqLink,
+} from '@/lib/po-vendor-view';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -58,6 +67,14 @@ import type { PoReapprovalChanges, PoQtyChange, PoRateChange, PoVendorChange } f
 const fmt = (v: number) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dateLabel = (s?: string | null) =>
   s ? new Date(s).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+/** SQLite's datetime('now') is UTC written as 'YYYY-MM-DD HH:MM:SS' with no
+ *  zone, which `new Date()` would read as LOCAL time. Mark it UTC first so a
+ *  late-evening stamp does not land on the wrong IST day. ISO strings that
+ *  already carry a zone, and bare dates, pass through untouched. */
+const sqlUtcStamp = (s: string): string =>
+  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(String(s || '').trim())
+    ? String(s).trim().replace(' ', 'T') + 'Z'
+    : String(s || '');
 /** Today on the LOCAL calendar, as YYYY-MM-DD. `toISOString().slice(0,10)`
  *  answers in UTC, which is 5½ h behind IST — before 05:30 it names YESTERDAY,
  *  so a delivery that fell due yesterday would not read as overdue until half
@@ -124,7 +141,10 @@ const RATE_EPS = 0.005;   // ₹ — half a paisa
  */
 const GST_RATES = ['0', '5', '12', '18', '28'] as const;
 
-interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number; }
+interface Material { id: string; name: string; unit: string; purchase_unit?: string; pack_size?: number; sku?: string; average_price: number; primary_vendor?: string; last_purchase_price?: number;
+  /** raw_materials.is_active (GET /api/inventory selects rm.*). 0 = switched off:
+   *  not offered by SimpleMaterialPicker for a NEW line; null/absent = on. */
+  is_active?: number | null; }
 
 /* ── PO UNIT BASIS ────────────────────────────────────────────────────────────
  * A Purchase Order is raised to a VENDOR, so it must be expressed in the
@@ -290,7 +310,27 @@ interface PO {
    *  server did not say" = show nothing. `recorded: false` inside it is the
    *  honest "edit predates change tracking" case and IS shown, as words. */
   reapproval_changes?: PoReapprovalChanges | null;
+  /** purchase_orders.merged — 1 when the PO was built by "Merge into one PO"
+   *  from many requisitions (ruling #63). Rides SELECT po.*; absent on a DB
+   *  that has not run the migration, which reads as not merged. */
+  merged?: number | boolean | null;
+  vendor_id?: string | null;
 }
+
+/** Was this PO built by the merge? Tolerates 1 / true / '1' and absence. */
+const isMergedPo = (p: { merged?: unknown } | null | undefined): boolean =>
+  !!p && (p.merged === true || Number(p.merged) === 1);
+
+/* ── VENDOR-LEVEL DELIVERY ON A LIST ROW ──────────────────────────────────────
+ * "2 of 5 vendors delivered · 1 closed" — counted by vendorProgress() in
+ * @/lib/po-vendor-view from the list API's own line tallies plus the vendor
+ * closures (a closed vendor is never counted as delivered). */
+const vendorProgressOf = (p: PO, closures: PoVendorClosure[] | undefined) =>
+  vendorProgress(
+    Array.isArray(p.delivered_vendors) ? vendorTally(p.delivered_vendors) : undefined,
+    Array.isArray(p.outstanding_vendors) ? vendorTally(p.outstanding_vendors) : undefined,
+    closures,
+  );
 
 const STATUS_COLOR: Record<string, string> = {
   draft: 'bg-gray-100 text-gray-700',
@@ -315,12 +355,6 @@ const STATUS_COLOR: Record<string, string> = {
  *     re-approval was invisible everywhere except the All tab, silently missing
  *     from the approval queue.
  * Add a new status here and both surfaces pick it up together.
- *
- * SHARING THIS MAP IS NECESSARY BUT NOT SUFFICIENT — the drift came back a third
- * time through the SEARCH box, which `counts` did not read at all. Both surfaces
- * must also be derived from the same ROW SET (`searched`), not just the same
- * status map. Any future narrowing control belongs upstream of both, in
- * `searched`, for the same reason.
  */
 const TAB_STATUSES: Record<string, string[]> = {
   draft:    ['draft'],
@@ -347,10 +381,25 @@ export default function PurchaseOrdersPage() {
   const initialQ = typeof window !== 'undefined'
     ? (new URLSearchParams(window.location.search).get('q') || '')
     : '';
+  /* /purchase-orders?id=<uuid> — the link a requisition (and the merge modal)
+   * gives to ITS PO. It used to be ignored: the page read only ?q=, so the link
+   * landed on the default Pending tab and an approved or received PO was not
+   * even listed. Now it widens the tab to 'all', opens that PO's detail and
+   * scrolls to it once the list has loaded. Read once at mount, same as ?q=. */
+  const [deepLinkId] = useState(() => typeof window !== 'undefined'
+    ? (new URLSearchParams(window.location.search).get('id') || '').trim()
+    : '');
+  const deepLinkDone = useRef(false);
+  const [deepLinkMissing, setDeepLinkMissing] = useState(false);
   const [tab, setTab] = useState<'all' | 'draft' | 'pending' | 'approved' | 'received' | 'rejected'>(
-    initialQ ? 'all' : 'pending',
+    initialQ || deepLinkId ? 'all' : 'pending',
   );
   const [search, setSearch] = useState(initialQ);
+  /* Vendor closures per PO (po_vendor_closures, via the read-only vendor-view
+   * route) — only for multi-vendor POs past approval, the only ones a vendor
+   * can be closed on. Empty map = none known; the progress chip then simply
+   * counts no closures, which is true of every PO before the feature existed. */
+  const [closuresByPo, setClosuresByPo] = useState<Record<string, PoVendorClosure[]>>({});
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [savingId, setSavingId] = useState<string | null>(null);
@@ -377,7 +426,27 @@ export default function PurchaseOrdersPage() {
         // scope=all — POs are a store operation; show every material.
         fetch('/api/inventory?scope=all').then(r => r.json()),
       ]);
-      setPos(posRes.purchase_orders || []);
+      const list: PO[] = posRes.purchase_orders || [];
+      setPos(list);
+      // Closures for the multi-vendor POs a vendor could have been closed on.
+      // Best-effort: a failed read leaves the map as it was.
+      const multiIds = list
+        .filter(p => ['approved', 'received'].includes(p.status)
+          && (vendorProgressOf(p, undefined)?.total || 0) > 1)
+        .map(p => p.id).slice(0, 150);   // bounded: keeps the query string well under any URL limit
+      if (multiIds.length > 0) {
+        fetch(`/api/purchase-orders/vendor-view?ids=${encodeURIComponent(multiIds.join(','))}`)
+          .then(r => (r.ok ? r.json() : null))
+          .then(d => {
+            if (!d?.by_po) return;
+            const next: Record<string, PoVendorClosure[]> = {};
+            for (const [pid, v] of Object.entries(d.by_po as Record<string, { closures?: PoVendorClosure[] }>)) {
+              if (Array.isArray(v?.closures) && v.closures.length) next[pid] = v.closures;
+            }
+            setClosuresByPo(next);
+          })
+          .catch(() => {});
+      }
       // Fail CLOSED to the lower tier. This was `=== 'manager' ? 'manager' : 'admin'`,
       // which handed out 'admin' for anything that wasn't literally "manager" — an
       // absent field, an error body, a future role string. `role` gates the
@@ -396,41 +465,54 @@ export default function PurchaseOrdersPage() {
   }, []);
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
+  /* ?id= deep link: once the first load lands, open that PO and bring it into
+   * view. Done ONCE — a later refresh must not yank the page back to it. If the
+   * PO is not in this list (another outlet's, or deleted), say so rather than
+   * leave the reader on a list that silently lacks it. */
+  useEffect(() => {
+    if (!deepLinkId || deepLinkDone.current || loading) return;
+    deepLinkDone.current = true;
+    if (!pos.some(p => p.id === deepLinkId)) { setDeepLinkMissing(true); return; }
+    setOpenDetailId(deepLinkId);
+    requestAnimationFrame(() => {
+      document.getElementById(`po-row-${deepLinkId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [deepLinkId, loading, pos]);
+
   // Role is now driven by the logged-in user (api/auth/me). Toggle is removed.
 
-  /* THE ONE BASE SET. Every visible number on this page is derived from this,
-   * so the badges and the rows can never describe different sets.
-   *
-   * They used to: `filtered` applied tab AND search while `counts` applied tab
-   * only, so typing "LOCAL" on the Received tab listed 7 rows under a badge
-   * still reading "Received (20)" — the third instance of the drift the
-   * TAB_STATUSES docblock above already records twice. A user cannot tell a
-   * wrong count from a filter they forgot they had left on, so the count has to
-   * be computed from the same rows that get rendered. */
-  const searched = useMemo(() => {
-    if (!search) return pos;
-    const q = search.toLowerCase();
-    return pos.filter(p => p.po_number.toLowerCase().includes(q) || (p.vendor || '').toLowerCase().includes(q));
-  }, [pos, search]);
-
   const filtered = useMemo(() => {
+    let list = pos;
     // Same map the badges use — never `status === tab`, which silently drops any
     // status whose name isn't identical to the tab key (cancelled, pending_reapproval).
-    if (tab === 'all') return searched;
-    const allowed = TAB_STATUSES[tab] || [tab];
-    return searched.filter(p => allowed.includes(p.status));
-  }, [searched, tab]);
+    if (tab !== 'all') {
+      const allowed = TAB_STATUSES[tab] || [tab];
+      list = list.filter(p => allowed.includes(p.status));
+    }
+    if (search) {
+      const q = search.toLowerCase();
+      /* ANY vendor on the PO, not just the header. A merged / mixed PO's header
+         reads "Mixed (N vendors)", so a header-only match could never find it
+         by the supplier the buyer is actually looking for. The line vendors
+         come from the list API's own delivered/outstanding tallies, which
+         between them name every line's filed vendor exactly once. */
+      list = list.filter(p => p.po_number.toLowerCase().includes(q)
+        || (p.vendor || '').toLowerCase().includes(q)
+        || [...vendorTally(p.delivered_vendors), ...vendorTally(p.outstanding_vendors)]
+             .some(v => v.vendor_name.toLowerCase().includes(q)));
+    }
+    return list;
+  }, [pos, tab, search]);
 
   // Derived from TAB_STATUSES so a badge can never count something the tab
-  // won't show (or miss something it will) — and from `searched`, so it cannot
-  // count something the search has hidden either.
+  // won't show (or miss something it will).
   const counts = useMemo(() => {
     const out: Record<string, number> = {};
     for (const [key, statuses] of Object.entries(TAB_STATUSES)) {
-      out[key] = searched.filter(p => statuses.includes(p.status)).length;
+      out[key] = pos.filter(p => statuses.includes(p.status)).length;
     }
     return out as { draft: number; pending: number; approved: number; received: number; rejected: number };
-  }, [searched]);
+  }, [pos]);
 
   const action = async (id: string, kind: 'submit' | 'approve' | 'reject' | 'cancel' | 'receive', body: any = {}) => {
     setSavingId(id);
@@ -480,7 +562,7 @@ export default function PurchaseOrdersPage() {
               scrollbar hidden. max-w-full keeps it inside the wrapping toolbar. */}
           <div className="flex gap-1 bg-[#FFF1E3] rounded-lg p-1 text-xs flex-nowrap overflow-x-auto max-w-full no-scrollbar">
             {([
-              ['all',      `All (${searched.length})`,                  'bg-[#af4408]'],
+              ['all',      `All (${pos.length})`,                       'bg-[#af4408]'],
               ['draft',    `Draft (${counts.draft})`,                   'bg-gray-600'],
               ['pending',  `Pending Approval (${counts.pending})`,      'bg-amber-500'],
               ['approved', `Approved (${counts.approved})`,             'bg-blue-600'],
@@ -495,50 +577,30 @@ export default function PurchaseOrdersPage() {
           </div>
           <div className="flex items-center gap-2 flex-1 min-w-[200px]">
             <Search className="w-4 h-4 text-[#8B7355]" />
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="PO number or vendor…"
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="PO number or any vendor on it…"
                    className="flex-1 px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
-            {/* Clearing the filter is ONE click. The badges now narrow with the
-                search, so a forgotten search box makes every tab read low — the
-                way out has to be visible next to the cause, not only in the
-                empty state. Rendered only when there is something to clear, so
-                the toolbar is unchanged when it is idle. */}
-            {search && (
-              <button onClick={() => setSearch('')} title="Clear search"
-                      className="shrink-0 px-2 py-1 text-xs rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3]">
-                Clear ✕
-              </button>
-            )}
           </div>
           <button onClick={fetchAll} className="text-xs text-[#6B5744] hover:text-[#af4408] flex items-center gap-1">
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} /> Refresh
           </button>
         </div>
 
+        {deepLinkMissing && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 text-xs text-amber-900 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>The PO this link points to is not in this list — it may belong to another outlet (switch outlet to see it) or no longer exist.</span>
+            <button onClick={() => setDeepLinkMissing(false)} className="ml-auto text-amber-800 hover:underline">Dismiss</button>
+          </div>
+        )}
+
         {/* List */}
         {loading ? (
           <div className="bg-white border border-[#E8D5C4] rounded-xl p-8 text-center text-[#8B7355] text-sm">Loading…</div>
         ) : filtered.length === 0 ? (
           <div className="bg-white border border-[#E8D5C4] rounded-xl p-8 text-center text-[#8B7355] text-sm">
-            {/* "✓ Nothing waiting for approval" is a CLAIM ABOUT THE QUEUE, not
-                about this view, so it may only be made when nothing is narrowing
-                the view. `counts` now follows the search (it has to, or the
-                badges lie), which means an unnoticed search box would otherwise
-                have this green tick assert the approval queue is clear while a
-                PO sat in it — silently reassuring, which is worse than visibly
-                empty. When a filter IS on, say which one, and offer the way out. */}
-            {search ? (
-              <>
-                No POs match “{search}”{tab !== 'all' ? ' in this tab' : ''}.{' '}
-                <button onClick={() => setSearch('')} className="text-[#af4408] underline hover:no-underline">
-                  Clear search
-                </button>
-                {' '}to see all {pos.length}.
-              </>
-            ) : tab === 'pending' && counts.pending === 0 ? (
-              '✓ Nothing waiting for approval.'
-            ) : (
-              'No POs in this view.'
-            )}
+            {tab === 'pending' && counts.pending === 0
+              ? '✓ Nothing waiting for approval.'
+              : 'No POs in this view.'}
           </div>
         ) : (
           <div className="bg-white border border-[#E8D5C4] rounded-xl shadow overflow-hidden">
@@ -594,7 +656,11 @@ export default function PurchaseOrdersPage() {
                        it is the same COUNT of purchase_order_items rows. */
                     const linesIn    = Number(p.received_line_count) || 0;
                     const linesTotal = Number(p.total_line_count) || Number(p.item_count) || 0;
-                    const owedVendors = vendorTally(p.outstanding_vendors);
+                    // A CLOSED vendor still has un-received lines, but it is not
+                    // "awaited" — it is not coming. Kept out of every "still to
+                    // deliver" phrase on this row (ruling #69).
+                    const closedKeys = new Set((closuresByPo[p.id] || []).map(c => vendorNameKey(c.vendor_name)));
+                    const owedVendors = vendorTally(p.outstanding_vendors).filter(v => !closedKeys.has(vendorNameKey(v.vendor_name)));
                     const inVendors   = vendorTally(p.delivered_vendors);
                     const partReceived = p.status === 'approved' && linesIn > 0;
                     /* The full picture on hover: who came, under which bill, and
@@ -604,20 +670,36 @@ export default function PurchaseOrdersPage() {
                       inVendors.length > 0 && `Delivered: ${inVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
                       (p.vendor_bills || []).length > 0 && `Bills: ${(p.vendor_bills || []).map(b => `${b.vendor_name || '?'} ${b.bill_no || '(no number)'}`).join(' · ')}`,
                       owedVendors.length > 0 && `Still to deliver: ${owedVendors.map(v => `${v.vendor_name} (${v.line_count} line${v.line_count === 1 ? '' : 's'})`).join(' · ')}`,
+                      (closuresByPo[p.id] || []).length > 0 && `Closed, not delivered: ${(closuresByPo[p.id] || []).map(c => `${c.vendor_name || 'vendor'}${c.reason ? ` (${c.reason})` : ''}`).join(' · ')}`,
                     ].filter(Boolean).join('\n') || undefined;
+                    /* VENDOR-LEVEL PROGRESS (ruling #63): "2 of 5 vendors
+                       delivered · 1 closed". Only on a PO with more than one
+                       vendor and only once it is approved — before that no
+                       vendor can have delivered, and a single-vendor PO
+                       already says it all with its status. */
+                    const vp = vendorProgressOf(p, closuresByPo[p.id]);
+                    const multiVendor = !!vp && vp.total > 1;
+                    const showVendorProgress = multiVendor && ['approved', 'received'].includes(p.status);
                     return (
                       // Key belongs on the FRAGMENT, not the inner <tr>: a row can
                       // render up to three siblings (row + detail + review), so a
                       // keyless <> makes React reconcile this list by index and
                       // remount everything below an approve/reject reorder.
                       <Fragment key={p.id}>
-                        <tr className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
+                        <tr id={`po-row-${p.id}`}
+                            className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 ${deepLinkId === p.id ? 'bg-[#FFF1E3]/60' : ''}`}>
                           <td className="py-2 px-3 text-xs font-mono">
                             <button onClick={() => setOpenDetailId(isOpen ? null : p.id)}
                                     className="inline-flex items-center gap-1 hover:text-[#af4408]">
                               <ChevronDown className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
                               {p.po_number}
                             </button>
+                            {isMergedPo(p) && (
+                              <span className="ml-1 inline-block px-1 py-px rounded border border-violet-200 bg-violet-50 text-violet-800 text-[9px] font-sans font-semibold align-middle"
+                                    title="Built by Merge into one PO from several requisitions — open it to see which departments each line is for">
+                                MERGED
+                              </span>
+                            )}
                           </td>
                           <td className="py-2 px-3 text-xs">{dateLabel(p.date)}</td>
                           {/* Expected delivery. NULL prints an em-dash — a PO
@@ -631,7 +713,16 @@ export default function PurchaseOrdersPage() {
                               </span>
                             ) : <span className="text-[#8B7355]">—</span>}
                           </td>
-                          <td className="py-2 px-3 text-xs">{p.vendor || <span className="text-[#8B7355]">—</span>}</td>
+                          <td className="py-2 px-3 text-xs">
+                            {p.vendor || <span className="text-[#8B7355]">—</span>}
+                            {/* A Mixed header names no vendor at all — list them,
+                                small, so the row says WHO the order is with. */}
+                            {multiVendor && (
+                              <div className="text-[10px] text-[#8B7355] max-w-[16rem] truncate" title={vp!.names.join(' · ')}>
+                                {vp!.names.join(' · ')}
+                              </div>
+                            )}
+                          </td>
                           <td className="py-2 px-3 text-xs text-right font-mono">{p.item_count ?? '-'}</td>
                           <td className="py-2 px-3 text-xs text-right font-mono font-semibold">{fmt(p.total_cost)}</td>
                           <td className="py-2 px-3 text-xs">
@@ -651,6 +742,13 @@ export default function PurchaseOrdersPage() {
                                     {' · '}{linesIn} of {linesTotal || '?'} lines in
                                     {owedVendors.length > 0 && <> · awaiting {owedVendors.map(v => v.vendor_name).join(' · ')}</>}
                                   </span>
+                                </span>
+                              )}
+                              {showVendorProgress && (
+                                <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${vp!.delivered + vp!.closed >= vp!.total ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-sky-50 text-sky-800 border border-sky-200'}`}
+                                      title={partTitle || `Still to deliver: ${owedVendors.map(v => v.vendor_name).join(' · ') || 'nobody'}`}>
+                                  {vp!.delivered} of {vp!.total} vendors delivered
+                                  {vp!.closed > 0 && <span className="font-normal"> · {vp!.closed} closed</span>}
                                 </span>
                               )}
                               {/* WHAT the re-approval is being asked for, beside
@@ -766,7 +864,8 @@ export default function PurchaseOrdersPage() {
                           <PODetail key={p.id + '-d'} po={p} editing={editingId === p.id}
                                     onCancelEdit={() => setEditingId(null)}
                                     materials={materials}
-                                    onSaved={() => { setEditingId(null); fetchAll(); }} />
+                                    onSaved={() => { setEditingId(null); fetchAll(); }}
+                                    onChanged={fetchAll} />
                         )}
                         {reviewId === p.id && (
                           /* The change-set rides the LIST ROW, so it is handed
@@ -906,6 +1005,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   /* Per-line "why does this differ from the PO" reason. (There is no longer a
      per-line rate LOCK — see the note above canEditRate.) */
   const [reasons, setReasons] = useState<Record<string, string>>({});
+  /* ONE reason for the whole vendor bill — owner ruling #78, "bottom fills
+     blanks". It covers every differing line left without a reason of its own;
+     a line's own reason always wins. Per bill, so it is cleared with the other
+     per-vendor fields (load() and the vendor tab switch). */
+  const [billReason, setBillReason] = useState('');
   /* RAW keystrokes for the rate box, per line. The committed rate lives in
      `overrides` as a NUMBER, but a controlled number input fed straight from it
      is untypeable: `<input type="number">` reports "" for a half-typed "900.",
@@ -1055,7 +1159,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     // Every per-line and per-bill entry belongs to ONE vendor's delivery — none
     // of it may carry over to the next vendor, so it is cleared with the reload.
     setReasons({}); setRateDraft({}); setExcluded({});
-    setBillNo(''); setChargesNote('');
+    setBillNo(''); setChargesNote(''); setBillReason('');
     /* THE STORE CHECKLIST IS PER BILL, so it is cleared with everything else.
        Carrying it across a vendor switch would sign vendor B's delivery with the
        ticks somebody gave for vendor A's — goods they never had in front of
@@ -1239,7 +1343,19 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   // Free text, trimmed, ≥ 3 chars — same floor the receive route enforces, so a
   // reason the server would reject can never look accepted here.
   const MIN_REASON = 3;
-  const missingReason = activeDeviations.filter(d => d.deviates && (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  /* ── "BOTTOM FILLS BLANKS" (owner ruling #78, 2026-10-28) ─────────────────
+     A reason on each differing line is OPTIONAL. `missingReason` is the
+     differing lines on this bill with no reason of their own (under the
+     floor); while there is at least one, the bill reason at the bottom is
+     REQUIRED and is filed on exactly those lines (the receive route copies
+     deviation_reason_all onto every line whose own reason is under 3
+     characters). A line's own reason always wins. No item-count threshold —
+     the same rule on a 2-line bill and a 40-line one. `reasonBlocked` is the
+     one gate the banner, the disabled Confirm and submit() all read. */
+  const differingLines = activeDeviations.filter(d => d.deviates);
+  const missingReason = differingLines.filter(d => (reasons[d.it.id] || '').trim().length < MIN_REASON);
+  const billReasonOk = billReason.trim().length >= MIN_REASON;
+  const reasonBlocked = missingReason.length > 0 && !billReasonOk;
   const missingList = (prefix: string) =>
     prefix + missingReason.map(d => `• ${d.it.material_name} — ${d.label}`).join('\n');
 
@@ -1529,8 +1645,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       alert('Tick at least one line to put on this bill.');
       return;
     }
-    if (missingReason.length > 0) {
-      alert(missingList('Add a reason for these lines before receiving:\n'));
+    if (reasonBlocked) {
+      alert(missingList('These lines differ from the PO and have no reason yet. Type one on each line, '
+        + 'or one "Reason for the differences on this bill" at the bottom — it fills every line left blank:\n'));
       return;
     }
     // The store-check gate on a deviating receipt — same belt-and-braces
@@ -1610,9 +1727,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           cess_rate: t?.cess_rate ?? 0,
         };
       });
-      const r = await api(`/api/purchase-orders/${poId}/receive`, {
-        method: 'POST',
-        body: {
+      const receiveBody: any = {
           received_at: receivedAt, item_overrides,
           // WHICH VENDOR is delivering. Only their outstanding lines are booked,
           // and the bill below is filed against them alone.
@@ -1652,9 +1767,24 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             // arrived, so it is recorded separately from received_at.
             bill_date: billDate,
           } : undefined,
-        },
-      });
-      const j = await r.json().catch(() => ({}));
+      };
+      /* THE BILL REASON (ruling #78) — sent only while it is filling a blank:
+         at least one differing line has no reason of its own. The route copies
+         it onto exactly those lines; a line's own reason is sent as its
+         deviation_reason above and always wins. When every differing line has
+         its own reason nothing is sent, so the payload is the one this screen
+         always posted. */
+      if (missingReason.length > 0 && billReasonOk) receiveBody.deviation_reason_all = billReason.trim();
+      let r = await api(`/api/purchase-orders/${poId}/receive`, { method: 'POST', body: receiveBody });
+      let j = await r.json().catch(() => ({}));
+      // RULING 71: the same vendor bill number already received on another PO or
+      // GRN. Same day = refused outright; another date = the server asks, and only
+      // an explicit yes re-posts with confirm_duplicate_bill (the ad-hoc GRN rule).
+      if (r.status === 409 && j.duplicate_bill && j.needs_confirmation
+          && window.confirm(`${j.error || 'This bill number was already received from this vendor.'}\n\nReceive it on this PO anyway?`)) {
+        r = await api(`/api/purchase-orders/${poId}/receive`, { method: 'POST', body: { ...receiveBody, confirm_duplicate_bill: true } });
+        j = await r.json().catch(() => ({}));
+      }
       if (!r.ok) {
         alert(j.error || 'Failed');
         // 409 = this delivery is already in (someone else received the PO, or
@@ -1737,7 +1867,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         alert(
           `${j.store_blocked.length} line(s) were NOT received:\n` +
           j.store_blocked.map((b: any) => `• ${b.material_name} — ${b.error}`).join('\n') +
-          '\n\nThese must be procured through Inventory → Liquor Store instead.'
+          '\n\nEnter their bill on Goods Receipt (GRN) → TGBCL Liquor Bill instead.'
         );
       }
       // Off-PO acknowledgement — show the receiver that the admin has been
@@ -1758,23 +1888,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           'quality check. The PO is recorded; the goods are not ours until it is signed off.'
         );
       }
-      /* ── WHAT HAPPENED TO THE VENDOR'S BILL ────────────────────────────────
-         Stated on EVERY receipt, success or failure, and never silently. Seeding
-         `notes` also means the "a clean receive stays silent" branch below can
-         never be reached without the bill being accounted for — which is the
-         whole point of the feature: there must never be a doubt about whether a
-         bill was handed over.
-
-         Second in the list, after the QC hold: a held delivery is a thing to do
-         while the driver is standing there, and this is a thing to read. A
-         FAILED record still lands here rather than in an alert() of its own,
-         because the receipt itself succeeded and an extra modal on a successful
-         receive trains a desk to dismiss modals. */
-      notes.push(
-        (bh.ok ? '' : '⚠ ') +
-          bh.message +
-          (bh.attachmentMessage ? ` ${bh.attachmentMessage}` : ''),
-      );
       /* ── THE SILENT CASE, MADE AUDIBLE ────────────────────────────────────
          GRN-2026-0018 came in through THIS route: SUGUNA FOODS, 90 kg chicken
          leg boneless and 30 kg whole bird, inwarded instantly. The gate was not
@@ -1982,7 +2095,8 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 about who may change a price is worse than no header at all. */}
             <p className="text-xs text-[#8B7355] mt-0.5">
               Adjust the qty if you got more / less. The rate starts at the PO rate and can be corrected
-              to what the vendor actually billed — any line that differs from the PO needs a reason, and the admin is
+              to what the vendor actually billed — any line that differs from the PO needs a reason: type it on the
+              line, or once for the whole bill at the bottom (it fills every line left blank), and the admin is
               notified with it. GST is worked out per line after discount and recorded on its own; it never enters the rate.
               Stock + recipe costs update on submit.
               {isMultiVendor && ' This PO spans several vendors — each is received separately, on their own bill.'}
@@ -2049,6 +2163,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     <button key={v.key} type="button" disabled={v.done}
                             onClick={() => {
                               setVendorKey(v.key); setBillNo('');
+                              // A bill-level statement, like the bill number:
+                              // vendor A's reason must never be filed on B's lines.
+                              setBillReason('');
                               setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
                               // Clears any picked bill photo with it — see the
                               // note on the same call inside load().
@@ -2174,7 +2291,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     const t = tax.byId.get(it.id);
                     // Only a line ON this bill can be off-PO — an excluded one
                     // is not being received at all, so it owes no explanation.
-                    const needsReason = included && deviates && reason.trim().length < MIN_REASON;
+                    // Ruling #78: the line's own reason is optional — a blank
+                    // one is filled by the bill reason at the bottom. It still
+                    // NEEDS one only while the bill reason is missing too.
+                    const ownBlank = included && deviates && reason.trim().length < MIN_REASON;
+                    const needsReason = ownBlank && !billReasonOk;
+                    const coveredByBill = ownBlank && billReasonOk;
                     return (
                       <Fragment key={it.id}>
                       <tr className={`border-t border-[#E8D5C4]/50 ${!included ? 'opacity-45' : deviates ? 'bg-amber-50/40' : ''}`}>
@@ -2269,7 +2391,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                 PO ₹{it.unit_price.toFixed(2)}{u && `/${u}`}
                                 {' · '}{priceDiff > 0 ? '+' : ''}₹{priceDiff.toFixed(2)}{u && `/${u}`}
                               </div>
-                              <div className="text-[9px] text-right text-amber-800">reason required · admin notified</div>
+                              <div className="text-[9px] text-right text-amber-800">reason needed (line or bill) · admin notified</div>
                             </>
                           )}
                           {/* Restores the PO rate — a half-typed change must not
@@ -2369,9 +2491,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         </td>
                       </tr>
                       {/* REASON — appears the moment a line stops matching the
-                          PO (short, excess, or a changed rate). Required: the
-                          receive route rejects a deviating line without one, and
-                          the admin alert quotes it. */}
+                          PO (short, excess, or a changed rate). OPTIONAL on the
+                          line (ruling #78): a blank one is filled by the bill
+                          reason at the bottom, and the receive route rejects a
+                          deviating line only when it has neither. The admin
+                          alert quotes whichever one the line carries. */}
                       {deviates && included && (
                         <tr className="bg-amber-50/40">
                           {/* colSpan matches the 10 columns above (6 goods + 4 tax). */}
@@ -2379,11 +2503,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                             <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
                               <span className={`text-[10px] shrink-0 ${needsReason ? 'text-amber-800 font-semibold' : 'text-[#6B5744]'}`}>
                                 <AlertTriangle className="w-3 h-3 inline mr-1 -mt-0.5" />
-                                {label}{needsReason ? ' — reason required' : ''}
+                                {label}
+                                {needsReason ? ' — needs a reason: here, or the bill reason below'
+                                  : coveredByBill ? ' — covered by the bill reason below' : ''}
                               </span>
                               <input value={reason}
                                      onChange={e => setReasons(r => ({ ...r, [it.id]: e.target.value }))}
-                                     placeholder="Why does this differ from the PO? e.g. vendor short-supplied; rate revised on bill #1234"
+                                     placeholder="Why does this line differ? optional — or use the bill reason below"
                                      className={`flex-1 min-w-0 px-2 py-1 border rounded text-[11px] bg-white ${needsReason ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
                             </div>
                           </td>
@@ -2601,9 +2727,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               all three ticks mandatory, Confirm stays disabled (qcBlocked) and
               the route refuses the payload anyway (400, field 'qc_store'). On
               a CLEAN receipt nothing disables Confirm — ticks stay optional
-              and an unticked receive files unsigned, exactly as before. The
-              typed per-line reason stays mandatory on every deviating line;
-              the tick is IN ADDITION to it, never instead of it. */}
+              and an unticked receive files unsigned, exactly as before. A
+              reason stays mandatory on every deviating line (its own, or the
+              bill reason that fills the blanks — ruling #78); the tick is IN
+              ADDITION to it, never instead of it. */}
           {!loading && stake && (
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
               <div className="text-xs font-semibold text-[#2D1B0E]">
@@ -2719,21 +2846,50 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
             </div>
           )}
 
-          {/* Names every line still blocking the receive, so the receiver never
-              has to hunt for which row the disabled button is waiting on. */}
-          {missingReason.length > 0 && (
-            <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+          {/* ── ONE REASON FOR THE WHOLE BILL (owner ruling #78) ────────────
+              Shown whenever a line on this bill differs from the PO. It FILLS
+              THE BLANKS: required only while a differing line has no reason of
+              its own, and then filed on exactly those lines (the receive route
+              copies deviation_reason_all onto them). A line's own reason always
+              wins. It also names every line still blocking the receive, so the
+              receiver never has to hunt for which row the disabled button is
+              waiting on. */}
+          {!loading && stake && differingLines.length > 0 && (
+            <div className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-[11px] ${
+              reasonBlocked ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-[#E8D5C4] bg-[#FFF8F0] text-[#2D1B0E]'}`}>
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-              <div>
-                <div className="font-semibold">
-                  {missingReason.length} line(s) differ from the PO and still need a reason (min {MIN_REASON} characters):
+              <div className="flex-1 min-w-0">
+                <label className="block">
+                  <span className="font-semibold">Reason for the differences on this bill</span>
+                  <span className="ml-1 text-[10px] font-normal">
+                    {missingReason.length > 0
+                      ? `— required: it fills the ${missingReason.length} line(s) left blank (min ${MIN_REASON} characters)`
+                      : '— not needed: every line that differs has its own reason'}
+                  </span>
+                  <textarea value={billReason} rows={2}
+                            onChange={e => setBillReason(e.target.value)}
+                            placeholder="e.g. vendor short-supplied this delivery; rates revised on the vendor's bill"
+                            className={`mt-1 w-full px-2 py-1 border rounded text-[11px] bg-white ${reasonBlocked ? 'border-amber-400' : 'border-[#E8D5C4]'}`} />
+                </label>
+                {missingReason.length > 0 ? (
+                  <>
+                    <div className="mt-1 font-semibold">
+                      {billReasonOk
+                        ? `This reason will be filed on the ${missingReason.length} line(s) left blank:`
+                        : `${missingReason.length} line(s) differ from the PO and still need a reason — type one on the line, or the bill reason above:`}
+                    </div>
+                    <ul className="mt-0.5 space-y-0.5">
+                      {missingReason.map(d => (
+                        <li key={d.it.id}>• <span className="font-medium">{d.it.material_name}</span> — {d.label}</li>
+                      ))}
+                    </ul>
+                  </>
+                ) : billReason.trim() ? (
+                  <div className="mt-1 text-[10px]">Every line that differs has its own reason, so this bill reason is not used.</div>
+                ) : null}
+                <div className="mt-1 text-[10px]">
+                  A line&apos;s own reason always wins on that line. The admin is alerted with the reason each line carries.
                 </div>
-                <ul className="mt-0.5 space-y-0.5">
-                  {missingReason.map(d => (
-                    <li key={d.it.id}>• <span className="font-medium">{d.it.material_name}</span> — {d.label}</li>
-                  ))}
-                </ul>
-                <div className="mt-1 text-[10px]">The admin is alerted with the reason you give.</div>
               </div>
             </div>
           )}
@@ -2758,10 +2914,10 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           </button>
           <button onClick={submit}
                   disabled={saving || loading || !stake || activeDeviations.length === 0
-                            || missingReason.length > 0 || qcBlocked || chargeBlockers.length > 0}
+                            || reasonBlocked || qcBlocked || chargeBlockers.length > 0}
                   title={!stake ? 'Pick which vendor is delivering'
                        : activeDeviations.length === 0 ? 'Tick at least one line to put on this bill'
-                       : missingReason.length > 0 ? missingList('Reason still needed on:\n')
+                       : reasonBlocked ? missingList('A reason is still needed on these lines — type one on each line, or one bill reason at the bottom that fills every line left blank:\n')
                        : qcBlocked ? 'This delivery differs from the PO — tick all three store checks to receive it'
                        : chargeBlockers.length > 0 ? chargeBlockers.join('\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
@@ -3031,17 +3187,34 @@ function ReapprovalChangesPanel({ rc, approvalNote }: { rc: PoReapprovalChanges;
   );
 }
 
-function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
+function PODetail({ po, editing, materials, onCancelEdit, onSaved, onChanged }: {
   po: PO; editing: boolean; materials: Material[]; onCancelEdit: () => void; onSaved: () => void;
+  /** A vendor was closed here — the list row's status/progress must refresh. */
+  onChanged?: () => void;
 }) {
   const [items, setItems] = useState<POItem[]>([]);
   const [loading, setLoading] = useState(true);
+  /* The per-vendor extras (rulings #63-#70): the requisition lines behind each
+     PO line, vendor closures, the "Send PO to vendor" switch and whether this
+     viewer may close a vendor. null = not loaded / failed, in which case the
+     table renders exactly as it did before these existed. */
+  const [view, setView] = useState<PoVendorViewPayload | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [closingGroup, setClosingGroup] = useState<PoVendorGroup<POItem> | null>(null);
 
   useEffect(() => {
-    fetch(`/api/purchase-orders?id=${po.id}`).then(r => r.json()).then(d => {
-      setItems(d.purchase_order?.items || []); setLoading(false);
-    });
-  }, [po.id]);
+    let live = true;
+    Promise.all([
+      fetch(`/api/purchase-orders?id=${po.id}`).then(r => r.json()),
+      fetch(`/api/purchase-orders/vendor-view?id=${po.id}`)
+        .then(r => (r.ok ? r.json() : null)).catch(() => null),
+    ]).then(([d, v]) => {
+      if (!live) return;
+      setItems(d?.purchase_order?.items || []);
+      setView(v && typeof v === 'object' && v.links_by_item ? v as PoVendorViewPayload : null);
+    }).catch(() => {}).finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [po.id, reloadKey]);
 
   if (loading) {
     return <tr><td colSpan={8} className="py-3 px-3 text-xs text-[#8B7355] bg-[#FFF8F0]">Loading items…</td></tr>;
@@ -3120,11 +3293,88 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   const rc = reapprovalOf(po);
   const editedIds = rc?.recorded ? new Set(rc.changed_material_ids) : null;
   const addedIds  = rc?.recorded ? new Set(rc.added.map(a => a.material_id)) : null;
+
+  /* ── VENDOR BY VENDOR (rulings #63, #66, #69, #70) ─────────────────────────
+     The receive route's own split (src/lib/po-vendor-view.ts), so a vendor this
+     table calls delivered is one receiving agrees has nothing left to bring.
+     Grouped only when there is more than one vendor or the PO came from the
+     merge; a single-vendor PO keeps the flat table it always had. */
+  const groups = groupPoLinesByVendor(items, po);
+  const grouped = groups.length > 1 || isMergedPo(po);
+  const colCount = anyReceived ? 11 : 7;
+  const sendOn = !!view?.send_to_vendor;
+  const vendorCopyHref = (g: PoVendorGroup<POItem>) => `/purchase-orders/${po.id}/print?vendor=${encodeURIComponent(g.param)}`;
+  const vendorPdfHref  = (g: PoVendorGroup<POItem>) => `/api/purchase-orders/${po.id}/vendor-pdf?vendor=${encodeURIComponent(g.param)}`;
+  // Per-vendor copies are for an order that can still be supplied against.
+  const showVendorCopies = sendOn && po.status === 'approved';
+  const closureOf = (g: PoVendorGroup<POItem>) =>
+    closureForGroup(view?.closures, g);
+  const owedLinesOf = (g: PoVendorGroup<POItem>) => g.lines.filter(it => (it as any).received_line_total == null);
+  /* Close this vendor: store manager or admin (server re-checks), an APPROVED
+     PO that is merged or carries several vendors, a vendor with lines still
+     owed and not already closed. A legacy line with no vendor-master id cannot
+     be named to the close route, so it is offered greyed with the reason. */
+  const closeState = (g: PoVendorGroup<POItem>): { show: boolean; ok: boolean; why?: string } => {
+    if (!view?.can_close_vendor || po.status !== 'approved' || !grouped) return { show: false, ok: false };
+    if (closureOf(g) || owedLinesOf(g).length === 0) return { show: false, ok: false };
+    if (!g.vendor_id) return { show: true, ok: false, why: 'This vendor is not in the vendor master, so it cannot be closed from here.' };
+    return { show: true, ok: true };
+  };
+
+  /* The requisition lines behind one PO line, with whether each department's
+     share has arrived — VALUE-based (a voided bill or a receipt still held for
+     QC counts as nothing yet), covering the departments in the order they asked. */
+  const renderLinks = (it: POItem, u: string) => {
+    const links: PoReqLink[] = view?.links_by_item?.[it.id] || [];
+    if (links.length === 0) return null;
+    const lineIn = (it as any).received_line_total != null;
+    const held = isHeldLine(it);
+    const arrivals = linkArrivals(links, {
+      acceptedQty: lineIn && !held ? Number((it as any).quantity_accepted ?? (it as any).quantity_received ?? 0) : null,
+      held,
+    });
+    const linked = links.reduce((s, l) => s + (l.qty_purchase != null ? Number(l.qty_purchase) : 0), 0);
+    const allQty = links.every(l => l.qty_purchase != null);
+    const topUp = allQty ? Number(it.quantity) - linked : 0;
+    return (
+      <div className="mt-0.5 space-y-px">
+        {links.map(l => {
+          const a = arrivals.get(l.id);
+          const asked = l.qty_line != null && l.line_unit && l.line_unit.trim().toLowerCase() !== u.trim().toLowerCase()
+            ? ` (asked ${qfmt(l.qty_line)} ${l.line_unit})` : '';
+          const state = !a ? null
+            : a.state === 'arrived' ? <span className="text-emerald-700">arrived</span>
+            : a.state === 'part' ? <span className="text-amber-700">part arrived — {qfmt(a.covered)} of {qfmt(Number(l.qty_purchase))} {u}</span>
+            : a.state === 'none' ? (lineIn ? <span className="text-red-700">not covered — accepted qty ran short</span> : null)
+            : a.state === 'held' ? <span className="text-blue-800">in, held for QC</span>
+            : a.state === 'direct' ? <span className="text-violet-800">delivered direct (Direct Issue rule) — not issued from central</span>
+            : a.state === 'closed' ? <span className="text-red-700">vendor closed — not delivered</span>
+            : null;
+          return (
+            <div key={l.id} className="text-[10px] text-[#6B5744] leading-tight">
+              <span className="font-medium">{l.department_name || '(no department)'}</span>
+              {l.is_party && <span className="text-[#8B7355]"> · party{l.event_name ? `: ${l.event_name}` : ''}</span>}
+              {l.qty_purchase != null && <span className="font-mono"> · {qfmt(l.qty_purchase)} {u}</span>}
+              {asked && <span className={HINT_CLS}>{asked}</span>}
+              {l.req_number && <span className="font-mono text-[#8B7355]"> · {l.req_number}</span>}
+              {state && <> · {state}</>}
+            </div>
+          );
+        })}
+        {topUp > QTY_EPS && (
+          <div className="text-[10px] text-[#8B7355] leading-tight">+ {qfmt(topUp)} {u} store top-up (no requisition)</div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
       {rc && <ReapprovalChangesPanel rc={rc} approvalNote={po.approval_note} />}
-      <div className="flex items-start gap-6">
-        <div className="text-xs text-[#6B5744] space-y-1">
+      {/* Details on ONE compact strip above the lines (owner, 2026-10-28): side by
+          side they took half the width and pushed the line table into a scroll. */}
+      <div className="flex flex-col gap-2">
+        <div className="text-xs text-[#6B5744] flex flex-wrap items-baseline gap-x-5 gap-y-1 pb-2 border-b border-[#E8D5C4]">
           {/* The two dates that bracket the order, side by side: when we raised
               it, and when the vendor said it would land. An overdue promise is
               called out here too — the detail panel is where a buyer chasing a
@@ -3139,18 +3389,19 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               </span>
             ) : <span className="text-[#8B7355]">—</span>}
           </div>
-          {po.notes && <div><span className="font-semibold">Notes:</span> {po.notes}</div>}
           {po.submitted_at && <div><span className="font-semibold">Submitted:</span> {dateLabel(po.submitted_at)}</div>}
           {po.approved_at  && <div><span className="font-semibold">Approved:</span>  {dateLabel(po.approved_at)} by {po.approved_by}</div>}
           {po.received_at  && <div><span className="font-semibold">Received:</span>  {dateLabel(po.received_at)}</div>}
-          {po.rejected_reason && <div className="text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
+          {po.rejected_reason && <div className="basis-full text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
+          {/* Notes on their own full-width line, at most two lines; the whole text on hover. */}
+          {po.notes && <div className="basis-full line-clamp-2" title={po.notes}><span className="font-semibold">Notes:</span> {po.notes}</div>}
           {/* WHY THE RECEIVED COLUMN LOOKS THE WAY IT DOES, NAMED ONCE at the
               top rather than only inferred from chips down the table — a
               storekeeper who reads "Received 0" concludes the delivery failed.
               Blue, not amber or red, matching /grn: the desk did nothing wrong;
               the receipt is waiting on somebody else. */}
           {heldLines.length > 0 && (
-            <div className="text-blue-800 max-w-[22rem]">
+            <div className="basis-full text-blue-800">
               <Clock className="w-3 h-3 inline-block align-[-2px] mr-1" />
               <span className="font-semibold">{heldGrns.join(', ') || 'This receipt'}</span>{' '}
               {heldLines.length === 1 ? 'has 1 line' : `has ${heldLines.length} lines`} held for a quality check —
@@ -3158,8 +3409,31 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               the accepted quantity is not decided yet.
             </div>
           )}
+          {/* Single-vendor PO: the vendor copy lives here (a grouped PO
+              carries it on each vendor's own row in the table). */}
+          {showVendorCopies && !grouped && groups.map(g => (
+            <div key={g.key} className="pt-1">
+              <span className="font-semibold">Vendor copy:</span>{' '}
+              <a href={vendorCopyHref(g)} target="_blank" rel="noreferrer" className="text-[#af4408] hover:underline inline-flex items-center gap-0.5">
+                <Printer className="w-3 h-3" /> Print
+              </a>{' · '}
+              <a href={vendorPdfHref(g)} className="text-[#af4408] hover:underline">Download PDF</a>
+            </div>
+          ))}
+          {grouped && (view?.closures || []).length > 0 && (
+            <div className="basis-full text-red-800">
+              {(view?.closures || []).map(c => (
+                <div key={c.vendor_id + c.closed_at}>
+                  <span className="font-semibold">{c.vendor_name || 'A vendor'} closed</span>
+                  {c.closed_at && <> on {dateLabel(sqlUtcStamp(c.closed_at))}</>}
+                  {c.closed_by && <> by {c.closed_by}</>}
+                  {c.reason && <> — {c.reason}</>}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
-        <div className="flex-1 min-w-0 overflow-x-auto">
+        <div className="min-w-0 overflow-x-auto">
         <table className="text-xs w-full min-w-[640px]">
           <thead className="text-[#8B7355]">
             <tr>
@@ -3181,7 +3455,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
             </tr>
           </thead>
           <tbody>
-            {items.map(it => {
+            {(() => { const renderRow = (it: POItem) => {
               // received_* fields come from /api/purchase-orders when grn_id is set
               // (server folds the linked GRN items into the response). See the
               // PO API GET handler for the join logic.
@@ -3259,6 +3533,8 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                         {lineAdded ? 'new' : 'changed'}
                       </span>
                     )}
+                    {/* Which departments (and requisitions) this line is for. */}
+                    {renderLinks(it, u)}
                     {anyReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
                         {/* quantity_rejected is a GRN qty = PURCHASE units, and
@@ -3269,7 +3545,15 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                       </div>
                     )}
                   </td>
-                  <td className="py-1 px-2 text-[#6B5744]">{(it as any).vendor || <span className="text-[#8B7355] italic">—</span>}</td>
+                  {/* A line with no vendor of its own is FILED under the PO
+                      header (that is whose bill receives it) — say that rather
+                      than print a dash that reads as "no vendor". */}
+                  <td className="py-1 px-2 text-[#6B5744]">
+                    {(it as any).vendor
+                      || (String(po.vendor || '').trim()
+                        ? <span className="italic" title="This line names no vendor of its own; it is received under the PO's vendor">{po.vendor}</span>
+                        : <span className="text-[#8B7355] italic">—</span>)}
+                  </td>
                   <td className="py-1 px-2 text-right font-mono">
                     {it.quantity.toLocaleString('en-IN')}
                     {ordHint && <div className={HINT_CLS}>{ordHint}</div>}
@@ -3339,7 +3623,80 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                   </>}
                 </tr>
               );
-            })}
+            };
+            if (!grouped) return items.map(renderRow);
+            /* One block per vendor: a header row saying where that vendor
+               stands (and its actions), its lines, then its subtotal — the
+               owner's "screen grouped by vendor + subtotals" (ruling #66). */
+            return groups.map(g => {
+              const owed = owedLinesOf(g);
+              const closure = closureOf(g);
+              // Where this vendor stands — vendorGroupState() in @/lib/po-vendor-view,
+              // the same reading the internal print sheet makes.
+              const st = vendorGroupState(g, closure, isReceiptHeldForQc);
+              const inCount = st.in_count;
+              const grns = st.grns;
+              const recSub = r2(g.lines.reduce((s, it) => s + Number((it as any).received_line_total || 0), 0));
+              const cs = closeState(g);
+              const status = st.state === 'delivered'
+                ? { tone: 'bg-green-100 text-green-800', text: `Delivered${grns.length ? ` — ${grns.join(', ')}` : ''}${st.held ? ' (part held for QC)' : ''}` }
+                : st.state === 'closed'
+                  ? { tone: 'bg-red-100 text-red-800', text: `Closed — ${owed.length} line${owed.length === 1 ? '' : 's'} not delivered${inCount ? ` (${inCount} in${grns.length ? `: ${grns.join(', ')}` : ''})` : ''}` }
+                  : st.state === 'part'
+                    ? { tone: 'bg-amber-100 text-amber-800', text: `Part delivered — ${inCount} of ${g.lines.length} lines in${grns.length ? ` (${grns.join(', ')})` : ''}` }
+                    : { tone: 'bg-sky-100 text-sky-800', text:
+                        po.status === 'approved' ? 'Awaiting delivery'
+                        : po.status === 'pending_reapproval' ? 'Awaiting re-approval'
+                        : ['received', 'cancelled', 'rejected'].includes(po.status) ? 'Not received'
+                        : 'Not ordered yet — PO not approved' };
+              return (
+                <Fragment key={'vg-' + g.key}>
+                  <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF1E3]/70">
+                    <td colSpan={colCount} className="py-1.5 px-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Truck className="w-3.5 h-3.5 text-[#af4408]" />
+                        <span className="font-semibold text-[#2D1B0E]">{g.vendor_name}</span>
+                        <span className="text-[10px] text-[#8B7355]">{g.lines.length} line{g.lines.length === 1 ? '' : 's'} · ordered {fmt(g.ordered_total)}</span>
+                        <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold ${status.tone}`}
+                              title={closure ? `Closed${closure.closed_by ? ` by ${closure.closed_by}` : ''}${closure.reason ? `: ${closure.reason}` : ''}` : undefined}>
+                          {status.text}
+                        </span>
+                        <span className="ml-auto inline-flex items-center gap-2">
+                          {showVendorCopies && (
+                            <>
+                              <a href={vendorCopyHref(g)} target="_blank" rel="noreferrer"
+                                 className="text-[10px] text-[#af4408] hover:underline inline-flex items-center gap-0.5"
+                                 title={`Only ${g.vendor_name}'s lines, with rates — safe to give this vendor`}>
+                                <Printer className="w-3 h-3" /> Vendor copy
+                              </a>
+                              <a href={vendorPdfHref(g)} className="text-[10px] text-[#af4408] hover:underline">PDF</a>
+                            </>
+                          )}
+                          {cs.show && (
+                            <button type="button" disabled={!cs.ok} title={cs.why || `Close ${g.vendor_name}: its ${owed.length} undelivered line${owed.length === 1 ? '' : 's'} will read "not delivered" and the rest of the PO can complete`}
+                                    onClick={() => setClosingGroup(g)}
+                                    className="px-2 py-0.5 rounded text-[10px] bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed">
+                              Close this vendor
+                            </button>
+                          )}
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                  {g.lines.map(renderRow)}
+                  <tr className="bg-white/60 text-[10px] font-semibold text-[#6B5744]">
+                    <td colSpan={6} className="py-1 px-2 text-right">Subtotal — {g.vendor_name}</td>
+                    <td className="py-1 px-2 text-right font-mono">{fmt(g.ordered_total)}</td>
+                    {anyReceived && <>
+                      <td colSpan={2}></td>
+                      <td className="py-1 px-2 text-right font-mono bg-emerald-50/40">{inCount > 0 ? fmt(recSub) : '—'}</td>
+                      <td></td>
+                    </>}
+                  </tr>
+                </Fragment>
+              );
+            });
+          })()}
           </tbody>
           {anyReceived && (
             <tfoot>
@@ -3396,10 +3753,119 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               </tr>
             </tfoot>
           )}
+          {/* A grouped PO's vendor subtotals need the figure they add up to. */}
+          {!anyReceived && grouped && (
+            <tfoot>
+              <tr className="border-t border-[#E8D5C4] font-semibold bg-white/60">
+                <td colSpan={6} className="py-1.5 px-2 text-right">Total ordered — {groups.length} vendor{groups.length === 1 ? '' : 's'}</td>
+                <td className="py-1.5 px-2 text-right font-mono">{fmt(items.reduce((s, it) => s + Number(it.total_price || 0), 0))}</td>
+              </tr>
+            </tfoot>
+          )}
         </table>
         </div>
       </div>
+      {closingGroup && typeof document !== 'undefined' && createPortal(
+        <CloseVendorModal po={po} group={closingGroup}
+                          owed={owedLinesOf(closingGroup)}
+                          links={view?.links_by_item || {}}
+                          onClose={() => setClosingGroup(null)}
+                          onClosed={() => { setClosingGroup(null); setReloadKey(k => k + 1); onChanged?.(); }} />,
+        document.body,
+      )}
     </td></tr>
+  );
+}
+
+/* ============================================================ */
+/* Close one vendor on an approved merged / multi-vendor PO     */
+/* ============================================================ */
+/**
+ * Ruling #69: store manager or admin may short-close ONE vendor, with a reason,
+ * so the rest of the PO can complete. POST /api/purchase-orders/<id>/close-vendor
+ * { vendor_id, reason } does the work and re-checks every rule server-side;
+ * this only shows what will happen first — which lines read "not delivered" and
+ * which departments were waiting on them — and requires the reason.
+ */
+function CloseVendorModal({ po, group, owed, links, onClose, onClosed }: {
+  po: PO; group: PoVendorGroup<POItem>; owed: POItem[];
+  links: Record<string, PoReqLink[]>;
+  onClose: () => void; onClosed: () => void;
+}) {
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const depts = [...new Set(owed.flatMap(it => (links[it.id] || []).map(l => l.department_name || '(no department)')))];
+  // 3 = the close-vendor route's own minimum; the UI must not refuse a reason
+  // the server would accept, nor the reverse.
+  const ok = reason.trim().length >= 3 && !!group.vendor_id && !busy;
+  const submit = async () => {
+    if (!ok) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await api(`/api/purchase-orders/${po.id}/close-vendor`, {
+        method: 'POST', body: { vendor_id: group.vendor_id, reason: reason.trim() },
+      });
+      const j = await r.json().catch(() => ({} as any));
+      if (!r.ok) { setErr(j.error || `Could not close the vendor (${r.status})`); return; }
+      onClosed();
+    } catch (e: any) {
+      setErr(e?.message || 'Could not close the vendor');
+    } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg my-8 shadow-xl">
+        <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+          <div>
+            <h2 className="font-bold text-[#2D1B0E]">Close {group.vendor_name} on {po.po_number}</h2>
+            <p className="text-xs text-[#8B7355] mt-0.5">
+              Use this when this vendor will not deliver the rest. The other vendors on the PO are not touched.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-[#8B7355]" aria-label="Close">✕</button>
+        </div>
+        <div className="p-5 space-y-3 text-xs">
+          <div>
+            <div className="font-semibold text-[#2D1B0E] mb-1">
+              {owed.length} line{owed.length === 1 ? '' : 's'} will be marked <span className="text-red-700">not delivered</span>:
+            </div>
+            <ul className="space-y-0.5 max-h-48 overflow-y-auto">
+              {owed.map(it => {
+                const u = (it as any).material_purchase_unit || it.material_unit || '';
+                return (
+                  <li key={it.id} className="flex justify-between gap-3">
+                    <span>{it.material_name}</span>
+                    <span className="font-mono">{qfmt(it.quantity)} {u} · {fmt(it.total_price)}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+          {depts.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-2 text-amber-900">
+              Departments waiting on these lines: <b>{depts.join(', ')}</b>. Their requisition lines stay open,
+              marked &ldquo;vendor closed — not delivered&rdquo;; the store can still issue them from stock as usual.
+            </div>
+          )}
+          <label className="block text-[#6B5744]">
+            Reason <span className="text-red-600">*</span>
+            <textarea value={reason} onChange={e => setReason(e.target.value)} rows={3}
+                      placeholder="e.g. Vendor out of stock this week — buying locally instead"
+                      className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            <span className="text-[10px] text-[#8B7355]">At least 3 characters. Recorded with your name.</span>
+          </label>
+          {err && <div className="bg-red-50 border border-red-200 rounded-lg p-2 text-red-700">{err}</div>}
+        </div>
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex justify-end gap-2">
+          <button onClick={onClose} disabled={busy} className="px-3 py-2 text-sm text-[#6B5744]">Cancel</button>
+          <button onClick={submit} disabled={!ok}
+                  className="px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
+            {busy && <Loader2 className="w-4 h-4 animate-spin" />} Close this vendor
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3488,7 +3954,7 @@ function ContractFlag({ materialId, vendorId, unitPrice, onMatch }: {
   );
 }
 
-function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor, onBlockedPick }: {
+function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor, onBlockedPick, isLockedOut, onLockedPick }: {
   materialId: string;
   currentVendor: string;
   onPick: (v: EligibleVendor) => void;
@@ -3500,6 +3966,17 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
    *  map) — it is just not selectable. */
   isMappedVendor?: (v: EligibleVendor) => boolean;
   onBlockedPick?: (v: EligibleVendor) => void;
+  /** VENDOR LOCK (ruling 108, New PO only): while the header's "Use <vendor>
+   *  for every line" tick is on, the line's vendor is not the buyer's to change
+   *  from here — a chip click used to rewrite it, which would silently undo the
+   *  lock. Chips for any OTHER vendor stay visible (their past rates are still
+   *  worth seeing) but greyed, and a click explains instead of switching.
+   *  Omitted everywhere else, so those screens behave exactly as before.
+   *  `unmapped` tells the explanation whether unticking is ENOUGH: a chip that
+   *  is locked out AND not mapped to the item stays blocked after unticking,
+   *  so its text has to name both steps or it promises something untrue. */
+  isLockedOut?: (v: EligibleVendor) => boolean;
+  onLockedPick?: (v: EligibleVendor, unmapped: boolean) => void;
 }) {
   const [list, setList] = useState<EligibleVendor[]>([]);
   const [loading, setLoading] = useState(false);
@@ -3526,13 +4003,24 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
         // > 0, not != null: a ₹0 contract row means no rate was agreed, so it must
         // not show as a contract chip nor be picked as the line rate.
         const hasContract = Number(v.contract_price) > 0;
-        const blocked = !!isMappedVendor && !isMappedVendor(v);
+        // Two separate facts. The lock decides which click handler runs (a
+        // locked-out chip never reaches onPick or onBlockedPick), but the mapping
+        // is worked out on its own so a chip that is BOTH locked out and not
+        // mapped says both steps: unticking alone leaves it blocked as NOT MAPPED.
+        const lockedOut = !!isLockedOut && isLockedOut(v);
+        const unmapped = !!isMappedVendor && !isMappedVendor(v);
+        const blocked = !lockedOut && unmapped;
         return (
           <button
             key={v.vendor}
             type="button"
-            onClick={() => (blocked ? onBlockedPick?.(v) : onPick(v))}
+            onClick={() => (lockedOut ? onLockedPick?.(v, unmapped) : blocked ? onBlockedPick?.(v) : onPick(v))}
             title={[
+              lockedOut
+                ? (unmapped
+                    ? 'LOCKED and NOT MAPPED to this item — to pick this vendor for this line, untick the box under the header Vendor AND map the pair on Vendor Items'
+                    : 'LOCKED — every line uses the header vendor; untick the box under it to pick this vendor for this line')
+                : null,
               blocked ? 'NOT MAPPED to this item — map the pair on Vendor Items before ordering' : null,
               `${v.purchase_count} purchase${v.purchase_count > 1 ? 's' : ''}`,
               v.last_date ? `last ${v.last_date}` : null,
@@ -3543,7 +4031,7 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
               v.lead_time_days ? `${v.lead_time_days}d lead` : null,
             ].filter(Boolean).join(' · ')}
             className={`text-[10px] px-1.5 py-0.5 rounded border transition ${
-              blocked
+              blocked || lockedOut
                 ? 'bg-[#F7F1E9] text-[#A08B76] border-dashed border-[#D4B896] cursor-not-allowed'
                 : active
                   ? 'bg-[#af4408] text-white border-[#af4408]'
@@ -3552,7 +4040,7 @@ function EligibleVendorChips({ materialId, currentVendor, onPick, isMappedVendor
                     : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:border-[#af4408] hover:bg-[#FFF1E3]'
             }`}
           >
-            {blocked && <span className="mr-0.5">🔒</span>}
+            {(blocked || lockedOut) && <span className="mr-0.5">🔒</span>}
             {v.vendor}
             {hasContract ? (
               <span className={`ml-1 font-mono font-semibold ${active ? 'text-white' : 'text-emerald-700'}`}>
@@ -3729,7 +4217,9 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' },
   ]);
   const [saving, setSaving] = useState(false);
-  // STRICT MAPPING. The header vendor is a convenience that seeds every line;
+  // STRICT MAPPING. The header vendor is a convenience — with the "same vendor
+  // on every line" tick (below) it is WRITTEN onto every line, without it a
+  // line only narrows to it and takes it once an item is picked; either way
   // the rule is enforced per LINE, in both directions, off `vm` below.
   // `showAllMaterials` no longer bypasses anything — it reveals the items that
   // are NOT mapped to the line's vendor, greyed, each with a one-click "+ map"
@@ -3737,6 +4227,15 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   // without mapping it is not possible: the save would be refused anyway.
   const [primaryVendorId, setPrimaryVendorId] = useState<string>('');
   const [primaryVendorName, setPrimaryVendorName] = useState<string>('');
+  /* RULING 108 — "Use <vendor> for every line". Most POs here are one supplier,
+     and picking that supplier again on every line was the slowest part of
+     entering one. While this is on, the header vendor is WRITTEN onto every
+     line (vendor_id + vendor — the values that are saved, not just shown), each
+     line's Vendor box is locked, and lines added later arrive already set. It
+     turns on by itself whenever a header vendor is picked; unticking hands each
+     line back to per-line editing with the vendor it has now. Only meaningful
+     with a header vendor, so clearing the header turns it off. */
+  const [sameVendorAll, setSameVendorAll] = useState(false);
   const [showAllMaterials, setShowAllMaterials] = useState(false);
   const [vendorLoadError, setVendorLoadError] = useState('');
   const [mapBusy, setMapBusy] = useState(false);
@@ -3768,6 +4267,48 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   }, [primaryVendorId, vendors]);
 
   const headerItemCount = primaryVendorId ? vm.itemCount(primaryVendorId) : 0;
+
+  /* The lock is ON only while the tick is on AND the header vendor resolves to
+     a master row — a lock with nothing to lock to must never leave the lines
+     un-editable. */
+  const headerVendor = useMemo(() => vendors.find(v => v.id === primaryVendorId), [vendors, primaryVendorId]);
+  const vendorLocked = sameVendorAll && !!headerVendor;
+
+  /** Put one vendor on EVERY line, the values the save carries. Only the vendor
+   *  moves: the material, qty and rate stay exactly as typed, so a line whose
+   *  item is not mapped to this vendor shows the pair conflict below (map it,
+   *  untick, or remove the line) instead of being silently cleared. */
+  const setEveryLineVendor = (v: { id: string; name: string }) =>
+    setItems(prev => prev.map(it =>
+      it.vendor_id === v.id && it.vendor === v.name ? it : { ...it, vendor_id: v.id, vendor: v.name }));
+
+  /** Header vendor changed. Picking one turns the lock on and moves every line
+   *  to it (ruling 108: "ticked automatically whenever a header vendor is
+   *  picked" — so switching suppliers mid-entry carries the lines across).
+   *  Clearing it turns the lock off and leaves each line as it is, editable. */
+  const pickHeaderVendor = (id: string) => {
+    setPrimaryVendorId(id);
+    const v = id ? vendors.find(x => x.id === id) : undefined;
+    if (!v) { setSameVendorAll(false); return; }
+    setSameVendorAll(true);
+    setEveryLineVendor(v);
+  };
+
+  /** The tick itself. On → every line takes the header vendor now; off → no
+   *  line changes, they just become editable per line again. */
+  const toggleSameVendorAll = (on: boolean) => {
+    setSameVendorAll(on);
+    if (on && headerVendor) setEveryLineVendor(headerVendor);
+  };
+
+  /** Chips come from purchase HISTORY, which can name a vendor the master no
+   *  longer resolves by id. Re-resolve by name so the dropdown can actually show
+   *  the pick instead of falling back to the legacy option. ONE resolution for
+   *  both the chip pick and the lock check, so they can never disagree about
+   *  which vendor a chip is. */
+  const resolveChipVendor = (v: EligibleVendor) =>
+    vendors.find(x => x.id === v.vendor_id)
+    || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
 
   /** The two lists a line's item picker gets, resolved for the vendor that line
    *  will actually be saved against (its own vendor, else the header vendor).
@@ -3816,7 +4357,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
     } finally { setMapBusy(false); }
   }, [vm]);
 
-  const addLine = () => setItems(prev => [...prev, { uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0, vendor: '', vendor_id: '' }]);
+  // Both Add line buttons (desktop top, full-width bottom) come through here, so
+  // a line added while the vendor is locked arrives already carrying it.
+  const addLine = () => setItems(prev => [...prev, {
+    uid: newLineUid(), material_id: '', quantity: 1, unit_price: 0,
+    vendor:    vendorLocked && headerVendor ? headerVendor.name : '',
+    vendor_id: vendorLocked && headerVendor ? headerVendor.id   : '',
+  }]);
   /* material_id → the 1-based line it already sits on. Feeds the picker so a
      material that is already on this PO can't be added twice (one material =
      one line: a duplicate double-orders and, on receive, bumps stock twice). */
@@ -3952,7 +4499,13 @@ function CreatePOModal({ materials, onClose, onCreated }: {
         // here first so the buyer is not told after a round trip.
         const bad = mappingProblem(i + 1, vm, it.vendor_id, it.vendor.trim(), it.material_id,
                                    mat ? `${mat.name}${mat.sku ? ` (${mat.sku})` : ''}` : it.material_id);
-        if (bad) problems.push(bad);
+        // mappingProblem's "pick a vendor that supplies it" points at the line's
+        // Vendor box, which the header tick has locked — so name the way to
+        // unlock it. Only once the mapping has loaded: the not-loaded message is
+        // about reloading, not about the vendor.
+        if (bad) problems.push(vendorLocked && vm.ready
+          ? `${bad} This line's vendor is locked by the "Use ${it.vendor.trim()} for every line" tick under the header Vendor — untick it first to pick another vendor for this line.`
+          : bad);
       }
     });
     if (problems.length) {
@@ -4003,29 +4556,56 @@ function CreatePOModal({ materials, onClose, onCreated }: {
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
-          {/* Header vendor is OPTIONAL: it seeds the line vendors and narrows the
-              material list to that vendor's mapped items. A PO that spans several
-              vendors just leaves it blank and sets the vendor per line. */}
+          {/* Header vendor is OPTIONAL: it narrows the material list to that
+              vendor's mapped items and, with the tick under it (on by default),
+              is set on every line. A PO that spans several vendors unticks it, or
+              leaves the header blank, and sets the vendor per line. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-              Vendor <span className="text-[#8B7355] font-normal">(optional — filters the item list)</span>
-              <select value={primaryVendorId} onChange={e => setPrimaryVendorId(e.target.value)}
-                      className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
-                <option value="">Select vendor…</option>
-                {vendors.map(v => <option key={v.id} value={v.id}>{v.name}{v.payment_terms ? ` · ${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d` : ''}</option>)}
-              </select>
+            {/* A div, not one big <label>: the tick below is a control of its
+                own, and nested inside the select's label a tap on its text
+                would land on the select instead. */}
+            <div className="text-xs text-[#6B5744] flex flex-col gap-1">
+              {/* The label says it sets every line's vendor because picking one
+                  turns the tick on. The select (and the tick) are held still
+                  while a "+ map & use" is saving: on a line added while unticked
+                  (empty vendor) that click writes the vendor as it stood when
+                  clicked, so a header switch mid-save would re-tick and then
+                  leave that line on the old vendor. */}
+              <label className="flex flex-col gap-1">
+                Vendor <span className="text-[#8B7355] font-normal">(optional — sets every line&apos;s vendor and filters the item list)</span>
+                <select value={primaryVendorId} onChange={e => pickHeaderVendor(e.target.value)}
+                        disabled={mapBusy}
+                        className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm disabled:opacity-60">
+                  <option value="">Select vendor…</option>
+                  {vendors.map(v => <option key={v.id} value={v.id}>{v.name}{v.payment_terms ? ` · ${v.payment_terms}` : ''}{v.lead_time_days ? ` · ${v.lead_time_days}d` : ''}</option>)}
+                </select>
+              </label>
+              {headerVendor && (
+                <label className="flex items-start gap-1.5 text-[11px] text-[#2D1B0E] cursor-pointer">
+                  <input type="checkbox" className="mt-0.5 shrink-0 accent-[#af4408] disabled:opacity-60" checked={sameVendorAll}
+                         disabled={mapBusy}
+                         onChange={e => toggleSameVendorAll(e.target.checked)} />
+                  <span className="flex-1 min-w-0">Use <strong>{headerVendor.name}</strong> for every line</span>
+                </label>
+              )}
               {vendorLoadError && (
                 <span className="text-[10px] text-red-600">{vendorLoadError}</span>
               )}
+              {/* Says what the lines will actually do — the old "Seeds every
+                  line." sat above an empty line still reading "Select vendor…". */}
               {primaryVendorId && (
                 <span className="text-[10px] text-[#8B7355]">
                   {!vm.ready ? 'Loading the vendor → item mapping…' :
-                   headerItemCount > 0
-                     ? <>Seeds every line. <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>)</>
-                     : <>No items mapped to {primaryVendorName} yet.</>}
+                   headerItemCount === 0
+                     // The tick is on by default, so every line is locked to a
+                     // vendor that can supply nothing — name the way out here.
+                     ? <>No items mapped to {primaryVendorName} yet.{vendorLocked ? ' Untick to set a vendor per line.' : ''}</>
+                     : vendorLocked
+                       ? <>Every line is set to {primaryVendorName} (locked); <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>). Untick to set a vendor per line.</>
+                       : <>Vendor is set per line. A line with no vendor yet lists the <strong>{headerItemCount}</strong> item{headerItemCount === 1 ? '' : 's'} mapped to {primaryVendorName} and takes {primaryVendorName} once an item is picked (<a href={vendorItemsHref(primaryVendorId)} target="_blank" rel="noopener noreferrer" className="text-[#af4408] underline">Vendor Items</a>).</>}
                 </span>
               )}
-            </label>
+            </div>
             <label className="text-xs text-[#6B5744] flex flex-col gap-1">
               PO Date
               <input type="date" value={date} onChange={e => setDate(e.target.value)}
@@ -4249,6 +4829,18 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                             : vendors;
                           return (
                             <>
+                            {vendorLocked ? (
+                              // LOCKED by the header tick (ruling 108): shown as a
+                              // read-only chip so it cannot be mistaken for a
+                              // dropdown. It reads the LINE's own vendor — the
+                              // value the save sends — never the header's, so
+                              // what is on screen is what gets filed.
+                              <div title={`Set by the header vendor — untick “Use ${it.vendor} for every line” to change it on this line`}
+                                   className={`w-full px-1.5 py-1 border rounded text-xs flex items-center gap-1 text-[#2D1B0E] ${pairConflict ? 'border-amber-400 bg-amber-50' : 'border-[#E8D5C4] bg-[#FFF8F0]'}`}>
+                                <Lock className="w-3 h-3 shrink-0 text-[#B8A590]" />
+                                <span className="truncate">{it.vendor}</span>
+                              </div>
+                            ) : (
                             <select
                               value={legacy ? '__legacy__' : (it.vendor_id || '')}
                               disabled={!vm.ready}
@@ -4270,6 +4862,7 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                 </option>
                               ))}
                             </select>
+                            )}
                             {it.material_id && vm.ready && (
                               offered.length === 0 ? (
                                 <div className="text-[10px] text-red-700 mt-0.5">
@@ -4291,7 +4884,14 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                                           onClick={async () => { await mapAndUse(it.vendor_id, lineVendorName || 'this vendor', mat); }}
                                           className="underline font-medium disabled:opacity-50">map it now</button>
                                 )}
-                                {' '}or pick a mapped vendor above.
+                                {/* The vendor box is locked while the tick is on,
+                                    so "pick another vendor" has to name the way
+                                    to unlock it rather than point at a dead box. */}
+                                {vendorLocked
+                                  ? (offered.some(v => vm.isMapped(v.id, it.material_id))
+                                      ? <>{' '}{mat ? 'or untick' : 'Untick'} &quot;Use {lineVendorName || 'this vendor'} for every line&quot; to pick a mapped vendor for this line, or remove the line.</>
+                                      : <>{' '}{mat ? 'or remove the line.' : 'Map it on Vendor Items or remove the line.'}</>)
+                                  : <>{' '}or pick a mapped vendor above.</>}
                               </div>
                             )}
                             </>
@@ -4305,23 +4905,39 @@ function CreatePOModal({ materials, onClose, onCreated }: {
                             `${v.vendor} has bought this item for you before, but the pair is not mapped, so a PO line cannot be filed against it.\n\n` +
                             `Map "${mat?.name || 'the item'}" to ${v.vendor} on Vendor Items (${VENDOR_ITEMS_HREF}), then pick them here.`
                           )}
+                          // While locked, any chip that is not the line's own
+                          // vendor is greyed and explains itself on click.
+                          isLockedOut={vendorLocked ? (v => resolveChipVendor(v)?.id !== it.vendor_id) : undefined}
+                          onLockedPick={(v, unmapped) => alert(
+                            `Every line on this PO is set to ${it.vendor} — the "Use ${it.vendor} for every line" tick under the header Vendor.\n\n` +
+                            (unmapped
+                              // Unticking alone is not enough here: the chip
+                              // would still be blocked as NOT MAPPED, so say both.
+                              ? `${v.vendor} is also not mapped to supply "${mat?.name || 'this item'}". To pick ${v.vendor} for this line, untick the box AND map the pair on Vendor Items (${VENDOR_ITEMS_HREF}).`
+                              : `Untick it to pick ${v.vendor} for this line.`)
+                          )}
                           onPick={v => {
-                            // Chips come from purchase HISTORY, which can name a
-                            // vendor the master no longer resolves. Re-resolve by
-                            // name so the dropdown can actually show the pick
-                            // instead of falling back to the legacy option.
-                            const mv = vendors.find(x => x.id === v.vendor_id)
-                                    || vendors.find(x => x.name.toLowerCase().trim() === v.vendor.toLowerCase().trim());
+                            const mv = resolveChipVendor(v);
+                            // Contract beats last_price beats nothing.
+                            // Always overwrite when a contract exists — that's the point.
+                            // > 0, not != null: a ₹0 contract row means no rate was
+                            // agreed and must not wipe a correctly seeded rate.
+                            const rate: Partial<POLine> = Number(v.contract_price) > 0
+                              ? { unit_price: Number(v.contract_price) }
+                              : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {});
+                            if (vendorLocked) {
+                              // NEVER switch a locked line's vendor from a chip.
+                              // Other vendors' chips are already greyed above;
+                              // this is the backstop. The line's own vendor's
+                              // chip still brings its contract / last rate.
+                              if (!mv || mv.id !== it.vendor_id) return;
+                              updateLine(i, rate);
+                              return;
+                            }
                             updateLine(i, {
                               vendor: mv ? mv.name : v.vendor,
                               vendor_id: mv ? mv.id : '',
-                              // Contract beats last_price beats nothing.
-                              // Always overwrite when a contract exists — that's the point.
-                              // > 0, not != null: a ₹0 contract row means no rate was
-                              // agreed and must not wipe a correctly seeded rate.
-                              ...(Number(v.contract_price) > 0
-                                  ? { unit_price: Number(v.contract_price) }
-                                  : (!it.unit_price && Number(v.last_price) > 0 ? { unit_price: Number(v.last_price) } : {})),
+                              ...rate,
                             });
                           }}
                         />
@@ -4478,25 +5094,42 @@ function SimpleMaterialPicker({
   // Portal the dropdown to <body> (fixed position) so the PO modal's overflow
   // can't clip it — the same clipping that hid this list inside the modal.
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  // The CURRENT value is resolved from the full lists, switched off or not — a
+  // line that already holds an item never loses it (ruling #78 filters the
+  // offer, never a line's value).
   const sel = materials.find(m => m.id === value) || unmapped.find(m => m.id === value);
   const matches = (m: Material, norm: string) =>
     !norm || m.name.toLowerCase().includes(norm) || (m.sku || '').toLowerCase().includes(norm);
+  // Every mount of this picker raises a NEW line (composer, draft editor's added
+  // line, approved-PO "add item"), so a switched-off material is not offered.
   const list = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return materials.filter(m => matches(m, norm)).slice(0, 1000);
+    return materials.filter(m => offeredInPicker(m, 'hide') && matches(m, norm)).slice(0, 1000);
   }, [q, materials]);
   /* The greyed half — same search box, so a buyer who types an item name always
      finds it, mapped or not, instead of concluding it does not exist. */
   const offMatches = useMemo(() => {
     const norm = q.toLowerCase().trim();
-    return unmapped.filter(m => matches(m, norm));
+    return unmapped.filter(m => offeredInPicker(m, 'hide') && matches(m, norm));
   }, [q, unmapped]);
+  /* Switched-off items the search WOULD have matched — named, never silently
+     dropped, so nobody concludes the item is missing and creates a second one. */
+  const switchedOff = useMemo(() => {
+    const norm = q.toLowerCase().trim();
+    return [...materials, ...unmapped]
+      .filter(m => !offeredInPicker(m, 'hide') && matches(m, norm))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [q, materials, unmapped]);
+  const switchedOffNames = switchedOff.slice(0, 3).map(m => m.name).join(', ')
+    + (switchedOff.length > 3 ? ` +${switchedOff.length - 3} more` : '');
   const offList = useMemo(() => offMatches.slice(0, 200), [offMatches]);
   const computePos = () => {
     const el = ref.current;
     if (!el || typeof window === 'undefined') return;
     const r = el.getBoundingClientRect();
-    const width = Math.max(r.width, 300);
+    // Wide enough for a full item name beside its unit and rate (owner,
+    // 2026-10-30: names were cut off); never wider than the screen.
+    const width = Math.min(Math.max(r.width, 460), window.innerWidth - 16);
     const left = Math.min(r.left, window.innerWidth - width - 8);
     setPos({ top: r.bottom + 4, left: Math.max(8, left), width });
   };
@@ -4519,7 +5152,13 @@ function SimpleMaterialPicker({
     <div ref={ref} className="relative">
       <button type="button" disabled={disabled} onClick={() => { setOpen(!open); setQ(''); }}
               className="w-full text-left px-2 py-1 border border-[#E8D5C4] rounded text-xs bg-[#FFF8F0] disabled:opacity-60 disabled:cursor-not-allowed">
-        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}</>)
+        {sel ? (<><span className="text-[10px] font-mono text-[#8B7355] mr-1">{sel.sku}</span>{sel.name}
+                  {isSwitchedOff(sel) && (
+                    <span title="Switched off in Raw Materials — not offered for new lines"
+                          className="ml-1 text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+                      Inactive
+                    </span>
+                  )}</>)
              : <span className="text-[#8B7355]">{disabled ? 'Loading…' : 'Select…'}</span>}
       </button>
       {scopeNote && <div className="text-[9px] text-[#B8A590] mt-0.5">{scopeNote}</div>}
@@ -4535,8 +5174,18 @@ function SimpleMaterialPicker({
           <div className="space-y-0.5">
             {list.length === 0 && (
               <div className="px-2 py-1 text-[11px] text-[#8B7355]">
-                {q.trim() ? <>No mapped item matches &quot;{q}&quot;.</> : <>No materials loaded yet — refresh if this stays empty.</>}
+                {q.trim() ? <>No mapped item matches &quot;{q}&quot;.</>
+                  : switchedOff.length > 0 ? <>No active mapped item to pick.</>
+                  : <>No materials loaded yet — refresh if this stays empty.</>}
                 {unmapped.length > 0 && offList.length > 0 && <> Unmapped matches are listed below.</>}
+              </div>
+            )}
+            {switchedOff.length > 0 && (
+              <div className="px-2 py-0.5 text-[10px] text-gray-500"
+                   title="Switched off in Raw Materials. An admin can switch an item back on there.">
+                {q.trim()
+                  ? <>Switched off in Raw Materials (not offered here): <b className="text-[#6B5744]">{switchedOffNames}</b></>
+                  : <>{notOfferedNote(switchedOff.length, 'hide')}</>}
               </div>
             )}
             {list.map(m => {
@@ -4551,19 +5200,20 @@ function SimpleMaterialPicker({
                       title={takenLine ? `Already on line ${takenLine} — add the extra quantity there` : undefined}
                       className={`w-full text-left px-2 py-1 rounded text-xs flex flex-col items-stretch gap-0.5 ${
                         takenLine ? 'bg-[#FFF8F0] text-[#A08B76] cursor-default' : 'hover:bg-[#FFF1E3]'}`}>
-                <span className="flex items-center gap-2 w-full">
-                  <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0">{m.sku || '·'}</span>
-                  <span className="flex-1 min-w-0 truncate">{m.name}</span>
+                <span className="flex items-start gap-2 w-full">
+                  <span className="text-[10px] font-mono text-[#8B7355] w-16 shrink-0 pt-px">{m.sku || '·'}</span>
+                  {/* The FULL name, wrapped — never cut to "…" (owner, 2026-10-30). */}
+                  <span className="flex-1 min-w-0 whitespace-normal break-words">{m.name}</span>
                   {takenLine ? (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-[#F0E4D6] text-[#8B7355] shrink-0 whitespace-nowrap">
                       already on line {takenLine}
                     </span>
                   ) : (<>
-                    <span className="text-[10px] text-[#6B5744]">{poUnitOf(m)}</span>
+                    <span className="text-[10px] text-[#6B5744] shrink-0 whitespace-nowrap pt-px">{poUnitOf(m)}</span>
                     {/* Rate carries its own basis: a bare "₹86.00" next to a list
                         of kitchen materials reads as ₹/g. poRateOf is already
                         ₹/purchase-unit — say which unit that is. */}
-                    <span className="text-[10px] font-mono text-[#6B5744]">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
+                    <span className="text-[10px] font-mono text-[#6B5744] shrink-0 whitespace-nowrap pt-px">₹{poRateOf(m).toFixed(2)}/{poUnitOf(m)}</span>
                   </>)}
                 </span>
                 {/* IN HAND, BEFORE THE PICK (owner's ask #1). Store and Dept as
@@ -4591,10 +5241,10 @@ function SimpleMaterialPicker({
               {unmappedHint && <div className="px-2 pb-1 text-[10px] text-[#8B7355]">{unmappedHint}</div>}
               <div className="space-y-0.5">
                 {offList.map(m => (
-                  <div key={m.id} className="w-full px-2 py-1 rounded text-xs flex items-center gap-2 bg-[#FAF6F0] text-[#A08B76]">
-                    <span className="text-[10px] font-mono w-16 shrink-0">{m.sku || '·'}</span>
-                    <span className="flex-1 truncate">{m.name}</span>
-                    <span className="text-[10px]">{poUnitOf(m)}</span>
+                  <div key={m.id} className="w-full px-2 py-1 rounded text-xs flex items-start gap-2 bg-[#FAF6F0] text-[#A08B76]">
+                    <span className="text-[10px] font-mono w-16 shrink-0 pt-px">{m.sku || '·'}</span>
+                    <span className="flex-1 min-w-0 whitespace-normal break-words">{m.name}</span>
+                    <span className="text-[10px] shrink-0 whitespace-nowrap pt-px">{poUnitOf(m)}</span>
                     {onMapAndPick ? (
                       <button type="button" disabled={mapBusy}
                               onClick={async () => { setOpen(false); setQ(''); await onMapAndPick(m); }}
@@ -5077,6 +5727,31 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
       .then(setData).catch(e => setErr(e.message)).finally(() => setLoading(false));
   }, [poId]);
 
+  /* WHO EACH LINE GOES TO, AND WHO ASKED FOR IT (ruling #66: approve the whole
+     PO once, on a screen grouped by vendor with subtotals). approval-context
+     carries no line vendor, so the vendor comes from the PO's own lines and the
+     departments from the vendor-view route. Best-effort: if either read fails
+     the review renders exactly as before — ungrouped, no departments. */
+  const [lineInfo, setLineInfo] = useState<{
+    vendorById: Map<string, { vendor: string; vendor_id: string | null }>;
+    links: Record<string, PoReqLink[]>;
+  } | null>(null);
+  useEffect(() => {
+    let live = true;
+    Promise.all([
+      fetch(`/api/purchase-orders?id=${poId}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+      fetch(`/api/purchase-orders/vendor-view?id=${poId}`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+    ]).then(([d, v]) => {
+      if (!live || !d?.purchase_order) return;
+      const vendorById = new Map<string, { vendor: string; vendor_id: string | null }>();
+      for (const it of (d.purchase_order.items || []) as any[]) {
+        vendorById.set(String(it.id), { vendor: String(it.vendor || ''), vendor_id: it.vendor_id ? String(it.vendor_id) : null });
+      }
+      setLineInfo({ vendorById, links: (v && v.links_by_item) || {} });
+    });
+    return () => { live = false; };
+  }, [poId]);
+
   /* THE CHANGE-SET MUST COME FROM THE SAME FETCH AS THE LINES IT ANNOTATES.
      `rc` (the prop) rides the LIST row and is as old as the last list load;
      `data.reapproval_changes` was computed by the approval-context request that
@@ -5140,7 +5815,7 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
               </tr>
             </thead>
             <tbody>
-              {data.items.map((it: any) => {
+              {(() => { const renderRow = (it: any) => {
                 // requested_qty is in PURCHASE units (10 kg) while current_stock and
                 // the usage columns are in RECIPE units (2,000 g) — they differ by
                 // pack_size, so they must not be labelled the same nor divided
@@ -5176,6 +5851,16 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
                     <td className="py-2 px-2">
                       <div className="font-medium text-[#2D1B0E]">{it.material_name}</div>
                       <div className="text-[10px] font-mono text-[#8B7355]">{it.material_sku}</div>
+                      {/* Who asked for it — purchase units first, the same
+                          basis as the Requested column beside it. */}
+                      {(lineInfo?.links[String(it.po_item_id)] || []).map(l => (
+                        <div key={l.id} className="text-[10px] text-[#6B5744] leading-tight">
+                          For {l.department_name || '(no department)'}
+                          {l.is_party && <span className="text-[#8B7355]"> · party{l.event_name ? `: ${l.event_name}` : ''}</span>}
+                          {l.qty_purchase != null && <span className="font-mono"> · {fmtQtyNum(Number(l.qty_purchase))} {poUnit}</span>}
+                          {l.req_number && <span className="font-mono text-[#8B7355]"> · {l.req_number}</span>}
+                        </div>
+                      ))}
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
                       {/* A LINE THAT IS NOT ON THE APPROVED PO AT ALL. Stated
@@ -5291,8 +5976,48 @@ function ApprovalContextPanel({ poId, rc, approvalNote }: {
                     </td>
                   </tr>
                 );
-              })}
+              };
+              if (!lineInfo) return data.items.map(renderRow);
+              /* Grouped by the vendor each line is FILED under (the receive
+                 route's rule), with that vendor's ordered value — the approver
+                 signs the whole PO once, but sees exactly which supplier each
+                 rupee is going to. A single-vendor PO stays one flat list. */
+              const rows = (data.items as any[]).map(it => ({
+                ...it, id: String(it.po_item_id),
+                vendor: lineInfo.vendorById.get(String(it.po_item_id))?.vendor ?? '',
+                vendor_id: lineInfo.vendorById.get(String(it.po_item_id))?.vendor_id ?? null,
+                total_price: Number(it.requested_total) || 0,
+              }));
+              const vgroups = groupPoLinesByVendor(rows, data.po || {});
+              if (vgroups.length <= 1) return data.items.map(renderRow);
+              return vgroups.map(g => (
+                <Fragment key={'avg-' + g.key}>
+                  <tr className="border-t-2 border-amber-200 bg-amber-50/70">
+                    <td colSpan={7} className="py-1.5 px-2 text-[11px]">
+                      <Truck className="w-3.5 h-3.5 text-amber-800 inline-block align-[-3px] mr-1" />
+                      <span className="font-semibold text-[#2D1B0E]">{g.vendor_name}</span>
+                      <span className="text-[#6B5744]"> · {g.lines.length} line{g.lines.length === 1 ? '' : 's'} · subtotal </span>
+                      <span className="font-mono font-semibold text-[#2D1B0E]">{fmt(g.ordered_total)}</span>
+                    </td>
+                  </tr>
+                  {g.lines.map(renderRow)}
+                </Fragment>
+              ));
+              })()}
             </tbody>
+            {lineInfo && (() => {
+              const total = r2((data.items as any[]).reduce((s, it) => s + (Number(it.requested_total) || 0), 0));
+              const nV = new Set((data.items as any[]).map(it => vendorNameKey(lineInfo.vendorById.get(String(it.po_item_id))?.vendor || data.po?.vendor))).size;
+              return nV > 1 ? (
+                <tfoot>
+                  <tr className="border-t border-amber-200 bg-amber-50 text-[11px] font-semibold">
+                    <td colSpan={7} className="py-1.5 px-2 text-right">
+                      Total for approval — {nV} vendors: <span className="font-mono">{fmt(total)}</span>
+                    </td>
+                  </tr>
+                </tfoot>
+              ) : null;
+            })()}
           </table>
         </div>
 
@@ -5492,6 +6217,19 @@ function ApprovePOModal({ po, onClose, onApproved }: {
     fetch(`/api/purchase-orders/${po.id}/approval-context`)
       .then(r => r.json()).then(setCtx).finally(() => setLoading(false));
   }, [po.id]);
+  /* "Vendor: Mixed (3 vendors) · Total ₹…" names nobody. On a PO with several
+     vendors the signer is shown each vendor's ordered value (ruling #66),
+     from the PO's own lines; best-effort — absent, the header reads as before. */
+  const [vendorSubs, setVendorSubs] = useState<PoVendorGroup[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetch(`/api/purchase-orders?id=${po.id}`).then(r => (r.ok ? r.json() : null)).then(d => {
+      if (!live || !d?.purchase_order) return;
+      const gs = groupPoLinesByVendor(d.purchase_order.items || [], d.purchase_order);
+      setVendorSubs(gs.length > 1 ? gs : null);
+    }).catch(() => {});
+    return () => { live = false; };
+  }, [po.id]);
 
   const flagCount = ctx?.summary?.total_flags || 0;
   const requiresNote = flagCount > 0;
@@ -5530,6 +6268,16 @@ function ApprovePOModal({ po, onClose, onApproved }: {
                 <span className="text-amber-800 font-semibold"> (was {fmt(rc.total_before)})</span>
               )}
             </p>
+            {vendorSubs && (
+              <ul className="text-[11px] text-[#6B5744] mt-1 space-y-0.5">
+                {vendorSubs.map(g => (
+                  <li key={g.key} className="flex justify-between gap-4">
+                    <span>{g.vendor_name} <span className="text-[#8B7355]">({g.lines.length} line{g.lines.length === 1 ? '' : 's'})</span></span>
+                    <span className="font-mono">{fmt(g.ordered_total)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>

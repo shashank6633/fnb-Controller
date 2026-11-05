@@ -34,19 +34,8 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     if (claim.changes === 0) {
       return Response.json({ error: 'This PO is no longer cancellable (someone else moved it). Reload the page.' }, { status: 409 });
     }
-    // This audit_events row is the ONLY record of who cancelled the PO, and of
-    // when. Do NOT "fix" that by writing purchase_orders.cancelled_at /
-    // cancelled_by: those columns are SCHEMA DRIFT, not schema. They exist in
-    // databases that have been around a while (this one has them, unwritten on all
-    // 24 rows) but src/lib/db.ts never creates them — its CREATE TABLE
-    // purchase_orders declares 15 columns and its ALTERs add only approval_note,
-    // vendor_id, outlet_id, requisition_id, delivery_date and grn_id, for 21. The
-    // five extras a long-lived DB carries (submitted_by, rejected_at, rejected_by,
-    // cancelled_at, cancelled_by) are created by nothing. So an UPDATE that sets
-    // one throws `no such column` on any database built from the current schema —
-    // a fresh install or a test DB — and this route's bare catch turns that into a
-    // 500 on Cancel. Add the guarded ALTER to db.ts FIRST if these are ever wanted;
-    // same applies to rejected_at in reject/route.ts.
+    // purchase_orders has no cancelled_by/cancelled_at column (db.ts:788-804),
+    // so this audit_events row is the ONLY record of who cancelled the PO.
     logAuditEvent(db, {
       event_type: 'po.cancel', entity_type: 'purchase_order', entity_id: id,
       actor_email: await effectiveActor(),

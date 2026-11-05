@@ -29,9 +29,14 @@ export async function GET(request: Request) {
       ? Math.round((totals.gross_profit / totals.total_revenue) * 10000) / 100
       : 0;
 
-    // Low stock count
+    // Low stock count. Switched-off materials (is_active = 0, owner #6 / ruling
+    // 78) are not reordered, so they are not "low" — the same filter Smart
+    // Reorder applies. NULL reads as on. The purchase / consumption figures
+    // further down are history and keep every material.
     const lowStockResult = db.prepare(`
-      SELECT COUNT(*) as count FROM raw_materials WHERE reorder_level > 0 AND current_stock < reorder_level
+      SELECT COUNT(*) as count FROM raw_materials
+      WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1
     `).get() as any;
 
     // Active recipes count
@@ -162,33 +167,28 @@ export async function GET(request: Request) {
       WHERE date >= ? AND date <= ?
     `).get(dateFrom, dateTo) as any;
 
-    // Category-wise purchase breakdown.
-    // LEFT JOIN, 2026-09-10 — same ruling as /api/reports/purchases and
-    // /api/purchases: purchase spend is never dropped for a broken material
-    // link, it is labelled. An INNER JOIN here would quietly shrink the very
-    // total this panel exists to state.
+    // Category-wise purchase breakdown
     const purchaseByCategory = db.prepare(`
       SELECT
-        COALESCE(NULLIF(TRIM(rm.category), ''), '(uncategorised)') AS category,
+        rm.category,
         SUM(p.total_price) as spend,
         SUM(p.quantity) as quantity
       FROM purchases p
-      LEFT JOIN raw_materials rm ON p.material_id = rm.id
+      JOIN raw_materials rm ON p.material_id = rm.id
       WHERE p.date >= ? AND p.date <= ?
-      GROUP BY LOWER(TRIM(COALESCE(rm.category, '')))
+      GROUP BY rm.category
       ORDER BY spend DESC
     `).all(dateFrom, dateTo);
 
-    // Top purchased materials — LEFT JOIN for the same reason.
+    // Top purchased materials
     const topPurchased = db.prepare(`
       SELECT
-        COALESCE(NULLIF(TRIM(rm.name), ''),
-                 '(material not linked · id ' || COALESCE(p.material_id, '?') || ')') AS name,
+        rm.name,
         SUM(p.total_price) as total_spend,
         SUM(p.quantity) as total_qty,
         rm.unit
       FROM purchases p
-      LEFT JOIN raw_materials rm ON p.material_id = rm.id
+      JOIN raw_materials rm ON p.material_id = rm.id
       WHERE p.date >= ? AND p.date <= ?
       GROUP BY p.material_id
       ORDER BY total_spend DESC
@@ -211,6 +211,7 @@ export async function GET(request: Request) {
         ROUND(reorder_level - current_stock, 2) as deficit
       FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level
+        AND COALESCE(is_active, 1) = 1   -- switched-off: not reordered (see low stock count)
       ORDER BY (reorder_level - current_stock) DESC
     `).all();
 

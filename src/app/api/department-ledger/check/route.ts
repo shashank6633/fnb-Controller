@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import type { DeptOnHandResult } from '@/lib/dept-ledger';
-import { DEPT_TXN_TYPES, cutoverAt, deptKey, deptOnHandBulk, isDeptTxnType } from '@/lib/dept-ledger';
+import { DEPT_TXN_TYPES, checkDeptTransferPairs, cutoverAt, deptKey, deptOnHandBulk, isDeptTxnType } from '@/lib/dept-ledger';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 
 /**
@@ -496,6 +496,19 @@ export async function GET(request: Request) {
     const negativeCount = negativesAll.length;
     const negatives = negativesAll.slice(0, limit);
 
+    /* ── DEPARTMENT → DEPARTMENT TRANSFER PAIRS ───────────────────────────
+     * A transfer is two ledger rows (transfer_out on the sender, transfer_in
+     * on the receiver) that must exist together, under one reference_id, equal
+     * and opposite, on the two departments the document names. The pair check
+     * lives in dept-ledger (checkDeptTransferPairs) — the checker does not own
+     * a second copy of the rule. Whole-ledger by construction: a pair spans two
+     * departments, so a department/material filter would cut pairs in half and
+     * report a healthy transfer as broken. It is therefore NOT narrowed by the
+     * filters above, and says so in `scope`. */
+    const transferCheck = checkDeptTransferPairs(db);
+    const transferIssueCount = transferCheck.issues.length;
+    const transferIssues = transferCheck.issues.slice(0, limit);
+
     /* ── the report ──────────────────────────────────────────────────────── */
     const cutover = cutoverAt(db);
     const notes: string[] = [];
@@ -511,6 +524,9 @@ export async function GET(request: Request) {
     if (liquorCount > 0) {
       notes.push('Store-mapped (liquor) materials appear on the department rail. They are supposed to be carved out of both legs — this is a carve-out breach, and that stock is now represented on two rails at once.');
     }
+    if (transferIssueCount > 0) {
+      notes.push('Department-to-department transfer pairs are broken: a transfer leg without its twin, unequal legs, or a document line whose legs do not match it. One physical kilo must sit in exactly one ledger; each issue names the transfer line (reference_id) to inspect. Never delete a leg to tidy this — post a reverse transfer or a count.');
+    }
 
     const summary = {
       cache_drift: driftCount,
@@ -519,6 +535,7 @@ export async function GET(request: Request) {
       balance_after_rows_disagreeing_with_running_sum: cumulativeMismatchTotal,
       row_integrity: rowIssueCount,
       liquor_on_department_rail: liquorCount,
+      transfer_pair_issues: transferIssueCount,
     };
     const clean = Object.values(summary).every((n) => n === 0);
 
@@ -538,12 +555,20 @@ export async function GET(request: Request) {
         balance_after: chainBreakCount > chainBreaks.length,
         row_integrity: rowIssueCount > rowIssues.length,
         liquor_on_department_rail: liquorCount > liquorPairs.length,
+        transfer_pair_issues: transferIssueCount > transferIssues.length,
       },
       cache_drift: drift,
       negative_balances: negatives,
       balance_after: chainBreaks,
       row_integrity: rowIssues,
       liquor_on_department_rail: liquorPairs,
+      transfer_pairs: {
+        scope: 'whole ledger (a pair spans two departments, so the department/material filters do not apply)',
+        pairs: transferCheck.pairs,
+        legs: transferCheck.legs,
+        lines: transferCheck.lines,
+        issues: transferIssues,
+      },
       notes,
     });
   } catch (e: unknown) {

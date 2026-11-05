@@ -9,6 +9,7 @@ import { rateMap, valueCount, valueSemiCount } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import { CLOSING_DATE_RE, checkClosingDate } from '@/lib/closing-date';
+import { switchedOffStillHeld } from '@/lib/count-list-active';
 
 /**
  * ALL-DEPARTMENTS CLOSING COUNT — ONE FILE, ONE COLUMN PER DEPARTMENT
@@ -362,6 +363,13 @@ export async function GET(request: Request) {
       return Response.json({ error: NO_SCOPE }, { status: 403 });
     }
     const deptIdsJson = JSON.stringify(depts.map(d => d.id));
+    // SWITCHED-OFF ITEMS (owner #6 / ruling 78): a switched-off material keeps
+    // its row while ANY department on this file still holds a non-zero balance
+    // of it on its books — the on-screen sheet's own rule (../route.ts), one row
+    // per item here — and drops off at zero. Every column is a DEPARTMENT, so
+    // central stock is not asked. src/lib/count-list-active.ts. Nothing switched
+    // off → '[]' → the template is exactly what it was.
+    const heldJson = JSON.stringify(switchedOffStillHeld(db, { deptIds: depts.map(d => d.id) }));
 
     // ONE row per item — the union of the included departments' item sets (the
     // house definition: ever issued to, UNION ever counted by). Store-mapped
@@ -408,9 +416,10 @@ export async function GET(request: Request) {
        WHERE ${NOT_STORE_MAPPED}
          AND (COALESCE(rm.is_active,1) = 1
               OR EXISTS (SELECT 1 FROM closing_stock cs2
-                          WHERE cs2.material_id = rm.id AND cs2.date = ?))
+                          WHERE cs2.material_id = rm.id AND cs2.date = ?)
+              OR rm.id IN (SELECT value FROM json_each(?)))
        ORDER BY sort_cat, name
-    `).all(...(wholeCatalogue ? [date] : [deptIdsJson, deptIdsJson, date])) as
+    `).all(...(wholeCatalogue ? [date, heldJson] : [deptIdsJson, deptIdsJson, date, heldJson])) as
       (Pick<MatRow, 'id' | 'name' | 'purchase_unit'> & { sku: string; category: string })[];
 
     // Sub-recipes have no department item set (they are cooked and held
@@ -875,13 +884,62 @@ export async function POST(request: Request) {
      * would hide the mapping, the sample and the error list behind a warning
      * about them. Apply is where the refusal belongs.
      * ────────────────────────────────────────────────────────────────────── */
-    const zeroGuard = zeroPatternGuard([
+    const fileZeroGuard = zeroPatternGuard([
       ...rawEntries.map(e => e.entered),
       ...semiEntries.map(e => e.entered),
     ]);
     // `entered` (what the counter TYPED), not recipeQty: a conversion cannot
     // turn a zero into a non-zero or back, so the two agree on which cells are
     // zero — and `entered` is the number the message quotes back at the owner.
+
+    /* THE SEMI-FINISHED CELLS ARE ALSO JUDGED ON THEIR OWN (2026-11, ruling 97).
+     * Pooled with the raw counts, a whole sub-recipe block filled down with 0
+     * was DILUTED below the share: 69 SUB zeros beside 120 RAW counts is 36.5%,
+     * no warning, and all 69 were saved as counted zeros. So the SUB cells get a
+     * second verdict of their own, across every department column at once —
+     * the file-wide verdict above pools the columns the same way; there is no
+     * per-column check on the raw side either.
+     *
+     * The file-wide verdict is UNCHANGED and still decides on its own: a file
+     * it refuses is refused exactly as before, with the same message (one
+     * sentence on the semi block is added when that block trips too). The semi
+     * verdict can only ADD a refusal, never remove one. counted / zeros / share
+     * stay the whole file's figures, because the screen prints them as "N of M
+     * counted cells in this file" and "record N shelves as empty" — and a
+     * confirm writes EVERY zero in the file, raw and semi alike. The message
+     * names the semi block, and the `semi` field carries its own figures.
+     *
+     * When ONLY the semi block trips, the message OPENS by saying it is the
+     * sub-recipe counts that are mostly zeros. The dialog's headline is fixed
+     * ("Mostly zeros — nothing was saved", ZeroCountGuard) and sits right above
+     * the file's own share (37%, say); without that first sentence the headline
+     * read as a claim about the whole file, which it is not. */
+    const semiZeroGuard = zeroPatternGuard(semiEntries.map(e => e.entered));
+    const semiPct = Math.round(semiZeroGuard.share * 100);
+    const filePct = Math.round(fileZeroGuard.share * 100);
+    const zeroGuard = !semiZeroGuard.suspicious
+      ? fileZeroGuard
+      : {
+          ...fileZeroGuard,
+          suspicious: true,
+          message: fileZeroGuard.suspicious
+            ? `${fileZeroGuard.message} The semi-finished (sub-recipe) counts on their own: ` +
+              `${semiZeroGuard.zeros} of ${semiZeroGuard.counted} (${semiPct}%) are 0.`
+            : `It is the semi-finished (sub-recipe) counts that are mostly zeros: ${semiZeroGuard.zeros} of the ` +
+              `${semiZeroGuard.counted} in this file (${semiPct}%) are 0. Across the whole file the share is ` +
+              `${fileZeroGuard.zeros} of ${fileZeroGuard.counted} (${filePct}%), but the sub-recipe counts are also ` +
+              `checked on their own, so a block of them typed as 0 cannot pass by being averaged in with the ` +
+              `raw-material counts. A 0 is recorded as "counted and found empty"; blank cells are what mean ` +
+              `"not counted". If those cells were meant to be BLANK, fix the file and upload again. If those ` +
+              `items really were used up, confirm and every 0 in this file (${fileZeroGuard.zeros}) will be ` +
+              `saved as a counted zero.`,
+          semi: {
+            counted: semiZeroGuard.counted,
+            zeros: semiZeroGuard.zeros,
+            share: semiZeroGuard.share,
+            suspicious: true,
+          },
+        };
 
     /* ── 5. PREVIEW — resolve everything, write nothing ────────────────────── */
     if (mode === 'preview') {

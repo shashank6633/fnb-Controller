@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { postDeptLedger, deptOnHand, cutoverAt } from '@/lib/dept-ledger';
+import { postDeptLedger, deptOnHand, deptSendableFor, deptSendableBulk, cutoverAt } from '@/lib/dept-ledger';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { packFactor } from '@/lib/pack-units';
 
@@ -44,7 +44,13 @@ import { packFactor } from '@/lib/pack-units';
  * anchor forward by three days while keeping the older quantity, and every
  * issue and consumption in between silently drops out of the balance. So adopt
  * refuses any pair that has moved since its count and names the count. The fix
- * is a fresh count, not a looser guard.
+ * is a fresh count, not a looser guard. The trap is measured from the count
+ * being ADOPTED, and refuses outright when a NEWER count exists for the pair
+ * (COUNT_NOT_CURRENT) — see adoptTrap() for what windowing from the current
+ * anchor instead let through. It also refuses (MOVED_SINCE_COUNT) when the
+ * opening would leave the balance alone but RAISE the transfer send figure: a
+ * count older than the cutover floor with an outflow hidden behind the floor
+ * (adoptTrap, floor_hidden).
  *
  * ── IDEMPOTENT, BY REFUSING ────────────────────────────────────────────────
  * One opening row per (department, material), ever. A second attempt is
@@ -67,6 +73,13 @@ import { packFactor } from '@/lib/pack-units';
  * label reads. Later departments cut over later and simply anchor later; the
  * floor never moves again. Re-stamping it would retroactively delete movement
  * from every department that went first.
+ *
+ * ── NEVER BELOW ZERO (owner's ruling #59) ──────────────────────────────────
+ * A cutover that would put any department's balance or transfer send figure
+ * below zero is REFUSED (409 CUTOVER_WOULD_GO_NEGATIVE) and writes nothing.
+ * Only the FIRST cutover can do it — its stamp moves every department counted
+ * before it at once. See checkBelowZero() for the rule, the reads and the way
+ * out the refusal names.
  */
 
 export const dynamic = 'force-dynamic';
@@ -82,6 +95,17 @@ const fmt = (n: number) => {
 type Db = Database.Database;
 
 const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
+
+/** A RECIPE-unit quantity for a message, LEADING with the purchase unit when
+ *  the material converts (owner rule; packFactor carries the both-halves
+ *  guard): "0.5 BTL (= 375 ml)", or "2 kg" when there is nothing to convert. */
+function qtyLabel(m: { unit: string; purchase_unit: string | null; pack_size: number | null } | undefined, recipeQty: number): string {
+  if (!m) return fmt(recipeQty);
+  const pf = packFactor(m);
+  return pf > 1
+    ? `${fmt(recipeQty / pf)} ${m.purchase_unit} (= ${fmt(recipeQty)} ${m.unit})`
+    : `${fmt(recipeQty)} ${m.unit}`;
+}
 
 /** Defensive: this route reads three tables that arrived with the cutover. A
  *  503 that says "run the migration" beats a 500 stack trace on the one screen
@@ -119,6 +143,520 @@ function openingDate(row: { reference_id?: string | null; event_date?: string | 
  * stamp is the trap: 'T' (0x54) > ' ' (0x20) shifts a whole day of movement.
  */
 const LEDGER_TS_SQL = `REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')`;
+
+/**
+ * WHERE A CLOSING COUNT ANCHORS — a literal mirror of dept-ledger.ts's
+ * countAnchorAt() (not exported), for the same reason LEDGER_TS_SQL is one:
+ * MIN(IST day-end of the count date, when the count was saved), 19 chars.
+ * It is never trusted alone: adoptTrap() cross-checks the result against
+ * deptOnHand() and refuses on any disagreement, so if the two ever drift the
+ * adopt fails CLOSED instead of writing an opening.
+ */
+function countAnchorAt(date: string, createdAt: string): string {
+  const dayEnd = `${String(date || '').slice(0, 10)} 18:29:59`;
+  const saved = countSavedAt(createdAt);
+  return saved && saved < dayEnd ? saved : dayEnd;
+}
+
+/** When a closing count was SAVED, in the ledger's 19-char UTC basis ('' when
+ *  the row carries no time). countAnchorAt's own normalisation, split out so
+ *  a refusal can say when the count was typed as well as where it stands. */
+function countSavedAt(createdAt: string): string {
+  const s = String(createdAt ?? '').trim();
+  return !s ? '' : /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s} 00:00:00` : s.slice(0, 19).replace('T', ' ');
+}
+
+/** A ledger time (19-char UTC) for a message, in the house's IST:
+ *  '2026-10-13 19:30:00' → '01:00 IST on 2026-10-14'. */
+function istLabel(ts: string): string {
+  const d = new Date(`${String(ts || '').replace(' ', 'T')}Z`);
+  if (Number.isNaN(d.getTime())) return String(ts || '');
+  const ist = new Date(d.getTime() + 330 * 60_000).toISOString();
+  return `${ist.slice(11, 16)} IST on ${ist.slice(0, 10)}`;
+}
+
+/** One ledger movement inside a floor_hidden gap, for the refusal. */
+interface GapRow { type: string; quantity: number; at: string }
+
+/** A count being adopted: where it anchors (`at`, the ledger's count rule),
+ *  its quantity, the date it is labelled for and when it was saved. */
+interface AdoptedCount { at: string; qty: number; date: string; saved: string }
+
+/** One adopt refusal. `newer_count` and `not_the_anchor` mean the count being
+ *  adopted is not the one the balance stands on; `moved` means it is, but the
+ *  pair has moved since it; `floor_hidden` means the balance is unchanged but
+ *  the SEND figure would rise (see adoptTrap). floor_hidden splits its gap by
+ *  the moment the count was SAVED, because the two halves are different
+ *  physical stories and the refusal must tell the one that happened:
+ *  booked_after_save went out after the count was typed (case W);
+ *  booked_before_save was booked before the count was typed but after the day
+ *  it is DATED had ended (case V10) — the count may already include it. */
+type AdoptRefusal =
+  | { kind: 'newer_count'; newest_count_date: string; newest_count_qty: number; newest_count_at: string }
+  | { kind: 'not_the_anchor'; anchor_source: string; anchor_at: string | null; anchor_qty: number | null }
+  | { kind: 'moved'; moved_rows: number }
+  | {
+      kind: 'floor_hidden'; moved_rows: number; hidden_outflow: number; send_figure_now: number; cutover_floor: string;
+      count_date: string; count_saved_at: string;
+      /** Up to GAP_ROWS_LISTED each; *_rows and *_net (signed, RECIPE units)
+       *  are over the whole half. */
+      booked_before_save: GapRow[]; booked_before_save_rows: number; booked_before_save_net: number;
+      booked_after_save: GapRow[]; booked_after_save_rows: number; booked_after_save_net: number;
+    };
+
+/** How many gap rows a floor_hidden refusal carries per half (JSON). */
+const GAP_ROWS_LISTED = 20;
+
+/** The refusals the admin answers with a fresh count (MOVED_SINCE_COUNT), as
+ *  opposed to adopting a different count date (COUNT_NOT_CURRENT). */
+type MovedRefusal = Extract<AdoptRefusal, { kind: 'moved' | 'floor_hidden' }>;
+const isMovedRefusal = (r: AdoptRefusal): r is MovedRefusal => r.kind === 'moved' || r.kind === 'floor_hidden';
+
+/**
+ * THE ADOPT TRAP, measured from the ADOPTED count — never from whatever count
+ * currently anchors the pair.
+ *
+ * An opening row is stamped when it is WRITTEN (now) and carries the adopted
+ * count's quantity. The balance is unchanged by that only if (a) the adopted
+ * count IS the pair's anchor, and (b) nothing the balance counts has moved
+ * since it. Each refusal below is one way an adopt silently rewrites a balance:
+ *
+ *   newer_count — a later count exists. The opening would re-assert the OLDER
+ *     figure on top of it and drop every movement since the older count. When
+ *     one of those movements is a transfer leg, its twin stays on the other
+ *     department: measured before this check (scratchpad conserve-adopt,
+ *     adopt-x.cjs) — receiver side 4 kg in no ledger (K 5 + T 1 from 10
+ *     physical), sender side 4 kg in two (K 10 + M 4 from 10, after which the
+ *     send check let 10 kg leave a 6 kg shelf). The old trap could not see it
+ *     because it windowed from deptOnHand's CURRENT anchor — the newer count —
+ *     and nothing had moved since THAT.
+ *   not_the_anchor — the resolver the balance uses disagrees about which count
+ *     anchors the pair (duplicate same-date rows, or drift between this file's
+ *     countAnchorAt and dept-ledger's). Refused rather than guessed.
+ *   moved — the adopted count anchors the pair, but the ledger moved after it.
+ *     The window is the ledger's own rule ("A TRANSFER PAIR IS NEVER SPLIT",
+ *     dept-ledger deptOnHand): every movement after MAX(count, cutover floor),
+ *     and transfer legs after the count itself, never the floor. A movement
+ *     that rule leaves out of the balance today stays out after the opening, so
+ *     it cannot be dropped FROM THE BALANCE and is not counted here.
+ *   floor_hidden — the balance is unchanged, but the SEND figure would rise.
+ *     A count taken before the cutover floor (on cutover day, counted before
+ *     the first department's cutover stamped it) has movement between the
+ *     count and the floor that the balance hides. The send check does not:
+ *     deptSendable is MIN(balance, count + every movement after it), so a
+ *     wastage or staff meal booked in that gap holds the send figure down to
+ *     what is really on the shelf. An opening is stamped NOW, after the floor,
+ *     so that MIN disappears and the send figure jumps back to the count.
+ *     Measured before this check (scratchpad adopt-r3, floor-hide.cjs W):
+ *     Kitchen counted 6, wasted 2, floor stamped, count adopted: 200, send
+ *     figure 4 → 6, then "ACCEPTED 6 kg from a 4 kg shelf". The 2 phantom kilos
+ *     would land in the receiver's ledger. The check reads the send figure from
+ *     the ledger's own deptSendableFor, so it cannot drift from the send check:
+ *     with nothing moved (the check above), the opening makes that figure
+ *     exactly the count, so the adopt is refused only when the figure is
+ *     LOWER than the count today. A hidden RECEIPT never trips it: the figure
+ *     is already capped at the count, and stays there (prod parity, D4/W2).
+ *     THE SAME REFUSAL, A DIFFERENT STORY (case V10): a count typed at 01:00
+ *     IST on the 14th but DATED the 13th stands at the 13th's day end (the
+ *     count rule's MIN), so a KOT consumed at 00:30 IST — BEFORE the count was
+ *     typed — sits in the gap too. The rule and the status are the same (the
+ *     ledger cannot tell whether the counted figure already includes it), but
+ *     "used after the count" would be false, so the refusal splits the gap by
+ *     the count's SAVE time and the message tells each half as it happened.
+ *
+ * Run twice: while planning (so every refusal is answered in one list), and
+ * again inside the IMMEDIATE write transaction, so nothing that posts between
+ * the plan and the write can be swallowed by the opening.
+ */
+function adoptTrap(
+  db: Db, departmentId: string, materialId: string,
+  adopted: AdoptedCount,
+): AdoptRefusal | null {
+  const counts = db.prepare(`
+    SELECT date, physical_stock, created_at FROM closing_stock
+     WHERE department_id = ? AND material_id = ?
+  `).all(departmentId, materialId) as Array<{ date: string; physical_stock: number; created_at: string }>;
+  let newest: { date: string; qty: number; at: string } | null = null;
+  for (const c of counts) {
+    const at = countAnchorAt(c.date, c.created_at);
+    if (at > adopted.at && (!newest || at >= newest.at)) newest = { date: String(c.date), qty: Number(c.physical_stock) || 0, at };
+  }
+  if (newest) return { kind: 'newer_count', newest_count_date: newest.date, newest_count_qty: r6(newest.qty), newest_count_at: newest.at };
+
+  const bal = deptOnHand(db, departmentId, materialId);
+  if (bal.anchorSource !== 'count' || bal.anchorAt !== adopted.at || r6(Number(bal.anchorQty)) !== r6(adopted.qty)) {
+    return { kind: 'not_the_anchor', anchor_source: bal.anchorSource, anchor_at: bal.anchorAt, anchor_qty: bal.anchorQty };
+  }
+
+  const floor = cutoverAt(db);
+  const windowFrom = floor && floor > adopted.at ? floor : adopted.at;
+  const moved = db.prepare(`
+    SELECT COUNT(*) AS n FROM department_material_transactions
+     WHERE department_id = ? AND material_id = ? AND type <> 'opening'
+       AND (${LEDGER_TS_SQL} > ?
+            OR (type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?))
+  `).get(departmentId, materialId, windowFrom, adopted.at) as { n: number } | undefined;
+  const n = Number(moved?.n) || 0;
+  if (n > 0) return { kind: 'moved', moved_rows: n };
+
+  /* floor_hidden (see above). Nothing has moved, so the balance IS the count
+   * and the opening would make the send figure exactly the count. */
+  const send = deptSendableFor(db, departmentId, materialId);
+  const qty = r6(adopted.qty);
+  if (r6(send.available) < qty - EPS) {
+    /* The same rows the send figure's MIN subtracts (sinceAnchorFigure: every
+     * non-opening movement after the anchor), listed so the refusal can name
+     * them. Split at the SAVE time — see the type's note: a row at or before
+     * the save was booked before the count was typed (only possible when the
+     * count is dated a day that had already ended, case V10). A count with no
+     * saved time cannot be split; its rows are told as after the dated day. */
+    const gap = db.prepare(`
+      SELECT type, quantity, ${LEDGER_TS_SQL} AS at FROM department_material_transactions
+       WHERE department_id = ? AND material_id = ? AND type <> 'opening' AND ${LEDGER_TS_SQL} > ?
+       ORDER BY at, rowid
+    `).all(departmentId, materialId, adopted.at) as Array<{ type: string; quantity: number; at: string }>;
+    const rows: GapRow[] = gap.map(g => ({ type: String(g.type), quantity: r6(Number(g.quantity)), at: String(g.at) }));
+    const before = adopted.saved ? rows.filter(g => g.at <= adopted.saved) : [];
+    const after = adopted.saved ? rows.filter(g => g.at > adopted.saved) : rows;
+    const net = (xs: GapRow[]) => r6(xs.reduce((s, g) => s + g.quantity, 0));
+    return {
+      kind: 'floor_hidden',
+      moved_rows: rows.length,
+      hidden_outflow: r6(qty - Number(send.available)),
+      send_figure_now: r6(Number(send.available)),
+      cutover_floor: floor,
+      count_date: adopted.date,
+      count_saved_at: adopted.saved,
+      booked_before_save: before.slice(0, GAP_ROWS_LISTED),
+      booked_before_save_rows: before.length,
+      booked_before_save_net: net(before),
+      booked_after_save: after.slice(0, GAP_ROWS_LISTED),
+      booked_after_save_rows: after.length,
+      booked_after_save_net: net(after),
+    };
+  }
+  return null;
+}
+
+const signedQty = (m: Mat | undefined, q: number) => `${q < 0 ? '−' : '+'}${qtyLabel(m, Math.abs(q))}`;
+
+/** A movement list for a message: "consumption −2 kg at 00:30 IST on
+ *  2026-10-14", or at most three then "+N more (−3.75 kg in all)". */
+function gapList(m: Mat | undefined, rows: GapRow[], total: number, totalNet: number): string {
+  const shown = rows.slice(0, 3).map(g => `${g.type.replace(/_/g, ' ')} ${signedQty(m, g.quantity)} at ${istLabel(g.at)}`);
+  const more = total > shown.length ? `, +${total - shown.length} more (${signedQty(m, totalNet)} in all)` : '';
+  return `${shown.join(', ')}${more}`;
+}
+const wasWere = (n: number) => (n === 1 ? 'was' : 'were');
+
+/**
+ * What a floor_hidden refusal says about ONE material — physically true for
+ * both stories (see AdoptRefusal). One sentence, no trailing full stop:
+ *   datedLate — something in the gap was booked BEFORE the count was saved:
+ *     the count is dated a day that had already ended when it was typed. Say
+ *     so, with both times; the counted figure may already include it.
+ *   otherwise — everything in the gap was booked after the count was saved
+ *     and before the rail went live: it really did leave after the count.
+ * `figures` (balance vs transfer check) are the two readings that disagree;
+ * the balance is the count itself here, because nothing else has moved.
+ */
+function floorHiddenDetail(
+  name: string, m: Mat | undefined,
+  h: Extract<AdoptRefusal, { kind: 'floor_hidden' }>, countQty: number,
+): { datedLate: boolean; savedKnown: boolean; body: string; text: string } {
+  const figures = `balance ${qtyLabel(m, countQty)}, transfer check ${qtyLabel(m, h.send_figure_now)}`;
+  const savedKnown = !!h.count_saved_at;
+  const afterList = gapList(m, h.booked_after_save, h.booked_after_save_rows, h.booked_after_save_net);
+  let datedLate = false;
+  let body: string;
+  if (h.booked_before_save_rows + h.booked_after_save_rows === 0) {
+    /* Cannot happen while this listing and the send figure read the same rows
+     * (both: every non-opening movement after the anchor). Kept so a future
+     * drift between them still produces a sentence, not an empty list. */
+    body = `the transfer check is ${qtyLabel(m, h.hidden_outflow)} below the count; ${figures}`;
+  } else if (h.booked_before_save_rows > 0) {
+    datedLate = true;
+    const afterBit = h.booked_after_save_rows > 0
+      ? `; ${afterList} ${wasWere(h.booked_after_save_rows)} booked after the save, before the department rail went live`
+      : '';
+    body =
+      `the count is dated ${h.count_date} but was saved at ${istLabel(h.count_saved_at)}, and ` +
+      `${gapList(m, h.booked_before_save, h.booked_before_save_rows, h.booked_before_save_net)} ` +
+      `${wasWere(h.booked_before_save_rows)} booked after ${h.count_date} ended, before the count was saved` +
+      `${afterBit}; ${figures}`;
+  } else {
+    body = `${afterList}; ${figures}`;
+  }
+  return { datedLate, savedKnown, body, text: `${name}: ${body}` };
+}
+
+/** Why a dated-late count is refused — the count rule (MIN of the dated day's
+ *  end and the save), said for the case where the day end wins. Exact only
+ *  for that case, which is the only one it is used for (datedLate ⇒ a row
+ *  after the anchor and at or before the save ⇒ anchor = the day end). */
+const DATED_LATE_WHY =
+  'A count saved after the day it is dated has ended stands at the end of that day (23:59 IST), so the app reads ' +
+  'anything booked between then and the save as after the count, and cannot tell whether the counted figure already includes it.';
+
+/** Up to three material sentences, then "+N more the same way". */
+function detailSentences(texts: string[]): string {
+  const shown = texts.slice(0, 3);
+  return shown.map(t => `${t}.`).join(' ') + (texts.length > shown.length ? ` +${texts.length - shown.length} more the same way.` : '');
+}
+
+/** Thrown inside the write transaction when the re-run trap refuses — rolls
+ *  the whole cutover back; the route answers 409. */
+class AdoptRaced extends Error {
+  constructor(readonly materialId: string, readonly refusal: AdoptRefusal) {
+    super(`adopt refused at write time for ${materialId}: ${refusal.kind}`);
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * RULING #59 — A CUTOVER NEVER PUTS A DEPARTMENT BELOW ZERO
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * WHY ONLY THE FIRST CUTOVER CAN. The first successful cutover stamps the
+ * floor (THE STAMP, above) for every department at once. A department counted
+ * BEFORE that moment keeps its count as its anchor, and from then on its
+ * balance is the count + movements after the floor + its transfer legs since
+ * the count (dept-ledger deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"). So
+ * whatever it booked between its count and the stamp — other than transfers —
+ * drops out of its balance the moment the stamp lands. When that was stock
+ * coming IN and a transfer sent it on, the books go below zero against a shelf
+ * that is not. Measured (conservation verifier, targeted.cjs A2): Akan
+ * Tandoori counted 2 kg, +5 kg issued, 4 kg sent on to Akan Pizza, then the
+ * first cutover — of ANOTHER department — read Tandoori at −2 kg, send figure
+ * −2 kg, against a 3 kg shelf. Without transfer legs a stamp can only leave a
+ * count's own quantity standing (never below zero), so this refusal cannot
+ * fire on a ledger that has none — production's today.
+ *
+ * A later cutover writes only its own opening rows, each one a counted
+ * quantity that is never below zero, and moves nobody else; it is still
+ * checked (its own department) so the rule holds whatever an opening becomes.
+ *
+ * THE RULE (owner, 2026-10-22): such a cutover is REFUSED, writes NOTHING, and
+ * says the true way out — count that department again (a count taken now
+ * starts its books from the shelf, so the stamp leaves nothing out of it), or
+ * cut it over at its shelf figure (an opening written by the first cutover is
+ * its own anchor, so nothing drops out either).
+ *
+ * "PUT BELOW ZERO" = below zero after the cutover AND lower than before. A
+ * figure that was already negative and is left where it was is not this
+ * cutover's doing; refusing it would block a cutover that changes nothing for
+ * that department.
+ *
+ * HOW IT IS READ: inside the IMMEDIATE write transaction, after the openings
+ * and the stamp are written and before commit, with the ledger's OWN functions
+ * — deptSendableBulk gives the balance every screen shows and the send figure
+ * the transfer check uses — before and after. It never re-implements the
+ * window rule (that already lives in four places). Every cutover the check
+ * passes commits exactly what it committed before the check existed.
+ */
+
+/** One department's two figures for one material, RECIPE units: the balance
+ *  (NULL = never counted) and the transfer send figure. */
+interface PairFigure { departmentId: string; materialId: string; onHand: number | null; send: number }
+
+/** Every department that has a count or a ledger row — the only ones whose
+ *  figures a stamp can move. */
+function stockDepartments(db: Db): string[] {
+  return (db.prepare(`
+    SELECT department_id AS d FROM department_material_transactions
+    UNION
+    SELECT department_id AS d FROM closing_stock WHERE TRIM(COALESCE(department_id, '')) <> ''
+  `).all() as Array<{ d: string | null }>).map(r => String(r.d ?? '')).filter(Boolean);
+}
+
+function pairFigures(db: Db, deptIds: string[]): Map<string, PairFigure> {
+  const out = new Map<string, PairFigure>();
+  for (const d of deptIds) {
+    for (const [m, s] of deptSendableBulk(db, d)) {
+      out.set(`${d}\u0000${m}`, { departmentId: d, materialId: m, onHand: s.onHand == null ? null : r6(s.onHand), send: r6(s.available) });
+    }
+  }
+  return out;
+}
+
+/** One pair the cutover would put below zero — the refusal's JSON row. */
+interface BelowZeroRow {
+  department_id: string; department: string;
+  material_id: string; name: string;
+  /** What its books start from, and where that stands (19-char UTC). */
+  anchor_source: string; anchor_qty: number | null; anchor_at: string | null;
+  balance_now: number | null; balance_after: number | null;
+  send_now: number | null; send_after: number;
+  balance_goes_negative: boolean; send_goes_negative: boolean;
+  /** Non-transfer movements booked after the anchor and up to the new floor,
+   *  by type (signed, RECIPE units) — what the stamp would leave out. */
+  left_out: Array<{ type: string; quantity: number; rows: number }>;
+  /** Signed transfer legs since the anchor — they stay in. */
+  transfers_since: number;
+}
+
+/** Thrown inside the write transaction (ruling #59) — rolls everything back. */
+class CutoverBelowZero extends Error {
+  constructor(
+    readonly rows: BelowZeroRow[],
+    readonly mats: Map<string, Mat>,
+    readonly stamping: boolean,
+    readonly floor: string,
+  ) {
+    super(`cutover would put ${rows.length} department figure(s) below zero`);
+  }
+}
+
+/** Thrown at the end of a dry run's rehearsal so it rolls back. */
+class DryRunRehearsed extends Error {}
+
+/** The pairs whose balance or send figure is below zero AFTER and lower than
+ *  BEFORE, described from the after-state (still inside the transaction). */
+function checkBelowZero(db: Db, before: Map<string, PairFigure>, after: Map<string, PairFigure>): { rows: BelowZeroRow[]; mats: Map<string, Mat> } {
+  const rows: BelowZeroRow[] = [];
+  const mats = new Map<string, Mat>();
+  const getMat = db.prepare(`SELECT id, name, category, unit, purchase_unit, pack_size, case_size FROM raw_materials WHERE id = ?`);
+  const getDept = db.prepare(`SELECT name FROM departments WHERE id = ?`);
+  for (const [k, a] of after) {
+    const b = before.get(k);
+    const balDown = a.onHand != null && a.onHand < -EPS && (b == null || b.onHand == null || a.onHand < b.onHand - EPS);
+    const sendDown = a.send < -EPS && (b == null || a.send < b.send - EPS);
+    if (!balDown && !sendDown) continue;
+    const m = getMat.get(a.materialId) as Mat | undefined;
+    if (m) mats.set(m.id, m);
+    const dn = getDept.get(a.departmentId) as { name: string } | undefined;
+    const bal = deptOnHand(db, a.departmentId, a.materialId);
+    let leftOut: BelowZeroRow['left_out'] = [];
+    let legs = 0;
+    if (bal.anchorAt != null) {
+      if (bal.anchorAt < bal.windowFrom) {
+        leftOut = (db.prepare(`
+          SELECT type, COALESCE(SUM(quantity), 0) AS q, COUNT(*) AS n FROM department_material_transactions
+           WHERE department_id = ? AND material_id = ? AND type NOT IN ('opening', 'transfer_out', 'transfer_in')
+             AND ${LEDGER_TS_SQL} > ? AND ${LEDGER_TS_SQL} <= ?
+           GROUP BY type ORDER BY type
+        `).all(a.departmentId, a.materialId, bal.anchorAt, bal.windowFrom) as Array<{ type: string; q: number; n: number }>)
+          .filter(r => Math.abs(Number(r.q)) > EPS)
+          .map(r => ({ type: String(r.type), quantity: r6(Number(r.q)), rows: Number(r.n) || 0 }));
+      }
+      const l = db.prepare(`
+        SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
+         WHERE department_id = ? AND material_id = ? AND type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?
+      `).get(a.departmentId, a.materialId, bal.anchorAt) as { s: number } | undefined;
+      legs = r6(Number(l?.s) || 0);
+    }
+    rows.push({
+      department_id: a.departmentId, department: String(dn?.name || a.departmentId),
+      material_id: a.materialId, name: String(m?.name || a.materialId),
+      anchor_source: bal.anchorSource, anchor_qty: bal.anchorQty, anchor_at: bal.anchorAt,
+      balance_now: b ? b.onHand : null, balance_after: a.onHand,
+      send_now: b ? b.send : null, send_after: a.send,
+      balance_goes_negative: balDown, send_goes_negative: sendDown,
+      left_out: leftOut, transfers_since: legs,
+    });
+  }
+  rows.sort((x, y) => x.department.localeCompare(y.department) || x.name.localeCompare(y.name));
+  return { rows, mats };
+}
+
+/** A ledger time (19-char UTC) in IST, with seconds when asked:
+ *  '15:59:05 IST on 2026-10-22'. */
+function istAt(ts: string, seconds: boolean): string {
+  const d = new Date(`${String(ts || '').replace(' ', 'T')}Z`);
+  if (Number.isNaN(d.getTime())) return String(ts || '');
+  const ist = new Date(d.getTime() + 330 * 60_000).toISOString();
+  return `${ist.slice(11, seconds ? 19 : 16)} IST on ${ist.slice(0, 10)}`;
+}
+
+/** A signed RECIPE-unit quantity, signed on BOTH halves when it converts:
+ *  "−1 kg (= −1000 g)", never "−1 kg (= 1000 g)"; `plus` marks a positive
+ *  movement "+2 kg (= +2000 g)". */
+function signedLabel(m: Mat | undefined, n: number, plus: boolean): string {
+  const s = n < 0 ? '−' : plus ? '+' : '';
+  const a = Math.abs(n);
+  const pf = m ? packFactor(m) : 1;
+  return pf > 1 && m ? `${s}${fmt(a / pf)} ${m.purchase_unit} (= ${s}${fmt(a)} ${m.unit})` : `${s}${qtyLabel(m, a)}`;
+}
+
+/** One affected pair, physically true. With the stamp: where its books start,
+ *  what the stamp drops out and what stays in, and the before → after. */
+function belowZeroSentence(r: BelowZeroRow, m: Mat | undefined, stamping: boolean, floor: string): string {
+  const q = (n: number | null) => (n == null ? 'not counted' : signedLabel(m, n, false));
+  const moves: string[] = [];
+  const sameFigure = r.balance_goes_negative && r.send_goes_negative
+    && r.balance_after != null && Math.abs(r.balance_after - r.send_after) <= EPS
+    && r.balance_now != null && r.send_now != null && Math.abs(r.balance_now - r.send_now) <= EPS;
+  if (sameFigure) {
+    moves.push(`its books and what it can send would go from ${q(r.balance_now)} to ${q(r.balance_after)}`);
+  } else {
+    if (r.balance_goes_negative) moves.push(`its books would go from ${q(r.balance_now)} to ${q(r.balance_after)}`);
+    if (r.send_goes_negative) moves.push(`what it can send would go from ${r.send_now == null ? 'nothing on its books' : q(r.send_now)} to ${q(r.send_after)}`);
+  }
+  const head = `${r.department} — ${r.name}`;
+  if (!stamping || r.anchor_at == null || r.anchor_qty == null) return `${head}: ${moves.join(', and ')}`;
+  const what = r.anchor_source === 'opening' ? 'opening' : 'count';
+  const secs = !!floor && istAt(r.anchor_at, false) === istAt(floor, false);
+  const leftOut = r.left_out.length
+    ? r.left_out.map(x => `${signedLabel(m, x.quantity, true)} ${x.type.replace(/_/g, ' ')}`).join(', ')
+    : '';
+  const dropped = leftOut
+    ? `what it booked since then other than transfers (${leftOut}) would drop out of its balance`
+    : `what it booked since then other than transfers would drop out of its balance`;
+  const kept = Math.abs(r.transfers_since) > EPS ? ` while its transfers since then (${signedLabel(m, r.transfers_since, true)}) stay in` : '';
+  return `${head}: its books start from its ${what} of ${qtyLabel(m, r.anchor_qty)}, placed at ${istAt(r.anchor_at, secs)}; ` +
+    `starting the ledger now, ${dropped}${kept}, so ${moves.join(', and ')}`;
+}
+
+/** The 409 for ruling #59 — the pairs, then the true way out. */
+function belowZeroResponse(
+  e: CutoverBelowZero,
+  ctx: { dept: { id: string; name: string }; adopt: boolean; today: string; dryRun: boolean },
+): Response {
+  const depts = [...new Map(e.rows.map(r => [r.department_id, r.department])).entries()];
+  const names = depts.map(([, n]) => n);
+  const nameList = names.length <= 1 ? (names[0] || '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const matsOf = (deptId: string) => {
+    const ms = e.rows.filter(r => r.department_id === deptId).map(r => r.name);
+    return ms.length <= 3 ? ms.join(', ') : `${ms.slice(0, 3).join(', ')} and ${ms.length - 3} more`;
+  };
+  const pairs = detailSentences(e.rows.map(r => belowZeroSentence(r, e.mats.get(r.material_id), e.stamping, e.floor)));
+  const lead = e.stamping
+    ? `${ctx.dept.name}'s cutover would be the first, and the first cutover starts the department ledger for every department at once. ` +
+      `That would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`
+    : `This cutover would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`;
+  const recount = (lead: string) =>
+    `${lead} ${nameList} again, dated today (${ctx.today}), in Inventory → Closing Stock — a count taken now starts ` +
+    `${depts.length === 1 ? 'its' : 'their'} books from the shelf, so nothing booked before it can drop out — ` +
+    `and run this cutover again`;
+  let atShelf: string;
+  if (depts.length === 1) {
+    const [only] = depts[0];
+    if (only === ctx.dept.id) {
+      atShelf = ctx.adopt
+        ? `or cut ${ctx.dept.name} over with lines[] instead of adopt_count, at what is on its shelf now (${matsOf(only)} included).`
+        : `or add ${matsOf(only)} to this cutover's lines[] with what is on the shelf now.`;
+    } else {
+      atShelf = `or cut ${depts[0][1]} over first, with lines[] at what is on its shelf now (${matsOf(only)} included), and then run this cutover again ` +
+        `— the first cutover is always checked this way.`;
+    }
+    return Response.json(belowZeroBody(e, `${lead} ${pairs} Either ${recount('count')}; ${atShelf}`, ctx.dryRun), { status: 409 });
+  }
+  atShelf = `Cutting one of them over first, at what is on its shelf now, helps only once the others are counted again: ` +
+    `whichever cutover is first starts the ledger for every department at once.`;
+  return Response.json(belowZeroBody(e, `${lead} ${pairs} ${recount('Count')}. ${atShelf}`, ctx.dryRun), { status: 409 });
+}
+
+function belowZeroBody(e: CutoverBelowZero, error: string, dryRun: boolean) {
+  return {
+    error,
+    code: 'CUTOVER_WOULD_GO_NEGATIVE',
+    ...(dryRun ? { dry_run: true } : {}),
+    first_cutover: e.stamping,
+    /** Where the ledger would have started had the cutover been written. */
+    ledger_would_start_at: e.stamping ? (e.floor || null) : null,
+    below_zero: e.rows,
+  };
+}
 
 /* ────────────────────────────────────────────────────────────────────────────
  * GET — the runbook's checklist
@@ -339,6 +877,13 @@ export async function POST(request: Request) {
     ).get(departmentId) as { id: string; name: string; is_active: number } | undefined;
     if (!dept) return Response.json({ error: 'Unknown department' }, { status: 404 });
 
+    /* Resolved HERE, before the first ledger read, so nothing between the
+     * checks below and the write transaction awaits. An await in that gap
+     * (it used to sit just before the write) lets another request post a
+     * movement after the adopt trap passed and before the opening lands — and
+     * the opening, stamped later, would then swallow it. */
+    const outletId = await getCurrentOutletId();
+
     const warnings: string[] = [];
     if (!Number(dept.is_active)) {
       warnings.push(`${dept.name} is switched off — its opening balance will not be visible on the active-department screens.`);
@@ -394,26 +939,46 @@ export async function POST(request: Request) {
      * exists to prevent. */
     let intended: Array<{ material_id: string; quantity: number; unit: string | null; note: string }> = [];
     let adoptedCountIds: string[] = [];
+    /* adopt only: where each adopted count anchors (the ledger's count rule),
+     * which is what the adopt trap measures from — plus when it was saved,
+     * which the floor_hidden refusal needs to tell its story truthfully. */
+    const adoptedAt = new Map<string, AdoptedCount>();
     if (adopt) {
       const rows = db.prepare(`
-        SELECT id, material_id, physical_stock, notes
+        SELECT id, material_id, physical_stock, notes, created_at
           FROM closing_stock
          WHERE department_id = ? AND date = ?
          ORDER BY created_at
-      `).all(departmentId, cutoverDate) as Array<{ id: string; material_id: string; physical_stock: number; notes: string | null }>;
+      `).all(departmentId, cutoverDate) as Array<{ id: string; material_id: string; physical_stock: number; notes: string | null; created_at: string }>;
       if (rows.length === 0) {
         return Response.json(
           { error: `No closing count recorded for ${dept.name} on ${cutoverDate}. Record the count first (Inventory → Closing Stock), or send lines[].` },
           { status: 400 },
         );
       }
-      adoptedCountIds = rows.map(r => r.id);
-      intended = rows.map(r => ({
-        material_id: String(r.material_id),
-        quantity: Number(r.physical_stock) || 0,
-        unit: null,                     // already recipe units — see above
-        note: String(r.notes ?? ''),
-      }));
+      /* ONE line per material. The closing-stock writers upsert per
+       * (date, material, department), but nothing in the schema enforces it,
+       * and two rows for one material here would plan TWO opening rows for one
+       * pair. The later-anchoring row is the one the ledger anchors on; if the
+       * resolver disagrees, adoptTrap refuses (not_the_anchor). */
+      const byMat = new Map<string, (typeof rows)[number] & { at: string }>();
+      for (const r of rows) {
+        const at = countAnchorAt(cutoverDate, r.created_at);   // every row is dated cutoverDate (WHERE above)
+        const seen = byMat.get(String(r.material_id));
+        if (!seen || at >= seen.at) byMat.set(String(r.material_id), { ...r, at });
+      }
+      adoptedCountIds = [...byMat.values()].map(r => r.id);
+      intended = [...byMat.values()].map(r => {
+        adoptedAt.set(String(r.material_id), {
+          at: r.at, qty: Number(r.physical_stock) || 0, date: cutoverDate, saved: countSavedAt(r.created_at),
+        });
+        return {
+          material_id: String(r.material_id),
+          quantity: Number(r.physical_stock) || 0,
+          unit: null,                     // already recipe units — see above
+          note: String(r.notes ?? ''),
+        };
+      });
     } else {
       const seen = new Set<string>();
       for (const l of rawLines) {
@@ -452,7 +1017,8 @@ export async function POST(request: Request) {
     const badUnit: Refused[] = [];
     const badQty: Refused[] = [];
     const already: Array<{ material_id: string; name: string; cutover_date: string; quantity: number }> = [];
-    const movedSinceCount: Array<{ material_id: string; name: string; moved_rows: number; count_at: string }> = [];
+    const movedSinceCount: Array<{ material_id: string; name: string; count_at: string } & MovedRefusal> = [];
+    const notCurrent: Array<{ material_id: string; name: string; adopted_count_at: string } & Exclude<AdoptRefusal, MovedRefusal>> = [];
 
     for (const it of intended) {
       const m = getMat.get(it.material_id) as Mat | undefined;
@@ -510,11 +1076,18 @@ export async function POST(request: Request) {
        * refused. Owner rule says purchase/inventory screens LEAD with the
        * purchase unit, so a bare number is genuinely ambiguous on those very
        * materials — and the wrong guess on a 1,000 g/kg pack is the 1,000×
-       * error that has already bitten this database once. */
+       * error that has already bitten this database once.
+       *
+       * ADOPT IS NOT A BARE NUMBER. closing_stock.physical_stock is RECIPE
+       * units by contract (see the gather above, and dept-sheet/route.ts), and
+       * deptOnHand anchors on that same figure verbatim — so the basis is
+       * known, not guessed. Without this, adopt refused EVERY packed material
+       * with 'unit_required', a refusal the admin could not answer: adopt mode
+       * takes no lines, so there is nowhere to say the unit. */
       const pf = packFactor(m);
       const ru = norm(m.unit);
       const pu = norm(m.purchase_unit || m.unit);
-      const given = norm(it.unit);
+      const given = adopt ? ru : norm(it.unit);
       let basis: 'recipe' | 'purchase';
       if (!given) {
         if (pf > 1) {
@@ -539,25 +1112,25 @@ export async function POST(request: Request) {
       const recipeQty = r6(basis === 'purchase' ? qty * pf : qty);
 
       /* ── the adopt trap ──────────────────────────────────────────────────
-       * Only in adopt mode, and only when a COUNT is what currently anchors
-       * this pair: if the department has moved since that count, writing the
-       * opening now would re-anchor forward and drop those movements out of the
-       * balance for good. windowFrom comes from deptOnHand — the SAME resolver
-       * the balance uses — so this guard and the balance can never disagree
-       * about where the window starts. */
+       * Measured from the ADOPTED count (adoptTrap, above): it must be the
+       * count the balance stands on, and the pair must not have moved since
+       * it — transfer legs from the count itself, never the floor (dept-ledger
+       * deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"; this is the fourth place
+       * that rule is implemented). It used to window from deptOnHand's CURRENT
+       * anchor, so adopting an older count after a newer one passed: the
+       * opening re-asserted the older figure and dropped every movement since. */
       if (adopt) {
-        const bal = deptOnHand(db, departmentId, m.id);
-        if (bal.anchorSource === 'count' && bal.windowFrom) {
-          const moved = db.prepare(`
-            SELECT COUNT(*) AS n FROM department_material_transactions
-             WHERE department_id = ? AND material_id = ? AND type <> 'opening'
-               AND ${LEDGER_TS_SQL} > ?
-          `).get(departmentId, m.id, bal.windowFrom) as { n: number } | undefined;
-          const n = Number(moved?.n) || 0;
-          if (n > 0) {
-            movedSinceCount.push({ material_id: m.id, name: m.name, moved_rows: n, count_at: bal.windowFrom });
-            continue;
+        const a = adoptedAt.get(m.id);
+        const ref: AdoptRefusal | null = a
+          ? adoptTrap(db, departmentId, m.id, a)
+          : { kind: 'not_the_anchor', anchor_source: 'none', anchor_at: null, anchor_qty: null };
+        if (ref) {
+          if (isMovedRefusal(ref)) {
+            movedSinceCount.push({ material_id: m.id, name: m.name, count_at: a ? a.at : '', ...ref });
+          } else {
+            notCurrent.push({ material_id: m.id, name: m.name, adopted_count_at: a ? a.at : '', ...ref });
           }
+          continue;
         }
       }
 
@@ -601,12 +1174,75 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    if (movedSinceCount.length) {
+    /* The count being adopted is not the one the balance stands on. Adopting
+     * it would put an OLDER figure on top of a newer count and drop every
+     * movement since — the kilos-in-two-ledgers / in-none case. Named, with the
+     * count date that WOULD be adoptable, and answered before MOVED_SINCE_COUNT
+     * because the admin's next step differs (adopt the newer date, not
+     * recount). */
+    if (notCurrent.length) {
+      const newerDates = [...new Set(notCurrent
+        .map(n => (n.kind === 'newer_count' ? n.newest_count_date : ''))
+        .filter(Boolean))].sort();
+      const latest = newerDates[newerDates.length - 1] || '';
       return Response.json(
         {
           error:
-            `${movedSinceCount.length} material(s) in ${dept.name} have moved since the ${cutoverDate} count. Adopting it now would drop those movements ` +
-            `out of the balance. Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`,
+            `${notCurrent.length} material(s) in ${dept.name} are not standing on the ${cutoverDate} count` +
+            `${latest ? ` — a newer count exists (latest ${latest})` : ''}. Adopting the older count would overwrite the newer one and drop ` +
+            `every movement since it out of the balance. ` +
+            `${latest ? `Adopt the latest count date instead (cutover_date ${latest})` : 'Take a fresh count dated today and adopt that'}, ` +
+            `or send lines[] with the quantities on the shelf right now. Nothing was written.`,
+          code: 'COUNT_NOT_CURRENT',
+          latest_count_date: latest || null,
+          materials: notCurrent,
+          moved_since_count: movedSinceCount,
+        },
+        { status: 409 },
+      );
+    }
+    if (movedSinceCount.length) {
+      /* THE WORDS MUST BE PHYSICALLY TRUE. A plain move (kind 'moved') reads
+       * exactly as production always said it. A floor_hidden pair is told as
+       * what actually happened (floorHiddenDetail): stock booked out AFTER the
+       * count was saved (case W), or booked before the count was saved but
+       * after the day it is DATED had ended (case V10 — "used after the count"
+       * would be false there; the count may already include it). The rule and
+       * the status are the same for all three; only the story differs. */
+      const plainN = movedSinceCount.filter(x => x.kind === 'moved').length;
+      const details = movedSinceCount.flatMap(x => (x.kind === 'floor_hidden'
+        ? [floorHiddenDetail(x.name, mats.get(x.material_id), x, adoptedAt.get(x.material_id)?.qty ?? 0)]
+        : []));
+      const afterSave = details.filter(d => !d.datedLate);
+      const datedLate = details.filter(d => d.datedLate);
+      const sentences: string[] = [];
+      const lead = (n: number) => (sentences.length ? `${n} more` : `${n} material(s) in ${dept.name}`);
+      if (plainN > 0) {
+        sentences.push(
+          `${plainN} material(s) in ${dept.name} have moved since the ${cutoverDate} count. ` +
+          `Adopting it now would drop those movements out of the balance.`,
+        );
+      }
+      if (afterSave.length) {
+        sentences.push(
+          `For ${lead(afterSave.length)}, stock was booked out after the ${cutoverDate} count` +
+          `${afterSave.every(d => d.savedKnown) ? ' was saved' : ''} and before the department rail went live. ` +
+          `${detailSentences(afterSave.map(d => d.text))} The balance already leaves that out; the transfer check does not, ` +
+          `and adopting would let more leave the shelf than is on it.`,
+        );
+      }
+      if (datedLate.length) {
+        sentences.push(
+          `For ${lead(datedLate.length)}, the ${cutoverDate} count cannot be adopted as it stands. ` +
+          `${detailSentences(datedLate.map(d => d.text))} ${DATED_LATE_WHY}`,
+        );
+      }
+      sentences.push(details.length
+        ? `Count again dated today (${today}) and adopt that, or send lines[] with the quantities on the shelf right now. Nothing was written.`
+        : `Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`);
+      return Response.json(
+        {
+          error: sentences.join(' '),
           code: 'MOVED_SINCE_COUNT',
           materials: movedSinceCount,
         },
@@ -644,7 +1280,8 @@ export async function POST(request: Request) {
       );
     }
 
-    const outletId = await getCurrentOutletId();
+    /* outletId was resolved before the first ledger read — see above. From
+     * the trap to the write below there is deliberately no await. */
     const refId = `cutover:${cutoverDate}`;
     const noteBits = [
       countSheetId ? `count sheet ${countSheetId}` : '',
@@ -653,32 +1290,37 @@ export async function POST(request: Request) {
     ].filter(Boolean);
     const note = noteBits.join(' — ');
 
-    if (dryRun) {
-      return Response.json({
-        ok: true,
-        dry_run: true,
-        department: { id: dept.id, name: dept.name },
-        cutover_date: cutoverDate,
-        mode: adopt ? 'adopt' : 'lines',
-        would_open: planned,
-        would_open_count: planned.length,
-        already_open: already,
-        skipped,
-        warnings,
-        cutover_at: stamp || null,
-        would_stamp_cutover: !stamp,
-      });
-    }
-
     /* ── write ──────────────────────────────────────────────────────────────
      * One transaction. postDeptLedger is the ONLY writer of department stock —
      * it inserts the ledger row and maintains the department_materials cache as
      * one pair, and it throws on anything it will not accept, which rolls this
-     * whole cutover back rather than leaving a department half-opened. */
+     * whole cutover back rather than leaving a department half-opened.
+     *
+     * IMMEDIATE, and in adopt mode the trap runs AGAIN inside it, per pair,
+     * just before that pair's opening is posted. IMMEDIATE takes the write lock
+     * before the re-check reads, so no other connection can post a movement
+     * between the check and the opening that would then swallow it.
+     *
+     * RULING #59 runs inside it too, after the openings and the stamp and
+     * before commit (checkBelowZero): figures read before the first write and
+     * again after the last, and a cutover that would put any department below
+     * zero throws CutoverBelowZero, which rolls ALL of it back. `rehearse` is
+     * the dry run of a first cutover: the same writes and the same check, then
+     * DryRunRehearsed rolls them back — so a dry run never says yes to a
+     * cutover the real run refuses. */
     let stampedNow = '';
-    const run = db.transaction(() => {
+    const run = db.transaction((rehearse: boolean) => {
+      const stamping = !cutoverAt(db);
+      const figuresBefore = pairFigures(db, stamping ? stockDepartments(db) : [departmentId]);
       const postedIds: string[] = [];
       for (const p of planned) {
+        if (adopt) {
+          const a = adoptedAt.get(p.material_id);
+          const ref: AdoptRefusal | null = a
+            ? adoptTrap(db, departmentId, p.material_id, a)
+            : { kind: 'not_the_anchor', anchor_source: 'none', anchor_at: null, anchor_qty: null };
+          if (ref) throw new AdoptRaced(p.material_id, ref);
+        }
         const res = postDeptLedger(db, {
           departmentId,
           materialId: p.material_id,
@@ -711,6 +1353,12 @@ export async function POST(request: Request) {
         db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('dept_ledger_cutover_at', ?)`).run(stampedNow);
       }
 
+      /* RULING #59 — nothing below zero, or nothing at all. */
+      const figuresAfter = pairFigures(db, stamping ? stockDepartments(db) : [departmentId]);
+      const below = checkBelowZero(db, figuresBefore, figuresAfter);
+      if (below.rows.length) throw new CutoverBelowZero(below.rows, below.mats, stamping, cutoverAt(db));
+      if (rehearse) throw new DryRunRehearsed();
+
       logAuditEvent(db, {
         event_type: 'dept_ledger.cutover',
         entity_type: 'department',
@@ -729,7 +1377,65 @@ export async function POST(request: Request) {
         note: `Department cutover: ${dept.name} — ${planned.length} opening row(s) dated ${cutoverDate}`,
       });
     });
-    run();
+    const belowZeroCtx = { dept: { id: dept.id, name: dept.name }, adopt, today };
+
+    if (dryRun) {
+      /* Only a FIRST cutover can put anyone below zero (checkBelowZero), so
+       * only its dry run rehearses the write. Anything else the rehearsal
+       * throws is left for the real run to answer, exactly as before. */
+      if (!stamp) {
+        try { run.immediate(true); } catch (e: unknown) {
+          if (e instanceof CutoverBelowZero) return belowZeroResponse(e, { ...belowZeroCtx, dryRun: true });
+        }
+        stampedNow = '';
+      }
+      return Response.json({
+        ok: true,
+        dry_run: true,
+        department: { id: dept.id, name: dept.name },
+        cutover_date: cutoverDate,
+        mode: adopt ? 'adopt' : 'lines',
+        would_open: planned,
+        would_open_count: planned.length,
+        already_open: already,
+        skipped,
+        warnings,
+        cutover_at: stamp || null,
+        would_stamp_cutover: !stamp,
+      });
+    }
+
+    try {
+      run.immediate(false);
+    } catch (e: unknown) {
+      if (e instanceof CutoverBelowZero) return belowZeroResponse(e, { ...belowZeroCtx, dryRun: false });
+      if (!(e instanceof AdoptRaced)) throw e;
+      const name = mats.get(e.materialId)?.name || e.materialId;
+      /* floor_hidden is told the same physically-true way as at planning
+       * time (floorHiddenDetail); the other two keep their words. */
+      let why: string;
+      if (e.refusal.kind === 'floor_hidden') {
+        const d = floorHiddenDetail(name, mats.get(e.materialId), e.refusal, adoptedAt.get(e.materialId)?.qty ?? 0);
+        why = d.datedLate
+          ? `: ${d.body}. ${DATED_LATE_WHY} `
+          : `: stock was booked out after the ${cutoverDate} count${d.savedKnown ? ' was saved' : ''} and before the department rail went live — ` +
+            `${d.body}. Adopting would let more leave the shelf than is on it. `;
+      } else {
+        why = ` (${e.refusal.kind === 'moved'
+          ? 'it moved after the ' + cutoverDate + ' count'
+          : 'its ' + cutoverDate + ' count is no longer the latest'}). `;
+      }
+      return Response.json(
+        {
+          error:
+            `${name} in ${dept.name} changed while the cutover was being written${why}` +
+            `Nothing was written. Run the cutover again.`,
+          code: isMovedRefusal(e.refusal) ? 'MOVED_SINCE_COUNT' : 'COUNT_NOT_CURRENT',
+          materials: [{ material_id: e.materialId, name, ...e.refusal }],
+        },
+        { status: 409 },
+      );
+    }
 
     /* Read the balance back through deptOnHand — the same function every screen
      * uses — so the response PROVES the opening landed rather than asserting

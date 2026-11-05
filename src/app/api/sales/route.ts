@@ -1,7 +1,16 @@
+import { getCurrentUser } from '@/lib/auth';
 import { getDb, generateId, deductInventoryForSale } from '@/lib/db';
+// THE CENTRAL FLOOR FOR AN UNATTENDED PATH. The restore leg of a sale deletion
+// binds a SIGNED delta and can therefore resolve to a DEBIT; a throw would
+// abandon the credits owed to every other material on the bill. See that
+// module's header and the clamp in DELETE below.
+import { clampCentralDelta, recordCentralDebitClamp, type CentralDeltaClamp } from '@/lib/central-debit-clamp';
 
 export async function GET(request: Request) {
   try {
+    // Ruling 53: the proxy only checks that a cookie is PRESENT on an API GET.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const from = url.searchParams.get('from');
@@ -60,10 +69,19 @@ export async function GET(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    // Ruling 53: deleting a sale row reverses its stock — admin + managers only.
+    const me = await getCurrentUser();
+    if (!me || (me.role !== 'admin' && me.role !== 'manager')) {
+      return Response.json({ error: 'Admin or manager only' }, { status: 403 });
+    }
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
+
+    /* Central restore legs that resolved to a DEBIT and were clamped — see THE
+     * CENTRAL FLOOR ON A RESTORE THAT CAN TURN INTO A DEBIT below. */
+    const centralClamps: CentralDeltaClamp[] = [];
 
     const txn = db.transaction(() => {
       // Reverse the sale's stock deduction BEFORE erasing its audit trail,
@@ -108,6 +126,54 @@ export async function DELETE(request: Request) {
         deptByMaterial.set(r.material_id, (deptByMaterial.get(r.material_id) || 0) + Number(r.qty || 0));
       }
 
+      // FOURTH LEG — THE SKIPS, WHICH MOVED NOTHING AT ALL.
+      // applyDeduct (src/lib/db.ts) has outcomes that move no stock anywhere: a
+      // store-mapped (liquor) material, an unmapped / blank station, a
+      // department with recipe deduction switched off, a failed department
+      // post. Each takes a recordSkip() branch, while the inventory_transactions
+      // audit row is still written unconditionally (Variance / Daily Roll-up /
+      // Sales-vs-Purchase read it). That audit row is `totalDeducted` below, so
+      // a skipped portion has to be excluded exactly like the floor and
+      // department portions — and it was not: the full audit quantity went back
+      // to central for stock central never lost. Every sale this route POSTs
+      // has a recipe skip (it passes station: null), so posting one and
+      // deleting it invented every ingredient on central.
+      // /api/admin/reset (its `consumption_skips` block) has always subtracted
+      // this leg; this is the same read, matched the same way.
+      //
+      // COUPLING, STATED OUT LOUD — the same one admin/reset declares:
+      // consumption_skips has no sale_id column, so the only link back to a sale
+      // is the notes string db.ts writes as `recipe:<id> sale:<id>`. If that
+      // format changes, this subtraction silently stops matching. source =
+      // 'recipe_consumption' keeps wastage and staff-meal skips — which have
+      // their own reversal paths — out of the sum.
+      //
+      // quantity is stored POSITIVE ("what WOULD have been deducted") and is
+      // rounded to 6 dp by recordConsumptionSkip, while the audit row is not.
+      // `rows` is kept so the arithmetic below can tell that rounding apart from
+      // stock (see THE SKIP LOG'S ROUNDING GRID).
+      //
+      // NOT fail-soft: a database without the table has no skips to exclude, so
+      // that one case is checked explicitly; any other failure throws and rolls
+      // the whole deletion back rather than silently crediting central again.
+      const skipByMaterial = new Map<string, { qty: number; rows: number }>();
+      const hasSkipLog = !!db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consumption_skips'"
+      ).get();
+      if (hasSkipLog) {
+        const skipRows = db.prepare(`
+          SELECT material_id, COALESCE(SUM(quantity), 0) AS qty, COUNT(*) AS n
+          FROM consumption_skips
+          WHERE source = 'recipe_consumption'
+            AND material_id IS NOT NULL
+            AND notes LIKE '%sale:' || ?
+          GROUP BY material_id
+        `).all(id) as any[];
+        for (const r of skipRows) {
+          skipByMaterial.set(r.material_id, { qty: Number(r.qty || 0), rows: Number(r.n || 0) });
+        }
+      }
+
       const txRows = db.prepare(`
         SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
         FROM inventory_transactions WHERE reference_id = ? GROUP BY material_id
@@ -119,17 +185,92 @@ export async function DELETE(request: Request) {
         const totalDeducted = -r.qty;                                   // deduction rows are negative
         const floorDeducted = -(floorByMaterial.get(r.material_id) || 0); // ledger deductions are negative too
         const deptDeducted  = -(deptByMaterial.get(r.material_id) || 0); // department rows are negative too
-        // What central actually lost = the audit total minus the two rails that
-        // were never central's. The inventory_transactions row is written on
-        // EVERY path (db.ts applyDeduct keeps it unconditional so Variance and
+        const skip = skipByMaterial.get(r.material_id);
+        const skipDeducted  = skip ? skip.qty : 0;                       // already positive (see above)
+        // What central actually lost = the audit total minus every leg that was
+        // never central's — the two other rails AND the skips, which moved
+        // nothing at all. The inventory_transactions row is written on EVERY
+        // path (db.ts applyDeduct keeps it unconditional so Variance and
         // Sales-vs-Purchase stay bit-identical), which is exactly why it is the
         // total and not the central figure.
-        const centralDeducted = totalDeducted - floorDeducted - deptDeducted;
-        // Epsilon, not `!== 0`: with three floating-point legs a fully
-        // department-attributed sale lands on ~1e-16 rather than a clean zero,
-        // and `!== 0` would post a meaningless sub-nanogram credit to central.
-        if (Math.abs(centralDeducted) > 1e-9) restoreStmt.run(centralDeducted, r.material_id);
+        let centralDeducted = totalDeducted - floorDeducted - deptDeducted - skipDeducted;
+        // THE SKIP LOG'S ROUNDING GRID. Each skip row is stored at 6 dp and the
+        // audit row is not, so a fully skipped material can leave up to half a
+        // micro-unit per skip row behind — of either sign. A NEGATIVE residue
+        // would reach the restore below as a DEBIT (a sale deletion taking stock
+        // off central, the shape the owner ruled out); a positive one is a
+        // sub-micro-unit credit of stock central never lost. Neither is stock:
+        // within that grid, the skips account for the whole audit quantity.
+        // Applies only where a skip leg exists, so every other sale's arithmetic
+        // is unchanged.
+        if (skip && skip.rows > 0 && Math.abs(centralDeducted) <= skip.rows * 5e-7 + 1e-9) {
+          centralDeducted = 0;
+        }
+        /* ── THE CENTRAL FLOOR ON A RESTORE THAT CAN TURN INTO A DEBIT ────────
+         * `centralDeducted` IS SIGNED, and restoreStmt is
+         * `current_stock = current_stock + ?`. Positive is the credit this whole
+         * block exists to post. NEGATIVE writes a DEBIT — a sale deletion
+         * TAKING stock off central — and there was no balance read anywhere in
+         * front of it.
+         *
+         * THE OWNER HAS ALREADY RULED THAT SHAPE OUT, in words, in the writer at
+         * the other end of this arithmetic: src/lib/db.ts (applyDeduct's
+         * `bookable`) says a mis-signed audit row "read the row back as 'central
+         * lost nothing, so credit it' and ran `current_stock + (-60)` — a sale
+         * DEBITING central stock, the one thing the owner's ruling forbids".
+         * That defect was fixed by refusing to WRITE the bad row. This is the
+         * same forbidden outcome guarded at the READER, which is where it
+         * actually reaches the column.
+         *
+         * HONEST ABOUT WHAT THIS IS: DEFENCE IN DEPTH, NOT A DEMONSTRATED BUG.
+         * I could not construct the ledger shape that produces a negative here
+         * on today's code, and I looked: all three legs of a settled sale are
+         * written from the same `totalDeduct`, `postDeptLedger` and
+         * `postCentralTxn` are paired on every branch of applyDeduct, and a
+         * second DELETE is self-limiting because this handler deletes the
+         * inventory_transactions rows that drive the loop. MEASURED on the live
+         * book: 0 of the 264 sale/nc references have a department-consumption
+         * leg at all (the table holds 0 'consumption' rows), every sale
+         * reference carries only negative quantities, and therefore every live
+         * `centralDeducted` is >= 0. SO THIS CLAMP IS A PROVABLE NO-OP ON EVERY
+         * ROW THAT EXISTS, and it is kept because the only thing standing
+         * between this signed bind and the column is a guard in a different
+         * file — this project's recorded "the guard is somewhere else" pattern,
+         * and the reason three previous rounds each found a new unfloored writer
+         * after the last one shipped.
+         *
+         * CLAMPS RATHER THAN THROWS: a sale deletion is a reversal, and a throw
+         * would abandon the credits for every OTHER material on the bill to
+         * prevent one debit. Clamped at zero and recorded, per the ruling in
+         * src/lib/central-debit-clamp.ts.
+         *
+         * Epsilon, not `!== 0`: with three floating-point legs a fully
+         * department-attributed sale lands on ~1e-16 rather than a clean zero,
+         * and `!== 0` would post a meaningless sub-nanogram credit to central.
+         * The clamp applies the SAME 1e-9 (CLAMP_EPS), so dust is still dust on
+         * both sides of it and the guard below keeps its exact meaning.
+         */
+        const clamp = clampCentralDelta(db, {
+          materialId: String(r.material_id),
+          deltaRecipe: centralDeducted,
+        });
+        if (clamp.clamped) centralClamps.push(clamp);
+        if (Math.abs(clamp.deltaToWrite) > 1e-9) restoreStmt.run(clamp.deltaToWrite, r.material_id);
       }
+      /* WHAT THE FLOOR WOULD NOT TAKE OFF, ON ITS OWN AUDIT ROW. Inside the
+       * transaction, so the record and the clamped writes commit together.
+       * Writes nothing when no clamp bit — which, per the measurement above, is
+       * every deletion of every sale on the book today. The actor is a system
+       * rail because this handler has no session of its own; naming a person who
+       * was never identified would be worse than naming the rail. */
+      recordCentralDebitClamp(db, {
+        eventType: 'sale.delete.central_short',
+        entityType: 'sale',
+        entityId: String(id),
+        actorEmail: 'system:sales-delete',
+        clamps: centralClamps,
+        note: `Sale ${id} deleted — the central restore leg resolved to a DEBIT and was clamped at zero`,
+      });
 
       // Give the department its grams back as a signed, additive 'adjustment'
       // row. The consumption rows are deliberately NOT deleted — the movement

@@ -9,7 +9,7 @@
  * Set the storage_location field on each material via Inventory → Edit.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   MapPin,
   Loader2,
@@ -39,9 +39,43 @@ import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState, { countKind } from '@/components/CountState';
+import { isSwitchedOff } from '@/components/MaterialTypeahead';
+import {
+  CLOSING_GST_PCT_CSV, CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
+  CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_INCL_LABEL, CLOSING_INCL_TITLE,
+  CLOSING_TAX_CSV, CLOSING_TAX_LABEL, CLOSING_TAX_TITLE, SEMI_GST,
+  closingTaxCsv, closingTaxNotes, fmtClosingGstPct, sumClosingTax,
+} from '@/lib/closing-tax';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
-const today = () => new Date().toISOString().slice(0, 10);
+/* The default COUNT date is today in INDIA, the same day the server's date
+   guard and /inventory/closing-sheet use. The UTC date
+   (toISOString().slice(0, 10)) is still yesterday between 00:00 and 05:30 IST,
+   so a count saved in that window used to land on the previous day unasked. */
+const today = () => todayIST();
+
+/**
+ * One GET, read to the end, that never throws. Returns the parsed body, or a
+ * short reason a person can read in a banner: the HTTP status where there was
+ * one, "cut off or unreadable" when a 2xx body would not parse (a reply cut
+ * short mid-stream), "no reply" when the request itself failed. A failed read
+ * must be SAID, never quietly turned into an empty list.
+ */
+async function readJson(url: string): Promise<{ ok: true; json: any } | { ok: false; why: string }> {
+  let res: Response;
+  try { res = await fetch(url); }
+  catch (e: any) { return { ok: false, why: `no reply from the server${e?.message ? `: ${e.message}` : ''}` }; }
+  if (!res.ok) return { ok: false, why: `HTTP ${res.status}` };
+  try { return { ok: true, json: await res.json() }; }
+  catch { return { ok: false, why: `HTTP ${res.status}, but the reply was cut off or unreadable` }; }
+}
+
+/** The list a half of the sheet carried, or null when that half did not load. */
+const listOf = (r: Awaited<ReturnType<typeof readJson>>, key: 'items' | 'dates'): any[] | null =>
+  (r.ok && Array.isArray(r.json?.[key]) ? r.json[key] : null);
+/** Why a half did not load — for the banner. */
+const whyNot = (r: Awaited<ReturnType<typeof readJson>>, key: 'items' | 'dates'): string =>
+  (r.ok ? `the reply carried no ${key === 'items' ? 'item' : 'date'} list` : r.why);
 /** The small grey recipe hint printed under a purchase-unit figure (house
  *  style). Null when the material has no real pack conversion, so a pack-1
  *  item never gets a second line repeating the same number. */
@@ -150,6 +184,43 @@ function ValueCell({ value, source, rate }: { value?: number | null; source?: st
   return <span className="font-mono">{fmtMoney(Number(value))}</span>;
 }
 
+/* ── HISTORY TAB ONLY: estimated GST beside Total Value (owner #4, rulings
+ * #77/#78/#81). The server resolves the rate and the rupees
+ * (src/lib/closing-tax.ts) — these cells only print them. Blank is an
+ * em-dash, never 0 / 0%: a 0 would claim the item is GST-free. Every rate
+ * prints where it came from ("last bill with GST 12 Oct 2026" / "Master GST %"). */
+function GstPctCell({ pct, note, title }: { pct?: number | null; note?: string | null; title?: string | null }) {
+  return (
+    <span title={title || undefined}>
+      {pct == null
+        ? <span className="text-[#B8A590]">—</span>
+        : <span className="font-mono">{fmtClosingGstPct(pct)}</span>}
+      {note && <span className="block text-[9px] font-sans text-[#B8A590]">{note}</span>}
+    </span>
+  );
+}
+
+function TaxMoneyCell({ value, why }: { value?: number | null; why?: string | null }) {
+  if (value == null) {
+    return <span className="text-[#B8A590]" title={why || 'No GST rate (or no value saved at count) for this row — left blank, never ₹0.'}>—</span>;
+  }
+  return <span className="font-mono">{fmtMoney(Number(value))}</span>;
+}
+
+/** Why a raw row's Tax / Total incl. cell is blank — the hover text. */
+const gstBlankWhy = (item: any): string | undefined => {
+  if (item?.gst_pct == null) return item?.gst_title || undefined;
+  // A rate is known but this count has no value saved with it: counted before
+  // values were stored with counts (its Total Value is worked out at TODAY's
+  // price, marked "est."), or nothing to value it on that day. A later bill
+  // must never move an old count's tax, so none is estimated.
+  if (item?.rate_is_stored === false && !noBasis(item?.rate_source, item?.rate_per_purchase_unit)) {
+    return 'No value was saved with this count (it was counted before values were stored with counts) — '
+      + 'the Total Value shown is worked out at today\'s price, so no GST is estimated on it.';
+  }
+  return 'No value was saved with this count — nothing to apply the GST rate to.';
+};
+
 /** The row's rate whichever sheet it came from: raw materials are priced per
  *  PURCHASE unit, sub-recipes per YIELD unit. */
 const rowRate = (r: any) => r?.rate_per_purchase_unit ?? r?.rate_per_unit;
@@ -225,6 +296,25 @@ interface Item {
   current_stock: number | null; average_price: number; reorder_level?: number;   // system stock — null for non-admins (blind count)
   super_category?: string; category?: string; closing_cadence?: string; shelf_life_days?: number;
   today_count: number | null; today_variance: number | null; today_by?: string;
+  /** raw_materials.is_active (0 = switched off) — for the Inactive tag only. */
+  is_active?: number | null;
+}
+
+/**
+ * Small grey "Inactive" tag on a count row whose material is switched off in
+ * Raw Materials (owner #6 / ruling 78). Grey, not red: a switched-off item is
+ * not an alert — it is hidden on NEW entries only, and while it is still on a
+ * count list (it holds stock, or already has a count that day) counting it is
+ * exactly right. The same tag on the Record Closing Stock sheet and on an
+ * area's count screen, so the two read alike.
+ */
+function InactiveTag() {
+  return (
+    <span title="Switched off in Raw Materials — not offered on new entries. Its stock still counts: if you hold some, count it as usual."
+          className="ml-1.5 align-middle text-[9px] font-semibold uppercase tracking-wide text-gray-600 bg-gray-100 border border-gray-300 rounded px-1 py-px">
+      Inactive
+    </span>
+  );
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -321,7 +411,10 @@ function AddOffListItem({ deptId, deptName, existingIds, onAdd, compact }: {
               {shown.map(r => (
                 <li key={r.id} className="flex items-center gap-2 px-3 py-1.5">
                   <span className="flex-1 min-w-0">
-                    <span className="block text-xs font-medium text-[#2D1B0E] truncate">{r.name}</span>
+                    <span className="block text-xs font-medium text-[#2D1B0E] truncate">
+                      {r.name}
+                      {isSwitchedOff(r) && <InactiveTag />}
+                    </span>
                     <span className="block text-[10px] text-[#8B7355]">
                       {categoryLabel(r.category || 'other')}
                       {r.sku ? ` · ${r.sku}` : ''} · counted in {r.purchase_unit || r.unit}
@@ -354,9 +447,40 @@ export default function ClosingStockByLocationPage() {
   // Admin / Manager / HOD (head-chef) / Store Manager may pick any department and
   // see the per-area rollup.
   const [me, setMe] = useState<any>(null);
+  /* A failed or unreadable /api/auth/me used to be swallowed, leaving `me`
+     null for the life of the page: an admin then got the non-admin view (no
+     system stock, shortage, excess or variance; no department picker) with
+     nothing saying why. Retry once; if it still fails, SAY so (roleBanner). */
+  const [meError, setMeError] = useState(false);
   useEffect(() => {
-    fetch('/api/auth/me').then(r => r.json()).then(d => { setMe(d?.user || null); setMeRole(d?.user?.role || null); }).catch(() => {});
+    let live = true;
+    const load = async (attempt: number) => {
+      const r = await readJson('/api/auth/me');
+      if (!live) return;
+      if (r.ok && r.json?.user) {
+        setMe(r.json.user); setMeRole(r.json.user.role || null); setMeError(false);
+        return;
+      }
+      if (attempt === 0) { setTimeout(() => { if (live) load(1); }, 1500); return; }
+      setMeError(true);
+    };
+    load(0);
+    return () => { live = false; };
   }, []);
+  const roleBanner = meError ? (
+    <div className="flex items-start gap-2 bg-red-50 border border-red-300 rounded-xl px-4 py-2.5 text-xs text-red-800">
+      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+      <span className="flex-1">
+        <strong>Could not confirm your role — reload the page.</strong> Until it loads, this page shows its most
+        limited view: admin figures (system stock, shortage, excess, variance) and the department picker are hidden.
+        Reload before saving any counts.
+      </span>
+      <button onClick={() => window.location.reload()}
+              className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">
+        Reload
+      </button>
+    </div>
+  ) : null;
   const isAdmin = meRole === 'admin';
   // Can this viewer see/update ALL departments (and the rollup)?
   const canSeeAllDepts = !!me && (me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef || !!me.is_store_manager);
@@ -448,13 +572,16 @@ export default function ClosingStockByLocationPage() {
      switching departments never carries one dept's addition onto another's
      sheet. Session-only: saving a count is what makes an addition permanent. */
   const [extraByDept, setExtraByDept] = useState<Record<string, any[]>>({});
+  // The Record sheet's date. Declared here, before the department-list effect
+  // below, because that effect sends it (?date=) and refetches when it changes.
+  const [closingDate, setClosingDate] = useState(todayIST());
   useEffect(() => {
     if (!me) return;
     if (!activeDeptId) { setDeptRequested(null); setDeptScopeError(false); setDeptScopeLoading(false); return; }
     let live = true;
     setDeptScopeLoading(true);
     setDeptScopeError(false);
-    const qs = new URLSearchParams({ dept_items: '1', department_id: activeDeptId });
+    const qs = new URLSearchParams({ dept_items: '1', department_id: activeDeptId, date: closingDate });
     fetch(`/api/closing-stock?${qs}`)
       .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(j => {
@@ -465,7 +592,7 @@ export default function ClosingStockByLocationPage() {
       .catch(() => { if (live) { setDeptRequested(null); setDeptScopeError(true); } })
       .finally(() => { if (live) setDeptScopeLoading(false); });
     return () => { live = false; };
-  }, [me, activeDeptId]);
+  }, [me, activeDeptId, closingDate]);
 
   /** Is the ever-requested scope in force right now (loaded, for THIS dept)? */
   const deptScopeActive = !!activeDeptId && !!deptRequested && deptRequested.deptId === activeDeptId;
@@ -532,7 +659,7 @@ export default function ClosingStockByLocationPage() {
   // location-count workflow above stays lightweight.
   const [materials, setMaterials] = useState<any[]>([]);
   const [closingStockOpen, setClosingStockOpen] = useState(false);
-  const [closingDate, setClosingDate] = useState(new Date().toISOString().split('T')[0]);
+  // closingDate is declared above (it feeds the department list's fetch).
   /* DEEP LINK from the Closing Overview board: /closing-stock?date=&location=&department_id=
      Seeded once on mount — without this every "Record" link on that board landed
      on today's page with no area or department selected, which reads as a dead
@@ -573,7 +700,12 @@ export default function ClosingStockByLocationPage() {
      instant it is saved (see recordCountVariance's header): there is no hold on
      that rail, so the screen must not stay silent and let the absence of
      "sent for variance approval" read as "nothing differed". */
-  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number; notCounted?: number; deptImmediate?: boolean } | null>(null);
+  /* `semiHeld` — the SUB-RECIPE half was refused by its own zero-pattern
+     guard AFTER the raw-material half of the same submit was already stored.
+     The "nothing was saved" dialog would be untrue there, so the question is
+     asked in this result box instead, and its confirm re-sends only the
+     sub-recipe rows. */
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number; notCounted?: number; deptImmediate?: boolean; semiHeld?: ZeroGuardInfo & { onConfirm: () => void } } | null>(null);
   /* THE ZERO-PATTERN REFUSAL (owner requirement 7). Every save path on this page
      — the modal, the CSV upload and the per-area keypad — posts to a route that
      answers 409 + `zero_guard` when an implausible share of the filled-in lines
@@ -588,20 +720,40 @@ export default function ClosingStockByLocationPage() {
      (req 2/3) — never a browser-side recomputation. */
   const [valued, setValued] = useState<{
     date: string; items: any[]; semi: any[]; total: number; priced: boolean;
+    /** Why the sub-recipe half could not be read back (null = it was). */
+    semiFail?: string | null;
   } | null>(null);
   const [closingHistory, setClosingHistory] = useState<any[]>([]);
+  /* Why each half of the date LIST failed to load (null = it loaded). A failed
+     list must never read as "No closing stock records found". */
+  const [historyListFail, setHistoryListFail] = useState<{ raw: string | null; semi: string | null }>({ raw: null, semi: null });
+  const historyListSeq = useRef(0);
   const [showHistory, setShowHistory] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyDate, setHistoryDate] = useState<string | null>(null);
   const [historyItems, setHistoryItems] = useState<any[]>([]);
   const [historySemi, setHistorySemi] = useState<any[]>([]);
   const [historySummary, setHistorySummary] = useState<any>(null);
+  /* Why each half of the open date's sheet failed to load (null = it loaded).
+     While either is set the sheet is INCOMPLETE: totals are withheld and the
+     CSV is refused, so a partial sheet can never pass for the whole day. */
+  const [historyFail, setHistoryFail] = useState<{ raw: string | null; semi: string | null }>({ raw: null, semi: null });
+  /* Request sequence for the History detail: only the newest view may write
+     the screen, so a late reply for one date can never land under another. */
+  const historySeq = useRef(0);
   // Per-area rollup (admin/HOD only) — each area's overall physical closing value
   // for the selected date. Sourced from summary.by_area on /api/closing-stock.
   const [byArea, setByArea] = useState<any[]>([]);
-  const AREA_LABELS: Record<string, string> = {
-    kitchen: 'Kitchen', bar: 'Bar', store: 'Store', service: 'Service / Ops', other: 'Other', __store__: 'Store / Overall',
-  };
+  // Area names come from Settings → Departments → Manage Areas (the owner's
+  // list); a key the list has no entry for shows as itself. '__store__' is
+  // this page's own bucket for counts with no department area.
+  const [areaNames, setAreaNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    fetch('/api/departments/areas').then(r => (r.ok ? r.json() : null)).then(j => {
+      if (Array.isArray(j?.areas)) setAreaNames(Object.fromEntries(j.areas.map((a: any) => [a.key, a.label])));
+    }).catch(() => {});
+  }, []);
+  const AREA_LABELS: Record<string, string> = { ...areaNames, __store__: 'Store / Overall' };
 
   // Name of the department a pinned user records for ('Store/Overall' when none).
   const ownDeptName = departments.find((d: any) => d.id === ownDeptId)?.name
@@ -620,6 +772,40 @@ export default function ClosingStockByLocationPage() {
       </span>
     </div>
   ) : null;
+
+  /* SWITCHED-OFF ITEMS ON THE STORE / OVERALL SHEET (owner #6 / ruling 78).
+     /api/inventory lists every material, switched-off ones included (it is the
+     shared list and is deliberately never filtered by is_active). On the
+     Store / Overall sheet — and the CSV template / upload built from the same
+     rows — a switched-off item stays only while the central store still holds
+     a non-zero balance of it, or a Store / Overall count is already saved for
+     it on the sheet's date; at zero it drops off. That is the rule a
+     Store / Overall area count screen (/api/closing-stock/by-location)
+     applies, answered by the server per date (GET /api/closing-stock?
+     store_keep=1 → src/lib/count-list-active.ts storeOverallKeepIds).
+     Until the answer for THIS date is in, switched-off rows are held back, so
+     none can be typed into and then vanish; if the call fails they are all
+     shown (tagged Inactive) rather than hiding something countable. A
+     department's sheet is untouched: its own list (dept_items) applies the
+     rule on the server, and its fail-open fallback promises the full list. */
+  const [storeKeepByDate, setStoreKeepByDate] = useState<Record<string, Set<string> | 'error'>>({});
+  const loadStoreKeep = async (d: string): Promise<Set<string> | 'error'> => {
+    let ids: Set<string> | 'error' = 'error';
+    try {
+      const r = await fetch(`/api/closing-stock?${new URLSearchParams({ store_keep: '1', date: d })}`);
+      const j = r.ok ? await r.json() : null;
+      if (Array.isArray(j?.keep_ids)) ids = new Set<string>(j.keep_ids.map((x: unknown) => String(x)));
+    } catch { /* 'error' → show every row, tagged */ }
+    setStoreKeepByDate(prev => ({ ...prev, [d]: ids }));
+    return ids;
+  };
+  useEffect(() => {
+    if (!closingStockOpen || activeDeptId) return;
+    loadStoreKeep(closingDate);
+  }, [closingStockOpen, activeDeptId, closingDate]);
+  /** Is this row on the Store / Overall sheet? Switched-ON rows always are. */
+  const storeSheetKeeps = (m: { id?: unknown; is_active?: unknown }, keep: Set<string> | 'error' | undefined) =>
+    !isSwitchedOff(m) || keep === 'error' || (keep instanceof Set && keep.has(String(m.id)));
 
   /* Modal item list scoped to the ACTIVE department's category whitelist.
      Staff (no dept choice) fetch WITHOUT scope=all, so the server whitelist
@@ -658,8 +844,14 @@ export default function ClosingStockByLocationPage() {
     if (!canSeeAllDepts && deptItemIds) {
       list = list.filter((m: any) => deptItemIds.has(String(m.id)));
     }
+    // Store / Overall only: a switched-off item stays while central holds it
+    // or a Store / Overall count is saved for this date (see storeKeepByDate).
+    if (!activeDeptId) {
+      const keep = storeKeepByDate[closingDate];
+      list = list.filter((m) => storeSheetKeeps(m, keep));
+    }
     return list;
-  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds, deptScopeActive, deptRequested, extraRows]);
+  }, [materials, hasDeptChoice, deptCategorySet, canSeeAllDepts, deptItemIds, deptScopeActive, deptRequested, extraRows, activeDeptId, storeKeepByDate, closingDate]);
   /** Ids on the sheet — the escape hatch must not offer a duplicate. */
   const sheetIds = useMemo(() => new Set(deptScopedMaterials.map((m: any) => String(m.id))), [deptScopedMaterials]);
   // Is a real category whitelist in effect for the active dept? Gates the base
@@ -705,7 +897,9 @@ export default function ClosingStockByLocationPage() {
         <div className="flex items-start gap-2 rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-4 py-2.5 text-xs text-[#6B5744]">
           <ListChecks className="w-4 h-4 flex-shrink-0 mt-0.5 text-[#8B7355]" />
           <span>
-            <strong>Store / Overall</strong> — the full central list, not scoped to any department.
+            <strong>Store / Overall</strong> — the full central list, not scoped to any department
+            (an item switched off in Raw Materials stays on it only while its central balance is not
+            zero, or once it has a Store / Overall count that day).
             Pick a department above to count only the items that department actually uses.
           </span>
         </div>
@@ -739,7 +933,8 @@ export default function ClosingStockByLocationPage() {
           <span>
             <strong>{activeDeptName} uses {ever} item{ever === 1 ? '' : 's'}</strong> — every material this
             department has ever requisitioned, with no time limit, so something it asked for months ago
-            stays on the list. Items it has never requested (or only ever had rejected) are not shown.
+            stays on the list. Items it has never requested (or only ever had rejected) are not shown,
+            nor is an item switched off in Raw Materials once this department&apos;s balance of it is zero.
             {extraRows.length > 0 && (
               <> {' '}<span className="text-[#af4408] font-medium">+{extraRows.length} added by hand this session.</span></>
             )}
@@ -892,7 +1087,7 @@ export default function ClosingStockByLocationPage() {
   };
 
   const openClosingStock = async () => {
-    const openDate = new Date().toISOString().split('T')[0];
+    const openDate = todayIST();
     setClosingStockOpen(true);
     setClosingDate(openDate);
     setClosingResult(null);
@@ -929,13 +1124,15 @@ export default function ClosingStockByLocationPage() {
       const semiQs = new URLSearchParams({ date: d, department_id: activeDeptId, counted_only: '1' });
       const [res, semiRes] = await Promise.all([
         fetch(`/api/closing-stock?${qs}`),
-        fetch(`/api/closing-stock/semi?${semiQs}`),
+        readJson(`/api/closing-stock/semi?${semiQs}`),
       ]);
       if (!res.ok) { setValued(null); return; }
       const json = await res.json();
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
       const items: any[] = json.items || [];
-      const semi: any[] = semiJson.items || [];
+      // The sub-recipe half failing used to read as "no sub-recipes" and the
+      // total quietly left them out. Now it is marked (semiFail) on screen.
+      const semiList = listOf(semiRes, 'items');
+      const semi: any[] = semiList || [];
       // The sheet total is the SUM OF THE LINES SHOWN — every addend is a
       // server-stored total_value, and a footer that disagreed with its own
       // column would be a bug. (A summary total from the API could legitimately
@@ -946,7 +1143,7 @@ export default function ClosingStockByLocationPage() {
       // valuation columns, say so instead of printing a column of em-dashes.
       const priced = items.some(i => i.total_value != null || i.rate_source != null)
         || semi.some(s => s.total_value != null || s.rate_per_unit != null);
-      setValued({ date: d, items, semi, total, priced });
+      setValued({ date: d, items, semi, total, priced, semiFail: semiList ? null : whyNot(semiRes, 'items') });
     } catch { setValued(null); }
   };
 
@@ -957,53 +1154,154 @@ export default function ClosingStockByLocationPage() {
    * one combined closing value rather than the raw half only.
    */
   const fetchClosingHistory = async () => {
-    try {
-      const [res, semiRes] = await Promise.all([
-        fetch('/api/closing-stock'),
-        fetch('/api/closing-stock/semi'),
-      ]);
-      const json = res.ok ? await res.json() : { dates: [] };
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({ dates: [] })) : { dates: [] };
-      const byDate = new Map<string, any>();
-      for (const d of json.dates || []) byDate.set(d.date, { ...d });
-      for (const s of semiJson.dates || []) {
-        const hit = byDate.get(s.date);
-        if (hit) {
-          hit.semi_count = s.item_count || 0;
-          hit.total_value = (Number(hit.total_value) || 0) + (Number(s.total_value) || 0);
-        } else {
-          byDate.set(s.date, {
-            date: s.date, item_count: 0, semi_count: s.item_count || 0,
-            total_value: Number(s.total_value) || 0,
-            total_variance_value: 0, shortage_count: 0, excess_count: 0,
-          });
-        }
+    // A failed half used to become `{ dates: [] }` — a dead list read as
+    // "No closing stock records found". Each half's failure is now kept and
+    // shown (historyListFail), and the newest call alone writes the list.
+    const seq = ++historyListSeq.current;
+    const [res, semiRes] = await Promise.all([
+      readJson('/api/closing-stock'),
+      readJson('/api/closing-stock/semi'),
+    ]);
+    if (seq !== historyListSeq.current) return;
+    const rawDates = listOf(res, 'dates');
+    const semiDates = listOf(semiRes, 'dates');
+    setHistoryListFail({
+      raw: rawDates ? null : whyNot(res, 'dates'),
+      semi: semiDates ? null : whyNot(semiRes, 'dates'),
+    });
+    // Without the raw-material index there is no honest list to draw.
+    if (!rawDates) { setClosingHistory([]); return; }
+    /* Each index answers at most its 50 newest dates. A date older than one
+       index's 50th is not "0 rows" in that half, it is just not covered, so
+       its count there is unknown (raw_known / semi_known = false) and the
+       History CSV check does not hold that count against the loaded sheet. */
+    const oldest = (list: any[]) => (list.length >= 50
+      ? list.reduce((m: string, x: any) => (String(x.date) < m ? String(x.date) : m), String(list[0].date))
+      : null);
+    const rawOldest = oldest(rawDates);
+    const semiOldest = semiDates ? oldest(semiDates) : null;
+    const byDate = new Map<string, any>();
+    for (const d of rawDates) {
+      byDate.set(d.date, { ...d, raw_known: true, semi_known: !!semiDates && (semiOldest == null || String(d.date) >= semiOldest) });
+    }
+    for (const s of semiDates || []) {
+      const hit = byDate.get(s.date);
+      if (hit) {
+        hit.semi_count = s.item_count || 0;
+        hit.total_value = (Number(hit.total_value) || 0) + (Number(s.total_value) || 0);
+      } else {
+        byDate.set(s.date, {
+          date: s.date, item_count: 0, semi_count: s.item_count || 0,
+          total_value: Number(s.total_value) || 0,
+          total_variance_value: 0, shortage_count: 0, excess_count: 0,
+          raw_known: rawOldest == null || String(s.date) >= rawOldest, semi_known: true,
+        });
       }
-      setClosingHistory([...byDate.values()].sort((a, b) => String(b.date).localeCompare(String(a.date))));
-    } catch (_) {}
+    }
+    setClosingHistory([...byDate.values()].sort((a, b) => String(b.date).localeCompare(String(a.date))));
   };
 
+  /* THE HISTORY SHEET IS ALL OR MARKED. On 31 Oct the raw-material request
+     failed while the semi-finished one answered, and the page drew the 89
+     semi rows alone at ₹0 — and a CSV of only those — with nothing on screen
+     to say anything was missing. Now: everything is cleared first (a failed
+     load can never show the previous date's rows under this heading), each
+     half's failure is kept separately (non-2xx, unreadable body, no reply),
+     and only the newest request may write the screen. */
   const viewHistoryDate = async (d: string) => {
+    const seq = ++historySeq.current;
     setHistoryDate(d);
     setHistoryLoading(true);
-    try {
-      // Raw-material counts, plus the same date's semi-finished counts across
-      // every department (counted_only=1 → saved rows, not the full catalogue).
-      const [res, semiRes] = await Promise.all([
-        fetch(`/api/closing-stock?date=${d}`),
-        fetch(`/api/closing-stock/semi?date=${d}&counted_only=1`),
-      ]);
-      const semiJson = semiRes.ok ? await semiRes.json().catch(() => ({})) : {};
-      setHistorySemi(semiJson.items || []);
-      if (res.ok) {
-        const json = await res.json();
-        setHistoryItems(json.items || []);
-        setHistorySummary(json.summary || null);
-        setByArea(json.summary?.by_area || []);
-      }
-    } catch (_) {}
+    setHistoryItems([]);
+    setHistorySemi([]);
+    setHistorySummary(null);
+    setHistoryFail({ raw: null, semi: null });
+    // Raw-material counts, plus the same date's semi-finished counts across
+    // every department (counted_only=1 → saved rows, not the full catalogue).
+    const [res, semiRes] = await Promise.all([
+      readJson(`/api/closing-stock?date=${d}`),
+      readJson(`/api/closing-stock/semi?date=${d}&counted_only=1`),
+    ]);
+    if (seq !== historySeq.current) return;   // a newer view owns the screen now
+    const rawItems = listOf(res, 'items');
+    const semiItems = listOf(semiRes, 'items');
+    setHistoryFail({
+      raw: rawItems ? null : whyNot(res, 'items'),
+      semi: semiItems ? null : whyNot(semiRes, 'items'),
+    });
+    if (semiItems) setHistorySemi(semiItems);
+    /* by_area is NOT taken from here any more. History never shows it; the
+       only place it appeared was the page's own Area rollup, labelled with the
+       TOP-LEVEL date — so opening a history date used to put that date's area
+       figures under another date's heading (and leave them there). The rollup
+       is reloadRollup()'s alone. */
+    if (rawItems && res.ok) {
+      setHistoryItems(rawItems);
+      setHistorySummary(res.json.summary || null);
+    }
     setHistoryLoading(false);
   };
+
+  /** Leave the open date: nothing of it may linger, and a reply still in
+   *  flight for it is ignored (the sequence moves on). */
+  const backToHistoryDates = () => {
+    historySeq.current++;
+    setHistoryDate(null);
+    setHistoryLoading(false);
+    setHistoryItems([]);
+    setHistorySemi([]);
+    setHistorySummary(null);
+    setHistoryFail({ raw: null, semi: null });
+  };
+
+  /** Retry reloads the date list too, so the row counts the CSV check
+   *  compares against are as fresh as the sheet. */
+  const retryHistory = () => {
+    fetchClosingHistory();
+    if (historyDate) viewHistoryDate(historyDate);
+  };
+
+  /* THE FILE IS THE WHOLE SHEET OR NOTHING. Refused (button off, reason shown,
+     and downloadHistoryCsv itself returns) when either half failed to load,
+     or when the rows loaded do not match the date list's own count for this
+     date — the owner's 31 Oct file held 0 of 1328 raw-material rows. */
+  const historyLine = historyDate ? closingHistory.find((h: any) => h.date === historyDate) : undefined;
+  const historyCsvBlock: string | null = (() => {
+    const missing = [historyFail.raw && 'raw-material', historyFail.semi && 'semi-finished'].filter(Boolean);
+    if (missing.length) {
+      return `Download is off — the ${missing.join(' and ')} counts for this date did not load, so the file would be missing them. Retry first.`;
+    }
+    if (!historyLine) return null;
+    /* Worded without blaming either side: the two were read at different
+       moments, and either one can be the stale one (a count saved after the
+       list was read, or after the sheet was). Retry rereads both. A sheet that
+       stays SHORT after a Retry has one other cause: the list counts every
+       stored row, but the sheet can only show rows whose raw material /
+       sub-recipe still exists (the routes' JOIN) — said plainly, since a Retry
+       will not clear that. */
+    const off: string[] = [];
+    const short: string[] = [];
+    let shortBy = 0;
+    const wantRaw = Number(historyLine.item_count) || 0;
+    const wantSemi = Number(historyLine.semi_count) || 0;
+    if (historyLine.raw_known !== false && historyItems.length !== wantRaw) {
+      off.push(`${historyItems.length} raw-material row(s) loaded, but the date list counts ${wantRaw}`);
+      if (historyItems.length < wantRaw) { short.push('a raw material'); shortBy += wantRaw - historyItems.length; }
+    }
+    if (historyLine.semi_known !== false && historySemi.length !== wantSemi) {
+      off.push(`${historySemi.length} semi-finished row(s) loaded, but the date list counts ${wantSemi}`);
+      if (historySemi.length < wantSemi) { short.push('a sub-recipe'); shortBy += wantSemi - historySemi.length; }
+    }
+    if (off.length) {
+      return `Download is off — ${off.join('; ')}. This sheet and the date list disagree, so the file is held back. ` +
+        `Retry reloads both, which clears a difference caused by counts saved in the meantime.` +
+        (short.length
+          ? ` If a Retry does not clear it, the ${shortBy} row(s) this sheet is short are most likely saved counts for ` +
+            `${short.join(' or ')} that no longer exists: the sheet cannot show them, so the file would leave them out.`
+          : '');
+    }
+    return null;
+  })();
 
   /**
    * Download the counted sheet for the ONE date currently open in History.
@@ -1029,6 +1327,7 @@ export default function ClosingStockByLocationPage() {
    */
   const downloadHistoryCsv = () => {
     if (!historyDate) return;
+    if (historyCsvBlock) return;   // the reason is on screen under the button
     const rows: Record<string, string | number>[] = [];
 
     for (const item of historyItems) {
@@ -1049,6 +1348,12 @@ export default function ClosingStockByLocationPage() {
       if (isAdmin) r['Variance'] = csvQty(toPurchaseQty(Number(item.variance) || 0, hm));
       if (isAdmin) r['Variance (Rs)'] = item.variance_value == null ? '' : Number(item.variance_value);
       r['Notes'] = item.notes || '';
+      // Estimated GST — APPENDED after the last existing column so every column
+      // above keeps its position. Blank (never 0) where there is no rate.
+      r[CLOSING_GST_PCT_CSV] = closingTaxCsv(item.gst_pct);
+      r[CLOSING_GST_SOURCE_CSV] = item.gst_note || '';
+      r[CLOSING_TAX_CSV] = closingTaxCsv(item.tax);
+      r[CLOSING_INCL_CSV] = closingTaxCsv(item.total_incl_tax);
       rows.push(r);
     }
 
@@ -1068,6 +1373,10 @@ export default function ClosingStockByLocationPage() {
       if (isAdmin) r['Variance'] = '';
       if (isAdmin) r['Variance (Rs)'] = '';
       r['Notes'] = s.notes || '';
+      r[CLOSING_GST_PCT_CSV] = '';
+      r[CLOSING_GST_SOURCE_CSV] = SEMI_GST.gst_note;
+      r[CLOSING_TAX_CSV] = '';
+      r[CLOSING_INCL_CSV] = '';
       rows.push(r);
     }
 
@@ -1124,11 +1433,41 @@ export default function ClosingStockByLocationPage() {
   };
 
   /**
-   * @param confirmZeros re-run of a submit the zero-pattern guard refused. The
-   * payload is rebuilt from the SAME on-screen entries, which have not changed
-   * — the dialog is modal and the grid is behind it.
+   * The sub-recipe half was refused by ITS zero-pattern guard after the
+   * raw-material half of the same submit had already been stored. Confirming
+   * re-sends exactly the refused sub-recipe rows with confirm_zeros — and
+   * nothing else, since the raw counts are already in.
    */
-  const submitClosingStock = async (confirmZeros = false) => {
+  const semiHeldAfterRaw = (
+    guard: ZeroGuardInfo, forDate: string,
+    rows: { sub_recipe_id: string; physical_stock: number; notes: string }[],
+  ) => ({
+    ...guard,
+    onConfirm: async () => {
+      setClosingSubmitting(true);
+      const errs: string[] = [];
+      try {
+        const again = await postSemiCounts(forDate, rows, errs, true);
+        setClosingResult(prev => (prev ? { ...prev, semi: again.saved, semiHeld: undefined, errors: [...prev.errors, ...errs] } : prev));
+        if (again.saved > 0) {
+          await fetchClosingHistory();
+          await loadValuedSheet(forDate);
+        }
+      } finally {
+        setClosingSubmitting(false);
+      }
+    },
+  });
+
+  /**
+   * @param confirmZeros re-run of a submit the RAW-MATERIAL zero-pattern guard
+   * refused. The payload is rebuilt from the SAME on-screen entries, which have
+   * not changed — the dialog is modal and the grid is behind it.
+   * @param confirmSemiZeros the same for the SUB-RECIPE half. Kept separate: a
+   * confirm given for the raw zeros must never wave the sub-recipe zeros
+   * through too — they get their own warning.
+   */
+  const submitClosingStock = async (confirmZeros = false, confirmSemiZeros = false) => {
     setClosingSubmitting(true);
     setClosingResult(null);
     try {
@@ -1186,7 +1525,7 @@ export default function ClosingStockByLocationPage() {
         if (!res.ok && res.status === 409) {
           const guard = readZeroGuard(json);
           if (guard) {
-            setZeroGuard({ ...guard, what: 'this sheet', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+            setZeroGuard({ ...guard, what: 'this sheet', onConfirm: () => { setZeroGuard(null); submitClosingStock(true, confirmSemiZeros); } });
             setClosingSubmitting(false);
             return;
           }
@@ -1217,18 +1556,21 @@ export default function ClosingStockByLocationPage() {
         rawNotCounted = json.not_counted || 0;
         rawDeptImmediate = json.dept_immediate === true;
       }
-      const semi = await postSemiCounts(closingDate, semiToSubmit, errors, confirmZeros);
-      if (semi.guard) {
-        // The raw half may already be saved; re-running the whole submit is
-        // safe because each count is keyed (date, material, department) and is
-        // delete-then-inserted, and the server re-reads live stock, so a count
-        // that already reconciled produces no second variance.
-        setZeroGuard({ ...semi.guard, what: 'the sub-recipe counts', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+      // The sub-recipe half carries ITS OWN confirm, never the raw half's.
+      const semi = await postSemiCounts(closingDate, semiToSubmit, errors, confirmSemiZeros);
+      if (semi.guard && rawSaved === 0) {
+        // Nothing from this submit is stored, so the dialog's "nothing was
+        // saved" is true. Confirming re-runs the submit with the sub-recipe
+        // confirm added and the raw-material confirm left as it was.
+        setZeroGuard({ ...semi.guard, what: 'the sub-recipe counts', onConfirm: () => { setZeroGuard(null); submitClosingStock(confirmZeros, true); } });
         setClosingSubmitting(false);
         return;
       }
+      // Raw counts ARE stored when semi.guard is set here — so the sub-recipe
+      // question is asked in the result box (semiHeld), which says so.
       const semiSaved = semi.saved;
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate,
+        semiHeld: semi.guard ? semiHeldAfterRaw(semi.guard, closingDate, semiToSubmit) : undefined });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1292,14 +1634,20 @@ export default function ClosingStockByLocationPage() {
    * sheet never needs it — those rows come from the server, not /api/inventory.
    * ────────────────────────────────────────────────────────────────────────── */
   const closingSheetRows = async (): Promise<any[]> => {
-    if (deptScopeActive || materials.length) return deptScopedMaterials;
-    const all = await fetchMaterials();
+    if (deptScopeActive || (activeDeptId && materials.length)) return deptScopedMaterials;
+    const all = materials.length ? materials : await fetchMaterials();
     let list = (hasDeptChoice && deptCategorySet)
       ? all.filter((m: any) => deptCategorySet.has(String(m.category || '').trim().toLowerCase()))
       : all;
     // Same dept item-set intersection as deptScopedMaterials.
     if (!canSeeAllDepts && deptItemIds) {
       list = list.filter((m: any) => deptItemIds.has(String(m.id)));
+    }
+    // Store / Overall: the same switched-off rule as the sheet, for THIS date —
+    // awaited here, so a template or an upload never runs ahead of it.
+    if (!activeDeptId) {
+      const keep = storeKeepByDate[closingDate] ?? await loadStoreKeep(closingDate);
+      list = list.filter((m: any) => storeSheetKeeps(m, keep));
     }
     return list;
   };
@@ -1352,6 +1700,14 @@ export default function ClosingStockByLocationPage() {
       const byName = new Map(mats.map(m => [String(m.name).trim().toLowerCase(), m]));
       const subById = new Map(subs.map(s => [String(s.id), s]));
       const subByName = new Map(subs.map(s => [s.name.trim().toLowerCase(), s]));
+      /* A row for a SWITCHED-OFF item the Store / Overall sheet does not list
+         (zero central stock, no Store / Overall count saved that date) is not
+         "material not found" — it exists. Say what is actually true. */
+      const offList = activeDeptId ? [] : (materials.length ? materials : await fetchMaterials())
+        .filter((m: any) => isSwitchedOff(m) && !byId.has(String(m.id)));
+      const offById = new Map(offList.map((m: any) => [String(m.id), m]));
+      const offBySku = new Map(offList.filter((m: any) => m.sku).map((m: any) => [String(m.sku).trim().toLowerCase(), m]));
+      const offByName = new Map(offList.map((m: any) => [String(m.name).trim().toLowerCase(), m]));
       const text = await file.text();
       const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
       if (parsed.errors?.length) {
@@ -1420,7 +1776,13 @@ export default function ClosingStockByLocationPage() {
         const skuKey = get(row, 'SKU', 'sku').toLowerCase();
         const nameKey = get(row, 'Name', 'name').toLowerCase();
         const m = (idKey && byId.get(idKey)) || (skuKey && bySku.get(skuKey)) || (nameKey && byName.get(nameKey));
-        if (!m) { errors.push(notOnSheet(label)); continue; }
+        if (!m) {
+          const off = (idKey && offById.get(idKey)) || (skuKey && offBySku.get(skuKey)) || (nameKey && offByName.get(nameKey));
+          errors.push(off
+            ? `${label}: switched off in Raw Materials, with no central stock and no Store / Overall count saved for ${closingDate}, so it is not on this sheet and was not counted. An admin can switch it back on in Raw Materials.`
+            : notOnSheet(label));
+          continue;
+        }
         // Basis comes from the row's own Unit cell: new templates declare the
         // purchase unit (count ×pack → recipe), old files declare the recipe
         // unit (raw). Anything else is ambiguous — reject the row rather than
@@ -1446,7 +1808,7 @@ export default function ClosingStockByLocationPage() {
       /* THE PARSED FILE IS SENT FROM HERE, and a zero-guard retry re-sends THIS
          payload — the file is not re-read and the rows are not re-derived, so
          the number the dialog quoted is the number that gets written. */
-      await sendParsedCsv(items, semiItems, errors, false);
+      await sendParsedCsv(items, semiItems, errors, false, false);
     } catch (err: any) {
       setClosingResult({ success: 0, errors: [err.message] });
     } finally {
@@ -1459,6 +1821,8 @@ export default function ClosingStockByLocationPage() {
     semiItems: { sub_recipe_id: string; physical_stock: number; notes: string }[],
     parseErrors: string[],
     confirmZeros: boolean,
+    /** The sub-recipe rows' own confirm — never inherited from the raw rows'. */
+    confirmSemiZeros: boolean,
   ) => {
     setClosingSubmitting(true);
     // Copy, so a retry does not accumulate the first attempt's messages.
@@ -1483,7 +1847,7 @@ export default function ClosingStockByLocationPage() {
           if (guard) {
             setZeroGuard({
               ...guard, what: 'this file',
-              onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+              onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true, confirmSemiZeros); },
             });
             return;
           }
@@ -1504,17 +1868,21 @@ export default function ClosingStockByLocationPage() {
         rawNotCounted = json.not_counted || 0;
         rawDeptImmediate = json.dept_immediate === true;
       }
-      // Sub-recipe rows from the same file go to the semi route.
-      const semi = await postSemiCounts(closingDate, semiItems, errors, confirmZeros);
-      if (semi.guard) {
+      // Sub-recipe rows from the same file go to the semi route, with their
+      // OWN confirm (a confirm for the raw rows' zeros does not carry over).
+      const semi = await postSemiCounts(closingDate, semiItems, errors, confirmSemiZeros);
+      if (semi.guard && rawSaved === 0) {
+        // Nothing from this file is stored yet — "nothing was saved" is true.
         setZeroGuard({
           ...semi.guard, what: 'the sub-recipe rows in this file',
-          onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+          onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, confirmZeros, true); },
         });
         return;
       }
+      // Raw rows ARE stored when semi.guard is set here — ask in the result box.
       const semiSaved = semi.saved;
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate,
+        semiHeld: semi.guard ? semiHeldAfterRaw(semi.guard, closingDate, semiItems) : undefined });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1572,11 +1940,24 @@ export default function ClosingStockByLocationPage() {
   // equals its own column (a summary figure from the API could cover a wider
   // scope than the rows on screen).
   const historyValueTotal = sumValue(historyItems) + sumValue(historySemi);
+  /** A half of the open date's sheet did not load — see historyFail. */
+  const historyIncomplete = !!(historyFail.raw || historyFail.semi);
   /** Does this date have any stored valuation at all? Counts saved before the
    *  valuation columns existed have none — say so instead of showing ₹0. */
   const historyPriced = historyItems.some((i: any) => i.total_value != null || i.rate_source != null)
     || historySemi.some((s: any) => s.total_value != null || s.rate_per_unit != null);
   const historyUnvalued = unvaluedCount([...historyItems, ...historySemi]);
+  /** Estimated-GST footer: only rows WITH a rate are summed (raw rows carry the
+   *  server's figures; semi-finished rows are always blank), and M counts every
+   *  row on the sheet so "rate known for N of M" describes the whole table. */
+  const historyTax = sumClosingTax([
+    ...historyItems,
+    ...historySemi.map(() => ({ gst_pct: null, tax: null, total_incl_tax: null })),
+  ]);
+  /** Every note printed with those totals (chip, footer lines, hover) — from
+   *  the ONE helper, so each states the true case: no rate / rates but no
+   *  value saved at count / some taxed. */
+  const historyTaxNotes = closingTaxNotes(historyTax, 'items', fmtMoney);
 
   const reloadLocations = async () => {
     setLoading(true);
@@ -1592,12 +1973,18 @@ export default function ClosingStockByLocationPage() {
   // Per-area rollup for the top-level date — admin / HOD / store-manager only.
   // Uses the summary.by_area block, which is date-scoped and independent of any
   // department filter, so it always reflects every area's overall closing value.
+  // A failed read used to hide the panel without a word; now it says so.
+  const [rollupFail, setRollupFail] = useState<string | null>(null);
   const reloadRollup = async () => {
-    if (!canSeeAllDepts) { setByArea([]); return; }
-    try {
-      const json = await fetch(`/api/closing-stock?date=${date}`).then(r => r.json());
-      setByArea(json?.summary?.by_area || []);
-    } catch { setByArea([]); }
+    if (!canSeeAllDepts) { setByArea([]); setRollupFail(null); return; }
+    const r = await readJson(`/api/closing-stock?date=${date}`);
+    if (r.ok && Array.isArray(r.json?.summary?.by_area)) {
+      setByArea(r.json.summary.by_area);
+      setRollupFail(null);
+    } else {
+      setByArea([]);
+      setRollupFail(r.ok ? 'the reply carried no area rollup' : r.why);
+    }
   };
   useEffect(() => { reloadRollup(); /* eslint-disable-next-line */ }, [date, canSeeAllDepts]);
 
@@ -1796,6 +2183,7 @@ export default function ClosingStockByLocationPage() {
             <ChevronLeft size={16} /> Back to locations
           </button>
         </div>
+        {roleBanner}
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 flex items-center gap-3 flex-wrap">
           <MapPin className="text-[#af4408]" size={22} />
           <div className="flex-1">
@@ -1934,7 +2322,10 @@ export default function ClosingStockByLocationPage() {
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${isLow ? 'bg-red-50/30' : ''}`}>
                         <td className="py-1.5 px-3">
-                          <div className="font-medium text-[#2D1B0E]">{it.name}</div>
+                          <div className="font-medium text-[#2D1B0E]">
+                            {it.name}
+                            {isSwitchedOff(it) && <InactiveTag />}
+                          </div>
                           <div className="flex gap-1.5 mt-0.5 items-center">
                             <span className="text-[10px] font-mono text-[#8B7355]">{it.sku || '·'}</span>
                             {cadenceTag && (
@@ -2125,6 +2516,8 @@ export default function ClosingStockByLocationPage() {
         </label>
       </div>
 
+      {roleBanner}
+
       <div className="grid grid-cols-3 gap-3">
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Locations</div>
@@ -2173,13 +2566,20 @@ export default function ClosingStockByLocationPage() {
       {renderDeptScope()}
 
       {/* Per-area rollup — admin/HOD view of each area's overall closing value. */}
+      {canSeeAllDepts && rollupFail && (
+        <div className="flex items-center gap-2 bg-red-50 border border-red-300 rounded-xl px-4 py-2.5 text-xs text-red-800">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+          <span className="flex-1">The area rollup for {date} could not be loaded ({rollupFail}). Saved counts are not affected.</span>
+          <button onClick={() => reloadRollup()} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
+        </div>
+      )}
       {canSeeAllDepts && byArea.length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4">
           <div className="text-xs font-semibold text-[#2D1B0E] mb-2">Area rollup — physical closing value ({date})</div>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
             {byArea.map((a: any) => (
               <div key={a.area} className="border border-[#E8D5C4] rounded-lg p-3 bg-[#FFF8F0]">
-                <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{AREA_LABELS[a.area] || a.area}</div>
+                <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">{a.label || AREA_LABELS[a.area] || a.area}</div>
                 <div className="text-lg font-semibold text-[#2D1B0E] mt-1">{fmt(a.physical_value)}</div>
                 <div className="text-[10px] text-[#8B7355] mt-0.5">{a.item_count} item{a.item_count === 1 ? '' : 's'}</div>
               </div>
@@ -2289,14 +2689,40 @@ export default function ClosingStockByLocationPage() {
               </div>
             </div>
 
+            {roleBanner && <div className="px-6 pt-4">{roleBanner}</div>}
+
             {showHistory ? (
               /* History View */
               <div className="px-6 py-5 space-y-4">
-                {closingHistory.length === 0 ? (
-                  <div className="text-center py-12 text-[#8B7355]">
-                    <ClipboardCheck className="w-10 h-10 mx-auto mb-3 opacity-30" />
-                    <p>No closing stock records found</p>
+                {/* A list that failed to load says so — it is never shown as
+                    "No closing stock records found". Without the raw-material
+                    index no list is drawn at all; without the semi-finished
+                    one, each value is marked as raw materials only. */}
+                {!historyDate && (historyListFail.raw || historyListFail.semi) && (
+                  <div className="flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-xs text-red-800">
+                    <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <div className="flex-1 space-y-1">
+                      {historyListFail.raw && (
+                        <p><strong>The list of closing-stock dates could not be loaded</strong> ({historyListFail.raw}).</p>
+                      )}
+                      {historyListFail.semi && (
+                        <p>
+                          <strong>The semi-finished part of the list could not be loaded</strong> ({historyListFail.semi})
+                          {historyListFail.raw ? '.' : ' — the values below leave out sub-recipes.'}
+                        </p>
+                      )}
+                      <p>The saved counts are <strong>not lost</strong> — reading them failed, nothing was deleted.</p>
+                    </div>
+                    <button onClick={() => fetchClosingHistory()} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
                   </div>
+                )}
+                {!historyDate && historyListFail.raw ? null : closingHistory.length === 0 && !historyDate ? (
+                  historyListFail.semi ? null : (
+                    <div className="text-center py-12 text-[#8B7355]">
+                      <ClipboardCheck className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                      <p>No closing stock records found</p>
+                    </div>
+                  )
                 ) : !historyDate ? (
                   <div className="space-y-2">
                     <h3 className="text-sm font-semibold text-[#2D1B0E]">Closing Stock Records</h3>
@@ -2324,7 +2750,10 @@ export default function ClosingStockByLocationPage() {
                                 every tier sees it (req 4). Shown only when the
                                 server sends it. */}
                             {h.total_value != null && (
-                              <span className="text-[#2D1B0E]">Value: <span className="font-semibold font-mono">{fmtMoney(h.total_value)}</span></span>
+                              <span className="text-[#2D1B0E]">
+                                Value: <span className="font-semibold font-mono">{fmtMoney(h.total_value)}</span>
+                                {historyListFail.semi && <span className="ml-1 text-red-700">(raw materials only)</span>}
+                              </span>
                             )}
                             {isAdmin && h.shortage_count > 0 && (
                               <span className="flex items-center gap-1 text-red-500"><TrendingDown className="w-3 h-3" />{h.shortage_count} shortage</span>
@@ -2344,7 +2773,7 @@ export default function ClosingStockByLocationPage() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-between">
                       <div>
-                        <button onClick={() => setHistoryDate(null)} className="text-xs text-[#af4408] hover:underline mb-1">&larr; Back to dates</button>
+                        <button onClick={backToHistoryDates} className="text-xs text-[#af4408] hover:underline mb-1">&larr; Back to dates</button>
                         <h3 className="text-sm font-semibold text-[#2D1B0E]">
                           Closing Stock — {new Date(historyDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}
                         </h3>
@@ -2357,28 +2786,74 @@ export default function ClosingStockByLocationPage() {
                             column at all. */}
                         <button
                           onClick={downloadHistoryCsv}
-                          disabled={!historyItems.length && !historySemi.length}
-                          title={`Download the ${historyItems.length + historySemi.length} recorded row(s) for this date as CSV`}
+                          disabled={(!historyItems.length && !historySemi.length) || !!historyCsvBlock}
+                          title={historyCsvBlock || `Download the ${historyItems.length + historySemi.length} recorded row(s) for this date as CSV`}
                           className="mt-1.5 inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-[#FFF1E3] text-[#6B5744] hover:bg-[#E8D5C4] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <Download className="w-3.5 h-3.5" /> Download CSV
                         </button>
+                        {historyCsvBlock && (
+                          <p className="mt-1 max-w-md text-[11px] text-red-700">
+                            {historyCsvBlock}{' '}
+                            {!historyIncomplete && (
+                              <button onClick={retryHistory} className="underline font-medium">Retry</button>
+                            )}
+                          </p>
+                        )}
                       </div>
-                      {historySummary && (
+                      {(historySummary || historyIncomplete) && (
                         <div className="flex gap-4 text-xs">
-                          <span className="text-[#6B5744]">Items: <span className="font-bold">{historySummary.total_items}</span></span>
-                          {historySemi.length > 0 && (
+                          {/* INCOMPLETE, never a confident figure, while a half is missing. */}
+                          {historyIncomplete && (
+                            <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 font-bold uppercase tracking-wide">Incomplete</span>
+                          )}
+                          <span className="text-[#6B5744]">Items: {historyFail.raw
+                            ? <span className="font-bold text-red-700">not loaded</span>
+                            : <span className="font-bold">{historySummary?.total_items ?? historyItems.length}</span>}
+                          </span>
+                          {historyFail.semi ? (
+                            <span className="text-[#6B5744]">Semi-finished: <span className="font-bold text-red-700">not loaded</span></span>
+                          ) : historySemi.length > 0 && (
                             <span className="text-[#6B5744]">Semi-finished: <span className="font-bold">{historySemi.length}</span></span>
                           )}
-                          {historyPriced && (
+                          {historyIncomplete ? (
+                            <span className="text-[#2D1B0E]">Closing value: <span className="font-bold text-red-700">INCOMPLETE</span></span>
+                          ) : historyPriced && (
                             <span className="text-[#2D1B0E]">Closing value: <span className="font-bold font-mono">{fmtMoney(historyValueTotal)}</span></span>
                           )}
-                          {isAdmin && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
-                          {isAdmin && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
-                          {isAdmin && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
+                          {!historyIncomplete && historyPriced && historyTax.taxed > 0 && (
+                            <span className="text-[#2D1B0E]" title={`${CLOSING_TAX_TITLE} ${historyTaxNotes.title}`}>
+                              {CLOSING_TAX_LABEL}: <span className="font-bold font-mono">{fmtMoney(historyTax.tax)}</span>
+                              <span className="ml-1 text-[10px] text-[#8B7355]">({historyTaxNotes.rate})</span>
+                            </span>
+                          )}
+                          {/* From the raw-material half only — absent when it did not load. */}
+                          {isAdmin && historySummary && <span className="text-red-500">Shortage: <span className="font-bold">{historySummary.shortage_count}</span></span>}
+                          {isAdmin && historySummary && <span className="text-blue-500">Excess: <span className="font-bold">{historySummary.excess_count}</span></span>}
+                          {isAdmin && historySummary && <span className="text-[#af4408]">Variance Value: <span className="font-bold">{formatCurrency(Math.abs(historySummary.total_variance_value))}</span></span>}
                         </div>
                       )}
                     </div>
+                    {/* THE BANNER. Names the half that failed and how, says the
+                        saved counts are not lost, and offers Retry. */}
+                    {historyIncomplete && (
+                      <div className="flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-xs text-red-800">
+                        <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                        <div className="flex-1 space-y-1">
+                          {historyFail.raw && (
+                            <p><strong>Raw-material counts for this date could not be loaded</strong> ({historyFail.raw}).</p>
+                          )}
+                          {historyFail.semi && (
+                            <p><strong>Semi-finished counts for this date could not be loaded</strong> ({historyFail.semi}).</p>
+                          )}
+                          <p>
+                            The saved counts are <strong>not lost</strong> — reading them failed, nothing was deleted.
+                            This sheet is incomplete: its totals are withheld and Download CSV is off until it loads in full.
+                          </p>
+                        </div>
+                        <button onClick={retryHistory} className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-medium">Retry</button>
+                      </div>
+                    )}
                     <div className="overflow-x-auto max-h-[60vh] overflow-y-auto rounded-lg border border-[#E8D5C4]">
                       <table className="w-full text-sm">
                         <thead className="sticky top-0 bg-[#FFF1E3] z-10">
@@ -2397,12 +2872,28 @@ export default function ClosingStockByLocationPage() {
                               <span className="block font-normal text-[9px] text-[#8B7355]">at count time, per purchase unit</span>
                             </th>
                             <th className="text-right py-2.5 px-3 font-medium">Total Value</th>
+                            {/* Estimated GST (rulings #77/#78/#81). Derived only
+                                from Total Value, so it has Total Value's
+                                visibility — every tier. */}
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_GST_PCT_TITLE}>
+                              {CLOSING_GST_PCT_LABEL}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{CLOSING_GST_PCT_SUB}</span>
+                            </th>
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_TAX_TITLE}>{CLOSING_TAX_LABEL}</th>
+                            <th className="text-right py-2.5 px-3 font-medium" title={CLOSING_INCL_TITLE}>{CLOSING_INCL_LABEL}</th>
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
                             {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance (₹)</th>}
                             <th className="text-left py-2.5 px-3 font-medium">Notes</th>
                           </tr>
                         </thead>
                         <tbody>
+                          {historyFail.raw && (
+                            <tr className="border-t border-[#E8D5C4]/50 bg-red-50">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3 text-xs font-medium text-red-700">
+                                Raw-material counts not loaded ({historyFail.raw}) — see the message above.
+                              </td>
+                            </tr>
+                          )}
                           {historyItems.map((item: any) => {
                             const isShortage = item.variance < 0;
                             const isExcess = item.variance > 0;
@@ -2441,6 +2932,15 @@ export default function ClosingStockByLocationPage() {
                                 <td className="py-2 px-3 text-right text-xs">
                                   <ValueCell value={item.total_value} source={item.rate_source} rate={item.rate_per_purchase_unit} />
                                 </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <GstPctCell pct={item.gst_pct} note={item.gst_note} title={item.gst_title} />
+                                </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <TaxMoneyCell value={item.tax} why={gstBlankWhy(item)} />
+                                </td>
+                                <td className="py-2 px-3 text-right text-xs">
+                                  <TaxMoneyCell value={item.total_incl_tax} why={gstBlankWhy(item)} />
+                                </td>
                                 {isAdmin && (
                                   <td className={`py-2 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : 'text-green-600'}`}>
                                     {item.variance > 0 ? '+' : ''}{hq(item.variance)} {hu}
@@ -2460,13 +2960,20 @@ export default function ClosingStockByLocationPage() {
                           {/* Semi-finished counts for this date (req 1 + 4).
                               Valued by cost_per_unit in the sub-recipe's own
                               yield unit — no purchase unit, no pack factor. */}
-                          {historySemi.length > 0 && (
+                          {(historySemi.length > 0 || historyFail.semi) && (
                             <tr className="border-t-2 border-[#D4B896] bg-[#F5EDE2]">
-                              <td colSpan={isAdmin ? 9 : 6} className="py-2 px-3">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3">
                                 <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-[#6B5744]">
                                   <Layers className="w-3.5 h-3.5" /> Semi-finished / sub-recipes
                                   <span className="font-normal normal-case text-[10px] text-[#8B7355]">— counted and costed per yield unit</span>
                                 </span>
+                              </td>
+                            </tr>
+                          )}
+                          {historyFail.semi && (
+                            <tr className="border-t border-[#E8D5C4]/50 bg-red-50">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3 text-xs font-medium text-red-700">
+                                Semi-finished counts not loaded ({historyFail.semi}) — see the message above.
                               </td>
                             </tr>
                           )}
@@ -2487,6 +2994,11 @@ export default function ClosingStockByLocationPage() {
                               <td className="py-2 px-3 text-right text-xs">
                                 <ValueCell value={s.total_value} source={s.rate_source} rate={s.rate_per_unit} />
                               </td>
+                              <td className="py-2 px-3 text-right text-xs">
+                                <GstPctCell pct={null} note={SEMI_GST.gst_note} title={SEMI_GST.gst_title} />
+                              </td>
+                              <td className="py-2 px-3 text-right text-xs"><TaxMoneyCell value={null} why={SEMI_GST.gst_title} /></td>
+                              <td className="py-2 px-3 text-right text-xs"><TaxMoneyCell value={null} why={SEMI_GST.gst_title} /></td>
                               {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
                               {isAdmin && <td className="py-2 px-3 text-right text-xs"><NoBasisDash what="variance" /></td>}
                               <td className="py-2 px-3 text-xs text-[#8B7355]">{s.notes || '-'}</td>
@@ -2497,6 +3009,19 @@ export default function ClosingStockByLocationPage() {
                             quantities and per-unit rates do not — those print an
                             em-dash rather than a meaningless sum. */}
                         <tfoot className="sticky bottom-0 bg-[#FFF1E3] text-xs font-semibold text-[#2D1B0E]">
+                          {historyIncomplete ? (
+                            /* No figure at all while a half is missing — a
+                               partial ₹ here would pass for the whole day. */
+                            <tr className="border-t-2 border-[#D4B896]">
+                              <td colSpan={isAdmin ? 12 : 9} className="py-2 px-3">
+                                Sheet total — <span className="text-red-700">INCOMPLETE</span>
+                                <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
+                                  {[historyFail.raw && 'raw-material', historyFail.semi && 'semi-finished'].filter(Boolean).join(' and ')} counts
+                                  not loaded, so no total is shown
+                                </span>
+                              </td>
+                            </tr>
+                          ) : (
                           <tr className="border-t-2 border-[#D4B896]">
                             <td colSpan={isAdmin ? 3 : 2} className="py-2 px-3">
                               Sheet total
@@ -2511,6 +3036,18 @@ export default function ClosingStockByLocationPage() {
                             <td className="py-2 px-3 text-right font-mono">
                               {historyPriced ? fmtMoney(historyValueTotal) : <NoBasisDash />}
                             </td>
+                            {/* A GST % does not add up across materials. Tax and
+                                Total incl. sum ONLY the rows with a rate, and say
+                                how many — so this footer foots its own column. */}
+                            <td className="py-2 px-3 text-right"><CrossDash what="GST % total" /></td>
+                            <td className="py-2 px-3 text-right" title={`${CLOSING_TAX_TITLE} ${historyTaxNotes.title}`}>
+                              {historyTax.taxed > 0 ? <span className="font-mono">{fmtMoney(historyTax.tax)}</span> : <span className="text-[#B8A590]">—</span>}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{historyTaxNotes.rate}</span>
+                            </td>
+                            <td className="py-2 px-3 text-right" title={historyTaxNotes.title}>
+                              {historyTax.taxed > 0 ? <span className="font-mono">{fmtMoney(historyTax.total_incl_tax)}</span> : <span className="text-[#B8A590]">—</span>}
+                              <span className="block font-normal text-[9px] text-[#8B7355]">{historyTaxNotes.incl}</span>
+                            </td>
                             {isAdmin && <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>}
                             {isAdmin && (
                               <td className="py-2 px-3 text-right font-mono">
@@ -2519,10 +3056,11 @@ export default function ClosingStockByLocationPage() {
                             )}
                             <td className="py-2 px-3" />
                           </tr>
+                          )}
                         </tfoot>
                       </table>
                     </div>
-                    {!historyPriced && (
+                    {!historyPriced && !historyIncomplete && (
                       <p className="text-[11px] italic text-[#8B7355]">
                         No stored valuation for this date — these counts were recorded before closing stock was valued. Historical rows are never re-priced from today&apos;s rates.
                       </p>
@@ -2715,7 +3253,10 @@ export default function ClosingStockByLocationPage() {
                         const isExcess = variance !== null && variance > 0;
                         return (
                           <tr key={m.id} className={`border-t border-[#E8D5C4]/50 ${isShortage ? 'bg-red-50/30' : isExcess ? 'bg-blue-50/30' : ''}`}>
-                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">{m.name}</td>
+                            <td className="py-1.5 px-3 text-[#2D1B0E] font-medium text-xs">
+                              {m.name}
+                              {isSwitchedOff(m) && <InactiveTag />}
+                            </td>
                             <td className="py-1.5 px-3">
                               <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${CATEGORY_COLORS[m.category]?.bg || ''} ${CATEGORY_COLORS[m.category]?.text || ''}`}>
                                 {categoryLabel(m.category)}
@@ -2969,6 +3510,28 @@ export default function ClosingStockByLocationPage() {
                           </p>
                         )}
                         {closingResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
+                        {/* The SUB-RECIPE zero-pattern refusal, asked here because
+                            the raw-material counts above WERE saved. Its own
+                            confirm, re-sending only the refused sub-recipe rows. */}
+                        {closingResult.semiHeld && (
+                          <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 space-y-1.5">
+                            <p className="font-semibold flex items-center gap-1.5">
+                              <AlertTriangle className="w-4 h-4 text-amber-600" />
+                              Sub-recipe counts were NOT saved — {closingResult.semiHeld.zeros} of {closingResult.semiHeld.counted} filled-in
+                              sub-recipe lines read 0 ({Math.round((Number(closingResult.semiHeld.share) || 0) * 100)}%).
+                            </p>
+                            {closingResult.semiHeld.message && <p className="text-[#6B5744]">{closingResult.semiHeld.message}</p>}
+                            <p className="text-[#6B5744]">
+                              A blank sub-recipe cell means <b>not counted</b>; a typed 0 means <b>counted, found empty</b>.
+                              Fix the blanks and save again, or confirm if those shelves really were empty.
+                            </p>
+                            <button onClick={closingResult.semiHeld.onConfirm} disabled={closingSubmitting}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50">
+                              {closingSubmitting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <AlertTriangle className="w-3.5 h-3.5" />}
+                              Yes — record {closingResult.semiHeld.zeros} sub-recipes as empty
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -2989,7 +3552,7 @@ export default function ClosingStockByLocationPage() {
                   * leading `*` so the rate-basis lock reads them as prose
                   * (scripts/check-rate-basis.js isProseLine) instead of as an
                   * LPP read — the sentence stays, the false hit goes. */}
-                {valued && (valued.items.length > 0 || valued.semi.length > 0) && (
+                {valued && (valued.items.length > 0 || valued.semi.length > 0 || !!valued.semiFail) && (
                   <div className="rounded-lg border border-[#E8D5C4] overflow-hidden">
                     <div className="px-3 py-2 bg-[#FFF1E3] flex items-center justify-between gap-3 flex-wrap">
                       <div className="text-xs font-semibold text-[#2D1B0E]">
@@ -2999,10 +3562,18 @@ export default function ClosingStockByLocationPage() {
                         </span>
                       </div>
                       <div className="text-xs text-[#6B5744]">
-                        Sheet total <span className="font-mono font-semibold text-[#2D1B0E]">{fmtMoney(valued.total)}</span>
+                        Sheet total {valued.semiFail
+                          ? <span className="font-semibold text-red-700">INCOMPLETE</span>
+                          : <span className="font-mono font-semibold text-[#2D1B0E]">{fmtMoney(valued.total)}</span>}
                       </div>
                     </div>
-                    {!valued.priced ? (
+                    {valued.semiFail && (
+                      <p className="px-3 py-2 text-xs text-red-800 bg-red-50 border-t border-red-200">
+                        The semi-finished half of this sheet could not be read back ({valued.semiFail}), so it is not
+                        listed and no total is shown. What was saved is unchanged — check it in View History.
+                      </p>
+                    )}
+                    {!valued.priced && !valued.semiFail ? (
                       <p className="px-3 py-3 text-xs text-amber-800 bg-amber-50">
                         The counts saved, but this server build did not return per-item valuation, so no rate or value can be shown.
                       </p>
@@ -3081,7 +3652,9 @@ export default function ClosingStockByLocationPage() {
                               {/* Cross-material quantities never add up (ml + g + BTL) — em-dash. */}
                               <td className="py-2 px-3 text-right"><CrossDash what="quantity total" /></td>
                               <td className="py-2 px-3 text-right"><CrossDash what="rate total" /></td>
-                              <td className="py-2 px-3 text-right font-mono">{fmtMoney(valued.total)}</td>
+                              <td className="py-2 px-3 text-right font-mono">
+                                {valued.semiFail ? <span className="font-sans text-red-700">INCOMPLETE</span> : fmtMoney(valued.total)}
+                              </td>
                             </tr>
                           </tfoot>
                         </table>

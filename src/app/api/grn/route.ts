@@ -1,6 +1,18 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } from '@/lib/auth';
-import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
+// TGBCL LIQUOR BILLS ON THIS SCREEN (owner rulings #83 / #84): a bill whose
+// lines belong to a store location is routed WHOLE to the store rail — ledger
+// rows + TGBCL charges, no `purchases`, no GRN lines, no central stock. The
+// central path below never sees such a line. See src/lib/liquor-grn.ts.
+import {
+  classifyGrnLines, receiveLiquorGrn, liquorGrnStores, readStoreBill, summariseStoreBill,
+} from '@/lib/liquor-grn';
+// THE house purchase→recipe converter, and the ONLY one. The back-correction
+// floor below weighs a PURCHASE-unit line against a RECIPE-unit balance, and it
+// must use the very factor the bump site uses or the two disagree.
+import { packFactor } from '@/lib/pack-units';
+import { planCentralDebit } from '@/lib/central-debit-clamp';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
@@ -24,6 +36,17 @@ import { canonNameInput } from '@/lib/name-canon';
 import { MAX_PAISE, mayRecordPettyCash, outflowWarning, fmtRs } from '@/lib/petty-cash';
 import { canAccessPage } from '@/lib/page-catalog';
 import { todayIST } from '@/lib/format-date';
+// TAX ACTUALLY CHARGED — the inward register's two appended columns (see
+// REGISTER_HEADER). ONE module owns the arithmetic, the base and the
+// blank-never-zero rule, shared with /reports/purchases, the purchase log and
+// /reports/purchase-bill-summary, so the same bill cannot read 18.00% on one
+// report and 16.20% on another. Cess is NOT in the figure: it is charged on the
+// GROSS line value and GST on the post-discount value, so no single percentage
+// can cover both — see src/lib/tax-applied.ts.
+import {
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, taxCsvNumber,
+} from '@/lib/tax-applied';
 
 /**
  * GRN read API. Listing + detail.
@@ -225,7 +248,7 @@ const csvCell = (v: any): string => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-/** The Inward Register column order. THE SAME 27 HEADINGS, IN THE SAME ORDER,
+/** The Inward Register column order. THE SAME 30 HEADINGS, IN THE SAME ORDER,
  *  as the client-side bulk export at src/app/grn/page.tsx — keep the two in
  *  step: two "inward register" files that disagree about column order are worse
  *  than one. COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS (the
@@ -237,10 +260,72 @@ const csvCell = (v: any): string => {
  *  on STATUS or SUPPLIER: status is what happened to the receipt, bill type is
  *  what kind of document it is, and one cell cannot carry both without losing
  *  one of them to the reader. */
+/*  TAX VALUE (GST) IS THE 28TH AND TAX % APPLIED (GST) THE 29TH, both APPENDED
+ *  for the same reason BILL TYPE was: the 27 ahead of them sit in filed sheets
+ *  and formulas point at them. The owner's "Ship B" ruling (98e1be7): tax
+ *  columns on TRANSACTION reports, and this register is one.
+ *
+ *  BOTH ARE DERIVED FROM THE ROW'S OWN FIGURES — Tax Value is CGST + SGST, and
+ *  Tax % Applied is that pair over the value GST was CHARGED on, less DISCOUNT
+ *  (see GST_GOODS_VALUE_SQL below: the ACCEPTED goods value, which is SUBTOTAL
+ *  itself on every line that rejected nothing). That is WHY they are appended
+ *  rather than slotted beside CGST:
+ *  TOTAL INWARD AMOUNT is footable from the columns to its left, and a
+ *  duplicate rupee column inside that run would let a reader adding across the
+ *  row count GST twice. After the total they read as a restatement.
+ *
+ *  TAX % APPLIED IS A BLANK, NEVER 0%, when the line recorded no GST (its Tax
+ *  Value then reads 0, exactly as its CGST and SGST do). The arithmetic
+ *  and the headings come from src/lib/tax-applied.ts, the same module
+ *  /reports/purchases, /reports/purchase-bill-summary and the purchase log use,
+ *  so a figure on this file and the same figure on those reports cannot round
+ *  differently. Kept byte-identical to the /grn page's own bulk export. */
+/*  PO NO. IS THE 30TH, APPENDED for the same reason as the three before it. BILL
+ *  TYPE says a row is AGAINST PO but not WHICH order, and a merged PO arrives as
+ *  one GRN per vendor bill under ONE PO number — so without this column the
+ *  several GRNs of one order could not be grouped back to it in the file the
+ *  owner reconciles. Blank on a DIRECT bill (it has no order). */
 const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
   'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
   'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
+  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER, 'PO NO.'];
+
+/* ── TAX % APPLIED IS STRUCK ON THE ACCEPTED VALUE (owner's ruling, 2026-10-14) ──
+ *  Every GST writer charges the tax on ACCEPTED qty × rate − discount: POST
+ *  /api/grn (`grossTax` over `accepted`), PO receive (`effAcc`), the QC sign-off
+ *  (src/lib/grn-qc.ts re-derives on the kitchen's accepted figure) and the bill
+ *  amendment (src/lib/grn-reversal.ts deriveLineTax). The register's SUBTOTAL
+ *  is RECEIVED × rate — what arrived, and what TOTAL INWARD is footed from — so
+ *  dividing the tax by it read a received 10 / accepted 8 @ ₹100, discount ₹50,
+ *  18% line (₹135 GST) as 14.21% while /reports/purchase-log printed 18.00% for
+ *  the same bill. Only the RATE's base moves: SUBTOTAL, TOTAL INWARD and every
+ *  other column keep printing what they printed.
+ *
+ *  ONE EXCEPTION, and it is the held receipt. While a GRN awaits QC its lines
+ *  carry accepted = 0 AND rejected = 0 — "no decision yet", not "nothing
+ *  accepted" (grn-qc.ts) — and the tax on them was recorded against what
+ *  ARRIVED (the store may not pre-reject a gated line, so the declared accepted
+ *  IS the received). A line that has decided nothing therefore keeps the
+ *  received base. Every decided line has accepted + rejected = received, so the
+ *  test cannot mistake one for the other; a fully-rejected line (accepted 0,
+ *  rejected > 0) takes the accepted base, which is nothing, and reads an em
+ *  dash — a rate over nothing is not a rate.
+ *
+ *  WRITTEN ONCE, read by the register rows AND the drawer's line items, so the
+ *  screen, its footer, the server CSV and the page's own export divide by the
+ *  same rupees. Same ROUND(…, 2) as SUBTOTAL, so a line that rejected nothing
+ *  has a base byte-identical to the one it had before. */
+const GST_GOODS_VALUE_SQL = `ROUND(CASE WHEN COALESCE(gi.quantity_accepted, 0) = 0 AND COALESCE(gi.quantity_rejected, 0) = 0
+                    THEN gi.quantity_received ELSE gi.quantity_accepted END * gi.unit_price, 2)`;
+
+/** The row the shared tax helper reads: the GST pair, the discount, and the
+ *  goods value GST was charged on in the `subtotal` slot. Falls back to the
+ *  printed SUBTOTAL only when the query did not supply the charged value. */
+const gstRateBasis = (r: any) => ({
+  cgst: r.cgst, sgst: r.sgst, discount: r.discount,
+  subtotal: r.gst_goods_value ?? r.subtotal,
+});
 
 /** Same field order as REGISTER_HEADER, against a row of the register query. */
 const registerRow = (r: any) => [
@@ -249,6 +334,13 @@ const registerRow = (r: any) => [
   r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
   r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
   r.bill_type,
+  // The 28th and 29th. Derived from this row's own cgst/sgst and the value GST
+  // was charged on (accepted goods − discount) by the shared helper; the
+  // percentage is '' (never 0) when no GST was recorded on the line.
+  taxCsvNumber(gstValue(r)),
+  taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
+  // The 30th: the order this GRN was received against ('' on a DIRECT bill).
+  r.po_number ?? '',
 ];
 
 /* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
@@ -314,6 +406,15 @@ export async function GET(request: Request) {
         next_cash_voucher: mayRecord ? mintCashVoucherNo(db) : '',
       });
     }
+    /* ── THE TGBCL LIQUOR BILL OPTION ────────────────────────────────────────
+     * Which store locations this screen may offer a liquor bill for, with the
+     * caller's own access to each, the categories it owns (the form filters
+     * its material list by them) and its recent suppliers. ADVISORY like the
+     * cash option above: POST re-derives store access from the session and
+     * fails closed. Only active stores that own at least one category. */
+    if (url.searchParams.get('liquor_option') === '1') {
+      return Response.json({ stores: liquorGrnStores(db, me) });
+    }
     const id = url.searchParams.get('id');
     if (id) {
       const grn = db.prepare(`
@@ -347,7 +448,10 @@ export async function GET(request: Request) {
                ROUND(gi.quantity_received * gi.unit_price
                      - gi.discount + gi.cgst + gi.sgst + gi.compensation_cess
                      + gi.special_excise_cess
-                     + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount
+                     + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount,
+               -- The base the drawer's Tax % Applied divides by — the register's
+               -- own fragment, so the screen and the CSV cannot disagree.
+               ${GST_GOODS_VALUE_SQL} AS gst_goods_value
         FROM goods_receipt_note_items gi
         JOIN raw_materials rm ON rm.id = gi.material_id
         WHERE gi.grn_id = ?
@@ -391,8 +495,13 @@ export async function GET(request: Request) {
           before: parse(r.before_json), after: parse(r.after_json),
         }));
       }
+      // A TGBCL LIQUOR GRN has no line rows (items is []): its lines are the
+      // frozen bill document, shipped parsed as grn.liquor. The raw JSON column
+      // never goes on the wire, on either kind of receipt.
+      const liquor = readStoreBill(grn);
+      delete grn.store_bill_json;
       return Response.json({
-        grn: { ...stripEditStamps(grn, isAdmin), items },
+        grn: { ...stripEditStamps(grn, isAdmin), items, liquor },
         is_admin: isAdmin,
         can_amend: canAmend,
         edit_history: editHistory,
@@ -483,10 +592,19 @@ export async function GET(request: Request) {
                -- The 27th register column. Computed here rather than in the
                -- browser so the bulk download, the per-entry Download and the
                -- screen all read one rule off one column (see BILL_TYPE_SQL).
-               ${BILL_TYPE_SQL} AS bill_type
+               ${BILL_TYPE_SQL} AS bill_type,
+               -- Not a column of the file: the base Tax % Applied (the 29th)
+               -- divides by. Shipped on the JSON row so the page's own export
+               -- prints the same rate this file does (see GST_GOODS_VALUE_SQL).
+               ${GST_GOODS_VALUE_SQL} AS gst_goods_value,
+               -- The 30th register column (PO NO.). LEFT JOIN: a DIRECT bill
+               -- has no order and still lists; one row per GRN line either way
+               -- (po.id is the primary key), so no line is doubled.
+               COALESCE(po.po_number, '') AS po_number
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
         JOIN raw_materials       rm ON rm.id = gi.material_id
+        LEFT JOIN purchase_orders po ON po.id = g.po_id
         WHERE ${rw.join(' AND ')}
         ORDER BY g.date DESC, g.grn_number, rm.name
       `).all(...rp) as any[];
@@ -495,7 +613,13 @@ export async function GET(request: Request) {
       // JS, no Blob and no second copy of the column order to keep in step.
       // The JSON shape is unchanged for every caller that does not ask for csv.
       if (String(url.searchParams.get('format') || '').toLowerCase() === 'csv') {
-        const lines = [REGISTER_HEADER.join(',')];
+        // THE HEADING ROW IS ESCAPED WITH THE SAME csvCell THE DATA ROWS USE.
+        // The two tax headings are sentences that contain commas (they name the
+        // formula and the exclusions — see src/lib/tax-applied.ts); joined RAW
+        // they split into extra fields and every heading from TAX VALUE rightward
+        // slides off its own column. The 27 headings ahead of them contain no
+        // comma, quote or leading sign, so csvCell leaves each byte-identical.
+        const lines = [REGISTER_HEADER.map(csvCell).join(',')];
         for (const r of rows) lines.push(registerRow(r).map(csvCell).join(','));
         // Named off the GRN when it is one entry (that is the document's own
         // identity, and the number is what an auditor searches for), off the
@@ -536,6 +660,14 @@ export async function GET(request: Request) {
     const rows = db.prepare(`
       SELECT g.*,
              po.po_number AS po_number,
+             -- How many live (non-void) vendor bills this GRN's ORDER was
+             -- delivered on. A merged PO is received one GRN per vendor bill
+             -- under ONE PO number, so the list shows the same PO number on
+             -- several rows; this lets the row say why. 0 on a DIRECT bill.
+             CASE WHEN g.po_id IS NOT NULL AND TRIM(g.po_id) <> ''
+                  THEN (SELECT COUNT(*) FROM goods_receipt_notes g3
+                         WHERE g3.po_id = g.po_id AND COALESCE(g3.status, '') <> 'void')
+                  ELSE 0 END                                                                            AS po_bill_count,
              (SELECT COUNT(*)        FROM goods_receipt_note_items WHERE grn_id = g.id)                    AS line_count,
              (SELECT SUM(quantity_rejected) FROM goods_receipt_note_items WHERE grn_id = g.id)             AS total_rejected,
              -- total_rejected sums the rejected qty of EVERY line, and GRN qtys are
@@ -567,6 +699,13 @@ export async function GET(request: Request) {
     // Delete control and the "edited" hint without a second /api/auth/me round
     // trip; it is advisory for the UI only — every write re-checks the role
     // server-side and fails closed.
+    // row.liquor: a TGBCL liquor GRN's summary (store, PINV, line count,
+    // invoice and Net Indent) from its frozen document — null on every central
+    // receipt. The raw JSON column itself never goes on the wire.
+    for (const r of rows) {
+      r.liquor = summariseStoreBill(r);
+      delete r.store_bill_json;
+    }
     return Response.json({ grns: rows.map(r => stripEditStamps(r, isAdmin)), is_admin: isAdmin, can_amend: canAmend });
   } catch (e: any) {
     return Response.json({ error: e.message }, { status: 500 });
@@ -753,13 +892,12 @@ export async function POST(request: Request) {
     // single delivered item.
     // PLACED HERE, on the raw payload, with the other shape checks and BEFORE
     // the store-mapped split below, for two reasons. The "Line N" in the message
-    // then names the caller's own row — checking the filtered `receivable` list
-    // instead would silently renumber it past any store-blocked line and send a
-    // storekeeper to the wrong row. And a repeated material is a defect in the
-    // payload the caller authored, true independently of which lines turn out to
-    // be store-mapped. The two can never disagree about WHAT a duplicate is:
-    // centralFlowBlock keys on the material, so two lines for one material are
-    // always both blocked or both receivable.
+    // then names the caller's own row. And a repeated material is a defect in
+    // the payload the caller authored, true independently of which door the
+    // bill turns out to belong to — so it covers a TGBCL liquor bill (routed
+    // to the store rail below) exactly as it covers a Central Store bill. The
+    // split keys on the material too (classifyGrnLines), so two lines for one
+    // material always land on the same side.
     const dupLine = duplicateLineError(items);
     if (dupLine) return Response.json({ error: dupLine }, { status: 400 });
 
@@ -834,21 +972,41 @@ export async function POST(request: Request) {
       return it;
     });
 
-    // Phase B store guard (batch endpoint → skip + report per line, never fail
-    // the whole GRN): store-mapped materials (liquor) can't be received into
-    // Central stock — they're procured on the store ledger instead.
-    const storeBlocked: { material_id: string; error: string }[] = [];
-    const receivable = normalised.filter((it: any) => {
-      const msg = centralFlowBlock(db, String(it.material_id || ''));
-      if (msg) { storeBlocked.push({ material_id: it.material_id, error: msg }); return false; }
-      return true;
-    });
-    if (receivable.length === 0) {
-      return Response.json({
-        error: `No receivable lines — ${storeBlocked.length} store-mapped line(s) blocked. ${storeBlocked[0]?.error || ''}`,
-        store_blocked: storeBlocked,
-      }, { status: 400 });
+    /* ═══════════════════════════════════════════════════════════════════════
+     * TGBCL LIQUOR BILLS — ONE DOOR PER INDENT (owner rulings #83 / #84)
+     * ═══════════════════════════════════════════════════════════════════════
+     * This used to SKIP store-mapped lines and report them in `store_blocked`,
+     * saving the rest of the bill. Liquor bills are now entered HERE, on the
+     * TGBCL Liquor Bill form, so a bill carrying any store-mapped line goes to
+     * the store rail as a whole (src/lib/liquor-grn.ts): ledger 'purchase'
+     * rows + store_bill_charges in one transaction, the GRN header kept for the
+     * number and the document — and NOTHING below this block runs for it (no
+     * `purchases`, no goods_receipt_note_items, no stock bump, no average
+     * price, no QC gate, no petty cash). A bill MIXING liquor and Central Store
+     * lines is refused there, so the two halves are saved as two receipts.
+     *
+     * Classified on the RAW `items`, not `normalised`: the CASE expansion above
+     * rewrites quantity_received / unit_price for entry_mode 'case', which the
+     * liquor form never sends and the store rail never reads.
+     *
+     * Every check above (date window, one material = one line, the bill-number
+     * mandate, the cash gates) has already run for both kinds of bill.
+     */
+    // `liquor: true` (the TGBCL Liquor Bill form) always takes the store
+    // branch, so a liquor-shaped payload can never fall through to central.
+    const lineClass = classifyGrnLines(db, items as any[]);
+    if (lineClass.store_ids.size > 0 || b?.liquor === true) {
+      const out = receiveLiquorGrn(db, {
+        me, body: b, items: items as any[], cls: lineClass, outletId,
+        date: String(date), vendor, invoiceNumber: invoice_number, paidInCash, noBill,
+      });
+      return Response.json(out.body, { status: out.status });
     }
+    // A Central Store bill: every line is receivable, exactly as before for a
+    // bill with no store-mapped line. `store_blocked` stays on the response as
+    // an always-empty array for the clients that read it.
+    const storeBlocked: { material_id: string; error: string }[] = [];
+    const receivable = normalised;
 
     // Per-line GST, as a PERCENT (5 | 12 | 18 …). Validated HERE, before the
     // transaction opens, because a Response cannot be returned from inside
@@ -1095,6 +1253,11 @@ export async function POST(request: Request) {
     // SAME-DATE MATCHES FIRST, so the hard refusal always wins over the
     // confirmable one when a vendor has used this number on several days
     // including today.
+    // A TGBCL LIQUOR GRN (store_dest_id set) IS NOT IN THIS GUARD. One paper
+    // bill that carried both liquor and Central Store lines is saved as two
+    // receipts under ONE vendor bill number (the liquor half on TGBCL Liquor
+    // Bill, this half here); the liquor half has its own hard, cross-rail
+    // indent guard in src/lib/liquor-grn.ts.
     const dupBill = !billNo ? null : db.prepare(`
       SELECT grn_number, date, status, received_by
         FROM goods_receipt_notes
@@ -1102,6 +1265,7 @@ export async function POST(request: Request) {
          AND LOWER(TRIM(COALESCE(vendor, '')))         = ?
          AND COALESCE(outlet_id, '') = COALESCE(?, '')
          AND status <> 'void'
+         AND COALESCE(store_dest_id, '') = ''
        ORDER BY CASE WHEN date = ? THEN 0 ELSE 1 END, created_at ASC
        LIMIT 1
     `).get(billNo.toLowerCase(), vendorKey, outletId, date) as any;
@@ -1333,6 +1497,159 @@ export async function POST(request: Request) {
     // bill this map is deliberately unused — nothing books at save time, and
     // the sign-off (decideGrnQc) resolves afresh when the goods actually move.
     const directTargets = resolveDirectIssueBulk(db, receivable.map((it: any) => String(it.material_id || '')));
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * THE CENTRAL FLOOR ON A BACK-CORRECTION — THE ONE DEBIT THIS ROUTE MAKES
+     * ═══════════════════════════════════════════════════════════════════════
+     * EVERY OTHER GUARD IN THIS FILE BOUNDS A RECEIPT; this one bounds the
+     * REDUCTION a receipt can also be. `bumpStock` is
+     * `current_stock = current_stock + ?` bound to a SIGNED accepted quantity,
+     * and the sign is deliberate — the rate block at the top of this handler
+     * says in as many words that "QUANTITY is NOT forced positive: a negative
+     * line is a back-correction and is a first-class shape here", and the
+     * insert loop lets it through. Sign-mixing, cash and the QC mix are all
+     * refused; the BALANCE was never asked about at all.
+     *
+     * MEASURED on a copy of the live book before this guard existed: Chicken
+     * Breast forced to current_stock 0, one line
+     * {quantity_received: -40, quantity_accepted: -40, unit_price: 100} →
+     * HTTP 201, GRN-2026-0030 written, current_stock 0 → −40. Nothing on the
+     * path refused it. Reachable from the shipped /grn page: the
+     * "This is a back-correction" checkbox is the only thing that permits a
+     * negative quantity to be typed, and it is on screen for an admin.
+     * The GRN VOID path has carried assertNoNegativeStock
+     * (src/lib/grn-reversal.ts) all along — this POST path never did, so the
+     * same material could be driven negative forwards that could not be driven
+     * negative backwards.
+     *
+     * ── IT REFUSES; IT DOES NOT CLAMP, AND THAT IS THE OWNER'S OWN SPLIT ────
+     * A storekeeper or admin is AT THE SCREEN, inside a request he just made,
+     * with the line in front of him. A refusal unwinds HIS gesture, puts the
+     * figure on HIS screen and he corrects the number — the same judgement
+     * /api/wastage and src/lib/issue-stock.ts make for the same reason. Only
+     * the unattended paths clamp (src/lib/central-debit-clamp.ts states that
+     * ruling in full, and grn-qc.ts's sign-off is one of them). Clamping here
+     * would silently book a correction SMALLER than the one he typed and close
+     * the document as though the whole over-booking had been undone.
+     *
+     * ── NETTED PER MATERIAL, NOT PER LINE ──────────────────────────────────
+     * The insert loop applies each line in turn inside ONE transaction, so the
+     * only balance that can be observed is the one at commit. A bill carrying
+     * +100 and −40 of the same material nets +60, and judging line-by-line
+     * would refuse it on an intermediate figure no reader ever sees — the same
+     * net-of-debit-and-credit rule assertNoNegativeStock applies on the
+     * reversal rails.
+     *
+     * TODAY THAT IS DEFENCE IN DEPTH, AND IT IS KEPT ANYWAY. duplicateLineError
+     * above already refuses two lines of one material on one bill ("put the full
+     * quantity on one line" — measured: that guard fires first on exactly the
+     * +100/−40 payload), so a bill cannot currently carry both signs for the
+     * same material. Writing the floor per line instead would be correct only
+     * for as long as that unrelated guard keeps its present shape, and would
+     * then fail in the refusing direction — which is the brittleness this round
+     * exists to stop, not a saving.
+     *
+     * ── WHAT IS IN SCOPE, AND WHY EACH EXCLUSION IS SOUND ──────────────────
+     *   · qc.required  → NOTHING books at save time on a held bill (the
+     *     `!qc.required && accepted !== 0` gate at the bump site), so there is
+     *     no central debit to bound. A back-correction cannot ride a held bill
+     *     anyway: refused ~90 lines above. The deferred writes are bounded at
+     *     their own writer, in grn-qc.ts decideGrnQc.
+     *   · direct-issue materials → the bump site posts these to the DEPARTMENT
+     *     rail via postDirectReceipt and explicitly does NOT touch
+     *     current_stock ("central never moved"). Bounding them here would
+     *     refuse a correction central is not party to.
+     *   · received === 0 && accepted === 0 → skipped by the insert loop.
+     *
+     * ── ONE CONVERSION, AND IT IS THE HOUSE ONE ────────────────────────────
+     * GRN lines are PURCHASE units; current_stock is RECIPE units. The bump
+     * site converts with an inline `packSize > 1 && ru !== pu ? ×packSize : 1`,
+     * which is packFactor() from src/lib/pack-units.ts character for character.
+     * This pre-flight calls packFactor() rather than re-typing that expression,
+     * so the quantity weighed against the balance and the quantity taken off it
+     * are one number and cannot drift — the rule src/lib/po-requisition-fulfil.ts
+     * learned when a hand-rolled CASE forked 750×.
+     *
+     * Validated BEFORE the transaction, like every other refusal in this
+     * handler, because a Response cannot be returned from inside
+     * db.transaction(): a short correction has to be a clean 400 with no GRN
+     * number burned and no row written.
+     */
+    if (!qc.required) {
+      const netDebit = new Map<string, number>();   // material_id → RECIPE units OUT (positive)
+      for (const it of receivable) {
+        const mid = String(it.material_id || '');
+        if (!mid || directTargets.get(mid)) continue;
+        const rec = Number(it.quantity_received) || 0;
+        const acc = it.quantity_accepted != null ? Number(it.quantity_accepted) : rec;
+        if (rec === 0 && acc === 0) continue;
+        const meta = db.prepare(
+          `SELECT unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?`,
+        ).get(mid) as any;
+        if (!meta) continue;                        // 404'd by the pre-flight above
+        const stockQty = acc * packFactor(meta);    // the bump site's own figure
+        netDebit.set(mid, (netDebit.get(mid) || 0) - stockQty);
+      }
+      const short: Array<{ name: string; on_hand: number; taking_out: number; short_by: number; unit: string }> = [];
+      for (const [mid, out] of netDebit) {
+        if (!(out > 1e-9)) continue;                // a net credit cannot go below zero
+        const rm = db.prepare(
+          `SELECT COALESCE(name, '') AS name, COALESCE(unit, '') AS unit,
+                  COALESCE(current_stock, 0) AS current_stock
+             FROM raw_materials WHERE id = ?`,
+        ).get(mid) as any;
+        if (!rm) continue;
+        // max(0, …): an already-negative balance reads as "nothing available",
+        // never as a negative allowance that lets this correction dig deeper.
+        // /api/inventory/fix-negative-stock exists because such balances happen,
+        // and a stock adjustment — not a receipt — is the rail that may move one.
+        const onHand = Math.max(0, Number(rm.current_stock) || 0);
+        // THE ONE RULE — planCentralDebit (src/lib/central-debit-clamp.ts), the
+        // same 6-dp-grid answer every central floor gets. `out − onHand > 1e-9`
+        // refused a correction of everything on the shelf whenever the balance
+        // carried a sub-grid crumb the screens print away (stored 99.9999996,
+        // shown and typed as 100). The bump site below takes the balance itself
+        // on such a correction, so accepting it cannot write below zero.
+        if (!planCentralDebit(Number(rm.current_stock) || 0, out).fits) {
+          short.push({
+            name: String(rm.name), unit: String(rm.unit),
+            /* EACH FIGURE GETS THE ONLY ROUNDING IT CAN SURVIVE — the rule
+             * src/lib/issue-stock.ts arrived at by measurement, applied here to
+             * the figures this sentence prints.
+             *   · on_hand is THE CAP, and it is the number he types back on the
+             *     retry, so it rounds DOWN. Rounded to nearest it can name a
+             *     hair MORE than the store holds, and the retry is then refused
+             *     with the identical sentence — the trap measured on a
+             *     14,842.5 g balance, where the refusal told the storekeeper to
+             *     issue 14.843 kg and then refused 14.843 kg.
+             *   · taking_out is THE ASK, so it rounds UP: it may never name
+             *     less than was actually requested.
+             * Together they also make the sentence structurally honest rather
+             * than honest by luck — the printed cap is always strictly below
+             * the printed ask, so "holds 40 kg and removes 40 kg" cannot print.
+             */
+            on_hand: Math.floor(onHand * 1e6) / 1e6,
+            taking_out: Math.ceil(out * 1e6) / 1e6,
+            short_by: Math.floor((out - onHand) * 1e6) / 1e6,
+          });
+        }
+      }
+      if (short.length > 0) {
+        const u = (n: number, unit: string) => `${n}${unit ? ` ${unit}` : ''}`;
+        return Response.json({
+          error:
+            `This back-correction takes out more than the central store holds, so it would leave stock below zero. `
+            + short.slice(0, 3).map(s =>
+                `"${s.name}": the store holds ${u(s.on_hand, s.unit)} and this bill removes ${u(s.taking_out, s.unit)} `
+                + `(${u(s.short_by, s.unit)} more than is there)`).join('; ')
+            + `${short.length > 3 ? `; and ${short.length - 3} more line(s)` : ''}. `
+            + `Nothing was saved. Reduce the correction to what the store actually holds, or — if the balance itself is wrong — `
+            + `fix it on a stock adjustment, which is the rail that may move a number a receipt cannot honestly move.`,
+          central_stock_short: true,
+          materials: short,
+        }, { status: 400 });
+      }
+    }
 
     // Generate GRN number
     const yr = String(date).slice(0, 4);
@@ -1680,9 +1997,10 @@ export async function POST(request: Request) {
         const hasGst = gstProvided(it);
         // LIQUOR IS ZERO-RATED — its duty rides on the TGBCL bill (excise / cess
         // / TCS), never on GST, so a credit here would be claimed twice.
-        // centralFlowBlock already dropped these lines from `receivable`, so in
+        // classifyGrnLines already sent any bill with a store-mapped line to the
+        // store rail (src/lib/liquor-grn.ts, GST forced to 0 there), so in
         // practice this never fires; it is the second lock, mirroring
-        // receive/route.ts. If that guard is ever relaxed per-category, a client
+        // receive/route.ts. If that split is ever relaxed per-category, a client
         // sending 18% still must not write a credit the TGBCL charges carry.
         const gstRate = (!hasGst || isStoreMappedMaterial(db, String(it.material_id || '')))
           ? 0 : Number(it.gst_rate);
@@ -1991,8 +2309,26 @@ export async function POST(request: Request) {
                 : `Direct issue: Ad-hoc GRN ${grnNumber}`,
             });
           } else {
-            bumpStock.run(stockQty, price, date, it.material_id);
-            insTx.run(generateId(), it.material_id, stockQty, purchaseId,
+            // A BACK-CORRECTION TAKES THE FLOOR'S FIGURE. The pre-flight above
+            // accepted it on planCentralDebit's grid; re-asked here against the
+            // balance read inside this transaction, the plan says what to
+            // subtract — the correction itself, or on a correction of everything
+            // on the shelf the balance itself, so the landing is exactly 0 and
+            // never -4e-7. The two differ by under one 6-dp step. If the plan
+            // does not fit HERE (only reachable by a race past the pre-flight),
+            // the figure is left exactly as it always was: the pre-flight is the
+            // refusal this route owns, and this line only removes the crumb.
+            // A receipt (stockQty > 0) is a credit and is never touched.
+            let centralDelta = stockQty;
+            if (stockQty < 0) {
+              const bal = Number((db.prepare(
+                `SELECT COALESCE(current_stock, 0) AS s FROM raw_materials WHERE id = ?`,
+              ).get(it.material_id) as any)?.s) || 0;
+              const plan = planCentralDebit(bal, -stockQty);
+              if (plan.fits) centralDelta = -plan.debit;
+            }
+            bumpStock.run(centralDelta, price, date, it.material_id);
+            insTx.run(generateId(), it.material_id, centralDelta, purchaseId,
                       accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
                       outletId);
           }
@@ -2282,12 +2618,12 @@ export async function POST(request: Request) {
                            cash_voucher_no: cashVoucherIssued || undefined,
                            cash_entry_id: cashRowId || undefined,
                            cash_warning: cashWarning || undefined,
-                           // ⚠ store_blocked above is NOT only a held-panel field.
-                           // A liquor line is filtered out of a receipt that
-                           // otherwise SUCCEEDS, so a form that renders this array
-                           // only inside the QC-hold panel drops a line off the
-                           // bill without a word. It must be shown on the success
-                           // path too.
+                           // store_blocked above is ALWAYS [] on this path now: a
+                           // bill carrying any store-mapped (liquor) line no
+                           // longer reaches here — it is posted whole to the store
+                           // rail, or refused as a mixed bill, by the TGBCL block
+                           // near the top of this handler. Kept for the clients
+                           // that read the field.
                          }, { status: 201 });
   } catch (e: any) {
     console.error('[grn POST]', e);

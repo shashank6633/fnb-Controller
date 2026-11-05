@@ -5,8 +5,9 @@
  *
  * Contract: docs/HRMS_DECISIONS.md. Two surfaces on one page:
  *  · KPIs — the weighted scoring dimensions (hr_kpis). Reads are management-
- *    tier; every MUTATION is admin-only (canAdminHr) and the API re-checks —
- *    hiding the controls for non-admins is UX, never the boundary.
+ *    tier; every MUTATION is canHrFull (admin, or a "Full HR access" role —
+ *    owner ruling #90) and the API re-checks — hiding the controls from
+ *    everyone else is UX, never the boundary.
  *    Deactivation is SOFT (is_active = 0): old reviews keep their frozen
  *    scores; only the score entry rows hide the KPI.
  *  · Reviews — IMMUTABLE entries (the API has no edit/delete by design; a
@@ -45,7 +46,7 @@ import { fmtISTShort, todayIST } from '@/lib/format-date';
 import Combobox, { type ComboOption } from '@/components/Combobox';
 import Toggle from '@/components/Toggle';
 import TabScroller from '@/components/TabScroller';
-import { canAdminHr, type HrKpi, type HrPerformanceReview } from '@/lib/hr';
+import { canHrFull, type HrKpi, type HrPerformanceReview } from '@/lib/hr';
 import type { SessionUser } from '@/lib/auth';
 
 const PAGE_SIZE = 25;
@@ -125,8 +126,9 @@ function niceErr(e: unknown, fallback: string): string {
 const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm';
 
 export default function HrPerformancePage() {
-  // Who am I — KPI mutation controls render only for admins (the API
-  // re-checks server-side; hiding is UX, not the boundary).
+  // Who am I — KPI mutation controls render only for canHrFull (admin, or a
+  // "Full HR access" role); the API re-checks server-side — hiding is UX, not
+  // the boundary.
   const [me, setMe] = useState<SessionUser | null>(null);
   useEffect(() => {
     fetch('/api/auth/me')
@@ -134,7 +136,7 @@ export default function HrPerformancePage() {
       .then(j => setMe(j?.user || null))
       .catch(() => {});
   }, []);
-  const isAdmin = canAdminHr(me);
+  const hrFull = canHrFull(me);
 
   /* ── KPI master ─────────────────────────────────────────────────────── */
   const [kpis, setKpis] = useState<HrKpi[]>([]);
@@ -165,7 +167,7 @@ export default function HrPerformancePage() {
   const activeKpis = useMemo(() => kpis.filter(k => k.is_active === 1), [kpis]);
   const kpiById = useMemo(() => new Map(kpis.map(k => [k.id, k])), [kpis]);
 
-  // KPI add/edit modal (admin only)
+  // KPI add/edit modal (canHrFull only)
   const [showKpiModal, setShowKpiModal] = useState(false);
   const [kpiEditing, setKpiEditing] = useState<HrKpi | null>(null);
   const [kpiName, setKpiName] = useState('');
@@ -428,13 +430,13 @@ export default function HrPerformancePage() {
                 {kpisLoading ? '' : `${activeKpis.length} active of ${kpis.length}`}
               </span>
             </h2>
-            {isAdmin ? (
+            {hrFull ? (
               <button onClick={() => openKpiModal(null)}
                       className="inline-flex items-center gap-1.5 px-2.5 py-1.5 border border-[#E8D5C4] bg-white hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs font-medium">
                 <Plus className="w-3.5 h-3.5" /> Add KPI
               </button>
             ) : (
-              <span className="text-[11px] text-[#8B7355]">KPI changes are admin-only.</span>
+              <span className="text-[11px] text-[#8B7355]">KPI changes need an admin or a role with Full HR access.</span>
             )}
           </div>
 
@@ -454,7 +456,7 @@ export default function HrPerformancePage() {
             </div>
           ) : kpis.length === 0 ? (
             <div className="p-6 text-center text-[#8B7355] text-sm">
-              No KPIs yet{isAdmin ? ' — add the scoring dimensions before recording reviews.' : ' — an admin adds the scoring dimensions first.'}
+              No KPIs yet{hrFull ? ' — add the scoring dimensions before recording reviews.' : ' — an admin or a role with Full HR access adds the scoring dimensions first.'}
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -464,7 +466,7 @@ export default function HrPerformancePage() {
                     <th className="text-left py-2 px-3 font-medium">KPI</th>
                     <th className="text-left py-2 px-3 font-medium">Weight</th>
                     <th className="text-left py-2 px-3 font-medium">Active</th>
-                    {isAdmin && <th className="text-left py-2 px-3 font-medium w-16"></th>}
+                    {hrFull && <th className="text-left py-2 px-3 font-medium w-16"></th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -476,12 +478,12 @@ export default function HrPerformancePage() {
                         <Toggle
                           size="sm"
                           checked={k.is_active === 1}
-                          disabled={!isAdmin || kpiBusyId === k.id}
+                          disabled={!hrFull || kpiBusyId === k.id}
                           onChange={next => toggleKpi(k, next)}
                           label={`${k.name} active`}
                         />
                       </td>
-                      {isAdmin && (
+                      {hrFull && (
                         <td className="py-2 px-3">
                           <button onClick={() => openKpiModal(k)} title="Edit KPI"
                                   className="p-1.5 border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
@@ -807,7 +809,7 @@ export default function HrPerformancePage() {
                   </div>
                   {activeKpis.length === 0 ? (
                     <div className="text-sm text-[#8B7355]">
-                      No active KPIs — {isAdmin ? 'add KPIs above before recording a review.' : 'an admin adds KPIs before reviews can be recorded.'}
+                      No active KPIs — {hrFull ? 'add KPIs above before recording a review.' : 'an admin or a role with Full HR access adds KPIs before reviews can be recorded.'}
                     </div>
                   ) : (
                     activeKpis.map(k => (

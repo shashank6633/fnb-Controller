@@ -2,7 +2,6 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
 import { getStoreById, postLedger } from '@/lib/store-engine';
 import { packFactor } from '@/lib/pack-units';
-import { postCentralTxn, storeParty } from '@/lib/movement-record';
 
 /**
  * POST /api/stores/[id]/migrate — ADMIN-ONLY one-time migration of CENTRAL
@@ -112,13 +111,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const zeroCentral = db.prepare(`
       UPDATE raw_materials SET current_stock = 0, updated_at = datetime('now') WHERE id = ?
     `);
-    // The raw INSERT that stood here is now postCentralTxn at the call site.
-    // This migration is a genuinely TWO-ENDED movement the record could not
-    // express before: stock leaves the central grocery and lands in a store
-    // location. The central row below now names the DESTINATION store, and the
-    // store's own ledger row (postLedger, just above it) names the central
-    // grocery as its SOURCE — so the two halves finally point at each other
-    // instead of each describing a one-sided disappearance.
+    const centralTxn = db.prepare(`
+      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
+      VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
+    `);
 
     const txn = db.transaction(() => {
       for (const m of migratable) {
@@ -140,23 +136,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           ref: 'central-migration',
           notes: `Migrated from Central Store (central stock ${qtyLabel} @ ₹${costPU}/${puLabel})`,
           created_by: user.email,
-          // NOTE — the STORE side of this movement carries no counterparty.
-          // postLedger (src/lib/store-engine.ts) is held by another lane and
-          // takes no counterparty, so the store row still names only itself and
-          // says "Migrated from Central Store" in prose. The CENTRAL side below
-          // does name the destination store, so the pair is recoverable from the
-          // central rail. See the movement-register note in movement-record.ts.
         });
         zeroCentral.run(m.id);
-        postCentralTxn(db, {
-          materialId: m.id,
-          type: 'adjustment',
-          quantity: -qty,
-          referenceId: ledgerId,
-          notes: `Migrated to ${store.name}: ${qtyLabel} moved to store ledger (opening ${ledgerId})`,
-          counterparty: storeParty(db, storeId),
-          actor: user.email,
-        });
+        centralTxn.run(
+          generateId(), m.id, -qty, ledgerId,
+          `Migrated to ${store.name}: ${qtyLabel} moved to store ledger (opening ${ledgerId})`,
+        );
         migrated.push({
           material_id: m.id, material: m.name, qty, unit: m.unit,
           qty_purchase: qtyPU, purchase_unit: puLabel, pack_factor: pf,

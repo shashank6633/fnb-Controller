@@ -7,7 +7,6 @@ import {
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
 import { findUnitLock } from '@/lib/unit-audit-lock';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
-import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 
 /**
  * Step 2 — actually persist the inward report into the DB.
@@ -34,9 +33,6 @@ import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  // FIELD 8 of the movement record — the admin who ran the import, taken from
-  // the SESSION requireRole has already resolved.
-  const importActor = String(auth.user.email || '').trim() || 'system:inward-import';
   try {
     const fd = await req.formData();
     const file = fd.get('file');
@@ -92,17 +88,34 @@ export async function POST(req: Request) {
      * 60 lines hiding 69 real bills worth ₹12,93,120.30. The owner reported it
      * as "the purchase report is missing bills". It was.
      *
-     * SAFE AGAINST THE DUPLICATE GUARD, which is the one thing to check before
-     * touching this column: /api/purchases scopes its (vendor, bill_no, date,
-     * outlet) dupe check with `COALESCE(invoice_id,'') LIKE 'PINV-%'`, and rows
-     * from this importer never mint an invoice_id — so they are not judged by
-     * that guard, with or without a bill_no. (That route's comment already
-     * claimed the inward-import commit stamps a bill_no; as of this change it
-     * finally does.)
+     * TWO DUPLICATE GUARDS READ THIS COLUMN; check both before touching it.
+     *  · /api/purchases scopes its (vendor, bill_no, date, outlet) dupe check
+     *    with `COALESCE(invoice_id,'') LIKE 'PINV-%'`, and rows from this
+     *    importer never mint an invoice_id, so that guard never judges them,
+     *    with or without a bill_no. (That route's comment already claimed the
+     *    inward-import commit stamps a bill_no; as of this change it does.)
+     *  · /api/purchases/bulk DOES judge them, and its dupCheck reads a STORED
+     *    blank bill_no as "matches any bill". While this column was '', a bulk
+     *    CSV line with the same item + vendor + date + qty + rate as an
+     *    imported row was refused whatever bill number it carried. With the
+     *    number stored, that line is still refused on the SAME bill number or
+     *    a BLANK one, but on a DIFFERENT bill number it is now inserted and
+     *    its stock counted again. That is the bulk route's own rule (two named
+     *    bills are two documents), no longer masked by the blank. Measured on
+     *    a copy of the book: import 3 kg on INV-OBV-19162, then bulk the same
+     *    line on VB-77: before this change it was refused; now it inserts and
+     *    stock goes 39000 → 42000. It also tightens the other way: a bulk
+     *    line naming the SAME bill for the same material at another qty or
+     *    rate is now refused (one material = one line on a named bill), where
+     *    the blank let it in. On 2026-10-14 no purchase from any other
+     *    path shared a vendor, material and day with an imported row, so no
+     *    stored row is affected; only future uploads are. bulk/route.ts's own
+     *    comment still lists this importer among the writers of bill_no ''.
      *
      * `notes` deliberately keeps saying "Invoice: …" too. It is what the
-     * repair path reads to recover the number on rows imported BEFORE this fix,
-     * and dropping it would strand them.
+     * repair path (/api/admin/repair-purchase-bill-no) reads to recover the
+     * number on rows imported BEFORE this fix, and dropping it would strand
+     * them.
      */
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (
@@ -111,10 +124,10 @@ export async function POST(req: Request) {
       )
       VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
-    // The raw INSERT that stood here is now postCentralTxn at the call site, so
-    // an imported inward line records the supplier it came from and the sheet's
-    // own INVOICE DATE — an import of last month's bills is last month's
-    // movements, not today's.
+    const insertTx = db.prepare(`
+      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
+      VALUES (?, ?, 'purchase', ?, ?, ?, ?, datetime('now'))
+    `);
     const bumpStock = db.prepare(`
       UPDATE raw_materials
       SET current_stock = current_stock + ?,
@@ -328,17 +341,8 @@ export async function POST(req: Request) {
             // vendor+day fallback for rows that genuinely have no bill number.
             String(r.invoiceId || '').trim(),
           );
-          postCentralTxn(db, {
-            materialId: mat.id,
-            type: 'purchase',
-            quantity: stockQty,
-            referenceId: purchaseId,
-            notes: `Inward import — ${r.supplier || 'unknown vendor'}`,
-            outletId,
-            counterparty: vendorParty(r.supplier),
-            txnDate: date,
-            actor: importActor,
-          });
+          insertTx.run(randomUUID(), mat.id, stockQty, purchaseId,
+                       `Inward import — ${r.supplier || 'unknown vendor'}`, outletId);
           bumpStock.run(stockQty, recipeUnitRate, date, mat.id);
 
           touchedMaterials.add(mat.id);

@@ -7,6 +7,7 @@ import {
   amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
 } from '@/lib/grn-reversal';
 import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutcome } from '@/lib/po-void';
+import { sweepCentralCrumbs } from '@/lib/central-debit-clamp';
 // Direct-issue rail: a cost row stamped purchases.direct_issue_dept_id booked
 // its stock on a DEPARTMENT ledger with no central movement row — the void's
 // orphan test must not read that as an unidentifiable receipt.
@@ -19,6 +20,13 @@ import { normalizeBillNo } from '@/lib/bill-no';
 // cash paragraph below for why reversing the cash automatically would be a
 // fabricated refund.
 import { cashLedgerForGrn } from '@/lib/cash-purchase';
+// TGBCL liquor GRNs (goods_receipt_notes.store_dest_id set) live on the STORE
+// rail: no goods_receipt_note_items, no `purchases`, no central stock. Their
+// void is a different reversal (store ledger rows + TGBCL charges) and their
+// identity (indent no + supplier) is also their record in the store.
+import { voidLiquorGrn } from '@/lib/liquor-grn';
+import { canonNameInput } from '@/lib/name-canon';
+import { getStoreById } from '@/lib/store-engine';
 
 /**
  * AMEND and VOID one inward entry (GRN).
@@ -288,6 +296,34 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     }
     if (has('status')) {
       return Response.json({ error: 'Status is not editable. Use the void action to cancel a bill.' }, { status: 400 });
+    }
+
+    // ── A TGBCL LIQUOR BILL'S IDENTITY IS ALSO ITS STORE RECORD ─────────────
+    // The indent number is the `ref` on every store_stock_ledger row the bill
+    // posted and the invoice_ref of its store_bill_charges row; the supplier is
+    // on every one of those ledger rows. Rewriting either on the header alone
+    // would split the document from its own stock and Net Indent, so both are
+    // refused here (void and re-enter). Notes, the invoice date and the store's
+    // QC ticks keep their normal behaviour below.
+    if (String(grn.store_dest_id || '').trim()) {
+      const indentMoves = has('invoice_number')
+        && normalizeBillNo(b.invoice_number) !== normalizeBillNo(grn.invoice_number);
+      // The SAME change test the vendor block below applies (trimmed text, and
+      // vendor_id with '' read as none), so anything this lets through is
+      // something that block will not write either. canonNameInput on both
+      // sides as well, so a look-identical variant is not a way round it.
+      const nextVendorRaw = has('vendor') ? String(b.vendor ?? '').trim() : String(grn.vendor ?? '').trim();
+      const nextVendorId = has('vendor_id') ? (String(b.vendor_id ?? '').trim() || null) : (String(grn.vendor_id ?? '').trim() || null);
+      const vendorMoves = nextVendorRaw !== String(grn.vendor ?? '').trim()
+        || canonNameInput(nextVendorRaw) !== canonNameInput(grn.vendor)
+        || nextVendorId !== (String(grn.vendor_id ?? '').trim() || null);
+      if (indentMoves || vendorMoves) {
+        const sName = getStoreById(db, String(grn.store_dest_id))?.name || 'the store';
+        return Response.json({
+          error: `The indent number and supplier of a liquor bill are also its record in ${sName} (ledger and TGBCL charges), so they can't be amended here. Void ${grn.grn_number} and enter it again. Notes and the invoice date can still be changed.`,
+          code: 'liquor_identity',
+        }, { status: 400 });
+      }
     }
 
     const isPoGrn = !!grn.po_id;
@@ -653,6 +689,17 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         refused: true,
       }, { status: 409 });
     }
+    // A TGBCL liquor bill has no goods_receipt_note_items to correct — its
+    // lines are store_stock_ledger rows, some of which may already have moved
+    // to a floor bar. The store rail's own correction is the Adjustment.
+    if (String(grn.store_dest_id || '').trim()) {
+      const sName = getStoreById(db, String(grn.store_dest_id))?.name || 'the store';
+      return Response.json({
+        error: `Lines on a TGBCL liquor bill can't be corrected here. If its bottles are still untouched in ${sName}, an admin can void ${grn.grn_number} and the bill can be entered again; otherwise correct the stock with an Adjustment on Inventory → Liquor Store.`,
+        code: 'liquor_bill',
+        refused: true,
+      }, { status: 409 });
+    }
 
     // Body read BEFORE the transaction: better-sqlite3 transactions are
     // synchronous and nothing may be awaited inside one.
@@ -985,6 +1032,18 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     let reason = '';
     try { const b = await request.json(); reason = String(b?.reason ?? '').trim(); } catch { /* no body is fine */ }
 
+    /* ── A TGBCL LIQUOR GRN IS VOIDED ON THE STORE RAIL ──────────────────────
+     * It wrote no `purchases`, no goods_receipt_note_items and no central stock,
+     * so none of the central steps below apply (cutover, returns, cost rows,
+     * PO rails, average price, petty cash — cash is refused at save). Its void
+     * takes its ledger rows back out of the store and removes its TGBCL charges,
+     * refused if any of the bottles have since moved or been counted, and keeps
+     * the header + frozen bill document struck through. src/lib/liquor-grn.ts. */
+    if (String(grn.store_dest_id || '').trim()) {
+      const out = voidLiquorGrn(db, { grn, me, reason });
+      return Response.json(out.body, { status: out.status });
+    }
+
     /* ── WAS THIS RECEIPT PAID OUT OF THE PETTY CASH BOX? ────────────────────
      * Read here, and read ONLY. This void reverses stock and DELETES the cost
      * rows; it does not, and must not, reverse the cash.
@@ -1237,6 +1296,16 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       if (poVoid) {
         poResult = applyPoReceiptVoid(db, poVoid, { actorEmail: me.email, grnNumber: String(grn.grn_number) });
       }
+
+      // THE CRUMB, ONCE EVERY LEG HAS RUN. assertNoNegativeStock judged the NET
+      // (receipt debit less any party credit) on the 6-dp grid, so a void of
+      // "everything on the shelf" is accepted — and the receipt's recorded
+      // figure can sit a sub-grid hair above the balance (stored 99.9999996,
+      // receipt 100), which the unwind's bare subtraction would leave at −4e-7.
+      // Not before the party credit: a debit-then-credit void legitimately
+      // passes through a transient negative. sweepCentralCrumbs sets only a
+      // landing in (−1e-6, 0) to exactly 0 (src/lib/central-debit-clamp.ts).
+      sweepCentralCrumbs(db, moves.map(m => m.material_id));
 
       // VERIFIED, NOT BEST-EFFORT — and of the two audit writes in this file
       // this is the one that must not be allowed to fail quietly. before_json

@@ -49,6 +49,20 @@
  * silently double-deducting. After a clean reverse it can never fire (only one
  * name is left on any requisition), so leave it in place; it is also harmless
  * to an older build, which knows nothing about it.
+ *
+ * NOT NEEDED TO ROLL BACK TO 6cd5615. That build already reads both names, so
+ * rolling the over-issue-clamp release back to it needs no data change at all.
+ *
+ * THE CLAMP ADVISORY (read-only, printed in both modes). Since the over-issue
+ * clamp, the party rail moves NOTHING for a Liquor Store (store-mapped) or
+ * unclear-unit line and records the refusal in audit_events
+ * ('requisition.party_transfer.declined' / 'requisition.party_consumption.short')
+ * instead of a transfer row. A requisition on which EVERY line was refused
+ * therefore carries no party row under either name — and any build from before
+ * the clamp reads "no party row" as "never transferred", so re-fulfilling one
+ * there would debit central for bottles central never held. This script cannot
+ * fix that (there is no row to rename); it counts and lists those requisitions
+ * so whoever rolls back knows not to re-fulfil them.
  */
 'use strict';
 
@@ -102,6 +116,37 @@ console.log(`    type='party_consumption' (legacy name) .... ${before.legacy}`);
 console.log(`    type='party_issue' ....................... ${before.modern}`);
 console.log(`      · on a requisition  → IN SCOPE ......... ${before.inScope}`);
 console.log(`      · Party Items rail  → CONSERVED ........ ${before.nativeRail}`);
+
+// THE CLAMP ADVISORY — read-only; see the header. Wrapped so a database from
+// before audit_events existed still runs the reverse.
+try {
+  const declinedOnly = db.prepare(`
+    SELECT r.id, COALESCE(r.req_number, '') AS req_number,
+           COALESCE(r.event_name, '') AS event_name, COALESCE(r.event_date, '') AS event_date
+      FROM requisitions r
+     WHERE r.purpose = 'party'
+       AND EXISTS (SELECT 1 FROM audit_events ae
+                    WHERE ae.entity_id = r.id
+                      AND ae.event_type IN ('requisition.party_transfer.declined',
+                                            'requisition.party_consumption.short'))
+       AND NOT EXISTS (SELECT 1 FROM inventory_transactions it
+                        WHERE it.reference_id = r.id
+                          AND it.type IN ('party_issue', 'party_consumption'))
+     ORDER BY r.event_date, r.req_number
+  `).all();
+  console.log(`    party reqs with NO transfer row (clamp refused every line) ... ${declinedOnly.length}`);
+  for (const r of declinedOnly.slice(0, 50)) {
+    console.log(`      · ${r.req_number || r.id}  ${r.event_date}  ${r.event_name}`);
+  }
+  if (declinedOnly.length > 50) console.log(`      … and ${declinedOnly.length - 50} more`);
+  if (declinedOnly.length > 0) {
+    console.log('      ADVISORY: a build from before the over-issue clamp reads these as never');
+    console.log('      transferred. Do NOT re-fulfil them on such a build — it would debit central');
+    console.log('      for Liquor Store / unclear-unit lines central never held. Nothing to rename.');
+  }
+} catch (e) {
+  console.log(`    (clamp advisory skipped: ${e && e.message ? e.message : e})`);
+}
 
 if (before.inScope === 0) {
   console.log('\n  Nothing to reverse: no party_issue row references a requisition.');

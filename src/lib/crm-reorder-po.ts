@@ -4,7 +4,7 @@
  *
  * Creates DRAFT purchase orders through the SAME shape/steps as
  * POST /api/purchase-orders (that route is deliberately untouched):
- *   - po_number   = next PO-YYYY-NNNN            (mirrors nextPoNumber)
+ *   - po_number   = next PO-YYYY-NNNN            (the shared nextPoNumber)
  *   - status      = 'draft'                      (normal approval flow applies:
  *                    submit → pending → approve → receive, exactly as if the
  *                    PO had been drafted on the Purchase Orders page)
@@ -21,7 +21,7 @@
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
-import { mergeDuplicateLines } from '@/lib/po-helpers';
+import { mergeDuplicateLines, nextPoNumber } from '@/lib/po-helpers';
 import { headerVendorFromLines } from '@/lib/vendor-mapping';
 
 type DB = Database.Database;
@@ -40,17 +40,8 @@ export interface CreatedReorderPo {
   total: number;
 }
 
-/** Mirrors nextPoNumber in /api/purchase-orders/route.ts. */
-function nextPoNumber(db: DB, isoDate: string): string {
-  const year = isoDate.slice(0, 4);
-  const lastRow = db.prepare(`
-    SELECT po_number FROM purchase_orders
-    WHERE po_number LIKE 'PO-' || ? || '-%'
-    ORDER BY po_number DESC LIMIT 1
-  `).get(year) as any;
-  const last = lastRow?.po_number ? parseInt(lastRow.po_number.split('-').pop() || '0', 10) : 0;
-  return `PO-${year}-${String(last + 1).padStart(4, '0')}`;
-}
+// nextPoNumber is THE shared PO numbering rule (@/lib/po-helpers) — one copy
+// for every PO creator, so two writers can never mint the same number.
 
 /** Mirrors recalcTotal in /api/purchase-orders/route.ts. */
 function recalcTotal(db: DB, poId: string) {

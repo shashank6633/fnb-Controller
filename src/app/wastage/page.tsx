@@ -145,6 +145,9 @@ export default function WastagePage() {
               onPick={setMatId}
               compact={false}
               purchaseBasis
+              // Wastage comes out of central stock (current_stock): a switched-off
+              // material stays pickable here while it still holds some (ruling #78).
+              inactive="with-stock"
             />
           </div>
           <label className="flex flex-col gap-1 text-[#6B5744] md:col-span-2">

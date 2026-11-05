@@ -27,9 +27,40 @@
  *   /reports/purchase-bill-summary  per bill, per day, per vendor-day
  *   /grn                          the Inward Register (per inward line)
  *
- * And NEVER on: stock-overview, closing-overview, closing-sheet,
- * closing-history, transfers, department-stock, central-cutover,
- * reconciliation, or the Raw Materials master's report columns.
+ * And NEVER on: stock-overview, closing-sheet, transfers, department-stock,
+ * central-cutover, reconciliation, or the Raw Materials master's report
+ * columns.
+ *
+ * ⚠ SUPERSEDED FOR THREE CLOSING SURFACES — OWNER RULINGS #77, #78 AND #81
+ * (2026-10-28). The 2026-09-19 "Ship B" text above used to say closing
+ * screens never show tax, and listed closing-overview and closing-history in
+ * the NEVER list. The owner has since asked, in his own words, "Closing Stock
+ * Report: Add tax values to the closing stock report" and "Tax is missing in
+ * amount so it should add that also", and ruled where:
+ *
+ *   · Closing Stock → History tab (/closing-stock) + its CSV
+ *   · Inventory → Closing History & Compare (/inventory/closing-history,
+ *     "All entries" view) + its flat CSV
+ *   · Closing Overview (/inventory/closing-overview) + its CSVs
+ *
+ * now show a GST %, an ESTIMATED Tax and a Total incl. GST beside the closing
+ * value. Do NOT "restore" the old rule by removing them. They are computed in
+ * src/lib/closing-tax.ts, NOT here, and they are a different figure from this
+ * module's: this module reports TAX ACTUALLY CHARGED on a transaction; the
+ * closing figures apply a rate (the GST % actually charged on the item's
+ * latest bill THAT RECORDED GST, dated on/before the count — derived with
+ * this module's gstValue()/taxAppliedPercent() — else the item master's
+ * tax_percent, else blank) to the value SAVED WITH THE COUNT (the stored
+ * closing_stock.total_value, on all three surfaces), so they are labelled
+ * "(est.)" and never use this module's TAX_VALUE_LABEL / TAX_PERCENT_LABEL
+ * wording. Ruling #78 is also what licenses raw_materials.tax_percent as that
+ * FALLBACK there (and only there, always labelled "Master GST %") — it stays
+ * a forbidden operand in this module. GST stays out of every stock value:
+ * closing-valuation.ts and the stored total_value are untouched; the estimate
+ * sits beside the value, never inside it. The count-entry screen (Record
+ * Closing Stock), the Dept Closing Sheet (closing-sheet — its screen and its
+ * "Download history" file: the history route adds GST only on `gst=1`, which
+ * that sheet does not send) and liquor closing still show no tax.
  *
  * ───────────────────────────────────────────────────────────────────────────
  * WHERE THE NUMBERS COME FROM — AND THE THREE THINGS THEY MUST NEVER COME FROM

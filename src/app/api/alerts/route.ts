@@ -14,6 +14,9 @@ export async function GET() {
         ROUND(reorder_level - current_stock, 2) as deficit
       FROM raw_materials
       WHERE reorder_level > 0 AND current_stock < reorder_level
+        -- Switched-off materials (owner #6 / ruling 78) are not reordered: the
+        -- same filter Smart Reorder applies. NULL reads as on.
+        AND COALESCE(is_active, 1) = 1
       ORDER BY (reorder_level - current_stock) DESC
     `).all();
 

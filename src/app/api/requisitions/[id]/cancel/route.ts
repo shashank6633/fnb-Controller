@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { requisitionHasMovedStock } from '@/lib/issue-stock';
+import { routedSendsOn } from '@/lib/routed-requisitions';
 
 /**
  * Cancel a requisition (any non-terminal state). Drafter or admin only.
@@ -54,6 +55,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       return Response.json({
         error: 'Cannot cancel — stock has already been issued against this requisition. Undo the issued lines on the Store Issue desk first, then cancel. (A store-rejected line keeps what was already handed over — un-reject it, then undo it.)',
       }, { status: 400 });
+    }
+    // ROUTED LINES (owner rulings #45 + #74). Goods a Direct Issue department
+    // SENT for a routed line moved by department transfer, not from central,
+    // so the guard above (central movement) cannot see them — yet cancelling
+    // would leave them in the receiving department's books against a line
+    // nobody can correct. Refused until the receiving department sends them
+    // back. Nothing routed or nothing sent → this asks nothing.
+    {
+      const sent = routedSendsOn(db, { reqId: id });
+      if (sent.lines.length > 0) {
+        return Response.json({
+          error: `Cannot cancel — ${sent.message} Then cancel.`,
+          code: 'routed_sent',
+          req_item_ids: sent.lines.map(l => l.req_item_id),
+        }, { status: 400 });
+      }
     }
     db.prepare(`
       UPDATE requisitions SET status = 'cancelled', cancelled_at = datetime('now'),

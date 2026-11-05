@@ -3,6 +3,7 @@ import { getCurrentUser, isManagement } from '@/lib/auth';
 import { cutoverAt, deptKey, deptOnHandBulk, type DeptOnHandResult } from '@/lib/dept-ledger';
 import { resolveDeptSet } from '@/lib/dept-stock';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+import { routedColSql } from '@/lib/routed-schema';
 
 /**
  * DEPARTMENT variance — what a kitchen was given, what its recipes say it used,
@@ -205,12 +206,29 @@ interface Buckets {
   reversals_out: number;
   adjustments_net: number;
   party_net: number;
+  /** DEPARTMENT → DEPARTMENT (2026-10-14). Their OWN buckets, never other_net:
+   *  a transfer is neither usage nor a correction — the goods still exist, on
+   *  another department's ledger — and filing it under the catch-all made a
+   *  Kitchen → Akan Tandoori hand-over read as "unrecognised movement". Both are
+   *  POSITIVE magnitudes like every out-leg here; `net` keeps the sign. */
+  transfer_in: number;
+  transfer_out: number;
+  /** VENDOR → DEPARTMENT, straight past central (Settings → Direct Issue):
+   *  'direct_receipt' minus its undo 'direct_receipt_reversal' (a GRN void or a
+   *  downward bill amendment). SIGNED, like the nets — a reversal can land in
+   *  the window after its receipt fell outside it. Its OWN bucket, never
+   *  issued_in (central issued nothing; that column is the requisition rail)
+   *  and never other_net: filed under the catch-all, Kitchen's 10 kg chicken
+   *  delivery read "Issued in: 0 kg" with the 10 kg hidden in a tooltip as
+   *  "Adjustments/party (net)" — a delivery named as a correction. */
+  delivered_direct: number;
   other_net: number;
   net: number;
 }
 const emptyBuckets = (): Buckets => ({
   issued_in: 0, consumption: 0, wastage: 0, staff_meal: 0,
-  reversals_out: 0, adjustments_net: 0, party_net: 0, other_net: 0, net: 0,
+  reversals_out: 0, adjustments_net: 0, party_net: 0,
+  transfer_in: 0, transfer_out: 0, delivered_direct: 0, other_net: 0, net: 0,
 });
 
 /** Not exported: a route module's export surface is validated by Next, and a
@@ -526,10 +544,22 @@ export async function GET(request: Request) {
 
       // Buckets over the cutover window. 'opening' rows are the BASE, never a
       // movement — excluded from every bucket and from `net`.
+      //
+      // A TRANSFER LEG IS NOT CUT BY THE FLOOR. The department ledger reads
+      // transfer_out / transfer_in under their own rule (dept-ledger.ts
+      // deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"): bounded by the pair's
+      // ANCHOR only, never by the cutover — otherwise a cutover stamped after a
+      // hand-over drops one leg and keeps the other. The buckets follow the same
+      // rule so they keep explaining the balance they sit beside: a leg counts
+      // when it is after the floor OR after this pair's anchor (every leg, when
+      // the pair was never counted). Every other type is untouched.
+      const balPre = balances.get(k);
+      const legFrom = balPre && balPre.anchorAt ? String(balPre.anchorAt) : '';
       const b = emptyBuckets();
       for (const row of ledger) {
         if (row.type === 'opening') continue;
-        if (!(row.at > floor)) continue;
+        const isLeg = row.type === 'transfer_in' || row.type === 'transfer_out';
+        if (!(row.at > floor) && !(isLeg && row.at > legFrom)) continue;
         b.net += row.q;
         switch (row.type) {
           case 'issued':         b.issued_in       += row.q;  break;
@@ -542,6 +572,14 @@ export async function GET(request: Request) {
           case 'received':
           case 'consumed':
           case 'returned':       b.party_net       += row.q;  break;   // party rail, own lifecycle
+          // One leg each of a department → department pair (postDeptTransfer).
+          // Magnitudes, like the out-legs above; the sign lives in `net`.
+          case 'transfer_in':    b.transfer_in     += row.q;  break;
+          case 'transfer_out':   b.transfer_out    += -row.q; break;
+          // Vendor delivery booked straight onto this department, and its
+          // undo. Signed (the undo row is negative) — see Buckets.
+          case 'direct_receipt':
+          case 'direct_receipt_reversal': b.delivered_direct += row.q; break;
           default:               b.other_net       += row.q;  break;   // unknown type — visible, never dropped
         }
       }
@@ -645,12 +683,20 @@ export async function GET(request: Request) {
         } else {
           const windowFrom = prior.at > floor ? prior.at : floor;
           const tieRowid = prior.source === 'opening' && windowFrom === prior.at ? prior.rowid : null;
+          // Transfer legs: the baseline alone, never the floor — the ledger's
+          // leg rule (see the bucket note above). Identical to windowFrom
+          // whenever the baseline is a count, since only counts at or after the
+          // cutover qualify as one.
+          const legTie = prior.source === 'opening' ? prior.rowid : null;
           let moved = 0;
           for (const row of ledger) {
             if (row.type === 'opening') continue;            // a base, never a movement
             if (row.at > lastCount.at) continue;             // after the count — not its business
+            const isLeg = row.type === 'transfer_in' || row.type === 'transfer_out';
             const inWindow = row.at > windowFrom
-              || (tieRowid !== null && row.at === windowFrom && row.rid > tieRowid);
+              || (tieRowid !== null && row.at === windowFrom && row.rid > tieRowid)
+              || (isLeg && (row.at > prior.at
+                || (legTie !== null && row.at === prior.at && row.rid > legTie)));
             if (!inWindow) continue;
             moved += row.q;
           }
@@ -694,6 +740,18 @@ export async function GET(request: Request) {
         reversals_out: r4(b.reversals_out),
         adjustments_net: r4(b.adjustments_net),
         party_net: r4(b.party_net),
+        // Only on rows that HAVE a transfer, so a building that has never
+        // transferred gets the payload it always got, key for key. Absent
+        // means zero; the page reads `|| 0`.
+        ...(b.transfer_in !== 0 || b.transfer_out !== 0
+          ? { transfer_in: r4(b.transfer_in), transfer_out: r4(b.transfer_out) }
+          : {}),
+        // Same rule: only on a row that HAS a Direct Issue delivery (or its
+        // undo) in the window, so a building without one gets production's
+        // payload key for key. Absent means zero. It used to sit inside
+        // other_net, so other_net is lower by exactly this much and `net` is
+        // unchanged — every bucket still adds up to net_movement_since_cutover.
+        ...(b.delivered_direct !== 0 ? { delivered_direct: r4(b.delivered_direct) } : {}),
         other_net: r4(b.other_net),
         net_movement_since_cutover: r4(b.net),
 
@@ -743,13 +801,18 @@ export async function GET(request: Request) {
     const q = (sql: string, ...p: any[]): number => {
       try { return Number((db.prepare(sql).get(...p) as any)?.n) || 0; } catch { return 0; }
     };
+    // A ROUTED line (owner rulings #45 + #74) is not on this rail: a Direct
+    // Issue department sent it by department transfer, which the department
+    // books as a transfer, not as a store issue. routedColSql is the literal
+    // '' on a database without the column, so every line qualifies there.
     const ISSUE_QUALIFIERS = `
       JOIN requisitions r ON r.id = ri.req_id
       WHERE r.status NOT IN ('cancelled','chef_rejected')
         AND COALESCE(r.purpose,'internal') <> 'party'
         AND ri.quantity_issued > 0
         AND COALESCE(ri.is_rejected,0) = 0
-        AND COALESCE(ri.store_rejected,0) = 0`;
+        AND COALESCE(ri.store_rejected,0) = 0
+        AND ${routedColSql(db)} = ''`;
 
     const materialsIssued = q(`SELECT COUNT(DISTINCT ri.material_id) AS n FROM requisition_items ri ${ISSUE_QUALIFIERS}`);
     const materialsIssuedAll = q('SELECT COUNT(DISTINCT material_id) AS n FROM requisition_items WHERE quantity_issued > 0');

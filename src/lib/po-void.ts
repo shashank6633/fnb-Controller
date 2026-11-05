@@ -5,6 +5,10 @@ import {
   planRequisitionUndoFromPo, reverseRequisitionFulfilFromPo,
   type RequisitionUndoPlan, type RequisitionUndoOutcome,
 } from './po-requisition-fulfil';
+// Short-closed vendors (ruling 69) and the merged-PO link flags (rulings 68/69).
+// Both are DERIVED from the ledger this void changes, so the void re-reads the
+// first and re-writes the second — see 4. below and the lib's header.
+import { closedPoItemIds, syncPoLinkFlags, type LinkFlagSync } from './po-link-lifecycle';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * VOIDING A PO-SOURCED RECEIPT — THE THREE RAILS THE STOCK REVERSAL DOES NOT
@@ -70,6 +74,18 @@ import {
  * not the one that closed the order — and unwinding it would have to un-stamp a
  * completion that a different vendor's bill earned. Voiding the LATEST receipt
  * is always available, which is the mistake an admin actually needs to undo.
+ *
+ * ── …PER VENDOR ON A PO THAT HAS SEVERAL (OWNER RULING 72, 2026-10-23) ─────
+ * "GRN void order — newest-first PER VENDOR on a PO (a vendor's newest bill may
+ * be voided without touching other vendors' later bills); single-vendor POs
+ * unchanged." On a PO whose LINES name more than one vendor (receive's own
+ * grouping — see poVendorScope), only a later live receipt from the SAME vendor
+ * blocks the void. Another vendor's later bill no longer does: if voiding this
+ * one un-claims lines, the order reopens exactly as it does for the latest
+ * receipt (received_at cleared, total_cost back to ORDERED, grn_id to the
+ * newest survivor), and the vendor's re-receipt completes it again. On a PO
+ * with ONE vendor the scope is never built and the rule is the one above,
+ * byte for byte.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 type PoRow = {
@@ -87,8 +103,14 @@ export interface PoVoidPlan {
   /** Does a SURVIVING receipt still claim every PO line this one claimed? */
   still_complete: boolean;
   /** The po_item_ids this void leaves with no live claim at all. Non-empty ⇒
-   *  the order is no longer complete and must reopen. */
+   *  the order is no longer complete and must reopen — unless every one of
+   *  them belongs to a SHORT-CLOSED vendor (see closed_orphan_po_item_ids). */
   orphaned_po_item_ids: string[];
+  /** The subset of orphaned_po_item_ids whose vendor was short-closed on this
+   *  PO (ruling 69). Those lines are not owed again — the vendor delivers
+   *  nothing more on this order — so they do not reopen it. Empty on every PO
+   *  that has never been short-closed, which keeps that path byte-identical. */
+  closed_orphan_po_item_ids: string[];
   /** Will this void take the order from 'received' back to 'approved'? */
   will_reopen: boolean;
   /** Deliveries on this order still sitting on a quality hold. While any does,
@@ -121,6 +143,9 @@ export interface PoVoidOutcome {
   bill_released: { id: string; vendor_name: string; bill_no: string; bill_date: string } | null;
   bill_matched_by: 'grn_id' | 'notes' | 'none';
   requisition: RequisitionUndoOutcome | null;
+  /** The merged-PO link flags re-derived after this void (null when the PO
+   *  carries no requisition links — every PO not built by the merge). */
+  requisition_links: LinkFlagSync | null;
   /** The verbatim po_vendor_bills row and PO fields, for the caller's audit
    *  snapshot — the released bill row has no other copy once it is deleted. */
   before: Record<string, unknown>;
@@ -140,6 +165,13 @@ export interface PoVoidOutcome {
  * need — voiding the LATEST receipt is always allowed, so a mis-keyed delivery
  * can be undone as long as it is undone before the next one is taken in, and
  * two receipts can be undone newest-first.
+ *
+ * THAT DECISION HAS SINCE BEEN MADE FOR THE MULTI-VENDOR PO (ruling 72): the
+ * completion belongs to the order, not to the bill that happened to land last,
+ * so voiding vendor B's bill while vendor C's later bill stands reopens the
+ * order (received_at cleared, ORDERED total back) and B's re-receipt completes
+ * it again. Only B's OWN later bills still block — laterVendorReceiptRefusal.
+ * This function remains the whole rule on a single-vendor PO.
  *
  * ── "LATER" MEANS KEYED LATER, NOT DATED LATER. THIS IS THE WHOLE GUARD. ───
  * It used to compare (date, created_at, grn_number) — the ordering poReceipts
@@ -163,6 +195,62 @@ function laterReceiptRefusal(grnNumber: string, poNumber: string, later: any[]):
     `${grnNumber} cannot be voided because ${later.length} receipt(s) on ${poNumber} were entered after it and still stand (${names}). Voiding an earlier bill would reopen the order and clear a completion date and a received total that those later bills stamped. Void the later receipt(s) first, newest first — or raise a vendor return for these goods instead.`,
     { grn_number: grnNumber, po_number: poNumber, later_grns: later.map(r => String(r.grn_number)) },
     'po_later_receipt');
+}
+
+/**
+ * The same refusal on a PO with SEVERAL vendors (ruling 72), where only the
+ * vendor's OWN later bills block. Its own sentence, because the one above would
+ * be untrue here: it says every later receipt blocks, and that a later bill's
+ * completion is what is being protected — on a multi-vendor order neither is
+ * the rule any more. Same code (the void modal keys on it) and the same payload
+ * keys, plus the vendor it was scoped to.
+ */
+function laterVendorReceiptRefusal(grnNumber: string, poNumber: string, vendorLabel: string, later: any[]): GrnRefused {
+  const names = later.map(r => r.grn_number).join(', ');
+  return new GrnRefused(409,
+    `${grnNumber} cannot be voided because ${later.length} later receipt(s) from ${vendorLabel} on ${poNumber} still stand (${names}). One vendor's bills on an order are voided newest first: void ${vendorLabel}'s later receipt(s) first — or raise a vendor return for these goods instead. Receipts from the other vendors on ${poNumber} do not block this void.`,
+    { grn_number: grnNumber, po_number: poNumber, later_grns: later.map(r => String(r.grn_number)), vendor: vendorLabel },
+    'po_later_receipt');
+}
+
+/**
+ * WHICH VENDOR A RECEIPT BELONGS TO, ON A PO THAT HAS MORE THAN ONE (ruling 72).
+ *
+ * THE GROUPING IS RECEIVE'S OWN, restated because a route file cannot export it:
+ *   lineVendorName = (it.vendor && String(it.vendor).trim()) || po.vendor || ''
+ *   vendorKeyOf    = String(name || '').trim().toLowerCase()
+ * (src/app/api/purchase-orders/[id]/receive/route.ts). One bill on such a PO is
+ * one of those groups — receive refuses a bill that spans two — so a receipt's
+ * vendor is the group of the PO lines it claims. The lines are frozen while any
+ * live receipt stands (edit-approved refuses), so that mapping cannot drift
+ * under a receipt that can still be voided. A receipt whose claimed lines are
+ * no longer on the PO falls back to its own header vendor, by the same key.
+ *
+ * Returns null when the PO's lines form ONE group (or none): that is the
+ * single-vendor PO, and the caller keeps today's whole-PO rule untouched.
+ */
+type PoVendorScope = { keysOf: (grnId: string, grnVendor: unknown) => Set<string> };
+function poVendorScope(db: Database.Database, poId: string): PoVendorScope | null {
+  const header = db.prepare(`SELECT vendor FROM purchase_orders WHERE id = ?`).get(poId) as { vendor?: unknown } | undefined;
+  const lines = db.prepare(`SELECT id, vendor FROM purchase_order_items WHERE po_id = ?`).all(poId) as Array<{ id: unknown; vendor: unknown }>;
+  const keyOf = (name: unknown): string => String(name || '').trim().toLowerCase();
+  const keyOfLine = new Map<string, string>();
+  for (const l of lines) {
+    const name = (l.vendor && String(l.vendor).trim()) || header?.vendor || '';
+    keyOfLine.set(String(l.id), keyOf(name));
+  }
+  if (new Set(keyOfLine.values()).size <= 1) return null;
+  return {
+    keysOf: (grnId: string, grnVendor: unknown) => {
+      const keys = new Set<string>();
+      for (const pid of claimedPoItemIds(db, grnId)) {
+        const k = keyOfLine.get(pid);
+        if (k !== undefined) keys.add(k);
+      }
+      if (keys.size === 0) keys.add(keyOf(grnVendor));
+      return keys;
+    },
+  };
 }
 
 /**
@@ -204,12 +292,24 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
   // a detail. This GRN is already 'void' at this point, so liveClaimSql excludes
   // it and the `id <> ?` is belt-and-braces rather than the filter.
   const later = db.prepare(`
-    SELECT grn_number, date, created_at FROM goods_receipt_notes
+    SELECT id, grn_number, vendor, date, created_at FROM goods_receipt_notes
     WHERE po_id = ? AND id <> ? AND ${liveClaimSql('goods_receipt_notes')}
       AND (created_at, grn_number) > (?, ?)
     ORDER BY created_at, grn_number
   `).all(poId, String(grn.id), String(grn.created_at ?? ''), String(grn.grn_number ?? '')) as any[];
-  if (later.length > 0) throw laterReceiptRefusal(String(grn.grn_number), po.po_number, later);
+  if (later.length > 0) {
+    // PER VENDOR on a multi-vendor PO (ruling 72): only this vendor's own later
+    // bills block. The scope is built only when something later stands, and is
+    // null on a single-vendor PO — whose refusal stays the sentence above.
+    const scope = poVendorScope(db, poId);
+    if (!scope) throw laterReceiptRefusal(String(grn.grn_number), po.po_number, later);
+    const mine = scope.keysOf(String(grn.id), grn.vendor);
+    const sameVendor = later.filter(r => [...scope.keysOf(String(r.id), r.vendor)].some(k => mine.has(k)));
+    if (sameVendor.length > 0) {
+      const vendorLabel = String(grn.vendor ?? '').trim() || 'this vendor';
+      throw laterVendorReceiptRefusal(String(grn.grn_number), po.po_number, vendorLabel, sameVendor);
+    }
+  }
 
   // ── THE VENDOR BILL ROW ───────────────────────────────────────────────────
   const { bill, matchedBy } = identifyVendorBill(db, poId, String(grn.id), String(grn.grn_number), po.po_number);
@@ -260,7 +360,32 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
   const ledger = receivedPoItemIds(db, poId);
   const orphaned_po_item_ids = [...claimedPoItemIds(db, String(grn.id))]
     .filter(pid => !ledger.has(pid));
-  const still_complete = !!surviving && orphaned_po_item_ids.length === 0;
+
+  // ── A SHORT-CLOSED VENDOR'S LINE IS NOT OWED AGAIN (ruling 69) ────────────
+  // closedPoItemIds is read after the claim too, so a line this void un-claims
+  // already counts as closed when its vendor was closed: the vendor delivers
+  // nothing more on this order, so un-receiving their bill cannot put that line
+  // back on anyone's list. Only the orphans that are still OWED reopen the
+  // order. No closure on the PO ⇒ the set is empty ⇒ owed === orphaned and this
+  // is exactly the rule above, untouched.
+  const closedNow = closedPoItemIds(db, poId);
+  const closed_orphan_po_item_ids = orphaned_po_item_ids.filter(pid => closedNow.has(pid));
+  const owedOrphans = orphaned_po_item_ids.filter(pid => !closedNow.has(pid));
+
+  // THE ONE SHAPE THAT HAS NO HONEST STATUS, REFUSED. A received order whose
+  // other vendors were all short-closed, and this is its last standing receipt:
+  // after the void nothing is delivered and nothing is left to receive.
+  // 'received' would claim goods that are not there; 'approved' would be an
+  // open order nobody can ever receive against. Refusing is reversible; the
+  // goods can go back to the vendor as a return instead.
+  if (po.status === 'received' && !surviving && orphaned_po_item_ids.length > 0 && owedOrphans.length === 0) {
+    throw new GrnRefused(409,
+      `${grn.grn_number} is the last receipt standing on ${po.po_number}, and every vendor on that order — this bill's own vendor included — has been short-closed. Voiding it would leave an order with nothing delivered and nothing left to receive. Raise a vendor return for these goods instead. Nothing was changed.`,
+      { grn_number: grn.grn_number, po_number: po.po_number, closed_lines: closed_orphan_po_item_ids.length },
+      'po_closed_last_receipt');
+  }
+
+  const still_complete = !!surviving && owedOrphans.length === 0;
   const will_reopen = po.status === 'received' && !still_complete;
 
   // Held deliveries on this SAME order. Counted before the money below is
@@ -311,7 +436,7 @@ export function planPoReceiptVoid(db: Database.Database, grn: any): PoVoidPlan {
 
   return {
     po, bill, bill_matched_by: matchedBy,
-    still_complete, orphaned_po_item_ids, will_reopen, held_siblings,
+    still_complete, orphaned_po_item_ids, closed_orphan_po_item_ids, will_reopen, held_siblings,
     surviving_grn_id: surviving?.id ? String(surviving.id) : null,
     surviving_grn_number: surviving?.grn_number ? String(surviving.grn_number) : null,
     ordered_total: r2(ordered_total),
@@ -409,6 +534,7 @@ export function applyPoReceiptVoid(
     bill_released: null,
     bill_matched_by: plan.bill_matched_by,
     requisition: null,
+    requisition_links: null,
     before: {
       purchase_order: {
         id: po.id, po_number: po.po_number, status: po.status,
@@ -496,6 +622,18 @@ export function applyPoReceiptVoid(
     plan: plan.requisition, actorEmail, poNumber: po.po_number, grnNumber,
   });
   out.requisition = undo.unfulfilled ? undo : null;
+
+  // ── 4. THE MERGED-PO LINK FLAGS ───────────────────────────────────────────
+  // A merged PO never takes rail 3 (requisition_id stays NULL); its requisition
+  // lines read their state from po_requisition_lines instead. Two of those
+  // flags are derived from the very ledger this void just changed:
+  // delivered_direct must come OFF a line whose Direct Issue goods this void
+  // took back out of the department (or the desk would refuse to issue goods
+  // nobody has), and vendor_closed comes ON for a closed vendor's line this
+  // void un-claimed. Inside the void's transaction, so the flags and the
+  // reversal commit together. A PO with no links returns at once.
+  const links = syncPoLinkFlags(db, po.id);
+  out.requisition_links = links.links > 0 ? links : null;
 
   return out;
 }

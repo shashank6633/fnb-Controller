@@ -1,0 +1,368 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { getDb, generateId } from '@/lib/db';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import {
+  canAuthorFssai, isFssaiFrequency, isFssaiShift, isFssaiTargetKind,
+  fssaiNextDueDate, fssaiToday, isISODate, FSSAI_FREQUENCIES,
+  type FssaiFrequency,
+} from '@/lib/fssai';
+import {
+  requireFssaiAdmin, fssaiAudit, fssaiAppAudit, str, toInt01, constraintMessage,
+  FSSAI_NO_MATCH,
+} from '@/lib/fssai-server';
+
+/**
+ * WHO OWES WHICH CHECKLIST, AND HOW OFTEN (/api/fssai/assignments).
+ *
+ * GET    ?template_id=&assignee_email=&include_inactive=1
+ *          Any signed-in user. An ADMIN sees every assignment; everyone else
+ *          sees only the ones that can land on them — their own email, their
+ *          department, or the role they hold. Nobody needs to read the whole
+ *          rota to do their own round.
+ * POST   ADMIN. Create. A second identical live assignment is a 409, not a
+ *        duplicate row (there is no unique index on this table, deliberately —
+ *        this is a route-level rule, not a schema change).
+ * PUT    ADMIN. Edit; recomputes the next due date when the schedule changes.
+ * DELETE ADMIN. Stand down (is_active=0). Never a hard delete: runs point at
+ *        assignment_id, and an assignment is the evidence of what was owed.
+ *
+ * THE DUE-DATE MATHS IS NOT REIMPLEMENTED HERE. fssai_assignments is
+ * column-for-column recurring_task_rules, so the calendar work is
+ * nextRecurrence() from src/lib/tasks.ts, reached through fssaiNextDueDate()
+ * which adds the four schedules FSSAI needs and the Task module does not
+ * (hourly, per-shift, twice-daily, quarterly/yearly). A second implementation
+ * of that maths is an automatic drift defect (RECON §5).
+ *
+ * §7 Q8 (PROVISIONAL): responsible_role_id must name a role that EXISTS.
+ * FSSAI never creates one — production config is the owner's (HARD RULE 4).
+ */
+export const dynamic = 'force-dynamic';
+
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function validate(db: any, a: {
+  template_id: string; frequency: string; shift: string; target_kind: string;
+  department_id: string; responsible_role_id: string; assignee_email: string;
+  day_of_week: number; day_of_month: number; grace_minutes: number;
+  times_csv: string; next_due_date: string;
+}): string | null {
+  if (!a.template_id) return 'Which checklist? No id was sent.';
+  const tpl = db.prepare(`SELECT id, name, status FROM fssai_templates WHERE id = ?`).get(a.template_id);
+  if (!tpl) return 'That checklist no longer exists.';
+  if (!isFssaiFrequency(a.frequency)) {
+    return `"${a.frequency}" is not a frequency this system knows. Choose one of: ${FSSAI_FREQUENCIES.map((f) => f.label).join(', ')}.`;
+  }
+  if (!isFssaiShift(a.shift)) return `"${a.shift}" is not one of the shifts.`;
+  if (!isFssaiTargetKind(a.target_kind)) return `"${a.target_kind}" is not something a check can be run against.`;
+  if (!Number.isInteger(a.day_of_week) || a.day_of_week < 0 || a.day_of_week > 6) {
+    return 'The day of the week must be between 0 (Sunday) and 6 (Saturday).';
+  }
+  if (!Number.isInteger(a.day_of_month) || a.day_of_month < 1 || a.day_of_month > 31) {
+    return 'The day of the month must be between 1 and 31.';
+  }
+  if (!Number.isInteger(a.grace_minutes) || a.grace_minutes < 0 || a.grace_minutes > 1440) {
+    return 'The grace period must be a whole number of minutes between 0 and 1440.';
+  }
+  if (a.times_csv) {
+    const times = a.times_csv.split(',').map((t) => t.trim()).filter(Boolean);
+    const bad = times.find((t) => !TIME_RE.test(t));
+    if (bad) return `"${bad}" is not a time of day. Use 24-hour times like 09:00,17:30.`;
+    if (times.length > 24) return 'That is more than 24 times in a day.';
+  }
+  if (a.next_due_date && !isISODate(a.next_due_date)) return 'The next due date must be a real date.';
+  // Masters are READ ONLY — existence checks only (owner §21 / HARD RULE 4).
+  if (a.department_id && !db.prepare('SELECT id FROM departments WHERE id = ?').get(a.department_id)) {
+    return 'That department no longer exists. Pick it again from the list.';
+  }
+  if (a.responsible_role_id && !db.prepare('SELECT id FROM roles WHERE id = ?').get(a.responsible_role_id)) {
+    return 'That role no longer exists. Pick it again from the list.';
+  }
+  if (a.assignee_email && !db.prepare('SELECT id FROM users WHERE lower(email) = lower(?)').get(a.assignee_email)) {
+    return 'There is no user with that email address.';
+  }
+  return null;
+}
+
+/** The live assignment that would collide with this one, or null. */
+function findDuplicate(db: any, a: any, excludeId = ''): any {
+  return db.prepare(
+    `SELECT id FROM fssai_assignments
+      WHERE template_id = ? AND is_active = 1
+        AND IFNULL(department_id,'') = ? AND IFNULL(assignee_email,'') = ?
+        AND IFNULL(responsible_role_id,'') = ? AND IFNULL(target_id,'') = ?
+        AND IFNULL(shift,'') = ? AND frequency = ? AND id <> ?`,
+  ).get(
+    a.template_id, a.department_id, a.assignee_email, a.responsible_role_id,
+    a.target_id, a.shift, a.frequency, excludeId,
+  );
+}
+
+export async function GET(request: Request) {
+  const me = await getCurrentUser();
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+  try {
+    const url = new URL(request.url);
+    const templateId = str(url.searchParams.get('template_id'));
+    const assignee = str(url.searchParams.get('assignee_email'));
+    const includeInactive = url.searchParams.get('include_inactive') === '1';
+    const admin = canAuthorFssai(me);
+
+    const db = getDb();
+    const where: string[] = [];
+    const args: any[] = [];
+    if (templateId) { where.push('a.template_id = ?'); args.push(templateId); }
+    if (assignee) { where.push('lower(a.assignee_email) = lower(?)'); args.push(assignee); }
+    if (!admin || !includeInactive) where.push('a.is_active = 1');
+    if (!admin) {
+      // Scoped to what can actually land on this person. Fail closed: with no
+      // email, no department and no role the list comes back EMPTY, never
+      // unfiltered — the dept-scoping lesson in RECON §5 row 12.
+      where.push(`(lower(a.assignee_email) = lower(?) OR (a.department_id <> '' AND a.department_id = ?) OR (a.responsible_role_id <> '' AND a.responsible_role_id = ?))`);
+      // NO_MATCH, not '': an empty string would match every row whose
+      // assignee_email/department_id/responsible_role_id is blank, which is
+      // most of them. A user with no email, department or role must see
+      // NOTHING, not everything.
+      args.push(me.email || FSSAI_NO_MATCH, me.department_id || FSSAI_NO_MATCH, me.role_id || FSSAI_NO_MATCH);
+    }
+
+    const rows = db.prepare(
+      `SELECT a.*, t.name AS template_name, t.status AS template_status, t.version AS template_version,
+              d.name AS department_name, ro.name AS responsible_role_name, u.name AS assignee_name
+         FROM fssai_assignments a
+         JOIN fssai_templates t ON t.id = a.template_id
+         LEFT JOIN departments d  ON d.id  = a.department_id
+         LEFT JOIN roles       ro ON ro.id = a.responsible_role_id
+         LEFT JOIN users       u  ON lower(u.email) = lower(a.assignee_email)` +
+      (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+      ` ORDER BY a.next_due_date ASC, t.name ASC`,
+    ).all(...args) as any[];
+
+    return Response.json({ assignments: rows, can_author: admin });
+  } catch (e: any) {
+    console.error('GET /api/fssai/assignments failed:', e);
+    return Response.json({ error: e?.message || 'Failed to load the schedule' }, { status: 500 });
+  }
+}
+
+export async function POST(request: Request) {
+  const g = await requireFssaiAdmin();
+  if ('resp' in g) return g.resp;
+  const me = g.me;
+
+  let body: any = {};
+  try { body = await request.json(); } catch { /* validated below */ }
+
+  const a = {
+    template_id: str(body?.template_id),
+    department_id: str(body?.department_id),
+    assignee_email: str(body?.assignee_email),
+    responsible_role_id: str(body?.responsible_role_id),
+    target_kind: str(body?.target_kind) || 'none',
+    target_id: str(body?.target_id),
+    target_label: str(body?.target_label),
+    shift: str(body?.shift),
+    frequency: str(body?.frequency) || 'daily',
+    day_of_week: Number(body?.day_of_week ?? 0),
+    day_of_month: Number(body?.day_of_month ?? 1),
+    times_csv: str(body?.times_csv),
+    grace_minutes: Number(body?.grace_minutes ?? 60),
+    next_due_date: str(body?.next_due_date),
+  };
+
+  try {
+    const db = getDb();
+    const bad = validate(db, a);
+    if (bad) return Response.json({ error: bad }, { status: 400 });
+
+    const dup = findDuplicate(db, a);
+    if (dup) {
+      return Response.json(
+        { error: 'This checklist is already assigned to the same people, target and shift at that frequency.', assignment_id: dup.id },
+        { status: 409 },
+      );
+    }
+
+    // If no first due date was given, the schedule starts TODAY for anything
+    // that recurs, and never for an on-the-spot check.
+    const freq = a.frequency as FssaiFrequency;
+    const nextDue = a.next_due_date || (freq === 'on_event' ? '' : fssaiToday());
+
+    const id = generateId();
+    const outletId = (await getCurrentOutletId()) || '';
+    const tpl = db.prepare(`SELECT name, outlet_id FROM fssai_templates WHERE id = ?`).get(a.template_id) as any;
+
+    const create = db.transaction(() => {
+      db.prepare(
+        `INSERT INTO fssai_assignments
+           (id, template_id, department_id, assignee_email, responsible_role_id, target_kind,
+            target_id, target_label, shift, frequency, day_of_week, day_of_month, times_csv,
+            grace_minutes, next_due_date, created_by, outlet_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id, a.template_id, a.department_id, a.assignee_email, a.responsible_role_id, a.target_kind,
+        a.target_id, a.target_label, a.shift, a.frequency, a.day_of_week, a.day_of_month,
+        a.times_csv, a.grace_minutes, nextDue, me.email || '', outletId,
+      );
+      fssaiAudit(db, {
+        entity_table: 'fssai_assignments', entity_id: id, action: 'create',
+        after: { ...a, next_due_date: nextDue, template_name: tpl?.name },
+        actor: { email: me.email, name: me.name }, outlet_id: outletId,
+      });
+    });
+    create();
+    fssaiAppAudit(db, {
+      event_type: 'fssai.assignment.create', entity_type: 'fssai_assignments', entity_id: id,
+      actor_email: me.email, after: { template: tpl?.name, frequency: a.frequency },
+    });
+
+    const row = db.prepare(`SELECT * FROM fssai_assignments WHERE id = ?`).get(id);
+    return Response.json({
+      assignment: row,
+      // What the sweep will consider due after this one is performed — shown
+      // so the admin can see the schedule he just described, not guess at it.
+      following_due_date: fssaiNextDueDate(freq, nextDue || fssaiToday(), a.day_of_week, a.day_of_month),
+    });
+  } catch (e: any) {
+    const nice = constraintMessage(e, 'That assignment could not be saved.');
+    if (nice) return Response.json({ error: nice }, { status: 409 });
+    console.error('POST /api/fssai/assignments failed:', e);
+    return Response.json({ error: e?.message || 'Failed to save the assignment' }, { status: 500 });
+  }
+}
+
+export async function PUT(request: Request) {
+  const g = await requireFssaiAdmin();
+  if ('resp' in g) return g.resp;
+  const me = g.me;
+
+  let body: any = {};
+  try { body = await request.json(); } catch { /* validated below */ }
+  const id = str(body?.id);
+  if (!id) return Response.json({ error: 'Which assignment? No id was sent.' }, { status: 400 });
+
+  try {
+    const db = getDb();
+    const existing = db.prepare(`SELECT * FROM fssai_assignments WHERE id = ?`).get(id) as any;
+    if (!existing) return Response.json({ error: 'That assignment no longer exists.' }, { status: 404 });
+
+    const next = {
+      template_id: body?.template_id !== undefined ? str(body.template_id) : existing.template_id,
+      department_id: body?.department_id !== undefined ? str(body.department_id) : existing.department_id,
+      assignee_email: body?.assignee_email !== undefined ? str(body.assignee_email) : existing.assignee_email,
+      responsible_role_id: body?.responsible_role_id !== undefined ? str(body.responsible_role_id) : existing.responsible_role_id,
+      target_kind: body?.target_kind !== undefined ? str(body.target_kind) : existing.target_kind,
+      target_id: body?.target_id !== undefined ? str(body.target_id) : existing.target_id,
+      target_label: body?.target_label !== undefined ? str(body.target_label) : existing.target_label,
+      shift: body?.shift !== undefined ? str(body.shift) : existing.shift,
+      frequency: body?.frequency !== undefined ? str(body.frequency) : existing.frequency,
+      day_of_week: body?.day_of_week !== undefined ? Number(body.day_of_week) : existing.day_of_week,
+      day_of_month: body?.day_of_month !== undefined ? Number(body.day_of_month) : existing.day_of_month,
+      times_csv: body?.times_csv !== undefined ? str(body.times_csv) : existing.times_csv,
+      grace_minutes: body?.grace_minutes !== undefined ? Number(body.grace_minutes) : existing.grace_minutes,
+      next_due_date: body?.next_due_date !== undefined ? str(body.next_due_date) : existing.next_due_date,
+      is_active: body?.is_active !== undefined ? toInt01(body.is_active, 1) : existing.is_active,
+    };
+    const bad = validate(db, next);
+    if (bad) return Response.json({ error: bad }, { status: 400 });
+
+    if (next.is_active) {
+      const dup = findDuplicate(db, next, id);
+      if (dup) {
+        return Response.json(
+          { error: 'Another live assignment already covers the same checklist, people, target and shift.', assignment_id: dup.id },
+          { status: 409 },
+        );
+      }
+    }
+
+    // The schedule changed and no explicit date was given: recompute rather
+    // than leave a due date that belongs to the old rhythm.
+    const scheduleChanged =
+      String(existing.frequency) !== String(next.frequency) ||
+      Number(existing.day_of_week) !== Number(next.day_of_week) ||
+      Number(existing.day_of_month) !== Number(next.day_of_month);
+    if (scheduleChanged && body?.next_due_date === undefined) {
+      next.next_due_date = next.frequency === 'on_event'
+        ? ''
+        : (fssaiNextDueDate(next.frequency as FssaiFrequency, fssaiToday(), next.day_of_week, next.day_of_month) || fssaiToday());
+    }
+
+    const changed = (Object.keys(next) as (keyof typeof next)[])
+      .filter((k) => String(existing[k] ?? '') !== String(next[k] ?? ''));
+    if (!changed.length) return Response.json({ assignment: existing, changed: [] });
+
+    const save = db.transaction(() => {
+      db.prepare(
+        `UPDATE fssai_assignments
+            SET template_id=?, department_id=?, assignee_email=?, responsible_role_id=?, target_kind=?,
+                target_id=?, target_label=?, shift=?, frequency=?, day_of_week=?, day_of_month=?,
+                times_csv=?, grace_minutes=?, next_due_date=?, is_active=?, updated_at=datetime('now')
+          WHERE id=?`,
+      ).run(
+        next.template_id, next.department_id, next.assignee_email, next.responsible_role_id,
+        next.target_kind, next.target_id, next.target_label, next.shift, next.frequency,
+        next.day_of_week, next.day_of_month, next.times_csv, next.grace_minutes,
+        next.next_due_date, next.is_active, id,
+      );
+      fssaiAudit(db, {
+        entity_table: 'fssai_assignments', entity_id: id, action: 'update', field: changed.join(','),
+        before: Object.fromEntries(changed.map((k) => [k, existing[k]])),
+        after: Object.fromEntries(changed.map((k) => [k, (next as any)[k]])),
+        actor: { email: me.email, name: me.name }, outlet_id: existing.outlet_id,
+      });
+    });
+    save();
+    return Response.json({ assignment: db.prepare(`SELECT * FROM fssai_assignments WHERE id = ?`).get(id), changed });
+  } catch (e: any) {
+    const nice = constraintMessage(e, 'That assignment could not be saved.');
+    if (nice) return Response.json({ error: nice }, { status: 409 });
+    console.error('PUT /api/fssai/assignments failed:', e);
+    return Response.json({ error: e?.message || 'Failed to update the assignment' }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: Request) {
+  const g = await requireFssaiAdmin();
+  if ('resp' in g) return g.resp;
+  const me = g.me;
+
+  try {
+    const url = new URL(request.url);
+    let id = str(url.searchParams.get('id'));
+    const reason = str(url.searchParams.get('reason'));
+    if (!id) { try { id = str((await request.json())?.id); } catch { /* noop */ } }
+    if (!id) return Response.json({ error: 'Which assignment? No id was sent.' }, { status: 400 });
+
+    const db = getDb();
+    const existing = db.prepare(`SELECT * FROM fssai_assignments WHERE id = ?`).get(id) as any;
+    if (!existing) return Response.json({ error: 'That assignment no longer exists.' }, { status: 404 });
+    if (!Number(existing.is_active)) {
+      return Response.json({ error: 'That assignment is already stood down.' }, { status: 409 });
+    }
+
+    // Stand down, never delete: fssai_runs.assignment_id points here, and the
+    // assignment is the evidence of what was owed and to whom.
+    const stand = db.transaction(() => {
+      const res = db.prepare(
+        `UPDATE fssai_assignments SET is_active=0, updated_at=datetime('now') WHERE id=? AND is_active=1`,
+      ).run(id);
+      if (res.changes !== 1) throw new Error('FSSAI_ASSIGNMENT_ALREADY_INACTIVE');
+      fssaiAudit(db, {
+        entity_table: 'fssai_assignments', entity_id: id, action: 'update', field: 'is_active',
+        before: { is_active: 1 }, after: { is_active: 0 },
+        reason: reason || 'Stood down',
+        actor: { email: me.email, name: me.name }, outlet_id: existing.outlet_id,
+      });
+    });
+    try { stand(); } catch (e: any) {
+      if (String(e?.message) === 'FSSAI_ASSIGNMENT_ALREADY_INACTIVE') {
+        return Response.json({ error: 'That assignment is already stood down.' }, { status: 409 });
+      }
+      throw e;
+    }
+    return Response.json({ ok: true, assignment: db.prepare(`SELECT * FROM fssai_assignments WHERE id = ?`).get(id) });
+  } catch (e: any) {
+    console.error('DELETE /api/fssai/assignments failed:', e);
+    return Response.json({ error: e?.message || 'Failed to stand down the assignment' }, { status: 500 });
+  }
+}

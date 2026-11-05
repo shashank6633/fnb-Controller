@@ -32,6 +32,7 @@ import { bridgePrint, probeBridge, bridgeStatus, listBridgePrinters, type Bridge
 import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
 import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
 import LabelCanvas from '@/components/LabelCanvas';
+import Combobox from '@/components/Combobox';
 
 // Representative batch used to render the live label-design preview.
 const SAMPLE_LABEL_BATCH: LabelBatch = {
@@ -299,7 +300,8 @@ export default function KitchenProductionPage() {
 
   // Reference data
   const [meName, setMeName] = useState('');
-  const [isAdmin, setIsAdmin] = useState(false);
+  // Admin, or a role with "Can change label printer settings" (Settings → Roles).
+  const [canEditPrinter, setCanEditPrinter] = useState(false);
   const [recipes, setRecipes] = useState<RecipeOpt[]>([]);
   const [printerCfg, setPrinterCfg] = useState<LabelPrinterConfig | null>(null);
 
@@ -361,7 +363,7 @@ export default function KitchenProductionPage() {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
       const n = d?.user?.name || d?.user?.email || '';
       setMeName(n);
-      setIsAdmin(d?.user?.role === 'admin');
+      setCanEditPrinter(d?.user?.role === 'admin' || !!d?.user?.can_manage_label_printer);
       setForm(f => (f.prepared_by ? f : { ...f, prepared_by: n }));
     }).catch(() => {});
     fetch('/api/recipes').then(r => r.json()).then(d => {
@@ -595,7 +597,7 @@ export default function KitchenProductionPage() {
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
             <Settings className="w-4 h-4" /> <span className="hidden sm:inline">Production Settings</span>
           </button>
-          {isAdmin && (
+          {canEditPrinter && (
             <button onClick={() => setShowPrinterSettings(true)}
                     title="Label printer settings"
                     className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
@@ -973,12 +975,14 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Field label="Production Item" required>
-              <select value={form.production_item_id} onChange={e => onPickItem(e.target.value)} className={inputCls} autoFocus>
-                <option value="">— select an item —</option>
-                {pItems.map(it => (
-                  <option key={it.id} value={it.id}>{it.name}{it.unit ? ` (${it.unit})` : ''}</option>
-                ))}
-              </select>
+              {/* Type to filter the Production Items list; tap a match to pick it. */}
+              <Combobox
+                options={pItems.map(it => ({ value: it.id, label: itemLabel(it) }))}
+                value={(() => { const it = pItems.find(x => x.id === form.production_item_id); return it ? itemLabel(it) : ''; })()}
+                onChange={v => onPickItem(v)}
+                placeholder="Type to search items…"
+                className={`${inputCls} pr-8`}
+              />
               <button type="button" onClick={onManageItems}
                       className="mt-1 text-[11px] text-[#af4408] hover:underline">
                 Item not in the list? Manage items…
@@ -1086,6 +1090,8 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
 }
 
 const inputCls = 'w-full px-2.5 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]/30';
+/** How a Production Item reads in the batch form's searchable picker: "BOILED PEANUT (KGS)". */
+const itemLabel = (it: { name: string; unit?: string | null }) => `${it.name}${it.unit ? ` (${it.unit})` : ''}`;
 
 function Field({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (

@@ -5,8 +5,9 @@
  *
  * Three surfaces in one page, all against /api/hr/tests (mgmtOnly page; the
  * API is the boundary — GETs are canManageHr, question authoring is
- * canAdminHr BY API DESIGN, so a non-admin manager sees the editor but the
- * server 403s the mutation and the message surfaces in the modal):
+ * canHrFull BY API DESIGN (admin, or a "Full HR access" role — owner ruling
+ * #90), so any other manager sees the editor but the server 403s the mutation
+ * and the message surfaces in the modal):
  *
  *   1. Test list (server-side pagination) + create/edit modal
  *      (pass score, max attempts, time limit, shuffle Toggle, active Toggle).
@@ -920,7 +921,7 @@ export default function HrTestsPage() {
                       <h3 className="font-bold text-[#2D1B0E]">Questions</h3>
                       <p className="text-[11px] text-[#8B7355]">
                         The correct answer is visible only on this manager surface — takers never receive it.
-                        Question changes are admin actions and bump the paper version.
+                        Question changes need an admin or a role with Full HR access, and bump the paper version.
                       </p>
                     </div>
                     <button onClick={openCreateQuestion}

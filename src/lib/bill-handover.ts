@@ -610,12 +610,17 @@ export function billHandoverSummary(db: Database.Database): BillHandoverSummary 
   // The leak detector. Voided GRNs are excluded — a cancelled receipt has no bill
   // to hand over. NOT EXISTS ignores voided handovers so a voided-then-not-redone
   // record correctly reappears as unrecorded.
+  // A TGBCL liquor GRN (store_dest_id set) is excluded too: its bottles post to a
+  // store location's own ledger, and this register covers Central Store bills
+  // only (bill-handover-schema.ts "Liquor … Out of scope for v1"), so it is not a
+  // bill that is missing from here.
   const leak = db
     .prepare(
       `SELECT COUNT(*) AS n
          FROM goods_receipt_notes g
         WHERE g.date >= ?
           AND COALESCE(g.voided_at, '') = ''
+          AND COALESCE(g.store_dest_id, '') = ''
           AND NOT EXISTS (
                 SELECT 1 FROM bill_handovers h
                  WHERE h.grn_id = g.id AND h.status <> ?
@@ -815,7 +820,8 @@ export function createBillHandover(
   if (grnId) {
     const grn = db
       .prepare(
-        `SELECT id, grn_number, date, vendor_id, vendor, invoice_number, invoice_date, outlet_id, voided_at
+        `SELECT id, grn_number, date, vendor_id, vendor, invoice_number, invoice_date, outlet_id, voided_at,
+                COALESCE(store_dest_id, '') AS store_dest_id
            FROM goods_receipt_notes WHERE id = ?`,
       )
       .get(grnId) as
@@ -829,10 +835,26 @@ export function createBillHandover(
           invoice_date: string | null;
           outlet_id: string | null;
           voided_at: string | null;
+          store_dest_id: string;
         }
       | undefined;
     if (!grn) {
       return { ok: false, status: 404, error: 'That goods receipt no longer exists.' };
+    }
+    // A TGBCL liquor GRN posted its bottles to a store location's own ledger and
+    // has no goods_receipt_note_items, so its face value would read ₹0 here.
+    // This register covers Central Store bills only — refuse rather than write a
+    // row that misstates the bill. The store is named as Settings → Store
+    // Locations names it (production: LIQUOR STORE).
+    if (str(grn.store_dest_id)) {
+      const st = db
+        .prepare(`SELECT name FROM store_locations WHERE id = ?`)
+        .get(str(grn.store_dest_id)) as { name?: string } | undefined;
+      return {
+        ok: false,
+        status: 400,
+        error: `This is a liquor bill posted to ${str(st?.name) || 'a store location'}; the bill hand-over register covers Central Store bills only.`,
+      };
     }
     if (str(grn.voided_at)) {
       return {
@@ -1283,6 +1305,9 @@ export function listUnrecordedReceipts(
          FROM goods_receipt_notes g
         WHERE g.date >= ?
           AND COALESCE(g.voided_at, '') = ''
+          -- Same exclusion as the leak count: a TGBCL liquor GRN is not a
+          -- Central Store bill, so it is never on the "not recorded" list.
+          AND COALESCE(g.store_dest_id, '') = ''
           AND NOT EXISTS (
                 SELECT 1 FROM bill_handovers h WHERE h.grn_id = g.id AND h.status <> ?
               )

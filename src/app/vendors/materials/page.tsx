@@ -456,6 +456,7 @@ export default function VendorMaterialsPage() {
                     <div className="flex-1 min-w-[240px] max-w-md">
                       <MaterialTypeahead
                         materials={allMaterials as any} purchaseBasis
+                        inactive="hide"
                         value={addPick[v.vendor_id] || ''}
                         onPick={(id: string) => setAddPick(p => ({ ...p, [v.vendor_id]: id }))}
                         excludeIds={[...mappedIds]}

@@ -5,7 +5,6 @@ import { getCurrentUser } from '@/lib/auth';
 // (store manager / HOD / management) and the measured callers.
 import { requirePurchasesAccess } from '@/lib/purchases-access';
 import { centralFlowBlock } from '@/lib/store-engine';
-import { postCentralTxn } from '@/lib/movement-record';
 
 /**
  * Opening-stock import — seed go-live stock + cost from a filled template.
@@ -69,11 +68,10 @@ export async function POST(request: Request) {
     // live receiving paths (PO receive, ad-hoc GRN, cash purchase, bulk
     // import) all consult src/lib/direct-issue.ts; this one must not.
     const updStock = db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`);
-    // Replaced by postCentralTxn at the call site. The stored `type` stays
-    // 'purchase' — every deployed report buckets on it, and renaming it would
-    // move opening stock out of all of them — but the movement's SOURCE is now
-    // recorded truthfully as 'opening' (the cutover anchor) rather than being
-    // silently filed against a vendor nobody bought from.
+    const insTxn = db.prepare(`
+      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
+      VALUES (?, ?, 'purchase', ?, ?, 'Opening stock', datetime('now'))
+    `);
 
     const created: any[] = [];
     const skipped: any[] = [];
@@ -123,24 +121,7 @@ export async function POST(request: Request) {
         // updateMaterialPrice() turns it into the correct ₹-per-recipe-unit average.
         insPurchase.run(pid, m.id, qty, rate, total, date);
         updStock.run(stockQty, m.id);
-        postCentralTxn(db, {
-          materialId: m.id,
-          type: 'purchase',
-          quantity: stockQty,
-          referenceId: pid,
-          notes: 'Opening stock',
-          counterparty: { kind: 'opening' },
-          // The ROW'S OWN business date — the same `date` written to
-          // purchases.date one line above, which the shipped template carries a
-          // column for (src/app/purchases/page.tsx maps it onto every row) and
-          // which defaults to today only when the row leaves it blank. Without
-          // it the movement was stamped TODAY while the purchase said 1 July,
-          // so one event read as two dates. Its four sibling importers
-          // (purchases, purchases/bulk, grn, inward-import/commit) all pass the
-          // bill's date here; this one was the outlier.
-          txnDate: date,
-          actor: me?.email || 'system:opening-stock',
-        });
+        insTxn.run(generateId(), m.id, stockQty, pid);
         updateMaterialPrice(db, m.id);
         created.push({ row: rowNo, name: m.name, entered: `${qty} ${m.purchase_unit || ''}`, base: `${stockQty} ${m.unit || ''}` });
       }

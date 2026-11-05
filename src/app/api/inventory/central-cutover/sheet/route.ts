@@ -67,9 +67,12 @@ export async function GET(request: Request) {
       // database it is blank on all 952 materials — so it is fetched here and
       // the column is dropped entirely when nothing fills it (see
       // buildCountSheetCsv). One indexed-by-id lookup, bounded by the master.
+      // Every material, switched on or off: the sheet lists a switched-off one
+      // while central still holds it (owner #6 / ruling 78, listCutoverSheet),
+      // and its row must carry its storage location like any other.
       const locs = new Map<string, string>(
         (db.prepare(
-          "SELECT id, COALESCE(storage_location,'') AS storage_location FROM raw_materials WHERE COALESCE(is_active,1) = 1",
+          "SELECT id, COALESCE(storage_location,'') AS storage_location FROM raw_materials",
         ).all() as Array<{ id: string; storage_location: string }>)
           .map((r) => [r.id, r.storage_location]),
       );
