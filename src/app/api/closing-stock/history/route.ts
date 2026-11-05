@@ -7,8 +7,8 @@ import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { bydeptCsv, bydeptCsvFilename } from '@/lib/closing-bydept-csv';
 import {
   CLOSING_GST_PCT_CSV, CLOSING_GST_SOURCE_CSV, CLOSING_INCL_CSV, CLOSING_TAX_CSV, SEMI_GST,
-  addClosingTaxTotals, closingTaxCells, closingTaxCsv, createClosingGstResolver, storedCountValue, sumClosingTax,
-  type ClosingGstSource, type ClosingTaxSummable, type ClosingTaxTotals,
+  addClosingTaxTotals, closingTaxCells, closingTaxCsv, closingTaxOnValue, createClosingGstResolver, storedCountValue,
+  sumClosingTax, type ClosingGstSource, type ClosingTaxSummable, type ClosingTaxTotals,
 } from '@/lib/closing-tax';
 
 /**
@@ -167,7 +167,8 @@ export interface HistoryRow {
   gst_title?: string;
   /** value × gst_pct ÷ 100; null when there is no rate or no value. */
   tax?: number | null;
-  /** value + tax; null when tax is null. */
+  /** value + tax (ruling 109) — the value alone when there is no GST rate
+   *  (SUB rows included); null only when the row has no value. */
   total_incl_tax?: number | null;
 }
 
@@ -1142,10 +1143,13 @@ export async function GET(request: Request) {
       // All entries, Closing Stock History and Closing Overview use
       // (src/lib/closing-tax.ts) — GST % from the last bill with GST on or
       // before THIS count date, else the item master; liquor / store items
-      // always blank; applied to the value SAVED with each count. Only counts
-      // with a rate are summed, and every footer says how many ("rate known for
-      // N of M"). Semi-finished counts are made in-house and never carry GST,
-      // so they have no tax lines. After truncation, like the ₹ totals.
+      // always blank; applied to the value SAVED with each count. The Tax sums
+      // only counts with a rate, and every footer says how many ("rate known
+      // for N of M"). Total incl. GST (ruling 109) = the column's raw-materials
+      // Value as printed above it + that Tax — counts with no GST rate are in
+      // at their value, no GST added — so each column foots to the paisa.
+      // Semi-finished counts are made in-house and never carry GST, so they
+      // have no tax lines. After truncation, like the ₹ totals.
       const gstResolver = rows.length
         ? createClosingGstResolver(db, {
             isStoreMapped: (category) => isStoreMappedMaterial(db, category),
@@ -1157,14 +1161,23 @@ export async function GET(request: Request) {
       for (const row of rows) {
         const gst = gstResolver!.forMaterial(String(row.material_id), date);
         for (const k of colKeys) {
-          if (!row.cells[k]) continue;
+          const cell = row.cells[k];
+          if (!cell) continue;
           const basis = rawBasis.get(`${row.key}|${k}`) ?? null;
-          taxCells[k].push({ value: basis, gst_pct: gst.gst_pct, ...closingTaxCells(basis, gst) });
+          // Tax on the value saved with the count; `value` is the cell's own
+          // printed value — the very figure the column's Value line adds up.
+          const { tax } = closingTaxCells(basis, gst);
+          taxCells[k].push({ value: cell.value, gst_pct: gst.gst_pct, tax });
         }
       }
       const taxByColumn: Record<string, ClosingTaxTotals> = {};
-      for (const k of colKeys) taxByColumn[k] = sumClosingTax(taxCells[k]);
-      const rawTax = { by_column: taxByColumn, total: addClosingTaxTotals(colKeys.map((k) => taxByColumn[k])) };
+      // Re-based on the Value figures this sheet PRINTS (rawTotals) — so
+      // Total incl. GST = the Value line above it + the Tax line, exactly.
+      for (const k of colKeys) taxByColumn[k] = closingTaxOnValue(sumClosingTax(taxCells[k]), rawTotals.by_column[k].value);
+      const rawTax = {
+        by_column: taxByColumn,
+        total: closingTaxOnValue(addClosingTaxTotals(colKeys.map((k) => taxByColumn[k])), rawTotals.total.value),
+      };
 
       const bnote = truncated
         ? `Showing the first ${(rows.length + semiRows.length).toLocaleString('en-IN')} items counted on ${date} — the day holds more. Search for an item to see the rest.`
@@ -1346,13 +1359,15 @@ export async function GET(request: Request) {
         type: 'SUB',
       };
       if (withGst) {
-        // Semi-finished stock is made in-house, never billed: always blank.
+        // Semi-finished stock is made in-house, never billed: no GST rate, no
+        // tax — and in Total incl. GST at its value, no GST added (ruling 109).
         semi.gst_pct = null;
         semi.gst_source = SEMI_GST.gst_source;
         semi.gst_note = SEMI_GST.gst_note;
         semi.gst_title = SEMI_GST.gst_title;
-        semi.tax = null;
-        semi.total_incl_tax = null;
+        const semiTax = closingTaxCells(semi.value, SEMI_GST);
+        semi.tax = semiTax.tax;
+        semi.total_incl_tax = semiTax.total_incl_tax;
       }
       rows.push(semi);
     }
@@ -1372,12 +1387,13 @@ export async function GET(request: Request) {
     // by the caller via rate_source.
     let value = 0;
     for (const r of rows) if (r.value != null) value += r.value;
-    // Estimated GST (gst=1 only) over the rows WITH a rate only, with the
-    // counts the page needs to say "rate known for N of M" — computed after
-    // truncation, from the same per-row figures the table prints, so the
-    // footer foots. Without gst=1 the totals are the deployed { count, value }.
+    // Estimated GST (gst=1 only): the Tax over the rows WITH a rate, with the
+    // counts the page needs to say "rate known for N of M"; Total incl. GST =
+    // this Value total + that Tax (ruling 109). Computed after truncation,
+    // from the same per-row figures the table prints, so the footer foots.
+    // Without gst=1 the totals are the deployed { count, value }.
     const totals: { count: number; value: number; tax?: ClosingTaxTotals } = { count: rows.length, value: r2(value) };
-    if (withGst) totals.tax = sumClosingTax(rows);
+    if (withGst) totals.tax = closingTaxOnValue(sumClosingTax(rows), totals.value);
 
     const note = truncated
       ? `Showing the first ${ROW_CAP.toLocaleString('en-IN')} rows — the range holds more. Narrow the dates or pick one department to see the rest.`

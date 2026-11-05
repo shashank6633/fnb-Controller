@@ -92,7 +92,8 @@ import { todayIST, fmtISTDate } from '@/lib/format-date';
 import {
   CLOSING_GST_PCT_LABEL, CLOSING_GST_PCT_SUB, CLOSING_GST_PCT_TITLE,
   CLOSING_INCL_LABEL, CLOSING_INCL_TITLE, CLOSING_TAX_LABEL, CLOSING_TAX_TITLE,
-  closingTaxNotes, fmtClosingGstPct, sumClosingTax, type ClosingTaxTotals,
+  closingIncl, closingInclShown, closingTaxNotes, closingTaxOnValue, fmtClosingGstPct, sumClosingTax,
+  type ClosingTaxTotals,
 } from '@/lib/closing-tax';
 import { bydeptCsv, bydeptCsvFilename } from '@/lib/closing-bydept-csv';
 
@@ -378,8 +379,14 @@ const normaliseFlat = (payload: unknown, from: string, to: string): FlatResp => 
     mode: 'flat',
     rows,
     // Re-summed here from the very rows the table prints (the route sends the
-    // same figure), so the footer can never disagree with its own column.
-    totals: { count: numOrNull(t.count) ?? rows.length, value: num(t.value), tax: sumClosingTax(rows) },
+    // same figure), so the footer can never disagree with its own column —
+    // and Total incl. GST re-based on the Value total the footer prints
+    // (ruling 109: value + tax, to the paisa).
+    totals: {
+      count: numOrNull(t.count) ?? rows.length,
+      value: num(t.value),
+      tax: closingTaxOnValue(sumClosingTax(rows), num(t.value)),
+    },
     truncated: !!j.truncated,
     from: str(j.from) || from,
     to: str(j.to) || to,
@@ -479,8 +486,9 @@ const normaliseBydept = (payload: unknown): Omit<BydeptResp, 'asked_q'> => {
   const readTax = (v: unknown): ClosingTaxTotals => {
     const o = rec(v);
     return {
-      tax: num(o.tax), total_incl_tax: num(o.total_incl_tax), value_taxed: num(o.value_taxed),
+      tax: num(o.tax), total_incl_tax: num(o.total_incl_tax), value: num(o.value), value_taxed: num(o.value_taxed),
       rated: num(o.rated), taxed: num(o.taxed), items: num(o.items),
+      valued: num(o.valued), at_value: num(o.at_value), at_value_rated: num(o.at_value_rated),
     };
   };
   const tx = j.tax == null ? null : rec(j.tax);
@@ -1319,9 +1327,13 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
                     ? <span className="text-[#B9A896]" title={r.gst_pct == null ? r.gst_title : 'No value basis for this count — nothing to apply the rate to.'}>{EM}</span>
                     : inr2(r.tax)}
                 </td>
-                <td className="px-3 py-1.5 text-right tabular-nums text-[#2D1B0E]">
+                {/* Value + Tax (ruling 109): a row with no GST rate shows its
+                    value here, no GST added; blank only with no value. */}
+                <td className="px-3 py-1.5 text-right tabular-nums text-[#2D1B0E]"
+                    title={r.total_incl_tax != null && r.tax == null
+                      ? 'No GST rate — the value, no GST added.' : undefined}>
                   {r.total_incl_tax == null
-                    ? <span className="text-[#B9A896]" title={r.gst_pct == null ? r.gst_title : 'No value basis for this count — nothing to apply the rate to.'}>{EM}</span>
+                    ? <span className="text-[#B9A896]" title="No value for this count — nothing to add.">{EM}</span>
                     : inr2(r.total_incl_tax)}
                 </td>
                 <td className="px-3 py-1.5 text-[10px] text-[#6B5744]">{r.recorded_by || EM}</td>
@@ -1342,8 +1354,9 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
                   title="Quantities cannot be added across different materials.">{EM}</td>
               <td className="px-3 py-2 text-right text-[#B9A896] font-normal">{EM}</td>
               <td className="px-3 py-2 text-right tabular-nums bg-[#FBE7D3]">{inr2(data.totals.value)}</td>
-              {/* A GST % does not add up across materials. Tax and Total incl.
-                  sum ONLY the rows with a rate, and say how many. */}
+              {/* A GST % does not add up across materials. Tax sums ONLY the
+                  rows with a rate, and says how many; Total incl. GST = the
+                  Value total + the Tax total (ruling 109). */}
               <td className="px-3 py-2 text-right text-[#B9A896] font-normal"
                   title="A GST % cannot be added across materials.">{EM}</td>
               <td className="px-3 py-2 text-right tabular-nums" title={`${CLOSING_TAX_TITLE} ${taxNotes.title}`}>
@@ -1351,7 +1364,7 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
                 <div className="text-[9px] font-normal text-[#8B7355]">{taxNotes.rate}</div>
               </td>
               <td className="px-3 py-2 text-right tabular-nums" title={taxNotes.title}>
-                {data.totals.tax.taxed > 0 ? inr2(data.totals.tax.total_incl_tax) : <span className="text-[#B9A896] font-normal">{EM}</span>}
+                {closingInclShown(data.totals.tax) ? inr2(data.totals.tax.total_incl_tax) : <span className="text-[#B9A896] font-normal">{EM}</span>}
                 <div className="text-[9px] font-normal text-[#8B7355]">{taxNotes.incl}</div>
               </td>
               <td className="px-3 py-2" />
@@ -1367,7 +1380,8 @@ function FlatTable({ data, filtered }: { data: FlatResp; filtered: boolean }) {
         GST is an estimate: Value × the GST % charged on the item&apos;s latest bill that recorded
         GST, dated on or before that count (else the item master&apos;s GST %). Bills with no GST
         recorded are skipped, and a later bill never changes it. Liquor / store items and
-        semi-finished items carry no GST here; a blank is never 0%.
+        semi-finished items carry no GST here; a blank is never 0%. Total incl. GST = Value + Tax:
+        a count with no GST rate is included at its value, with no GST added.
       </p>
     </div>
   );
@@ -1414,6 +1428,8 @@ function BydeptSummary({ data, filtered }: { data: BydeptResp; filtered: boolean
   const deptCols = data.columns.filter(c => !c.is_store);
   const store = data.columns.find(c => c.is_store);
   const items = data.rows.length + data.semi_rows.length;
+  /** The Value at count card prints a figure (not a dash). */
+  const allValued = !!data.totals.all.total.lines && data.totals.all.total.unpriced < data.totals.all.total.lines;
   return (
     <>
       <SummaryCard icon={<CalendarDays className="w-4 h-4" />} label="Count date"
@@ -1432,25 +1448,32 @@ function BydeptSummary({ data, filtered }: { data: BydeptResp; filtered: boolean
                    note={`${data.rows.length.toLocaleString('en-IN')} raw · ${data.semi_rows.length.toLocaleString('en-IN')} semi-finished${filtered ? ' · filtered view' : ''}`} />
       {/* A day nobody counted has no value — an em-dash, never ₹0. Nor has a
           day whose every count carries no rate: that is "no rate", not ₹0. */}
+      {/* To the paisa, like the Total incl. GST card beside it, so the two
+          cards and its GST add up exactly (ruling 109). */}
       <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label="Value at count"
-                   value={data.totals.all.total.lines && data.totals.all.total.unpriced < data.totals.all.total.lines
-                     ? inr(data.totals.all.total.value) : EM}
+                   value={allValued ? inr2(data.totals.all.total.value) : EM}
                    note={!data.totals.all.total.lines
                      ? (filtered ? 'no count matches the item search' : 'nothing was counted on this date')
                      : data.totals.all.total.unpriced === data.totals.all.total.lines
                        ? 'counted, but no item has a rate — so no value'
                        : 'valued at the rate stored when it was counted'} />
-      {/* Ruling 107: the raw block's estimated GST, as on the footer. It covers
-          only the counts with a GST rate and a value at count — the note says
-          which, so it is never read as "the Value card + tax". */}
+      {/* Ruling 109: Total incl. GST = the Value at count card beside it +
+          the raw materials' estimated GST (the footer's Tax total). That card
+          also holds semi-finished stock — made in-house, no GST — so it is
+          added at its value, and the note says so. */}
       {data.tax && (() => {
         const tt = data.tax.total;
-        const n = closingTaxNotes(tt, 'counts', inr);
+        const n = closingTaxNotes(tt, 'counts', inr2);
+        const semi = data.totals.semi.total;
+        const semiNote = !semi.lines ? ''
+          : semi.unpriced < semi.lines ? ' · semi-finished at value, no GST' : ' · semi-finished: no value';
         return (
           <SummaryCard icon={<IndianRupee className="w-4 h-4" />} label={CLOSING_INCL_LABEL}
-                       value={tt.taxed > 0 ? inr(tt.total_incl_tax) : EM}
-                       note={tt.taxed > 0
-                         ? `raw materials: value at count + ${inr(tt.tax)} GST · ${n.covers}`
+                       value={allValued ? inr2(closingIncl(data.totals.all.total.value, tt.tax)) : EM}
+                       note={allValued
+                         // No tax worked out → no "+ GST ₹0" (a ₹0 reads as GST-free).
+                         ? `value at count ${inr2(data.totals.all.total.value)}${tt.taxed > 0 ? ` + GST ${inr2(tt.tax)}` : ''}`
+                           + ` · raw materials: ${n.incl}${semiNote}`
                          : `raw materials: ${n.rate}`} />
         );
       })()}
@@ -1972,18 +1995,21 @@ function BydeptBlockBody({ label, rows, columns, dayLabel, totals, totalLabel, f
 /**
  * Estimated GST under the raw-materials value (ruling 107): "Tax (GST, est.)"
  * and "Total incl. GST (est.)" for Store, every department and the Total.
- * Same labels, hover text and notes as the other GST surfaces (closing-tax.ts)
- * — only counts with a rate AND a value at count are in either figure, and the
- * line under each says how many. No such count in a column → an em-dash,
- * never ₹0.
+ * Same labels, hover text and notes as the other GST surfaces (closing-tax.ts).
+ * Tax: only counts with a rate AND a value at count, and the line under it
+ * says how many; none in a column → an em-dash, never ₹0. Total incl. GST
+ * (ruling 109): the Value line above + the Tax line (a dash = 0) — counts with
+ * no GST rate are in at their value — so each column adds up; a dash only
+ * where the Value line has no figure.
  */
 function BydeptTaxRows({ tax, columns }: { tax: NonNullable<BydeptResp['tax']>; columns: BydeptColumn[] }) {
   const cellFor = (x: ClosingTaxTotals | undefined, f: 'tax' | 'total_incl_tax', key: string, total?: boolean, isStore?: boolean) => {
     const n = x ? closingTaxNotes(x, 'counts', bdInr2) : null;
+    const shown = f === 'tax' ? !!x && x.taxed > 0 : closingInclShown(x);
     return (
       <td key={key} title={n?.title}
           className={`px-2 sm:px-3 py-1.5 text-right tabular-nums text-[11px] sm:text-xs ${total ? 'bg-[#FBE7D3] border-l border-[#E8D5C4]' : isStore ? 'border-r border-[#E8D5C4]' : ''}`}>
-        {x && x.taxed > 0 ? bdInr2(x[f]) : <span className="text-[#B9A896] font-normal">{EM}</span>}
+        {x && shown ? bdInr2(x[f]) : <span className="text-[#B9A896] font-normal">{EM}</span>}
         {n && x && x.items > 0 && (
           <div className="text-[9px] font-normal text-[#8B7355]">{f === 'tax' ? n.short : n.incl}</div>
         )}
@@ -1994,7 +2020,9 @@ function BydeptTaxRows({ tax, columns }: { tax: NonNullable<BydeptResp['tax']>; 
     <tr className="border-t border-[#E8D5C4] font-semibold text-[#2D1B0E] bg-[#FFF1E3]">
       <td className="sticky left-0 z-10 px-3 py-1.5 border-r border-[#E8D5C4] bg-[#FFF1E3]" title={title}>
         {label}
-        <div className="text-[9px] font-normal text-[#8B7355]">raw materials · on the value at count</div>
+        <div className="text-[9px] font-normal text-[#8B7355]">
+          {f === 'tax' ? 'raw materials · on the value at count' : 'raw materials · value above + tax'}
+        </div>
       </td>
       {columns.map(c => cellFor(tax.by_column[c.key], f, c.key, false, c.is_store))}
       {cellFor(tax.total, f, '__total__', true)}
@@ -2165,15 +2193,29 @@ function EmptyState({ filtered, from, to }: { filtered: boolean; from: string; t
   );
 }
 
+/**
+ * A card figure never breaks inside the number — "₹11,36,531.4" with "1" on
+ * the next line reads as two figures. A ₹ figure stays on ONE line and shrinks
+ * to fit its card (a phone-width card holding a lakh-scale paise figure): font
+ * size = the card's width ÷ the figure's width in em (Inter bold tabular
+ * figures, rounded up), never above the usual text-lg.
+ */
+const cardFigureStyle = (value: string): React.CSSProperties | undefined => {
+  if (!value.startsWith('₹')) return undefined;
+  let em = 0;
+  for (const ch of value) em += ch === ',' || ch === '.' ? 0.32 : 0.66;
+  return { whiteSpace: 'nowrap', fontSize: `min(1.125rem, calc(100cqi / ${em.toFixed(2)}))` };
+};
+
 function SummaryCard({ icon, label, value, note }: {
   icon: React.ReactNode; label: string; value: string; note?: string;
 }) {
   return (
-    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 [container-type:inline-size]">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-[#8B7355]">
         {icon} {label}
       </div>
-      <div className="mt-1 text-lg font-bold text-[#2D1B0E] tabular-nums">{value}</div>
+      <div className="mt-1 text-lg font-bold text-[#2D1B0E] tabular-nums" style={cardFigureStyle(value)}>{value}</div>
       {note && <div className="text-[9px] text-[#B9A896] leading-tight mt-0.5">{note}</div>}
     </div>
   );

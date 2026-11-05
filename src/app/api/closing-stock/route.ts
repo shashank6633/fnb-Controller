@@ -350,12 +350,18 @@ export async function GET(request: Request) {
           materialIds: valuedItems.map(i => String(i.material_id)),
         })
       : null;
+    const bases: (number | null)[] = [];
     const items = valuedItems.map(i => {
       const g = gstResolver!.forMaterial(String(i.material_id), String(i.date));
       const basis = i.rate_is_stored ? storedCountValue(i) : null;
+      bases.push(basis);
       return { ...i, ...g, ...closingTaxCells(basis, g) };
     });
-    const closingTax = sumClosingTax(items);
+    // Tax over the rows with a rate; Total incl. GST = Σ value at count of
+    // every row that has one + that tax (ruling 109). The History tab prints
+    // its own figures from the rows (its Total Value can hold an "est." value
+    // worked out today, which is in its Total incl. at that value, no GST).
+    const closingTax = sumClosingTax(items.map((i, k) => ({ value: bases[k], gst_pct: i.gst_pct, tax: i.tax })));
 
     // Per-area rollup of the physical closing VALUE (physical_stock × average_price).
     // Built from the SAME date/range window as `items` but WITHOUT the department_id
@@ -433,8 +439,9 @@ export async function GET(request: Request) {
       total_closing_value: r2((items as any[]).reduce((s, i) => s + (Number(i.total_value) || 0), 0)),
       unvalued_items: (items as any[]).filter(i => i.rate_source === 'none').length,
       derived_rate_items: (items as any[]).filter(i => !i.rate_is_stored).length,
-      // Estimated GST over the rows WITH a rate only (closing-tax.ts):
-      // { tax, total_incl_tax, value_taxed, rated, taxed, items }.
+      // Estimated GST (closing-tax.ts): tax over the rows WITH a rate; total
+      // incl. = value at count + tax. { tax, total_incl_tax, value,
+      // value_taxed, rated, taxed, items, valued, at_value, at_value_rated }.
       closing_tax: closingTax,
     };
 
