@@ -127,8 +127,13 @@ interface Summary {
 }
 
 /* ── format helpers ──────────────────────────────────────────────────────────── */
-const inr = (v: number | null | undefined, dp = 0) =>
-  v == null ? '—' : '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+// The sign goes BEFORE the ₹ ("-₹211", not "₹-211" — the MRP rounding and a
+// negative variance are the signed figures on this page).
+const inr = (v: number | null | undefined, dp = 0) => {
+  if (v == null) return '—';
+  const n = Number(v) || 0;
+  return (n < 0 ? '-₹' : '₹') + Math.abs(n).toLocaleString('en-IN', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+};
 const n2 = (v: number | null | undefined, dp = 2) =>
   v == null ? '—' : (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: dp });
 const pct = (v: number | null | undefined) => v == null ? '—' : `${(Number(v) || 0).toFixed(1)}%`;

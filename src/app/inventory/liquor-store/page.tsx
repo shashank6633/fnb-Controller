@@ -2510,7 +2510,7 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                   (RETAIL_DEPOT_WITHHELD_NOTE). */}
               Leave the rate blank when this item has been indented from TGBCL — the depot landed cost is the
               rate paid on the latest TGBCL indent of it recorded by the buy date plus that indent&apos;s share of
-              the levies, and the excess is computed against it; a rate you type here is <b>not</b> used then.
+              the levies, and the excess is computed against it; a rate you type here is <b>not</b>{' '}used then.
               With no indent by that date the Brand Map&apos;s master rate is used, unless you type one.
               {' '}<b>If the item is neither indented nor in the Brand Map and you leave this blank, the buy is
               still recorded, but the excess is stored as 0 with the depot rate marked “unknown”.</b> That 0
@@ -2525,7 +2525,7 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                   one that is not, so the operator is told and given the
                   override, which is correct in whatever unit they mean. */}
               {' '}That master rate is TGBCL&apos;s <b>₹ per bottle</b>, compared directly with the rate you
-              typed above — if a {pu} of this item is <b>not</b> a single bottle, enter the depot ₹ per {pu}
+              typed above — if a {pu} of this item is <b>not</b> a single bottle, enter the depot ₹ per {pu}{' '}
               here instead of leaving it blank.
             </div>
           </div>
