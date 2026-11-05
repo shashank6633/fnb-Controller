@@ -1001,9 +1001,13 @@ function IntegrityPanel(
             ))}
           </ul>
           <div className="text-[11px] mt-1">
-            The stock arrived but no bill-level charges row was written, so no Net Indent exists and the wallet never
-            moved. A CSV register uploaded with the four TGBCL levy fields blank does exactly this. Re-save the bill
-            with its levies (₹0 is fine) to create the indent and its debit.
+            The stock arrived but no TGBCL charges row was written, so no Net Indent exists and the wallet never
+            moved. Only the old Liquor Store bill CSV did this (retired 29 Oct 2026 — it skipped the charges row when
+            all four TGBCL levy fields were blank); a bill entered on Goods Receipt always writes it. The bill cannot
+            be entered again (Goods Receipt refuses an indent the store already holds), so if the TGBCL portal charged
+            it, record what it charged as an <b>Adjustment</b> naming the indent; the bill stays listed here as the
+            record that it has no charges row. Bills dated before the wallet&apos;s opening balance are not listed:
+            the opening already includes them.
           </div>
         </div>
       )}
@@ -1014,9 +1018,9 @@ function IntegrityPanel(
             {foreign.slice(0, 8).map(f => <li key={f.id}>{f.reference}: {rs(f.amount)} · {f.store}</li>)}
           </ul>
           <div className="text-[11px] mt-1">
-            Any store&apos;s bill-level charges debit this one TGBCL wallet — the bill screen is a picker over every store.
-            Check these belong here; if they do not, correct the balance with an adjustment and re-file the bill against
-            the right store.
+            Every recorded TGBCL bill debits this one wallet, whichever store it posted to — a Goods Receipt liquor bill
+            goes to the store its items&apos; categories belong to (Settings → Store Locations). Check these belong
+            here; if they do not, correct the balance with an adjustment.
           </div>
         </div>
       )}
@@ -1036,6 +1040,11 @@ function IntegrityPanel(
           <ul className="text-xs mt-1 space-y-0.5">
             {integrity.orphaned.slice(0, 8).map(m => <li key={m.id}>{m.reference}: {rs(m.amount)}</li>)}
           </ul>
+          <div className="text-[11px] mt-1">
+            The bill these debits were written for is no longer recorded — usually its Goods Receipt was voided. Voiding
+            removes a debit the app wrote; one that was typed by hand and taken over by the bill is kept, because it is
+            somebody&apos;s entry. If the TGBCL portal did not charge it, take it back out with an <b>Adjustment</b>.
+          </div>
         </div>
       )}
       {integrity.non_positive.length > 0 && (

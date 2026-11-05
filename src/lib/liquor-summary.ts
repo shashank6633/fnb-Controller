@@ -345,6 +345,11 @@ export interface LqRetailRow {
   excess_pct: number | null;
   /** A depot rate is frozen on this buy (> 0). Never a money figure. */
   priced: boolean;
+  /** Ruling 39: a saved count already held these bottles, so the buy booked NO
+   *  stock and is recorded for its cost only. Its money figures count as for
+   *  any buy; the count date says which count absorbed the bottles. */
+  cost_only: boolean;
+  cost_only_count_date: string | null;
   paid_by: string;
   reimbursement_status: string;
   reason: string;
@@ -1219,6 +1224,8 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     excess_total: revealDepot ? (Number(r.excess_total) || 0) : null,
     excess_pct: revealDepot ? (Number(r.excess_pct) || 0) : null,
     priced: (Number(r.depot_landed_per_bottle) || 0) > 0,
+    cost_only: r.cost_only === true,
+    cost_only_count_date: r.cost_only ? (r.cost_only_count_date || null) : null,
     paid_by: String(r.paid_by || ''),
     reimbursement_status: String(r.reimbursement_status || ''),
     reason: String(r.reason || ''),

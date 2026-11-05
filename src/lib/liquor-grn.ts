@@ -687,6 +687,10 @@ export function voidLiquorGrn(db: Database, args: { grn: any; me: Actor; reason:
   const store = getStoreById(db, storeId);
   const sName = store?.name || 'the store';
   const removed: { material_id: string; material_name: string; recipe_qty: number; purchase_qty: number }[] = [];
+  // [LIQUOR-RECON] what the void did to the TGBCL wallet debit (set in step 5).
+  // Cast, not annotated: it is assigned inside the transaction closure, which
+  // TypeScript's narrowing cannot see — annotated, it reads as always null here.
+  let walletOnVoid = null as { action: string; id: string | null; note: string } | null;
   try {
     db.transaction(() => {
       // 1. Claim — the write lock and the replay guard in one statement.
@@ -781,6 +785,41 @@ export function voidLiquorGrn(db: Database, args: { grn: any; me: Actor; reason:
       for (const r of ledgerRows) {
         if (del.run(r.id).changes !== 1) throw mismatch();
       }
+      // [LIQUOR-RECON:BEGIN] ── the TGBCL wallet debit goes with its indent ─────
+      // GATED: ships only on "Deploy Liquor Reconciliation"; a ship without it
+      // deletes BEGIN..END. The wallet debit is keyed on THIS charges row's id
+      // (lq_wallet_txns.source_ref), so once the row is deleted below nothing
+      // would ever re-derive it: the wallet would go on spending an indent the
+      // store no longer holds. Re-deriving it at a Net Indent of ₹0 is the
+      // wallet's own rule for "this indent spends nothing" (liquor-wallet.ts
+      // writeAutoDebit): a machine-written debit is removed; one a person typed
+      // and the bill adopted is KEPT and shows on the wallet page as a debit
+      // whose indent no longer exists. Same transaction as the void; a
+      // wallet-side failure never blocks it (autoDebitForIndent's contract) and
+      // is filed where the wallet page and the errors bell show it.
+      // Only when this indent HAS a debit: with none there is nothing to take
+      // back, and calling the writer anyway would file a bill-save failure
+      // ("the bill was saved, its debit was not") for a database without the
+      // wallet table — untrue of a void.
+      const hasDebit = !!db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_wallet_txns'",
+      ).get() && !!db.prepare(
+        "SELECT 1 FROM lq_wallet_txns WHERE type = 'indent_debit' AND source_ref = ? LIMIT 1",
+      ).get(String(chargeRows[0].id));
+      if (hasDebit) {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { autoDebitForIndent } = require('./liquor-wallet') as typeof import('./liquor-wallet');
+        walletOnVoid = autoDebitForIndent(db, {
+          source_ref: String(chargeRows[0].id),
+          reference: String(chargeRows[0].invoice_ref || indent),
+          date: String(chargeRows[0].date || grn.date || ''),
+          net_indent_value: 0,
+          store_id: storeId,
+          supplier: String(chargeRows[0].supplier || ''),
+          created_by: me.email,
+        });
+      }
+      // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────
       db.prepare(`DELETE FROM store_bill_charges WHERE id = ?`).run(chargeRows[0].id);
 
       for (const r of ledgerRows) {
@@ -817,7 +856,15 @@ export function voidLiquorGrn(db: Database, args: { grn: any; me: Actor; reason:
     grn_number: grn.grn_number,
     store: { id: storeId, name: sName },
     bottles_removed: removed,
-    notice: `The bill document is kept (struck through). Its bottles were taken back out of ${sName} and its TGBCL charges removed; the indent number can now be entered again.`,
+    notice: `The bill document is kept (struck through). Its bottles were taken back out of ${sName} and its TGBCL charges removed; the indent number can now be entered again.`
+      // [LIQUOR-RECON] one sentence on the wallet, never a wallet ₹ figure (this
+      // reply reaches anyone who may void, not only the wallet's managers).
+      + (walletOnVoid?.action === 'removed' ? ' Its TGBCL wallet debit was removed with it.'
+        // 'none' WITH an id = the debit a person typed, adopted and now kept.
+        : walletOnVoid?.action === 'none' && walletOnVoid.id
+          ? ' Its TGBCL wallet debit was entered by hand, so it was kept — correct it with an adjustment on Liquor Wallet.'
+          : walletOnVoid?.action === 'failed' ? ' Its TGBCL wallet debit could NOT be removed — the Liquor Wallet page lists it.' : ''),
+    ...(walletOnVoid ? { wallet_debit: walletOnVoid } : {}),
   } };
 }
 

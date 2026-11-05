@@ -37,7 +37,6 @@ import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead'
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState from '@/components/CountState';
 import WineShopRegister from './WineShopRegister';
-import { BillWalletNotices, billWalletNotices, mergeBillWalletNotices, type BillWalletNotice } from './BillWalletNotice';
 import {
   packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown,
   toPurchaseQty, csvQty, PackMeta,
@@ -303,11 +302,6 @@ export default function LiquorStorePage() {
      figures, the history list) dies with the instance, which is the fix. */
   const [closingDate, setClosingDate] = useState(today());
   const [flash, setFlash] = useState<string | null>(null);
-  /* What a TGBCL bill save did to the wallet, when it was not the ordinary
-     "debited" — above all a debit that FAILED while the bill saved (see
-     BillWalletNotice.tsx). Kept until dismissed: the flash above is gone in
-     five seconds, and this is the only place the saver is told. */
-  const [walletNotices, setWalletNotices] = useState<BillWalletNotice[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [meRole, setMeRole] = useState<string>('');   // admin-only closing 'adjust' toggle
   /* MANAGEMENT (admin / manager / HOD) — the gate GET /api/liquor/retail
@@ -704,23 +698,11 @@ export default function LiquorStorePage() {
             <ReceiptText className="w-4 h-4" /> Enter bill on Goods Receipt
           </a>
         )}
-        {/* AFTER New Bill, never before it. This header WRAPS, so a new button
-            always moves something — the only question is which. Measured with
-            can_adjust present (admin / store manager), where Adjustment + Bulk
-            Adjust fill the first row: inserted BEFORE New Bill it pushed the
-            page's primary purchase CTA from top 79 to top 147 at both 1440 and
-            1600. Placed here, nothing AHEAD of it moves.
-            What it does cost, measured BEFORE/AFTER on the rendered page:
-              · admins — Inward Register (which follows it) slides right, left
-                316 → 512 at 1440, same row; nothing below moves;
-              · can_procure WITHOUT can_adjust — the storekeeper who actually
-                does wine-shop runs — that bar is two buttons shorter, so it
-                re-wraps: New Bill top 71 → 79 at 1440, and at 1280 Inward
-                Register drops to a second row, shifting the tabs and everything
-                under them down 16–46px.
-            Nothing is hidden, clipped or unreachable, and page overflow stays 0
-            at 320 / 375 / 768 / 1024 / 1280 / 1440 in both builds. The cost is
-            muscle memory, and it is paid only by the buttons AFTER this one. */}
+        {/* [LIQUOR-RECON] Wine-shop Purchase — AFTER the primary "Enter bill on
+            Goods Receipt" link, never before it: this header WRAPS, so a button
+            inserted ahead of the primary action would push it to a later row.
+            Placed here only the buttons after it move. Gated on can_procure,
+            the same right /api/liquor/retail re-checks server-side. */}
         {access.can_procure && (
           <button onClick={() => setShowRetail(true)}
                   title="Emergency retail buy from a wine shop (depot dry) — records the bottles, the excess over depot landed cost, who paid and whether they are owed it back"
@@ -742,8 +724,6 @@ export default function LiquorStorePage() {
           <CheckCircle2 className="w-4 h-4 shrink-0" /> {flash}
         </div>
       )}
-      <BillWalletNotices notices={walletNotices}
-                         onDismiss={key => setWalletNotices(ns => ns.filter(n => n.key !== key))} />
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-center gap-2">
           <AlertCircle className="w-4 h-4 shrink-0" /> {error}

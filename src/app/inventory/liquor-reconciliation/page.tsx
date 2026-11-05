@@ -55,7 +55,10 @@ interface IndentRow { invoice_ref: string; date: string; supplier: string; lines
 interface RetailRow { id: string; date: string; shop_name: string; bottles: number; rate_paid_per_bottle: number;
   /** The four depot figures are null for a non-admin (they re-derive the TGBCL master — liquor-summary.ts LqSectionE). */
   depot_landed_per_bottle: number | null; excess_per_bottle: number | null; excess_total: number | null; excess_pct: number | null;
-  priced?: boolean; paid_by: string; reimbursement_status: string; reason: string; }
+  priced?: boolean;
+  /** Ruling 39: a saved count already held these bottles — no stock was booked, cost only. */
+  cost_only?: boolean; cost_only_count_date?: string | null;
+  paid_by: string; reimbursement_status: string; reason: string; }
 interface RateRow { ledgerId: string; invoiceRef: string; inwardDate: string; materialName: string; category: string; bottles: number; indentRate: number; masterRate: number | null; variance: number | null; varianceValue: number | null; proposedRatePerCase: number | null; mapReason: string;
   /** Which way the indent moved against the master — all a non-admin is told (the master-derived figures are null for them). */
   direction?: 'above_master' | 'below_master'; }
@@ -533,7 +536,15 @@ export default function LiquorReconciliationPage() {
                       <tr key={r.id} className="border-t border-[#F0E4D6]">
                         <td className="px-2 py-1.5 text-[#6B5744]">{r.date}</td>
                         <td className="px-2 py-1.5 text-[#2D1B0E]">{r.shop_name || '—'}</td>
-                        <td className="px-2 py-1.5 text-right tabular-nums">{n2(r.bottles)}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">
+                          {n2(r.bottles)}
+                          {r.cost_only && (
+                            <span className="block text-[10px] text-[#8B7355]"
+                                  title={`A count${r.cost_only_count_date ? ` on ${r.cost_only_count_date}` : ''} already held these bottles, so this buy added no stock — it is recorded for its cost only (owner ruling 39).`}>
+                              cost only · no stock
+                            </span>
+                          )}
+                        </td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{inr(r.rate_paid_per_bottle, 2)}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums">{r.depot_landed_per_bottle == null
                           ? <span className="text-[#8B7355]">{r.priced === false ? 'unknown' : 'admin-only'}</span>

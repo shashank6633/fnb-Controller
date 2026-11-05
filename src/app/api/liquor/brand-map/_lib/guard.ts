@@ -14,8 +14,10 @@ import type { SessionUser } from '@/lib/auth';
  * else — a signed-in staff account can still curl the route. page-catalog.ts
  * says this in as many words ("Each page's own routes MUST re-check
  * server-side... This list is never the security boundary"), and one brand-map
- * row re-prices a brand for every later indent, every landed cost and the whole
- * §G rate-movement watch. Admin, server-side, on every verb including GET.
+ * row sets the yardstick every later indent of that pack is measured against
+ * (the §G rate-movement watch), the cost of a pack before its first indent, and
+ * its beer / spirit split. It never re-prices an indent: landed cost is built on
+ * the rate PAID (owner decision 2). Admin, server-side, on every verb incl. GET.
  *
  * ── WHY CSRF IS CHECKED HERE AND NOT IN THE PROXY ────────────────────────────
  * proxy.ts enforces CSRF by PREFIX (CSRF_REQUIRED_PREFIXES) and '/api/liquor'
@@ -58,7 +60,7 @@ export async function requireBrandMapAdmin(request: Request): Promise<Gate | Gat
   if (user.role !== 'admin') {
     return {
       ok: false, status: 403,
-      error: 'Admin access required — the TGBCL brand master re-prices every future indent.',
+      error: 'Admin access required — the TGBCL brand master is the yardstick every indent rate is checked against (Rate Movement), and the rate a pack is costed at before its first indent.',
     };
   }
   const method = (request.method || 'GET').toUpperCase();

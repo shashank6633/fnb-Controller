@@ -49,6 +49,8 @@ import {
   parseLiquorBillCsv, liquorBillTemplateCsv, liquorBalanceCsv,
   type LiquorCsvRow, type LiquorBalanceRow,
 } from '@/lib/liquor-bill-csv';
+// [LIQUOR-RECON] what the save did to the TGBCL wallet (see BillWalletNotice.tsx).
+import { BillWalletNotices, billWalletNotices } from '@/components/BillWalletNotice';
 
 /* ── Wire shapes (POST/GET /api/grn liquor contract) ──────────────────────── */
 
@@ -97,8 +99,12 @@ interface SavedLine {
 }
 interface SavedBill {
   grn_number: string; invoice_id?: string; store?: { id: string; name: string };
+  /** The saved header; invoice_number is the indent as the server normalised it. */
+  grn?: { invoice_number?: string };
   posted?: number; lines?: SavedLine[]; invoice_value?: number;
-  bill_charges?: { net_indent_value?: number };
+  /** wallet_debit rides here when Liquor Reconciliation is deployed
+   *  (store-engine.ts [LIQUOR-RECON]); billWalletNotices reads it as unknown. */
+  bill_charges?: { net_indent_value?: number; wallet_debit?: unknown };
 }
 /** One matched sheet row as POST /api/grn/liquor-match returns it. */
 interface MatchedLine {
@@ -645,6 +651,10 @@ export default function LiquorGrnBillModal({ onClose, onSaved, prefill }: {
                   })()}
                 </div>
               </div>
+              {/* [LIQUOR-RECON:BEGIN] the TGBCL wallet outcome — silent when the
+                  debit was written normally; failed / adopted / none say so. */}
+              <BillWalletNotices notices={billWalletNotices(result.bill_charges, String(result.grn?.invoice_number || indent || ''))} />
+              {/* [LIQUOR-RECON:END] */}
               {Array.isArray(result.lines) && result.lines.length > 0 && (
                 <div className="border border-[#E8D5C4] rounded-lg overflow-x-auto">
                   <table className="w-full text-[11px] min-w-[420px]">

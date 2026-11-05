@@ -893,7 +893,9 @@ export const LQ_AUTO_DEBIT_FAILED_EVENT = 'liquor_wallet.auto_debit_failed';
  *
  * Called from upsertBillCharges() in src/lib/store-engine.ts, which is where a
  * Net Indent is written and which is itself called inside the indent's own
- * db.transaction() (/procure-bill and /procure-bulk) — and, for a register
+ * db.transaction() (Goods Receipt → TGBCL Liquor Bill, liquor-grn.ts; before
+ * 2026-10-29 the retired /procure-bill and /procure-bulk); from a GRN void with
+ * a Net Indent of ₹0, which removes the debit (voidLiquorGrn) — and, for a register
  * header, from linkIndentMembers in that same transaction, when linking the
  * upload's inward numbers widened the header (settleRegisterHeader, the only
  * other writer of a Net Indent). Also from retryAutoDebit, the heal path.
@@ -927,10 +929,8 @@ export const LQ_AUTO_DEBIT_FAILED_EVENT = 'liquor_wallet.auto_debit_failed';
  *      "Write the debit" button beside the indent re-runs this from the RECORDED
  *      indent (its store_bill_charges row), so the debit lands keyed on that
  *      row's id exactly as if the bill had saved cleanly. It is NOT a bill
- *      re-save: /procure-bill refuses a recorded invoice as a duplicate (409),
- *      and a /procure-bulk re-upload that posts no new line never reaches
- *      upsertBillCharges — measured, neither path could write it. (A balance
- *      re-upload that DOES post a new line also re-runs this, incidentally.)
+ *      re-save: Goods Receipt refuses an indent the store already holds (409),
+ *      so no bill path can write it.
  *      A debit entered BY HAND for the indent's number also stands in for it:
  *      indentIntegrity() counts it, as autoDebitForIndent's adoption rule does.
  *
@@ -1170,7 +1170,11 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
       + (sameRef.reference === reference ? '' : `which is the same indent number as "${reference}" (case is ignored, exactly as the bill register ignores it) — `)
       + 'created from a different recorded bill. One wallet cannot tell two indents that share a number apart from '
       + 'one indent recorded twice, and guessing would double the spend — so this indent was NOT debited. '
-      + 'Use the indent\'s real TGBCL number, or correct the other bill that is using it, then re-save.',
+      // Not "re-save": Goods Receipt refuses an indent number already recorded,
+      // and a liquor bill's indent number cannot be amended — the remedy is to
+      // void the wrongly-numbered Goods Receipt and enter it again.
+      + 'If one of the two bills carries the wrong number, void that Goods Receipt and enter it again under the indent\'s real TGBCL number; '
+      + 'once only one recorded bill uses this number, "Write the debit" on the Liquor Wallet page writes this one.',
       409,
     );
   }
@@ -1703,7 +1707,13 @@ export interface IndentIntegrity {
    *  twice (measured before: −₹22,251 under a ₹1,50,000 opening, check A failing
    *  by exactly that indent). opening_date is null when no opening is recorded —
    *  then nothing is before it and every undebited indent is `missing`. */
-  before_opening: { opening_date: string | null; count: number; total: number };
+  before_opening: {
+    opening_date: string | null; count: number; total: number;
+    /** Ledger-side indents with NO charges row (the `undebited` kind) dated
+     *  before the opening: inside it, so not listed in `undebited`. Value is
+     *  the recorded line value (no Net Indent exists for them). */
+    no_charges_count: number; no_charges_value: number;
+  };
   /** REGISTER HEADERS RECORDED SHORT of their own lines: the header's invoice
    *  value is less than the 'purchase' lines under its own ref plus every inward
    *  number linked to it (see settleRegisterHeader, which widens a header on
@@ -1725,10 +1735,14 @@ export interface IndentIntegrity {
   non_positive: Array<{ invoice_ref: string; date: string; net_indent_value: number }>;
   /** Liquor-store purchases recorded in the stock ledger that have NO bill-charges
    *  row, so no Net Indent was ever computed and NOTHING was debited. `missing`
-   *  cannot see these — it selects FROM store_bill_charges. This is the CSV door:
-   *  /procure-bulk only writes a charges row when a levy is non-zero, so a
-   *  register uploaded with the four levy fields blank spends real TGBCL money
-   *  and moves nothing here. An inward number a register upload's header row
+   *  cannot see these — it selects FROM store_bill_charges. This was the old CSV
+   *  door: /procure-bulk (retired 2026-10-29, rulings #83/#84) wrote a charges
+   *  row only when a levy was non-zero, so a register uploaded with the four
+   *  levy fields blank spent real TGBCL money and moved nothing here. Goods
+   *  Receipt → TGBCL Liquor Bill ALWAYS writes the charges row, so a bill
+   *  entered there never lands in this list. Dated before the wallet's opening
+   *  it is inside the opening and is counted in before_opening instead of
+   *  listed (see indentIntegrity). An inward number a register upload's header row
    *  covers (lq_indent_members) is NOT listed: it is inside that debit — unless
    *  the header is recorded short of its lines (register_short), when it is. */
   undebited: Array<{ invoice_ref: string; store: string; date: string; recorded_value: number }>;
@@ -1852,7 +1866,10 @@ export function indentIntegrity(db: Database): IndentIntegrity {
            AND ${EFF_DATE} < ?
       `).get(handIds, openingDate) as { n: number; p: number }
     : { n: 0, p: 0 };
-  const before_opening = { opening_date: openingDate || null, count: Number(pre.n) || 0, total: toRupees(Number(pre.p) || 0) };
+  const before_opening: IndentIntegrity['before_opening'] = {
+    opening_date: openingDate || null, count: Number(pre.n) || 0, total: toRupees(Number(pre.p) || 0),
+    no_charges_count: 0, no_charges_value: 0,
+  };
 
   // The machine debits by their source_ref (a primary-key join), plus the
   // hand-entered ones standing in for an indent (above) — a typed amount that
@@ -1954,7 +1971,9 @@ export function indentIntegrity(db: Database): IndentIntegrity {
   // rows, which is one liquor year, on a panel that loads with the page.
   // Collapsing the ledger to one row per indent first turns that into 2,000
   // comparisons against a materialised key set (measured below 100 ms).
-  const undebited = liqIds.length ? db.prepare(`
+  // The ledger-side indents with no charges row, as one CTE shared by the list
+  // and by the count of those the opening already includes (below).
+  const undebitedWith = `
     WITH led AS (
       SELECT l.store_id                                  AS store_id,
              LOWER(TRIM(l.ref))                          AS k,
@@ -1985,6 +2004,16 @@ export function indentIntegrity(db: Database): IndentIntegrity {
        WHERE m.store_id IN (${inList})
          AND m.charges_id NOT IN (SELECT value FROM json_each(?))
     )
+  `;
+  // AN INDENT DATED BEFORE THE WALLET'S OPENING IS INSIDE IT — the same rule
+  // as `missing` / before_opening above. The portal figure the opening was read
+  // from had already paid it, so it owes the wallet nothing and is not listed
+  // as a gap; it is COUNTED instead (before_opening.no_charges_*), so deploy
+  // day's history of bills recorded through the retired Liquor Store doors
+  // with no TGBCL charges row is accounted for rather than an alarm nobody can
+  // clear (those doors answer 410, and Goods Receipt refuses an indent the
+  // store already holds). With no opening recorded, nothing is before it.
+  const undebited = liqIds.length ? db.prepare(undebitedWith + `
     SELECT led.invoice_ref, COALESCE(s.name,'') AS store, led.date,
            ROUND(led.recorded_value, 2) AS recorded_value
       FROM led
@@ -1992,9 +2021,20 @@ export function indentIntegrity(db: Database): IndentIntegrity {
      WHERE led.recorded_value > 0
        AND NOT EXISTS (SELECT 1 FROM chg WHERE chg.store_id = led.store_id AND chg.k = led.k)
        AND NOT EXISTS (SELECT 1 FROM covered cv WHERE cv.store_id = led.store_id AND cv.k = led.k)
+       AND (? = '' OR led.date >= ?)
      ORDER BY led.date DESC
      LIMIT 200
-  `).all(...liqIds, ...liqIds, ...liqIds, shortIds) as IndentIntegrity['undebited'] : [];
+  `).all(...liqIds, ...liqIds, ...liqIds, shortIds, openingDate, openingDate) as IndentIntegrity['undebited'] : [];
+  const preNoCharges = liqIds.length && openingDate ? db.prepare(undebitedWith + `
+    SELECT COUNT(*) AS n, COALESCE(SUM(CAST(ROUND(led.recorded_value * 100) AS INTEGER)), 0) AS p
+      FROM led
+     WHERE led.recorded_value > 0
+       AND NOT EXISTS (SELECT 1 FROM chg WHERE chg.store_id = led.store_id AND chg.k = led.k)
+       AND NOT EXISTS (SELECT 1 FROM covered cv WHERE cv.store_id = led.store_id AND cv.k = led.k)
+       AND led.date < ?
+  `).get(...liqIds, ...liqIds, ...liqIds, shortIds, openingDate) as { n: number; p: number } : { n: 0, p: 0 };
+  before_opening.no_charges_count = Number(preNoCharges.n) || 0;
+  before_opening.no_charges_value = toRupees(Number(preNoCharges.p) || 0);
 
   const foreign_store = liqIds.length ? db.prepare(`
     SELECT w.id, w.reference, w.amount, COALESCE(s.name, c.store_id) AS store

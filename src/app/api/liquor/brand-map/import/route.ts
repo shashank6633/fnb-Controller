@@ -298,7 +298,7 @@ export async function POST(request: Request) {
       if (rate !== null && rate < 0) rowErrors.push('rate_per_case_master must be ≥ 0');
       if (rate === null && !rateRaw) {
         rate = 0;
-        warnings.push({ line: row.line, message: 'No rate_per_case_master — mapped with rate ₹0, fill it in before relying on landed cost' });
+        warnings.push({ line: row.line, message: 'No rate_per_case_master — mapped with rate ₹0. Rate Movement cannot compare this pack, and it has no cost before its first indent, until a master rate is filled in' });
       }
 
       // ── the three OPTIONAL columns ──────────────────────────────────────

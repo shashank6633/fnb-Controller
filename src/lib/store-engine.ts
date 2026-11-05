@@ -2298,13 +2298,18 @@ export function upsertBillCharges(
   // production store-engine inserts it, unchanged, above the final return.
   //
   // WHY HERE: every store_bill_charges row is a TGBCL indent, this function is
-  // where net_indent_value is computed and written, and both callers
-  // (/procure-bill and /procure-bulk) run it INSIDE their own db.transaction().
-  // So the debit is attempted in the bill's own transaction, and there is no
-  // second door an indent could be recorded through.
+  // where net_indent_value is computed and written, and its one live caller —
+  // Goods Receipt → TGBCL Liquor Bill (liquor-grn.ts receiveLiquorGrn, owner
+  // rulings #83/#84) — runs it INSIDE its own db.transaction(). So the debit is
+  // attempted in the bill's own transaction, and there is no second door an
+  // indent could be recorded through (Liquor Store New Bill / Upload CSV, the
+  // old callers, answer 410). A GRN void re-derives the debit at ₹0 before it
+  // deletes the charges row (liquor-grn.ts voidLiquorGrn, [LIQUOR-RECON]).
   //
-  // A REGISTER HEADER COVERS EVERY INWARD LINKED TO IT. A /procure-bulk
-  // register upload keys its levies on a header ref whose lines sit under each
+  // A REGISTER HEADER COVERS EVERY INWARD LINKED TO IT (history from the
+  // retired /procure-bulk; a GRN bill links nothing, so for it the settle below
+  // keeps the caller's figure exactly). A register upload keyed its levies on a
+  // header ref whose lines sit under each
   // row's own inward number, and the caller sums `invoice_value` over the refs
   // of THIS upload only — so a balance re-upload of one fixed row shrank the
   // header's Net Indent, and the debit with it, to that row (measured: ₹6,704.08
@@ -2334,8 +2339,8 @@ export function upsertBillCharges(
   // stands. That id is the debit's identity (its source_ref), so the fresh one
   // would add a SECOND debit on every re-save of the same bill.
   //
-  // Both callers refuse a blank invoice_ref with 400 before they get here, so
-  // the `if` below is taken on every real call; a blank ref is not an indent.
+  // The GRN door refuses a blank indent number before it gets here, so the
+  // `if` below is taken on every real call; a blank ref is not an indent.
   //
   // require(), not a top-of-file import, so that this module's whole footprint
   // stays inside the two markers. The specifier is a literal, so the bundler and
