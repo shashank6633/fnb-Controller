@@ -168,6 +168,14 @@ export async function POST(request: Request) {
       }, { status: 400 });
     }
 
+    // A line that recorded no rate (₹0 — a free or unpriced line) is not a
+    // rate anyone paid: accepting it would write a ₹0 master and blank the
+    // pack's cost before its first indent.
+    if (!(Number(row.indentRate) > 0)) {
+      return Response.json({
+        error: 'This line recorded no rate (₹0), so there is no paid rate to accept into the master. Nothing was changed.',
+      }, { status: 400 });
+    }
     const newRatePerCase = Math.round(row.indentRate * bm.bottles_per_case * 100) / 100;
     const oldRatePerCase = Math.round(bm.rate_per_case_master * 100) / 100;
     if (Math.abs(newRatePerCase - oldRatePerCase) < 0.005) {

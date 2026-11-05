@@ -89,6 +89,7 @@ import { recordError, maybeNotifyAdmins } from './error-alerts';
 import { todayIST } from './format-date';
 import type { LqWalletTxnType, LqBankMatch } from './liquor-recon';
 import { LQ_WALLET_TXN_TYPES, LQ_BANK_MATCH, lqBillKey } from './liquor-recon';
+import { normalizeBillNo } from './bill-no';
 
 /** The catalog path this module's page and API are gated on (mgmtOnly). */
 export const LQ_WALLET_PAGE = '/inventory/liquor-wallet';
@@ -147,12 +148,36 @@ export function r2(n: number): number {
  * not own), so the index can only ever be the backstop for the byte-identical
  * case. This function is the real rule, applied on both write paths.
  *
- * Inner whitespace is deliberately NOT collapsed: "IND/ 9" is a different bill
- * to the register, to the charges table and to the dup guard on both bill
- * routes, and the wallet must not be the one place where it is the same one.
+ * walletIndentKey stays TRIM + lowercase because it keys REGISTER joins
+ * between two strings one door wrote (a ledger ref and its charges ref), which
+ * SQL matches with LOWER(TRIM()). Where a HAND-TYPED wallet reference meets a
+ * recorded indent, use indentIdentityKey below instead.
  */
 export function walletIndentKey(reference: string | null | undefined): string {
   return lqBillKey(reference);
+}
+
+/**
+ * THE INDENT'S IDENTITY where a hand-typed wallet reference (a typed debit, a
+ * check-B portal reading) meets a recorded bill — production's own rule, the one
+ * Goods Receipt's duplicate guard applies (liquor-grn.ts indentKey: invisible
+ * characters out, trimmed, case folded, EVERY whitespace character removed). The
+ * store rail treats "TG/2026/77", "tg/2026/ 77" and "TG/2026/77<U+200B>" as ONE
+ * indent and refuses the second; the wallet must agree, or a typed debit under
+ * one spelling and the bill's own debit under another are two debits for one
+ * indent — double the spend with every integrity list reading clean.
+ * SQL reaches it through lq_indent_key() (useIndentKeyFn).
+ */
+export function indentIdentityKey(reference: unknown): string {
+  return normalizeBillNo(reference).toLowerCase().replace(/\s+/g, '');
+}
+
+/** Registers lq_indent_key() = indentIdentityKey on this connection, once. */
+const indentKeyFnReady = new WeakSet<Database>();
+function useIndentKeyFn(db: Database): void {
+  if (indentKeyFnReady.has(db)) return;
+  db.function('lq_indent_key', { deterministic: true }, (v: unknown) => indentIdentityKey(v));
+  indentKeyFnReady.add(db);
 }
 
 /* ── errors ────────────────────────────────────────────────────────────────── */
@@ -778,21 +803,23 @@ export function insertWalletTxn(
   // L0 defect 2, second half — ONE debit per indent. Checked here so the answer
   // names the existing row; uq_lq_wallet_indent_debit is the backstop.
   //
-  // Matched on walletIndentKey (TRIM + lowercase), NOT on the raw string: a
-  // byte-exact match let `IND/9`, `ind/9` and `IND/9` again through as three
-  // debits of one indent, and a history import is exactly where a reference
-  // arrives in a different case from the one already recorded.
+  // Matched on indentIdentityKey (production's Goods Receipt rule), NOT on the
+  // raw string: a byte-exact match let `IND/9`, `ind/9` and `IND/9` again
+  // through as three debits of one indent, and a typed reference is exactly
+  // where `IND/ 9` or a pasted zero-width space arrives for a bill the store
+  // rail already holds as `IND/9`.
   if (type === 'indent_debit') {
+    useIndentKeyFn(db);
     const dup = db.prepare(`
       SELECT id, date, amount, reference, source_ref FROM lq_wallet_txns
-      WHERE type = 'indent_debit' AND LOWER(TRIM(reference)) = ? LIMIT 1
-    `).get(walletIndentKey(reference)) as { id: string; date: string; amount: number; reference: string; source_ref: string } | undefined;
+      WHERE type = 'indent_debit' AND lq_indent_key(reference) = ? LIMIT 1
+    `).get(indentIdentityKey(reference)) as { id: string; date: string; amount: number; reference: string; source_ref: string } | undefined;
     if (dup) {
       const sameCase = dup.reference === reference;
       throw new WalletWriteError(
         'debit_exists',
         `Indent "${reference}" is already debited (₹${r2(dup.amount).toFixed(2)} on ${dup.date})`
-        + (sameCase ? '' : ` — recorded as "${dup.reference}"; indent numbers are matched ignoring case`)
+        + (sameCase ? '' : ` — recorded as "${dup.reference}"; indent numbers are matched ignoring case and spaces, as Goods Receipt matches them`)
         + (dup.source_ref ? ' — that row was created automatically from the recorded indent.' : '.')
         + ' A second debit would double the spend. Correct the amount with an adjustment.',
         409,
@@ -972,6 +999,81 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
   }
 }
 
+/**
+ * A VOIDED BILL TAKES ITS DEBIT WITH IT — whoever first typed it.
+ *
+ * Called by voidLiquorGrn (liquor-grn.ts [LIQUOR-RECON]) inside the void's own
+ * transaction, before the charges row the debit is keyed on is deleted. Unlike
+ * autoDebitForIndent at ₹0 (which KEEPS a hand-typed row the bill adopted), this
+ * removes the indent's debit outright: once adopted, that row's amount, date and
+ * remark were already rewritten to the bill's own Net Indent, so it is the
+ * bill's debit, and the bill is gone. What the person first typed is in its
+ * remarks (ADOPTED_MARK) and goes into the audit event below.
+ *
+ * Why not keep it (2026-11-05, measured on a DB copy): void and re-enter is THE
+ * correction for a liquor bill, and a kept row left the wallet with no right
+ * answer — re-entry was refused as a conflict, and the advised "correct it with
+ * an adjustment" followed by re-entry overstated the balance with every
+ * integrity list empty. Removing it makes re-entry an ordinary new debit.
+ *
+ * Same contract as autoDebitForIndent: a SAVEPOINT, never throws (except when
+ * SQLite abandoned the outer transaction), a failure is filed where the wallet
+ * page and the errors bell show it — the debit is then on the wallet page as one
+ * whose indent no longer exists.
+ */
+export function removeDebitForVoidedIndent(db: Database, args: {
+  source_ref: string; reference: string; created_by?: string; voided_doc?: string;
+}): AutoDebitResult | null {
+  const sourceRef = String(args.source_ref || '').trim();
+  const reference = String(args.reference || '').trim().slice(0, 120);
+  if (!sourceRef) return null;
+  const outerTxn = db.inTransaction;
+  try {
+    return db.transaction((): AutoDebitResult | null => {
+      const row = db.prepare(`
+        SELECT id, date, amount, remarks FROM lq_wallet_txns WHERE type = 'indent_debit' AND source_ref = ?
+      `).get(sourceRef) as { id: string; date: string; amount: number; remarks: string } | undefined;
+      if (!row) return null;
+      db.prepare('DELETE FROM lq_wallet_txns WHERE id = ?').run(row.id);
+      const wasTyped = String(row.remarks || '').includes(ADOPTED_MARK);
+      logAuditEvent(db, {
+        event_type: 'liquor_wallet.auto_debit_removed',
+        entity_type: 'lq_wallet_txns',
+        entity_id: row.id,
+        actor_email: String(args.created_by || '').trim(),
+        before: { amount: row.amount, date: row.date, reference, source_ref: sourceRef, remarks: row.remarks },
+        note: `TGBCL wallet: debit for indent ${reference} (₹${r2(-row.amount).toFixed(2)}) removed — its bill ${args.voided_doc || ''} was voided`
+          + (wasTyped ? '; it had first been typed by hand, and what was typed is in this event' : ''),
+      });
+      return {
+        action: 'removed',
+        id: null,
+        amount: 0,
+        note: wasTyped
+          ? 'Its TGBCL wallet debit was removed with it (it had first been typed by hand; what was typed is kept in the audit trail).'
+          : 'Its TGBCL wallet debit was removed with it.',
+      };
+    })();
+  } catch (e: any) {
+    if (outerTxn && !db.inTransaction) throw e;
+    try { console.error(`[liquor-wallet] void: debit for ${reference} NOT removed: ${String(e?.message || e)}`); } catch { /* never fail a void */ }
+    try {
+      const res = recordError({
+        source: 'server',
+        message: 'TGBCL wallet: a voided liquor bill\'s wallet debit could not be removed — the void went through. Liquor Wallet lists it as a debit whose indent no longer exists.',
+        stack: `indent ${reference} · store_bill_charges ${sourceRef}\n${String(e?.message || e)}`,
+        url: '/inventory/liquor-wallet',
+      });
+      if (res?.isNew) void maybeNotifyAdmins(res);
+    } catch { /* the reporter must never fail a void */ }
+    return {
+      action: 'failed', id: null, amount: 0,
+      note: 'Its TGBCL wallet debit could NOT be removed — the Liquor Wallet page lists it as a debit whose indent no longer exists.',
+      error: { code: 'wallet_remove_failed', message: String(e?.message || e) },
+    };
+  }
+}
+
 /** The wallet-side failure, recorded where it will be seen — and never thrown. */
 function recordAutoDebitFailure(db: Database, args: AutoDebitArgs, e: any): AutoDebitResult {
   const reference = String(args.reference || '').trim().slice(0, 120);
@@ -1128,9 +1230,9 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
       actor_email: createdBy,
       before: { amount: existing.amount },
       after: { date, reference, amount, source_ref: sourceRef },
-      note: `TGBCL wallet: indent ${reference} re-saved — debit now ₹${amount.toFixed(2)}`,
+      note: `TGBCL wallet: indent ${reference} re-derived — debit now ₹${(-amount).toFixed(2)}`,
     });
-    return { action: 'updated', id: existing.id, amount, note: `Wallet debit updated to ₹${amount.toFixed(2)}.` };
+    return { action: 'updated', id: existing.id, amount, note: `Wallet debit updated to ₹${(-amount).toFixed(2)}.` };
   }
 
   // A debit already filed under this indent number that is NOT this indent.
@@ -1140,7 +1242,15 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
   //     in). ADOPT it below: stamp the source on and re-derive it. Without this
   //     the INSERT would hit uq_lq_wallet_indent_debit and the indent would be
   //     left with no debit of its own.
-  //   · source_ref set   → ANOTHER recorded indent already claims this number.
+  //   · source_ref set, its charges row GONE → the debit a VOIDED bill of this
+  //     indent left behind: a hand-typed row the voided bill had adopted (the
+  //     void keeps those — voidLiquorGrn), or a machine row whose removal at the
+  //     void failed. Void and re-enter is THE correction for a liquor bill
+  //     (Goods Receipt refuses to amend its indent or lines), so the re-entered
+  //     bill takes that row over instead of being refused by a bill that no
+  //     longer exists — otherwise the wallet keeps the old figure, the new bill
+  //     sits on "missing" and "Write the debit" answers 409 for ever.
+  //   · source_ref set, its charges row LIVE → ANOTHER recorded indent already claims this number.
   //     store_bill_charges is keyed UNIQUE(store_id, invoice_ref), so this can
   //     only be two DIFFERENT stores filing the same TGBCL indent number. The
   //     wallet is ONE wallet and cannot tell "two indents that share a number"
@@ -1151,23 +1261,59 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
   //     the wallet page's "no debit" list with this sentence beside it until the
   //     number is corrected — the wallet never silently absorbs it.
   //
-  // Matched on walletIndentKey, so `IND/9` and `ind/9` are ONE indent here as
-  // they already are to the register, to invoiceRefHasPurchases and to
-  // /procure-bulk's charges probe. Byte-exact matching is how one ₹1,180 indent
-  // became ₹2,360 of spend with the integrity panel reading clean.
+  // Matched on indentIdentityKey — production's Goods Receipt rule — so `IND/9`,
+  // `ind/9` and `IND/ 9` are ONE indent here as they are to the store rail's
+  // duplicate guard. Byte-exact matching is how one ₹1,180 indent became ₹2,360
+  // of spend with the integrity panel reading clean.
+  useIndentKeyFn(db);
   const sameRef = db.prepare(`
-    SELECT id, amount, reference, COALESCE(source_ref,'') AS source_ref FROM lq_wallet_txns
-     WHERE type = 'indent_debit' AND LOWER(TRIM(reference)) = ?
-     ORDER BY CASE WHEN COALESCE(source_ref,'') = '' THEN 0 ELSE 1 END
+    SELECT w.id, w.amount, w.reference, w.remarks, COALESCE(w.source_ref,'') AS source_ref,
+           CASE WHEN COALESCE(w.source_ref,'') = '' THEN 0
+                WHEN EXISTS (SELECT 1 FROM store_bill_charges c WHERE c.id = w.source_ref) THEN 2
+                ELSE 1 END AS src_state
+      FROM lq_wallet_txns w
+     WHERE w.type = 'indent_debit' AND lq_indent_key(w.reference) = ?
+     ORDER BY src_state
      LIMIT 1
-  `).get(walletIndentKey(reference)) as { id: string; amount: number; reference: string; source_ref: string } | undefined;
+  `).get(indentIdentityKey(reference)) as
+    { id: string; amount: number; reference: string; remarks: string; source_ref: string; src_state: number } | undefined;
+  if (sameRef && sameRef.src_state === 1) {
+    // LEFT BEHIND BY A VOIDED BILL OF THIS INDENT — taken over, never refused.
+    // A row a person typed keeps its remarks (they carry ADOPTED_MARK and the
+    // figure it replaced, which is what stops a later correction deleting it);
+    // a machine row is simply re-derived, as 'updated' would.
+    const human = String(sameRef.remarks || '').includes(ADOPTED_MARK);
+    db.prepare(`
+      UPDATE lq_wallet_txns
+         SET date = ?, reference = ?, amount = ?, source_ref = ?, remarks = ?, outlet_id = ?, updated_at = datetime('now')
+       WHERE id = ?
+    `).run(date, reference, amount, sourceRef, human ? String(sameRef.remarks) : remarks, walletOutletId(), sameRef.id);
+    logAuditEvent(db, {
+      event_type: 'liquor_wallet.auto_debit_readopted',
+      entity_type: 'lq_wallet_txns',
+      entity_id: sameRef.id,
+      actor_email: createdBy,
+      before: { amount: sameRef.amount, reference: sameRef.reference, source_ref: sameRef.source_ref },
+      after: { date, reference, amount, source_ref: sourceRef },
+      note: `TGBCL wallet: the debit a voided bill of indent ${reference} left behind (₹${r2(-sameRef.amount).toFixed(2)}${human ? ', typed by hand' : ''}) was taken over by the re-entered bill — now ₹${(-amount).toFixed(2)}`,
+    });
+    // Saver-facing: the bill's own Net Indent only, never the old wallet figure.
+    return {
+      action: human ? 'adopted' : 'updated',
+      id: sameRef.id,
+      amount,
+      note: human
+        ? `A hand-entered TGBCL wallet debit kept from a voided bill of ${reference} was taken over by this bill and now equals its Net Indent (₹${(-amount).toFixed(2)}). What it replaced is on the Liquor Wallet page.`
+        : `Wallet debit updated to ₹${(-amount).toFixed(2)}.`,
+    };
+  }
   if (sameRef && sameRef.source_ref) {
     // No ₹ in this sentence: it reaches the bill saver (as the 'failed' note
     // and error.message), and the other indent's debit is a wallet-ledger row.
     throw new WalletWriteError(
       'debit_reference_conflict',
       `The TGBCL wallet already holds a debit for indent "${sameRef.reference}", `
-      + (sameRef.reference === reference ? '' : `which is the same indent number as "${reference}" (case is ignored, exactly as the bill register ignores it) — `)
+      + (sameRef.reference === reference ? '' : `which is the same indent number as "${reference}" (case and spaces are ignored, exactly as Goods Receipt ignores them) — `)
       + 'created from a different recorded bill. One wallet cannot tell two indents that share a number apart from '
       + 'one indent recorded twice, and guessing would double the spend — so this indent was NOT debited. '
       // Not "re-save": Goods Receipt refuses an indent number already recorded,
@@ -1206,7 +1352,7 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
       actor_email: createdBy,
       before: { amount: adoptable.amount, date: prior?.date || '', remarks: priorRemark, source_ref: '' },
       after: { date, reference, amount, source_ref: sourceRef },
-      note: `TGBCL wallet: hand-entered debit for ${reference} (₹${r2(adoptable.amount).toFixed(2)} on ${prior?.date || '?'}) adopted by the recorded indent — now ₹${amount.toFixed(2)}`,
+      note: `TGBCL wallet: hand-entered debit for ${reference} (₹${r2(adoptable.amount).toFixed(2)} on ${prior?.date || '?'}) adopted by the recorded indent — now ₹${(-amount).toFixed(2)}`,
     });
     // WHAT THE BILL SAVER IS TOLD. This note rides the bill-save reply
     // (bill_charges.wallet_debit) to whoever saved the bill — bar staff with
@@ -1221,7 +1367,7 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
       action: 'adopted',
       id: adoptable.id,
       amount,
-      note: `A hand-entered TGBCL wallet debit already filed under ${reference} was adopted by this bill and now equals its Net Indent (₹${amount.toFixed(2)}). What it replaced is on the Liquor Wallet page.`,
+      note: `A hand-entered TGBCL wallet debit already filed under ${reference} was adopted by this bill and now equals its Net Indent (₹${(-amount).toFixed(2)}). What it replaced is on the Liquor Wallet page.`,
     };
   }
 
@@ -1238,9 +1384,9 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
     entity_id: id,
     actor_email: createdBy,
     after: { date, reference, amount, source_ref: sourceRef, store_id: args.store_id || '' },
-    note: `TGBCL wallet: indent ${reference} debited ₹${amount.toFixed(2)}`,
+    note: `TGBCL wallet: indent ${reference} debited ₹${(-amount).toFixed(2)}`,
   });
-  return { action: 'inserted', id, amount, note: `Wallet debited ₹${amount.toFixed(2)} for indent ${reference}.` };
+  return { action: 'inserted', id, amount, note: `Wallet debited ₹${(-amount).toFixed(2)} for indent ${reference}.` };
 }
 
 /* ── healing: write a recorded indent's debit from the recorded indent ─────── */
@@ -1801,28 +1947,36 @@ export function indentIntegrity(db: Database): IndentIntegrity {
   // the panel still alarming (measured). Only when exactly ONE recorded indent
   // carries the number (two stores sharing a number cannot be told apart, and
   // one typed row must not be counted as both), only for an indent with no
-  // machine debit of its own, and matched ignoring case as walletIndentKey is.
+  // machine debit of its own, and matched on indentIdentityKey (production's
+  // Goods Receipt rule: case, spaces and invisible characters ignored).
   // insertWalletTxn refuses a second debit under a number already debited, so a
   // hand row and a machine row cannot both stand for one indent.
   //
   // Built in JS from three straight reads, joined on Maps — the same rule the
   // old CTE stated, without its LOWER(TRIM()) nested-loop join (no index can
   // serve one) and its correlated COUNT per matched pair, which ran once for
-  // `missing` and again for `mismatched`. Both keys are computed by SQLite's own
-  // LOWER(TRIM()), exactly as before, so the match is byte-for-byte the old one.
-  const handRows = db.prepare(`
-    SELECT id, reference, amount, date, LOWER(TRIM(reference)) AS k
+  // `missing` and again for `mismatched`. Both keys are computed in JS by
+  // indentIdentityKey, so a typed `IND/ 9` stands in for the bill `IND/9`
+  // exactly as the store rail's duplicate guard treats them as one indent.
+  const handRows = (db.prepare(`
+    SELECT id, reference, amount, date
       FROM lq_wallet_txns
      WHERE type = 'indent_debit' AND COALESCE(source_ref,'') = ''
-  `).all() as Array<{ id: string; reference: string; amount: number; date: string; k: string }>;
+  `).all() as Array<{ id: string; reference: string; amount: number; date: string }>)
+    .map(r => ({ ...r, k: indentIdentityKey(r.reference) }));
   const hand: Array<{ id: string; reference: string; amount: number; date: string; charges_id: string; net_indent_value: number }> = [];
   if (handRows.length > 0) {
+    // Grouped in JS on the same key (the MIN id / MIN net / COUNT the SQL
+    // GROUP BY gave, over indentIdentityKey instead of LOWER(TRIM())).
     const byKey = new Map<string, { charges_id: string; n: number; net: number }>();
     for (const r of db.prepare(`
-      SELECT LOWER(TRIM(invoice_ref)) AS k, MIN(id) AS charges_id, COUNT(*) AS n, MIN(net_indent_value) AS net
-        FROM store_bill_charges GROUP BY LOWER(TRIM(invoice_ref))
-    `).all() as Array<{ k: string; charges_id: string; n: number; net: number }>) {
-      byKey.set(r.k, { charges_id: r.charges_id, n: Number(r.n) || 0, net: Number(r.net) || 0 });
+      SELECT id, invoice_ref, net_indent_value FROM store_bill_charges
+    `).all() as Array<{ id: string; invoice_ref: string; net_indent_value: number }>) {
+      const k = indentIdentityKey(r.invoice_ref);
+      const net = Number(r.net_indent_value) || 0;
+      const g = byKey.get(k);
+      if (!g) byKey.set(k, { charges_id: r.id, n: 1, net });
+      else { g.n += 1; if (r.id < g.charges_id) g.charges_id = r.id; if (net < g.net) g.net = net; }
     }
     const machine = new Set((db.prepare(MACHINE_SET).all() as Array<{ source_ref: string }>).map(r => r.source_ref));
     for (const w of handRows) {
@@ -2245,13 +2399,15 @@ export interface IndentPortalCheckResult {
 
 /** The recorded indent(s) a reference names, LIQUOR STORE first. */
 function recordedIndentsFor(db: Database, reference: string): Array<{ invoice_ref: string; net_indent_value: number; store: string }> {
+  // A typed reading meets a recorded bill: production's identity rule.
+  useIndentKeyFn(db);
   return db.prepare(`
     SELECT c.invoice_ref, c.net_indent_value, COALESCE(s.name,'') AS store
       FROM store_bill_charges c
       LEFT JOIN store_locations s ON s.id = c.store_id
-     WHERE LOWER(TRIM(c.invoice_ref)) = ?
+     WHERE lq_indent_key(c.invoice_ref) = ?
      ORDER BY CASE WHEN TRIM(COALESCE(s.name,'')) = 'LIQUOR STORE' COLLATE NOCASE THEN 0 ELSE 1 END, c.rowid
-  `).all(walletIndentKey(reference)) as Array<{ invoice_ref: string; net_indent_value: number; store: string }>;
+  `).all(indentIdentityKey(reference)) as Array<{ invoice_ref: string; net_indent_value: number; store: string }>;
 }
 
 function indentComparison(db: Database, reference: string, portalAmount: number) {
@@ -2371,15 +2527,17 @@ export function recordIndentPortalCheck(
   const source = String(args.source ?? '').trim().slice(0, 120) || 'indent PDF';
   const note = String(args.note ?? '').trim().slice(0, 500);
 
-  // The same indent on the same day, matched ignoring case: uq_lq_portal_check
-  // is BINARY on `reference`, so the index alone would file "IND/9" and "ind/9"
-  // as two readings of one indent and check B would count whichever was newer.
+  // The same indent on the same day, matched on indentIdentityKey (case,
+  // spaces, invisible characters ignored): uq_lq_portal_check is BINARY on
+  // `reference`, so the index alone would file "IND/9" and "ind/ 9" as two
+  // readings of one indent and check B would count whichever was newer.
+  useIndentKeyFn(db);
   const prior = db.prepare(`
     SELECT id, portal_amount FROM lq_portal_checks
      WHERE COALESCE(outlet_id,'') = '' AND kind = 'indent_value' AND as_of_date = ?
-       AND LOWER(TRIM(reference)) = ?
+       AND lq_indent_key(reference) = ?
      ORDER BY created_at DESC LIMIT 1
-  `).get(args.as_of_date, walletIndentKey(reference)) as { id: string; portal_amount: number } | undefined;
+  `).get(args.as_of_date, indentIdentityKey(reference)) as { id: string; portal_amount: number } | undefined;
   const replacedAmount = prior ? r2(Number(prior.portal_amount) || 0) : null;
 
   let id: string;

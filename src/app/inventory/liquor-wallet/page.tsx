@@ -651,6 +651,8 @@ function TopUpPanel(
   const [step, setStep] = useState(String(data.top_up_step));
   const [busy, setBusy] = useState(false);
   const t = data.top_up;
+  // A ₹0 plan is no plan (see the stat grid below); a negative one is planned_invalid.
+  const noPlan = !t.planned_invalid && !(Number(t.planned_indent) > 0);
 
   const saveStep = async () => {
     setBusy(true); onError('');
@@ -704,16 +706,22 @@ function TopUpPanel(
         </div>
       </label>
 
+      {/* NOTHING PLANNED → no plan figures. A ₹0 "plan" is not a plan: worked
+          out against it, the shortfall is just the balance with a minus sign and
+          the sentence below would say the wallet "already covers this indent". */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
-        <Stat label="Planned indent" value={rs(t.planned_indent)} />
+        <Stat label="Planned indent" value={noPlan ? '—' : rs(t.planned_indent)} />
         <Stat label="Wallet balance" value={rs(t.balance)} tone={t.balance < 0 ? 'bad' : undefined} />
-        <Stat label="Shortfall" value={rs(t.shortfall)} tone={t.shortfall > 0 ? 'warn' : 'good'} />
-        <Stat label={`Challan (to ${rs(t.step)})`} value={rs(t.recommended_challan)} tone={t.recommended_challan > 0 ? 'warn' : 'good'} strong />
+        <Stat label="Shortfall" value={noPlan ? '—' : rs(Math.max(0, t.shortfall))} tone={!noPlan && t.shortfall > 0 ? 'warn' : undefined} />
+        <Stat label={`Challan (to ${rs(t.step)})`} value={noPlan ? '—' : rs(t.recommended_challan)}
+          tone={noPlan ? undefined : t.recommended_challan > 0 ? 'warn' : 'good'} strong />
       </div>
 
       <p className={`text-xs ${t.planned_invalid ? 'text-red-700 font-medium' : 'text-[#8B7355]'}`}>
         {t.planned_invalid
           ? 'A planned indent cannot be negative — an indent takes money OUT of the wallet. Nothing was planned; enter the indent value as a positive figure.'
+          : noPlan
+            ? 'Enter what the next indent will cost and press Plan: the planner shows the shortfall and the challan to deposit, rounded up to the step.'
           : <>
               {t.shortfall <= 0
                 ? `The wallet already covers this indent — no challan needed${t.surplus > 0 ? `, with ${rs(t.surplus)} to spare` : ''}.`
@@ -1041,9 +1049,10 @@ function IntegrityPanel(
             {integrity.orphaned.slice(0, 8).map(m => <li key={m.id}>{m.reference}: {rs(m.amount)}</li>)}
           </ul>
           <div className="text-[11px] mt-1">
-            The bill these debits were written for is no longer recorded — usually its Goods Receipt was voided. Voiding
-            removes a debit the app wrote; one that was typed by hand and taken over by the bill is kept, because it is
-            somebody&apos;s entry. If the TGBCL portal did not charge it, take it back out with an <b>Adjustment</b>.
+            The bill these debits were written for is no longer recorded — its Goods Receipt was voided and the debit
+            could not be removed with it (a void normally removes it). If the indent will be entered again on Goods
+            Receipt, leave it: the new bill takes this debit over. If it will not, and the TGBCL portal did not charge
+            it, take it out with an <b>Adjustment</b> — one or the other, never both.
           </div>
         </div>
       )}

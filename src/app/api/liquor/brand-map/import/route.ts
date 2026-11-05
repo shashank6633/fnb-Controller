@@ -293,13 +293,12 @@ export async function POST(request: Request) {
 
       // ── numbers that degrade to a warning ──
       const rateRaw = cell('rate_per_case_master');
-      let rate = numCell(rateRaw);
+      const rate = numCell(rateRaw);
       if (rateRaw && rate === null) rowErrors.push(`rate_per_case_master "${rateRaw}" is not a number`);
       if (rate !== null && rate < 0) rowErrors.push('rate_per_case_master must be ≥ 0');
-      if (rate === null && !rateRaw) {
-        rate = 0;
-        warnings.push({ line: row.line, message: 'No rate_per_case_master — mapped with rate ₹0. Rate Movement cannot compare this pack, and it has no cost before its first indent, until a master rate is filled in' });
-      }
+      // A blank or absent rate is resolved against the stored row below, like
+      // the optional columns: a file that only re-sends codes and packs must
+      // not wipe every master it does not mention down to ₹0.
 
       // ── the three OPTIONAL columns ──────────────────────────────────────
       // null here means "the file said nothing about this" — resolved against
@@ -354,8 +353,16 @@ export async function POST(request: Request) {
         else foldOverflow++;
       }
 
-      const rate2 = Math.round((rate as number) * 100) / 100;
       const existing = byKey.get(tgbcl_brand_code, size_code) as any;
+      // The master rate: what the file said, else what is stored, else ₹0 on a
+      // NEW row — and only that last case is warned about.
+      const storedRate = existing ? Math.round((Number(existing.rate_per_case_master) || 0) * 100) / 100 : null;
+      const rate2 = rate !== null
+        ? Math.round(rate * 100) / 100
+        : (storedRate !== null ? storedRate : 0);
+      if (rate === null && !(rate2 > 0)) {
+        warnings.push({ line: row.line, message: 'No rate_per_case_master — mapped with rate ₹0. Rate Movement cannot compare this pack, and it has no cost before its first indent, until a master rate is filled in' });
+      }
 
       // RESOLVE the optional columns: what the file said, else what is stored,
       // else the documented default. An omitted column can no longer rewrite a

@@ -4,12 +4,36 @@
 is for, what you do on it, how the money moves from an indent to the wallet, the four checks and
 what to do when one of them fails. Written against the code as it stands on 2026-08-31.
 
-**State.** The module is BUILT and UNCOMMITTED. It ships only when you say "Deploy Liquor
-Reconciliation". Nothing in it is live yet, so nothing below has been exercised against your real
-indents — the local database copy has **zero** rows in every `lq_` table and zero rows in the
-liquor store ledger. Every number in the worked example is arithmetic I computed with the
-module's own formulas, using real brands, real pack sizes and real rates from your database. The
-screens are described from their code, not from a browser session (see *Provenance* at the end).
+> **READ THIS FIRST — 2026-11-05 (where the module stands today).**
+>
+> - **TGBCL bills are entered on Goods Receipt → TGBCL Liquor Bill** (owner rulings #83/#84,
+>   live since 49ecdc0). Liquor Store "New Bill" and "Upload CSV (Bill)" are retired. Everywhere
+>   below that says "the Liquor Store bill screen", "the Bill CSV" or "re-save the bill", read
+>   **Goods Receipt**. A Goods Receipt liquor bill writes the store-ledger lines and the TGBCL
+>   charges (Net Indent) — and, with this module, the wallet debit — in ONE save.
+> - **A wallet problem never stops the bill** (owner decision 2026-10-14): the bill saves and the
+>   saved panel says the debit was NOT written and why; the Liquor Wallet page lists it with a
+>   "Write the debit" button. (§3 below said the opposite; that was the August design.)
+> - **A liquor bill cannot be edited** (indent, supplier, date, lines): it is **voided and entered
+>   again**. Voiding now takes the bill's wallet debit out with it, so the re-entry is an ordinary
+>   new debit.
+> - **The Recorded | Landed switch exists** ("Value at" on the Reconciliation page; default
+>   Recorded — nothing revalues). Landed cost is built on the **rate paid** (decision 2). The
+>   figures in §4f and §4i (uplift, avg landed per bottle, ₹1,85,561.24 / 9.38%) are the
+>   **Landed** view; the default Recorded view shows avg ₹928.64 a bottle, total ₹1,65,612 + your
+>   wine-shop spend, and uplift only after you switch to Landed.
+> - **Cases** in §C/§D come from the Brand Map's bottles-per-case first, then the item's
+>   case_size — so once a pack is mapped it counts in cases (the §4f example then reads 14 cases,
+>   0 loose, cess ₹660 a case).
+> - **Wallet history before your opening balance** is inside the opening: bills dated before it
+>   are counted, not listed as missing. Open the wallet at the portal figure on the day you start.
+> - Verified on 2026-11-05 on a throwaway copy, through the real screens and routes — see the
+>   preview checklist sent with this build.
+
+**State (August, kept for the record).** When this was first written the module was built and
+uncommitted, the local database had no liquor ledger rows, and every number in the worked example
+was computed with the module's own formulas from real brands, pack sizes and rates. Those figures
+were re-produced exactly through the real Goods Receipt door on 2026-11-05.
 
 **What it replaces.** The `Liquor_Purchase_Reconciliation.xlsx` workbook — Brand Master, Portal
 Wallet, Indent Register, Indent Lines, Wine Shop Purchases, Stock Withdrawals and Summary — as
@@ -68,12 +92,9 @@ material,material_id,sku,tgbcl_brand_code,size_code,size_ml,bottles_per_case,rat
 - A column your file does not carry is left alone on an existing row. A file that only pushes new
   TGBCL rates cannot wipe your sizes, notes or retired packs.
 
-**One thing to fix in the item master while you are here.** Of your 126 active bar items, only
-**2** carry `case_size > 1` (100 PIPERS and DEWAR'S 15 YRS). `bottles_per_case` in the Brand Map
-prices a bottle; it does **not** teach the app that the item arrives in cases. Section C/D counts
-"cases" only from `raw_materials.case_size`, so with today's data almost your whole indent reads
-as **loose bottles** and "cess per case" is computed over a handful of lines. Set `case_size` on
-each item you buy by the case.
+**Cases.** Section C/D counts cases from the Brand Map's `bottles_per_case` first (the TGBCL
+case), and only for an unmapped pack from the item's own `case_size` — of your 126 active bar
+items only **2** carry `case_size > 1`. So map each pack you indent and its bottles read as cases.
 
 ### 2b. Open the wallet (L2)
 
@@ -94,7 +115,7 @@ moves money with no challan and no indent behind it).
 ## 3. The money trail, end to end
 
 ```
- TGBCL indent (what you keyed on the Liquor Store bill screen or the Bill CSV)
+ TGBCL indent (keyed on Goods Receipt → TGBCL Liquor Bill, by hand or from the TGBCL CSV)
    │
    ├─ per LINE, on the ledger row:   bottles × ₹/bottle = line value
    │                                  (+ any discount / CGST / SGST / delivery on that line;
@@ -114,10 +135,12 @@ moves money with no challan and no indent behind it).
 
 Two things follow from "same transaction", and they are the point of the whole design:
 
-- If the wallet debit cannot be written, **the bill does not save**. You get a sentence saying
-  why. There is no moment where an indent exists without its debit.
-- Re-saving a bill (a corrected levy, a re-uploaded CSV) **re-derives the one debit**. It never
-  adds a second.
+- If the wallet debit cannot be written, **the bill still saves** (the bottles must reach the
+  store) and the saved panel says, in a red box, that the debit was NOT written and why. The
+  indent then sits on the Liquor Wallet page's "no debit" list with a **Write the debit** button.
+- One indent, one debit: Goods Receipt refuses an indent number already recorded (case, spaces
+  and invisible characters ignored — the wallet uses the same rule), and voiding a bill removes
+  its debit, so void-and-re-enter never leaves two.
 
 ### How the four bill-level levies are split across the lines
 
@@ -413,7 +436,8 @@ Two banners to trust:
 **When B says "no data".** That is today's normal state — see follow-up item 5: nothing in the app
 records a per-indent portal reading yet. When readings exist, a **fail** means the portal charged
 something different from what you recorded: compare the indent's four levies against the portal
-PDF and re-save the bill (the wallet debit re-derives itself). A **warn** means a reading names an
+PDF; if the bill was entered wrong, void it on Goods Receipt and enter it again (the debit follows
+the bill). A **warn** means a reading names an
 indent this store has no record of — usually a mistyped indent number.
 
 **When C warns.** Deposits you have recorded but not yet ticked off against the bank statement.
@@ -437,10 +461,12 @@ on the existing basis by default.** The toggle is opt-in and never touches
 `raw_materials.average_price`, `raw_materials.last_purchase_price` or
 `store_stock_ledger.unit_cost`.
 
-Where the code stands: the *recorded-only* half is honoured everywhere in the module (nothing in
-L1–L5 writes a valuation column) and landed cost is computed and displayed as analytics. **The
-toggle itself does not exist** — the module's only setting is the wallet's rounding step — and the
-default basis is **not actually protected** from the wine-shop path. See follow-up items 1 and 2.
+Where the code stands (2026-11-05): **built and verified.** "Value at: Recorded | Landed" on the
+Reconciliation page, default Recorded, admin-only to change the default (audited). Nothing in
+L1–L5 writes a valuation column; a wine-shop buy writes no purchases row; a Goods Receipt liquor
+bill never moves average price. Measured on a copy: every material's closing value and price
+columns identical before and after the module, two bills, a wine-shop buy, a withdrawal, a rate
+accept and a basis flip.
 
 ### Decision 2 — Rate basis: value at the RATE PAID, and surface every drift
 

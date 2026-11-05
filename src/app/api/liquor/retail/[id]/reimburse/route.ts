@@ -1,7 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { closeReimbursementWithPettyCash, retailErrorResponse } from '@/lib/liquor-retail';
-import { requireRetailReimburse, gateResponse } from '../../_lib/guard';
+import { requireRetailReimburse, gateResponse, canReadRetailRegister } from '../../_lib/guard';
 
 /**
  * POST /api/liquor/retail/[id]/reimburse — close a pending wine-shop
@@ -58,6 +58,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       date: body.date === undefined || body.date === null ? undefined : String(body.date),
       notes: body.notes ? String(body.notes) : undefined,
       amountOverride,
+      // The "bottles × rate paid" behind a wrong-amount refusal is register
+      // money: only for a payer the register itself admits. The owed total is
+      // told to everyone this gate admits — it is what they must pay.
+      revealBreakdown: canReadRetailRegister(db, gate.user),
     });
 
     return Response.json({

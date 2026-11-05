@@ -74,9 +74,10 @@ import {
   buildWalletView, topUpPlan, getTopUpStep, walletBalanceAsOf,
   csvCell, type TopUpPlan, type WalletView,
   indentMembersForStore, registerCoverFor, type IndentMemberLink,
+  indentIdentityKey,
 } from './liquor-wallet';
 import {
-  allocateIndentBill, pickBrandMap, rateMovementForStore,
+  allocateIndentBill, allocateIndentBills, lqBillKey, pickBrandMap, rateMovementForStore,
   type LqIndentLine, type LqRateVarianceRow,
 } from './liquor-recon';
 import { retailExcessSummary, RETAIL_DEPOT_WITHHELD_NOTE, type RetailExcessSummary } from './liquor-retail';
@@ -484,8 +485,11 @@ export interface LqRateMoveRow {
  * switch too (LqSectionH).
  */
 export interface LqSectionG {
+  /** EMPTY for a non-admin, with moved_lines null: which mapped lines moved is
+   *  itself the master — a line that did NOT move has master = the rate paid,
+   *  which the viewer already sees on the bill. */
   rows: LqRateMoveRow[];
-  moved_lines: number;
+  moved_lines: number | null;
   scanned_lines: number;
   unmapped_lines: number;
   /** null when the master rates are withheld (non-admin). */
@@ -723,13 +727,24 @@ function readLines(db: Database, storeId: string, from: string, to: string): Lin
   const allocByLedger = new Map<string, LqIndentLine>();
   const wholeBillLines = new Map<string, number>();
   const seenRef = new Set<string>();
+  const billRefs: string[] = [];
   for (const r of raw) {
     const ref = String(r.invoiceRef || '');
     const k = ref.toLowerCase();
     if (!ref || seenRef.has(k)) continue;
     seenRef.add(k);
-    const alloc = allocateIndentBill(db, storeId, ref);
-    wholeBillLines.set(k, alloc.lines.length);
+    billRefs.push(ref);
+  }
+  // ONE batched read for every bill in range. allocateIndentBills answers each
+  // bill byte-for-byte as allocateIndentBill does (proven over 452 bills, case
+  // and space variants, across the 400-key chunk) but reads the store ledger
+  // once, not once per bill: per bill it was bills × ledger rows on every
+  // Reconciliation GET, which a year's range turns into seconds of a blocked
+  // Node process.
+  const allocs = allocateIndentBills(db, storeId, billRefs);
+  for (const ref of billRefs) {
+    const alloc = allocs.get(lqBillKey(ref)) ?? allocateIndentBill(db, storeId, ref);
+    wholeBillLines.set(ref.toLowerCase(), alloc.lines.length);
     for (const ln of alloc.lines) allocByLedger.set(ln.ledgerId, ln);
   }
 
@@ -1063,7 +1078,7 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     pending: linesErr
       ? unavailable('L1', 'The recorded indent lines')
       : (indents.length === 0
-        ? { phase: 'L1', reason: 'No liquor indents recorded in this range — record purchases through the Liquor Store inward register.' }
+        ? { phase: 'L1', reason: 'No liquor indents recorded in this range — TGBCL bills are entered on Goods Receipt → TGBCL Liquor Bill.' }
         : null),
   };
   const depotNetIndent = B.totals.net_indent_value;
@@ -1318,18 +1333,22 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
       direction: (r.variance ?? 0) > 0 ? 'above_master' as const : 'below_master' as const,
       mapReason: r.mapReason,
     }));
+  // WITHHELD WHOLE for a non-admin, not just the master columns: listing the
+  // lines that moved (or even counting them) tells a manager that every OTHER
+  // mapped line's master equals its rate paid — the master for nearly every
+  // brand, re-derived by elimination. Direction alone is the same leak.
   const G: LqSectionG = {
-    rows: gRows,
-    moved_lines: moved.length,
+    rows: revealMaster ? gRows : [],
+    moved_lines: revealMaster ? moved.length : null,
     scanned_lines: moveRows.length,
     unmapped_lines: unmappedG,
     total_variance_value: revealMaster ? r2(moved.reduce((s, r) => s + (r.varianceValue ?? 0), 0)) : null,
     master_rates_visible: revealMaster,
     master_rates_note: revealMaster
       ? null
-      : 'TGBCL master rates are admin-only, so the master rate, the variance against it, the variance value and the '
-        + 'proposed rate per case are withheld here. The lines that moved, and which way, are listed; an admin sees '
-        + 'the figures here and on the Brand Map\'s Rate Movement tab.',
+      : 'TGBCL master rates are admin-only, and so is which indent lines moved against them: a line that did not move '
+        + 'has a master equal to the rate paid, so the list (or its count) would give the master back. An admin sees '
+        + 'the lines, the variance and the one-tap accept here and on the Brand Map\'s Rate Movement tab.',
     pending: gErr
       ? unavailable('L1', 'The rate-movement watch')
       : ((moveRows.length > 0 && moveRows.every(r => r.masterRate == null))
@@ -1448,7 +1467,9 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     pct_basis: (landed
       ? (revealLanded
         ? `LANDED (opt-in): the landed value frozen on each withdrawal (${rs(wdLanded)}) ÷ the §B Net Indent `
-          + `${rs(depotNetIndent)} — the bills' landed value, so both halves include the TGBCL levies.`
+          + `${rs(depotNetIndent)} — the bills' landed value. A withdrawal's landed value is the rate paid on its `
+          + `latest indent plus that line's TGBCL levies; for an item never indented it is the master (or the store's `
+          + `recorded cost) with no levies, since none were ever charged on it.`
         : `LANDED (opt-in): the landed value frozen on each withdrawal ÷ the §B Net Indent — withheld from this view.`)
       : `RECORDED basis (the default): withdrawn stock at the store's recorded average cost on each withdrawal's date `
         + `(${rs(wdRecorded)}) ÷ the recorded purchase value in range ${rs(purchasesValue)} (store-ledger purchase and `
@@ -1534,10 +1555,18 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     WHERE kind = 'indent_value' AND as_of_date >= ? AND as_of_date <= ?
     ORDER BY as_of_date DESC, created_at DESC
   `).all(from, to) as any[], []);
+  // Keyed on indentIdentityKey — the rule the wallet's own check-B receipt and
+  // Goods Receipt's duplicate guard use — so "IND/9" and "ind/ 9" are one
+  // indent here too and this card cannot disagree with the reading's receipt.
   const latestByRef = new Map<string, any>();
   for (const pc of indentChecksRead.value) {
-    const key = String(pc.reference || '').trim().toLowerCase();
+    const key = indentIdentityKey(pc.reference);
     if (!latestByRef.has(key)) latestByRef.set(key, pc);
+  }
+  const chargesByIdentity = new Map<string, any>();
+  for (const c of Object.values(billCharges) as any[]) {
+    const k = indentIdentityKey(c?.invoice_ref);
+    if (k && !chargesByIdentity.has(k)) chargesByIdentity.set(k, c);
   }
   const indentReadings = [...latestByRef.values()];
   // bInRegister: a reading for an inward number a REGISTER upload covers (see
@@ -1550,7 +1579,7 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
   let bMismatch = 0, bMatched = 0, bMissing = 0, bWorstDiff = 0, bInRegister = 0;
   for (const pc of indentReadings) {
     const ref = String(pc.reference || '').trim();
-    const bc = billCharges[ref.toLowerCase()];
+    const bc = chargesByIdentity.get(indentIdentityKey(ref));
     let recordedNet: number | null = bc ? (Number(bc.net_indent_value) || 0) : null;
     if (!bc) {
       const cover = readOr(() => registerCoverFor(db, ref, storeId), null).value;
@@ -1739,8 +1768,8 @@ export function liquorSummaryCsv(res: LqSummaryResult, section: LqCsvSection): s
       lines.push(row(['Wallet balance', a.balance]));
       lines.push(row(['Overdrawn', a.overdrawn ? 'yes' : 'no']));
       lines.push(row(['Working capital parked', a.working_capital_parked]));
-      lines.push(row(['Funded in (opening + deposits)', a.funded_in]));
-      lines.push(row(['Utilised out (indent debits)', a.utilised_out]));
+      lines.push(row(['Funded in (opening + deposits + positive adjustments)', a.funded_in]));
+      lines.push(row(['Utilised out (indent debits + negative adjustments)', a.utilised_out]));
       lines.push(row(['Deposits utilised %', num(a.deposits_utilised_pct)]));
       lines.push(row(['Opening total', a.opening_total]));
       lines.push(row(['Deposit total', a.deposit_total]));
@@ -1904,7 +1933,7 @@ export function liquorSummaryCsv(res: LqSummaryResult, section: LqCsvSection): s
           lines.push(row([r.inwardDate, r.invoiceRef, r.materialName, r.category, r.bottles, r.indentRate, r.direction]));
         }
       }
-      lines.push(row(['Moved lines', g.moved_lines]));
+      lines.push(row(['Moved lines', g.moved_lines === null ? 'admin-only' : g.moved_lines]));
       lines.push(row(['Scanned lines', g.scanned_lines]));
       lines.push(row(['Unmapped lines', g.unmapped_lines]));
       if (g.master_rates_visible) lines.push(row(['Total variance value (Rs)', num(g.total_variance_value)]));

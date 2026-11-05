@@ -91,7 +91,7 @@ export async function GET(request: Request) {
     // Rule b: ADMIN ONLY, the same bar /api/liquor/brand-map applies to these
     // figures on every verb. Not a 403: the register itself is allowed.
     if (user.role !== 'admin') {
-      return withheld('Rate-vs-master and landed cost are admin-only — the TGBCL master re-prices every future indent. The register itself is unaffected.');
+      return withheld('Rate-vs-master and landed cost are admin-only — they give back the TGBCL master rate, which is admin-only. The register itself is unaffected.');
     }
 
     try {

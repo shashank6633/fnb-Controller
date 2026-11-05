@@ -1,8 +1,6 @@
 import { getDb } from '@/lib/db';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
-import {
-  backfillDepotLanded, setReimbursementStatus, retailErrorResponse,
-} from '@/lib/liquor-retail';
+import { correctRetailFlag, retailErrorResponse } from '@/lib/liquor-retail';
 import { requireRetailRecord, requireSignedInWrite, gateResponse, canReadRetailRegister } from '../_lib/guard';
 
 /**
@@ -31,6 +29,12 @@ import { requireRetailRecord, requireSignedInWrite, gateResponse, canReadRetailR
  *                                         is reached only by a real payout, so
  *                                         the settled state always has cash
  *                                         behind it.
+ *
+ * ALL OR NOTHING. Both parts are validated before either is written, and both
+ * are written in ONE transaction (correctRetailFlag): a request refused on
+ * either part — a bad figure, a status that is unchanged or payout-backed, a
+ * rate already frozen — writes nothing. It used to save the rate and only then
+ * refuse the status, answering 409 over a record it had just changed.
  *
  * Gated exactly like recording (can_procure on the material's own store) and
  * CSRF-checked in the guard, because '/api/liquor' is not in the proxy's CSRF
@@ -91,16 +95,29 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       }, { status: 400 });
     }
 
-    const out: Record<string, unknown> = { ok: true, flag_id: id };
+    // The shape checks, BOTH of them, before anything is written.
+    const rate = hasRate ? Number(body.depot_landed_per_bottle) : null;
+    if (rate !== null && (!Number.isFinite(rate) || rate <= 0)) {
+      return Response.json({ error: 'depot_landed_per_bottle must be a number greater than 0 (₹ per bottle).' }, { status: 400 });
+    }
+    const status = hasStatus ? String(body.reimbursement_status) as LqReimbursementStatus : null;
+    if (status !== null && !(LQ_REIMBURSEMENT_STATUS as readonly string[]).includes(status)) {
+      return Response.json({
+        error: `reimbursement_status must be one of: ${LQ_REIMBURSEMENT_STATUS.join(', ')}.`,
+      }, { status: 400 });
+    }
 
-    if (hasRate) {
-      const rate = Number(body.depot_landed_per_bottle);
-      if (!Number.isFinite(rate) || rate <= 0) {
-        return Response.json({ error: 'depot_landed_per_bottle must be a number greater than 0 (₹ per bottle).' }, { status: 400 });
-      }
-      const res = backfillDepotLanded(db, { flagId: id, depotLandedPerBottle: rate, actorEmail: gate.user.email });
+    // The state checks of both parts, then both writes, in ONE transaction.
+    const res = correctRetailFlag(db, {
+      flagId: id, actorEmail: gate.user.email,
+      depotLandedPerBottle: rate, status,
+      note: body.note ? String(body.note) : undefined,
+    });
+
+    const out: Record<string, unknown> = { ok: true, flag_id: id };
+    if (res.rate) {
       // The rate is the caller's own figure — echoing it tells them nothing.
-      out.depot_landed_per_bottle = res.depotLandedPerBottle;
+      out.depot_landed_per_bottle = res.rate.depotLandedPerBottle;
       // The EXCESS is not: it is the rate paid minus that figure, so it hands
       // over SOMEONE ELSE'S retail price (measured: a can_procure bartender
       // outside management priced a colleague's buy at ₹90 and was told excess
@@ -108,24 +125,12 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       // authority, never a can_procure one (requireRetailView), so only a
       // viewer the register itself admits — who sees the rate paid there
       // already — gets it. The POST duplicate refusal uses the same predicate.
-      if (canReadRetailRegister(db, gate.user)) out.excess = res.excess;
+      if (canReadRetailRegister(db, gate.user)) out.excess = res.rate.excess;
     }
-
-    if (hasStatus) {
-      const status = String(body.reimbursement_status) as LqReimbursementStatus;
-      if (!(LQ_REIMBURSEMENT_STATUS as readonly string[]).includes(status)) {
-        return Response.json({
-          error: `reimbursement_status must be one of: ${LQ_REIMBURSEMENT_STATUS.join(', ')}.`,
-        }, { status: 400 });
-      }
-      const res = setReimbursementStatus(db, {
-        flagId: id, status, actorEmail: gate.user.email,
-        note: body.note ? String(body.note) : undefined,
-      });
-      out.reimbursement_status = res.to;
-      out.reimbursement_status_from = res.from;
+    if (res.status) {
+      out.reimbursement_status = res.status.to;
+      out.reimbursement_status_from = res.status.from;
     }
-
     return Response.json(out);
   } catch (e: any) {
     return retailErrorResponse(e, 'Could not update the wine-shop record.');

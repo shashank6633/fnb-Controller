@@ -48,10 +48,14 @@ interface Summary {
 }
 interface MatMeta extends PackMeta {
   id: string; name: string; category: string; onHand: number;
-  /** ₹/recipe-unit — this STORE's weighted-average ledger cost, 0 when the
-   *  store has never received the item. Preview only; the server freezes the
-   *  authoritative figure at issue. */
-  storeCost: number;
+}
+/** GET /api/liquor/withdrawals/landed — the landed cost the server WILL freeze
+ *  when the Landed box is left blank (the same resolver POST runs). */
+interface AutoLanded {
+  /** store|material|date the figure was resolved for — a stale answer is ignored. */
+  key: string;
+  per_recipe_unit: number; per_bottle: number;
+  source: string; basis: string;
 }
 
 const CAT_LABEL: Record<string, string> = {
@@ -451,21 +455,9 @@ function NewWithdrawalForm({ stores, categories, basisList, onClose, onSaved }: 
         if (!r.ok) throw new Error(j.error || 'Failed to load materials');
         const onHand = new Map<string, number>();
         for (const c of (j.catalog || j.stock || [])) onHand.set(c.material_id, Number(c.qty) || 0);
-        // Preview cost basis: the STORE's own weighted-average unit cost, and
-        // only for a material the store has actually received (has_ledger).
-        // raw_materials.average_price is deliberately NOT used — this database
-        // stores it in mixed bases (HENDRICKS GIN carries ₹5,641.83 against a
-        // 700 ml recipe unit, i.e. ₹/bottle), and reading it as ₹/recipe-unit
-        // previewed one bottle at ₹3.9 million. The server resolves the real
-        // figure on save; where this is 0 the preview says so.
-        const storeCost = new Map<string, number>();
-        for (const c of (j.catalog || j.stock || [])) {
-          if (c.has_ledger) storeCost.set(c.material_id, Number(c.avg_cost) || 0);
-        }
         const list: MatMeta[] = (j.materials || []).map((m: any) => ({
           id: m.id, name: m.name, category: m.category, unit: m.unit,
           purchase_unit: m.purchase_unit, pack_size: m.pack_size, case_size: m.case_size,
-          storeCost: storeCost.get(m.id) || 0,
           onHand: onHand.get(m.id) || 0,
         }));
         setMats(list);
@@ -478,25 +470,57 @@ function NewWithdrawalForm({ stores, categories, basisList, onClose, onSaved }: 
   const pf = mat ? (packFactor(mat) || 1) : 1;
   const cf = mat ? (Number(mat.case_size) || 1) : 1;
 
-  // Live computed figures (mirror the server maths for the preview only).
+  // THE AUTO LANDED COST IS THE SERVER'S OWN FIGURE. This preview used to be
+  // the store's AVERAGE ledger cost while POST froze L1's landed cost (rate
+  // paid on the latest indent + its TGBCL levies), so "Landed value (auto)"
+  // and the 'landed' recoverable on screen were not what got billed to the
+  // person. It now asks GET /api/liquor/withdrawals/landed, which runs the
+  // resolver createWithdrawal runs, for this store, item and business date.
+  const autoKey = storeId && materialId && date ? `${storeId}|${materialId}|${date}` : '';
+  const [auto, setAuto] = useState<AutoLanded | null>(null);
+  const [autoErr, setAutoErr] = useState('');
+  useEffect(() => {
+    if (!autoKey) return;
+    let live = true;
+    setAutoErr('');
+    (async () => {
+      try {
+        const p = new URLSearchParams({ store_id: storeId, material_id: materialId, date });
+        const r = await api(`/api/liquor/withdrawals/landed?${p.toString()}`);
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'Could not work out the landed cost');
+        if (live) setAuto({ key: autoKey, per_recipe_unit: Number(j.per_recipe_unit) || 0,
+          per_bottle: Number(j.per_bottle) || 0, source: String(j.source || ''), basis: String(j.basis || '') });
+      } catch (e: any) { if (live) setAutoErr(e.message || 'Could not work out the landed cost'); }
+    })();
+    return () => { live = false; };
+  }, [autoKey, storeId, materialId, date]);
+  /** The server's answer for exactly this store, item and date — else none yet. */
+  const autoNow = auto && auto.key === autoKey ? auto : null;
+
+  // Live computed figures. The typed rate and the quantity maths mirror the
+  // server; the auto rate IS the server's (above).
   const qtyRecipe = mat ? ((Number(cases) || 0) * cf * pf + (Number(bottles) || 0) * pf) : 0;
   const landedUnit = landedPerBottle !== '' ? (Number(landedPerBottle) / pf)
-    : (mat ? mat.storeCost : 0);       // preview only; the server resolves L1 → store-avg → last purchase
+    : (autoNow ? autoNow.per_recipe_unit : 0);
   const landedValue = Math.round(qtyRecipe * landedUnit * 100) / 100;
-  /** Nothing to preview from: the server may still resolve a cost on save. */
-  const landedUnknown = landedPerBottle === '' && !(landedUnit > 0);
+  /** No figure to show yet: still asking, or the ask failed (the server still
+   *  resolves one on save). */
+  const landedPending = landedPerBottle === '' && !autoNow;
+  /** The server answered, and it has no cost on record for this item. */
+  const landedNone = landedPerBottle === '' && !!autoNow && !(autoNow.per_recipe_unit > 0);
   const mrpUnit = mrpPerBottle !== '' ? Number(mrpPerBottle) / pf : 0;
   const mrpValue = Math.round(qtyRecipe * mrpUnit * 100) / 100;
   const recoverablePreview = basis === 'landed' ? landedValue : basis === 'mrp' ? mrpValue
     : basis === 'custom' ? (Number(recoverableCustom) || 0) : 0;
 
   // The server refuses a recovery basis whose recoverable would be ₹0 — such a
-  // row says money is owed but can never be billed or corrected. Only the two
-  // bases the BROWSER can settle are mirrored here; 'landed' is resolved
-  // server-side (L1 landed cost → store weighted-avg → last purchase), so
-  // blocking it from the preview figure would refuse saves the server accepts.
+  // row says money is owed but can never be billed or corrected. 'landed' is
+  // blocked only on the SERVER'S own answer that nothing is on record; while
+  // that answer is pending (or the ask failed) the save is left to the server.
   const basisBlocked = basis === 'mrp' && !(mrpValue > 0) ? 'Enter the MRP ₹/bottle, or set recovery to "Not recoverable".'
     : basis === 'custom' && !(Number(recoverableCustom) > 0) ? 'Enter the recoverable amount, or set recovery to "Not recoverable".'
+    : basis === 'landed' && landedNone ? 'No landed cost is on record for this item — type the Landed ₹/bottle, or set recovery to "Not recoverable".'
     : '';
   const wholeCounts = [cases, bottles].every(v => v === '' || (Number.isInteger(Number(v)) && Number(v) >= 0));
 
@@ -662,11 +686,31 @@ function NewWithdrawalForm({ stores, categories, basisList, onClose, onSaved }: 
       {mat && qtyRecipe > 0 && (
         <div className="bg-[#FBF3EA] border border-[#E8D5C4] rounded p-3 text-xs text-[#6B5744] flex flex-wrap gap-x-6 gap-y-1">
           <span>Qty: <b className="text-[#2D1B0E]">{fmtBreakdown(qtyRecipe, mat) || `${toPurchaseQty(qtyRecipe, mat)} ${mat.purchase_unit || mat.unit}`}</b> ({qtyRecipe} {mat.unit})</span>
-          <span>Landed value: {landedUnknown
-            ? <b className="text-[#8B7355]">resolved on save</b>
-            : <><b className="text-[#2D1B0E]">{inr(landedValue)}</b>{landedPerBottle === '' ? ' (auto)' : ''}</>}</span>
+          <span>Landed value: {landedPending
+            ? <b className="text-[#8B7355]">{autoErr ? 'worked out on save' : 'working out…'}</b>
+            : landedNone
+              ? <b className="text-[#8B7355]">none on record — type the Landed ₹/bottle</b>
+              : <><b className="text-[#2D1B0E]">{inr(landedValue)}</b>{landedPerBottle === '' ? ' (auto — this is the figure saved)' : ''}</>}</span>
           {mrpValue > 0 && <span>MRP value: <b className="text-[#2D1B0E]">{inr(mrpValue)}</b></span>}
-          {basis !== 'none' && <span>Recoverable: <b className="text-[#af4408]">{inr(recoverablePreview)}</b></span>}
+          {basis !== 'none' && (
+            <span>Recoverable: {basis === 'landed' && (landedPending || landedNone)
+              ? <b className="text-[#8B7355]">{landedNone ? '—' : 'at the landed value'}</b>
+              : <b className="text-[#af4408]">{inr(recoverablePreview)}</b>}</span>
+          )}
+          {/* WHICH landed cost, in the server's words: rate paid + levies on
+              the latest indent (and at which store, for a floor bar stocked by
+              transfer), the Brand Map master for an item never indented, or a
+              plain store average when there is no landed cost at all. */}
+          {landedPerBottle === '' && autoNow && autoNow.per_recipe_unit > 0 && (
+            <span className="basis-full text-[11px] text-[#8B7355]">
+              Auto landed {inr(autoNow.per_bottle)}/{mat.purchase_unit || mat.unit}: {autoNow.basis}.
+            </span>
+          )}
+          {landedPerBottle === '' && autoErr && (
+            <span className="basis-full text-[11px] text-[#8B7355]">
+              The landed cost could not be previewed ({autoErr}); the server works it out when you record.
+            </span>
+          )}
         </div>
       )}
 

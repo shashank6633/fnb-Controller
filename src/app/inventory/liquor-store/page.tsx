@@ -1891,10 +1891,12 @@ function wineShopStockAdded(res: Pick<RetailResult, 'ledger_id' | 'stock_qty' | 
  */
 function landedBasisText(detail?: string): string {
   switch (String(detail || '')) {
-    case 'master_only':   return 'TGBCL Brand Map — master rate only, no recorded indent levies yet';
-    case 'latest_indent': return 'TGBCL Brand Map + levies from the latest recorded indent';
-    case 'named_bill':    return 'TGBCL Brand Map + levies from the named indent bill';
-    default:              return 'TGBCL Brand Map';
+    // Owner decision 2: the RATE PAID on the indent line + its TGBCL levies;
+    // the Brand Map master only for a pack that has never been indented.
+    case 'master_only':   return 'TGBCL Brand Map master rate — this pack has no recorded indent yet, so no levies';
+    case 'latest_indent': return 'rate paid on the latest recorded indent + its TGBCL levies';
+    case 'named_bill':    return 'rate paid on the named indent bill + its TGBCL levies';
+    default:              return 'latest recorded indent (rate paid + levies)';
   }
 }
 
@@ -2488,7 +2490,7 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                     rate-basis: purchase */}
                 <L>Depot ₹ per {pu} (optional)</L>
                 <input type="number" min={0} step="0.01" inputMode="decimal" value={depotOverride}
-                       onChange={e => setDepotOverride(e.target.value)} placeholder="leave blank to use the Brand Map" className={inputCls} />
+                       onChange={e => setDepotOverride(e.target.value)} placeholder="leave blank to use the latest indent" className={inputCls} />
               </div>
               <div>
                 <L>TGBCL size code (optional)</L>
@@ -2497,26 +2499,32 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
               </div>
             </div>
             <div className="text-[11px] text-[#6B5744] leading-relaxed">
-              Leave the rate blank when the brand is in the TGBCL Brand Map — the depot landed cost is
-              read from there and the excess is computed against it. <b>If the brand is not mapped and you
-              leave this blank the buy is still recorded, but the excess is stored as 0 with the depot rate
-              marked “unknown”.</b> That 0 means “not computed”, not “this run cost us nothing”, and the buy
-              stays out of the “price of running out” total until a rate is supplied on the Wine-shop buys
-              tab.
-              {/* BASIS, SAID OUT LOUD. The Brand Map's figure is TGBCL's ₹ per
-                  BOTTLE (rate_per_case_master ÷ bottles_per_case) and the excess
-                  compares it, one for one, with the rate typed above. On this
-                  catalogue that is exact — every counted item's purchase unit
-                  holds one bottle (pack_size = the bottle's own size_ml). It
-                  would NOT be exact for a material whose purchase unit held
-                  several bottles, and nothing on this screen can detect that,
-                  so the operator is told which basis is being compared and given
-                  the override that is already correct in whatever unit they
-                  mean. Making the library convert is the real fix and belongs in
-                  liquor-retail.ts / liquor-recon.ts, not here. */}
-              {' '}The Brand Map figure is TGBCL&apos;s <b>₹ per bottle</b>, compared directly with the
-              rate you typed above — if a {pu} of this item is <b>not</b> a single bottle, enter the
-              depot ₹ per {pu} here instead of leaving it blank.
+              {/* WHAT "BLANK" USES — L1's landed cost (liquor-recon.ts), which
+                  is NOT read from the Brand Map: it is the rate PAID on the
+                  latest recorded TGBCL indent of this item plus that indent's
+                  share of the bill's levies (owner decision 2). The Brand Map
+                  only decides whether the brand is priceable at all, and its
+                  master rate is used only for a pack that has never been
+                  indented. No figure is shown here — the depot rate is
+                  admin-only (RETAIL_DEPOT_WITHHELD_NOTE). */}
+              Leave the rate blank when the brand is in the TGBCL Brand Map — the depot landed cost is the
+              rate paid on the latest recorded TGBCL indent of this item plus that indent&apos;s share of the
+              levies (the Brand Map&apos;s master rate is used only for a pack that has never been indented),
+              and the excess is computed against it. <b>If the brand is not mapped and you leave this blank
+              the buy is still recorded, but the excess is stored as 0 with the depot rate marked
+              “unknown”.</b> That 0 means “not computed”, not “this run cost us nothing”, and the buy stays
+              out of the “price of running out” total until a rate is supplied on the Wine-shop buys tab.
+              {/* BASIS, SAID OUT LOUD. The indent figure is per {pu} of this
+                  item (the line's own rate × pack), so it compares one for one
+                  with the rate typed above. The master fallback is TGBCL's ₹ per
+                  BOTTLE (rate_per_case_master ÷ bottles_per_case), which is the
+                  same thing only while a {pu} holds one bottle — true of every
+                  counted item on this catalogue, and not detectable here for
+                  one that is not, so the operator is told and given the
+                  override, which is correct in whatever unit they mean. */}
+              {' '}For a pack never indented that master rate is TGBCL&apos;s <b>₹ per bottle</b>, compared
+              directly with the rate you typed above — if a {pu} of this item is <b>not</b> a single bottle,
+              enter the depot ₹ per {pu} here instead of leaving it blank.
             </div>
           </div>
         </>

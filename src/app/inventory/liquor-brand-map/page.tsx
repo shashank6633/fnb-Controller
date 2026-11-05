@@ -835,7 +835,7 @@ export default function LiquorBrandMapPage() {
                         <p className="text-xs mt-1">
                           {onlyMoved
                             ? 'Every mapped line arrived at the rate the master holds.'
-                            : 'Record a liquor bill on the Liquor Store page and it appears here.'}
+                            : 'Enter a TGBCL bill on Goods Receipt → TGBCL Liquor Bill and its lines appear here.'}
                         </p>
                       </td></tr>
                     ) : vRows.map(r => {

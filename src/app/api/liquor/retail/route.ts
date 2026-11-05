@@ -64,10 +64,15 @@ export async function GET(request: Request) {
       from: isRealDate(from) ? from : '0000-01-01',
       to: isRealDate(to) ? to : '9999-12-31',
       outletId: outletParam === 'all' ? null : outletId,
-      // Scope the depot-spend denominator to THIS liquor store when one is
-      // configured; the summary otherwise derives the stores from the flags'
-      // own materials. Either way it never joins every store's category map.
-      storeId: liquorStore(db)?.id ?? null,
+      // NO store scope: this is the register of every store's wine-shop buys
+      // (the Wine-shop buys tab says "across every liquor store"). A storeId
+      // now scopes the BUYS as well as the depot-spend denominator (the
+      // per-store §E of the Summary passes one), so passing the liquor store
+      // here would hide any buy booked into another store. Unscoped, the
+      // depot spend is taken over the stores the listed buys' own materials
+      // belong to — the stores recordWineShopPurchase books every buy into —
+      // so the share of spend stays one scope over one scope. It never joins
+      // every store's category map.
     });
     // Admin-only depot rate + excess: withheld (null, with the reason) for
     // everyone else this gate admits. Fail closed — see liquor-retail.ts.

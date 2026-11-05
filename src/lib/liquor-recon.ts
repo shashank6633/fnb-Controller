@@ -528,6 +528,44 @@ function allocateFromRows(
   return { storeId, invoiceRef: String(invoiceRef || '').trim(), levies, billBottles, billSubtotal, lines };
 }
 
+/**
+ * allocateIndentBill for MANY bills of one store, in batched reads.
+ *
+ * Same reason rateMovementForStore batches (see the ⚠️ there): every
+ * allocateIndentBill call scans the whole store ledger, because
+ * `lower(TRIM(l.ref)) = ?` is an expression no index serves, so a caller that
+ * loops over bills is O(bills × ledger rows). This hoists the two reads —
+ * billLinesForKeys and billLeviesForKeys, chunked under KEY_CHUNK, each in the
+ * order the single-bill read uses (lines created_at DESC, rowid DESC; charges
+ * ORDER BY rowid, first row wins) — and runs the SAME pure allocateFromRows.
+ *
+ * Keyed by lqBillKey, so case/space variants of one ref ("IND-1", " ind-1 ")
+ * are ONE bill, exactly as they are to allocateIndentBill. Each value is
+ * identical to allocateIndentBill(db, storeId, ref) for the FIRST ref in
+ * `invoiceRefs` carrying that key: every field depends only on the key except
+ * `invoiceRef`, which (as there) is the caller's ref, trimmed. A ref with no
+ * recorded line still gets its entry — no lines, levies as recorded — because
+ * that is what allocateIndentBill answers for it too.
+ */
+export function allocateIndentBills(
+  db: Database, storeId: string, invoiceRefs: string[],
+): Map<string, LqIndentAllocation> {
+  const firstRef = new Map<string, string>();
+  for (const ref of invoiceRefs) {
+    const k = lqBillKey(ref);
+    if (!firstRef.has(k)) firstRef.set(k, ref);
+  }
+  const out = new Map<string, LqIndentAllocation>();
+  if (firstRef.size === 0) return out;
+  const keys = [...firstRef.keys()];
+  const linesByKey = billLinesForKeys(db, storeId, keys);
+  const leviesByKey = billLeviesForKeys(db, storeId, keys);
+  for (const [k, ref] of firstRef) {
+    out.set(k, allocateFromRows(storeId, ref, linesByKey.get(k) ?? [], leviesByKey.get(k) ?? null));
+  }
+  return out;
+}
+
 /* ── Brand-map resolution ──────────────────────────────────────────────────── */
 
 /** A brand-map row joined to the material it maps. */
@@ -788,6 +826,13 @@ export interface LqLandedCost {
   ratePerCaseMaster: number;
   /** The indent line the levies were taken from ('' when basis is master_only). */
   ledgerId: string;
+  /** The store that line was recorded in ('' when basis is master_only). */
+  lineStoreId: string;
+  /** true → the caller scoped the search to a store with NO recorded indent line
+   *  of its own for this material (a floor bar receives by transfer — indents
+   *  happen only at the depot), so the line came from another store. See the
+   *  STORE FALLBACK note on latestIndentLine. */
+  lineFromOtherStore: boolean;
   invoiceRef: string;
   inwardDate: string;
   /** ₹ per bottle actually paid on that line — null when there is no line.
@@ -812,7 +857,9 @@ export interface LqLandedCostOpts {
   sizeCode?: string;
   /** Take the levies from THIS recorded bill. */
   billRef?: string;
-  /** Scope the bill / the latest-indent search to one store. */
+  /** Look in THIS store first. When it has no recorded indent line for the
+   *  material, the search falls back to every store (see STORE FALLBACK on
+   *  latestIndentLine) before it falls back to the master. */
   storeId?: string;
   /** YYYY-MM-DD. Without billRef, the newest recorded indent at or before this
    *  date supplies the levies. Omitted = no upper bound. */
@@ -859,28 +906,17 @@ export function landedCostPerBottleExplained(
   // normal, expected state.
   const masterRate: number | null = bm.rate_per_case_master > 0 ? bm.rate_per_bottle_master : null;
 
-  // Find the recorded line whose RATE (owner decision 2) and levies apply.
-  const where: string[] = ["l.txn_type = 'purchase'", 'l.material_id = ?'];
-  const args: any[] = [bm.material_id];
-  if (opts.storeId) { where.push('l.store_id = ?'); args.push(opts.storeId); }
-  if (opts.billRef) { where.push('lower(TRIM(l.ref)) = ?'); args.push(lqBillKey(opts.billRef)); }
-  if (opts.asOf)    { where.push('date(l.created_at) <= date(?)'); args.push(opts.asOf); }
-  const line = db.prepare(`
-    SELECT l.id, l.store_id, TRIM(l.ref) AS invoice_ref
-    FROM store_stock_ledger l
-    WHERE ${where.join(' AND ')}
-    ORDER BY l.created_at DESC, l.rowid DESC
-    LIMIT 1
-  `).get(...args) as any;
-
-  // The line, allocated over its WHOLE bill. `undefined` when nothing was ever
-  // recorded, or (should be unreachable — the line was found by the same
-  // predicate the allocation reads) when it is missing from its own bill; both
-  // degrade to master-only rather than to a wrong number.
-  const ln: LqIndentLine | undefined = line
-    ? allocateIndentBill(db, String(line.store_id), String(line.invoice_ref))
-        .lines.find(x => x.ledgerId === String(line.id))
-    : undefined;
+  // Find the recorded line whose RATE (owner decision 2) and levies apply —
+  // store first, then ANY store (latestIndentLine's STORE FALLBACK), allocated
+  // over its WHOLE bill. null when nothing was ever recorded, or (should be
+  // unreachable — the line is found by the same predicate the allocation
+  // reads) when it is missing from its own bill; both degrade to master-only
+  // rather than to a wrong number.
+  const found = latestIndentLine(db, {
+    materialId: bm.material_id, storeId: opts.storeId, billRef: opts.billRef, asOf: opts.asOf,
+  });
+  const ln: LqIndentLine | undefined = found?.line;
+  const lineFromOtherStore = found?.fromOtherStore ?? false;
 
   // OWNER DECISION 2 — VALUE AT THE RATE PAID. The rate is the line's own
   // indent rate whenever one was recorded; the master only when nothing was
@@ -921,7 +957,7 @@ export function landedCostPerBottleExplained(
         ratePerBottle,
         allocatedLevies: 0,
         landedPerBottle: ratePerBottle,
-        ledgerId: '', invoiceRef: '', inwardDate: '',
+        ledgerId: '', lineStoreId: '', lineFromOtherStore: false, invoiceRef: '', inwardDate: '',
         indentRatePerBottle: null, ratePerBottleVariance: null,
         lineChargesPerBottle: 0,
         landedWithLineChargesPerBottle: ratePerBottle,
@@ -940,6 +976,8 @@ export function landedCostPerBottleExplained(
       allocatedLevies,
       landedPerBottle,
       ledgerId: ln.ledgerId,
+      lineStoreId: ln.storeId,
+      lineFromOtherStore,
       invoiceRef: ln.invoiceRef,
       inwardDate: ln.inwardDate,
       indentRatePerBottle: ln.indentRatePerBottle,
@@ -955,6 +993,116 @@ export function landedCostPerBottleExplained(
 /** THE contract function. null = "not mapped" (or "which pack?"), never 0. */
 export function landedCostPerBottle(db: Database, opts: LqLandedCostOpts): LqLandedCost | null {
   return landedCostPerBottleExplained(db, opts).value;
+}
+
+/**
+ * The newest recorded indent LINE for a material, allocated over its whole
+ * bill — the line landedCostPerBottle takes its rate and levies from.
+ *
+ * STORE FALLBACK. Indents happen only at the depot: a floor bar receives its
+ * bottles by TRANSFER and never has a 'purchase' line of its own. Scoped to
+ * such a store, the search found nothing and landedCostPerBottle answered with
+ * the bare MASTER and ₹0 levies — which L4 then FROZE onto a floor bar's
+ * withdrawal (measured on a copy: the ₹4,200 master where the bottle cost
+ * ₹4,500 paid + ₹343 of levies at the depot — ₹4,843), and the master is
+ * admin-only besides. So
+ * when `storeId` has no recorded line for the material (same bill / asOf
+ * filters), the newest line for it in ANY store is used — still allocated over
+ * its own bill in its own store — and `fromOtherStore` says so. Only when
+ * there is none anywhere does the caller fall back to the master.
+ *
+ * null = no recorded line (or, unreachably, a line missing from its own bill).
+ * Reads the Brand Map not at all: a line's rate and levies do not need it.
+ */
+export function latestIndentLine(
+  db: Database, opts: { materialId: string; storeId?: string; billRef?: string; asOf?: string },
+): { line: LqIndentLine; fromOtherStore: boolean } | null {
+  // Same belt as landedCostPerBottleExplained: a bad asOf must not read as
+  // "never indented" (date(?) is NULL and nothing would match).
+  if (opts.asOf != null && String(opts.asOf).trim() !== ''
+      && !/^\d{4}-\d{2}-\d{2}$/.test(String(opts.asOf).trim())) {
+    throw new Error(`latestIndentLine: asOf must be YYYY-MM-DD, got "${opts.asOf}".`);
+  }
+  const materialId = String(opts.materialId || '').trim();
+  if (!materialId) return null;
+  const lineAt = (storeId: string | null) => {
+    const where: string[] = ["l.txn_type = 'purchase'", 'l.material_id = ?'];
+    const args: any[] = [materialId];
+    if (storeId)      { where.push('l.store_id = ?'); args.push(storeId); }
+    if (opts.billRef) { where.push('lower(TRIM(l.ref)) = ?'); args.push(lqBillKey(opts.billRef)); }
+    if (opts.asOf)    { where.push('date(l.created_at) <= date(?)'); args.push(opts.asOf); }
+    return db.prepare(`
+      SELECT l.id, l.store_id, TRIM(l.ref) AS invoice_ref
+      FROM store_stock_ledger l
+      WHERE ${where.join(' AND ')}
+      ORDER BY l.created_at DESC, l.rowid DESC
+      LIMIT 1
+    `).get(...args) as any;
+  };
+  let row = lineAt(opts.storeId || null);
+  let fromOtherStore = false;
+  if (!row && opts.storeId) {
+    row = lineAt(null);
+    fromOtherStore = !!row;
+  }
+  if (!row) return null;
+  const line = allocateIndentBill(db, String(row.store_id), String(row.invoice_ref))
+    .lines.find(x => x.ledgerId === String(row.id));
+  return line ? { line, fromOtherStore } : null;
+}
+
+/** The landed cost of a material from its newest recorded indent line ALONE —
+ *  see landedFromIndentLine. ₹ per bottle of the material's own pack
+ *  (packFactor), the basis landedCostPerBottle answers in. */
+export interface LqIndentLanded {
+  /** The RATE PAID on the line (indentRatePerBottle). Always > 0. */
+  ratePerBottle: number;
+  /** The line's allocated bill-level levies per bottle. SIGNED. */
+  allocatedLevies: number;
+  /** ratePerBottle + allocatedLevies. */
+  landedPerBottle: number;
+  ledgerId: string;
+  lineStoreId: string;
+  lineFromOtherStore: boolean;
+  invoiceRef: string;
+  inwardDate: string;
+}
+
+/**
+ * Landed cost from the newest recorded indent line WITHOUT the Brand Map:
+ * the rate paid on the line + its share of the bill's TGBCL levies.
+ *
+ * landedCostPerBottle answers null for a material with no (single) Brand Map
+ * pack — by contract, because its pack is what it prices and what supplies the
+ * master yardstick. But a line that WAS indented carries its own rate and its
+ * own allocated levies; neither needs the Brand Map. L4 used to fall straight
+ * from that null to the store's recorded average and froze a withdrawal with
+ * NO levies (measured on a copy: an unmapped rum, 1 bottle frozen at the
+ * store's ₹1,500 where its indent allocated ₹115 a bottle of levies on top —
+ * ₹1,615). This is the figure for that case, on the same line search
+ * (latestIndentLine, store fallback included) and the same arithmetic as
+ * landedCostPerBottle.
+ *
+ * null when there is no recorded line, or the line recorded no rate (₹0): a
+ * figure made only of levies is not a landed cost (see the no_master_rate
+ * refusal in landedCostPerBottleExplained). Read-only, like everything here.
+ */
+export function landedFromIndentLine(
+  db: Database, opts: { materialId: string; storeId?: string; billRef?: string; asOf?: string },
+): LqIndentLanded | null {
+  const found = latestIndentLine(db, opts);
+  if (!found || !(found.line.indentRatePerBottle > 0)) return null;
+  const ln = found.line;
+  return {
+    ratePerBottle: ln.indentRatePerBottle,
+    allocatedLevies: ln.leviesPerBottle,
+    landedPerBottle: r4(ln.indentRatePerBottle + ln.leviesPerBottle),
+    ledgerId: ln.ledgerId,
+    lineStoreId: ln.storeId,
+    lineFromOtherStore: found.fromOtherStore,
+    invoiceRef: ln.invoiceRef,
+    inwardDate: ln.inwardDate,
+  };
 }
 
 /* ── rateVarianceForIndent — CONTRACT (L0) ───────────────────────────────────

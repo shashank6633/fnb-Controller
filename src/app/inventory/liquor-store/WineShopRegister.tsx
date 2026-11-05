@@ -267,7 +267,7 @@ export function RowActions({ r, onAction, canCorrect = true }: {
         </button>
       )}
       {st.payoutBacked && (
-        <span className="text-[10px] text-[#8B7355]" title="Closed by a petty-cash payout. Delete or reverse that payout on Petty Cash to reopen it.">
+        <span className="text-[10px] text-[#8B7355]" title="Closed by a petty-cash payout — final. Petty Cash has no delete; if the money came back, record it there as a Return / refund (this claim still reads Reimbursed).">
           paid from petty cash
         </span>
       )}

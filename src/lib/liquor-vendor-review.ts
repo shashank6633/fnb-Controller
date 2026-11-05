@@ -135,6 +135,14 @@ export function vendorNameReview(db: Database, opts?: { maxDistance?: number }):
     SELECT TRIM(vendor) AS name, COUNT(*) AS n FROM purchases
     WHERE TRIM(COALESCE(vendor, '')) != '' GROUP BY TRIM(vendor)
   `)) purchaseUses.set(String(r.name), Number(r.n) || 0);
+  // And per exact store-bill spelling: a TGBCL bill entered on Goods Receipt
+  // writes no purchases row, only store-ledger lines under its supplier, so a
+  // depot vendor used on every liquor bill would otherwise read "0 uses".
+  const storeUses = new Map<string, number>();
+  for (const r of rowsOr(db, `
+    SELECT TRIM(supplier) AS name, COUNT(*) AS n FROM store_stock_ledger
+    WHERE txn_type = 'purchase' AND TRIM(COALESCE(supplier, '')) != '' GROUP BY TRIM(supplier)
+  `)) storeUses.set(String(r.name), Number(r.n) || 0);
 
   const refs: VendorNameRef[] = [];
   const masterNames = new Set<string>();
@@ -144,7 +152,7 @@ export function vendorNameReview(db: Database, opts?: { maxDistance?: number }):
     refs.push({
       name, source: 'vendor', vendor_id: String(v.id),
       is_active: v.is_active == null ? null : Number(v.is_active) === 1,
-      uses: purchaseUses.get(name) ?? 0,
+      uses: (purchaseUses.get(name) ?? 0) + (storeUses.get(name) ?? 0),
     });
   }
   const vendorCount = refs.length;
@@ -161,10 +169,7 @@ export function vendorNameReview(db: Database, opts?: { maxDistance?: number }):
     }
   };
   addFree('purchase', [...purchaseUses].map(([name, n]) => ({ name, n })));
-  addFree('store_bill', rowsOr(db, `
-    SELECT TRIM(supplier) AS name, COUNT(*) AS n FROM store_stock_ledger
-    WHERE txn_type = 'purchase' AND TRIM(COALESCE(supplier, '')) != '' GROUP BY TRIM(supplier)
-  `));
+  addFree('store_bill', [...storeUses].map(([name, n]) => ({ name, n })));
   addFree('wine_shop', rowsOr(db, `
     SELECT TRIM(shop_name) AS name, COUNT(*) AS n FROM lq_retail_flags
     WHERE TRIM(COALESCE(shop_name, '')) != '' GROUP BY TRIM(shop_name)

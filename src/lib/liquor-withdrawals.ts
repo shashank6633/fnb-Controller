@@ -112,34 +112,88 @@ export function mintWithdrawalRef(db: Database.Database, businessDate?: string):
 }
 
 /* ── Landed cost, frozen at issue ─────────────────────────────────────────────
- * Contract: L4 FREEZES the landed cost onto the withdrawal. The true landed cost
- * (master rate + this line's share of the recorded TGBCL levies) is L1's
- * landedCostPerBottle(); we do NOT reimplement it. Until L1 lands, or for a
- * material with no brand-map row, we fall back to the store's ordinary cost basis
- * (the same weighted-average the ledger already uses) — which is NOT landed cost
- * and is NOT levy allocation, just the best-known unit cost — and record which
- * source was used so the freeze is auditable. Whatever value is resolved is
- * STORED on the row and never recomputed, so a later rate change cannot move it. */
-export type LandedCostSource = 'manual' | 'l1_landed' | 'store_avg' | 'last_purchase' | 'none';
+ * Contract: L4 FREEZES the landed cost onto the withdrawal. The landed cost
+ * (the RATE PAID on the latest recorded indent line + that line's share of the
+ * recorded TGBCL levies; the Brand Map master only for a pack never indented —
+ * owner decision 2) is L1's landedCostPerBottle(); we do NOT reimplement it.
+ * A withdrawal from a store with no indent line of its own (a floor bar,
+ * stocked by transfer) is priced on the newest indent line in ANY store — L1's
+ * STORE FALLBACK — not on the master. A material with no (single) Brand Map
+ * pack that WAS indented is still landed: L1's landedFromIndentLine prices it
+ * on that line's rate paid + its allocated levies, which need no Brand Map
+ * (source 'indent_landed'). Only with no recorded indent line at all do we
+ * fall back to the store's ordinary cost basis (the same weighted-average the
+ * ledger already uses) — which is NOT landed cost and is NOT levy allocation,
+ * just the best-known unit cost. Which source was used, and on what basis, is
+ * returned with the figure (the POST reply and the audit event carry it — the
+ * row has no column for it), so the freeze is auditable. Whatever value is
+ * resolved is STORED on the row and never recomputed, so a later rate change
+ * cannot move it. */
+export type LandedCostSource = 'manual' | 'l1_landed' | 'indent_landed' | 'store_avg' | 'last_purchase' | 'none';
 
-/** Ask L1 for the landed cost per bottle, converted to ₹/recipe-unit, or null. */
+/** What L1 answered, as far as this file reads it. */
+interface L1Landed {
+  landedPerBottle: number;
+  basis?: string;
+  rateSource?: string;
+  lineStoreId?: string;
+  lineFromOtherStore?: boolean;
+  invoiceRef?: string;
+  inwardDate?: string;
+}
+
+/** Ask L1 for the landed cost per bottle, converted to ₹/recipe-unit (plus the
+ *  basis L1 used, for the sentence), or null. */
 function landedUnitCostFromL1(
   db: Database.Database,
   args: { materialId: string; mat: WithdrawalMaterial; asOf: string; billRef?: string; storeId?: string },
-): number | null {
+): { value: number; l1: L1Landed } | null {
   const fn = (recon as any).landedCostPerBottle as
     | ((db: Database.Database, a: { materialId?: string; brandMapId?: string; billRef?: string; asOf?: string; storeId?: string }) =>
-        { ratePerBottle: number; allocatedLevies: number; landedPerBottle: number } | null)
+        L1Landed | null)
     | undefined;
   if (typeof fn !== 'function') return null;                 // L1 not built yet
-  let res: { landedPerBottle: number } | null = null;
+  let res: L1Landed | null = null;
   try {
     res = fn(db, { materialId: args.materialId, billRef: args.billRef, asOf: args.asOf, storeId: args.storeId });
   } catch { return null; }                                   // never let analytics break an issue
   if (!res || !Number.isFinite(res.landedPerBottle)) return null;
   const pf = packFactor(args.mat) || 1;                      // ₹/bottle → ₹/recipe-unit
   const v = res.landedPerBottle / pf;
-  return Number.isFinite(v) && v >= 0 ? v : null;
+  return Number.isFinite(v) && v >= 0 ? { value: v, l1: res } : null;
+}
+
+/** Ask L1 for the landed cost of an item WITHOUT a (single) Brand Map pack,
+ *  from its newest recorded indent line alone, in ₹/recipe-unit — or null when
+ *  it has no line with a rate paid. */
+function landedUnitCostFromIndent(
+  db: Database.Database,
+  args: { materialId: string; mat: WithdrawalMaterial; asOf: string; billRef?: string; storeId?: string },
+): { value: number; l1: L1Landed } | null {
+  let res: ReturnType<typeof recon.landedFromIndentLine> = null;
+  try {
+    res = recon.landedFromIndentLine(db, { materialId: args.materialId, billRef: args.billRef, asOf: args.asOf, storeId: args.storeId });
+  } catch { return null; }                                   // never let analytics break an issue
+  if (!res || !Number.isFinite(res.landedPerBottle)) return null;
+  const pf = packFactor(args.mat) || 1;                      // ₹/bottle → ₹/recipe-unit
+  const v = res.landedPerBottle / pf;
+  return Number.isFinite(v) && v >= 0
+    ? { value: v, l1: { ...res, basis: 'latest_indent', rateSource: 'paid' } }
+    : null;
+}
+
+/** The basis of an L1 figure, in English — one sentence, used by the audit
+ *  event, the POST reply and the form's preview, so all three say the same. */
+function l1BasisText(db: Database.Database, l1: L1Landed, storeId: string): string {
+  if (l1.basis === 'master_only' || !l1.lineStoreId) {
+    return 'TGBCL Brand Map master rate — no indent has been recorded for this item, so no levies';
+  }
+  const at = l1.lineStoreId === storeId ? '' : ` at ${getStoreById(db, l1.lineStoreId)?.name || 'another store'}`;
+  const rate = l1.rateSource === 'master'
+    ? 'Brand Map master rate (the indent line recorded no rate)'
+    : 'rate paid';
+  return `${rate} + levies on indent ${l1.invoiceRef || '(no ref)'} of ${l1.inwardDate || '?'}${at}`
+    + (l1.lineFromOtherStore ? ' — this store has no recorded indent line of its own for it by that date' : '');
 }
 
 /** Weighted-average ₹/recipe-unit from this store's INFLOW ledger rows — the
@@ -180,9 +234,13 @@ function lastPurchaseUnitCost(db: Database.Database, mat: WithdrawalMaterial): n
 }
 
 /**
- * Resolve the ₹/recipe-unit to FREEZE onto the withdrawal, with its source.
- * Order: explicit admin value → L1 landed cost → store weighted-avg → last
+ * Resolve the ₹/recipe-unit to FREEZE onto the withdrawal, with its source and
+ * the basis in words (`detail`).
+ * Order: explicit admin value → L1 landed cost (Brand Map pack) → L1 landed
+ * cost from the indent line alone (no single pack) → store weighted-avg → last
  * purchase price → none (0, and the caller must be told).
+ * createWithdrawal freezes exactly this; GET /api/liquor/withdrawals/landed
+ * runs it unchanged so the form previews the figure that will be frozen.
  */
 export function resolveLandedUnitCost(
   db: Database.Database,
@@ -190,19 +248,42 @@ export function resolveLandedUnitCost(
     storeId: string; materialId: string; mat: WithdrawalMaterial;
     explicitPerRecipeUnit?: number | null; asOf: string; billRef?: string;
   },
-): { value: number; source: LandedCostSource } {
+): { value: number; source: LandedCostSource; detail: string } {
   const ex = args.explicitPerRecipeUnit;
   if (ex !== undefined && ex !== null && Number.isFinite(Number(ex)) && Number(ex) >= 0) {
-    return { value: Number(ex), source: 'manual' };
+    return { value: Number(ex), source: 'manual', detail: 'typed by the admin' };
   }
   const l1 = landedUnitCostFromL1(db, { materialId: args.materialId, mat: args.mat, asOf: args.asOf, billRef: args.billRef, storeId: args.storeId });
-  if (l1 !== null) return { value: l1, source: 'l1_landed' };
+  if (l1 !== null) return { value: l1.value, source: 'l1_landed', detail: l1BasisText(db, l1.l1, args.storeId) };
+  const ind = landedUnitCostFromIndent(db, { materialId: args.materialId, mat: args.mat, asOf: args.asOf, billRef: args.billRef, storeId: args.storeId });
+  if (ind !== null) {
+    return {
+      value: ind.value, source: 'indent_landed',
+      detail: `${l1BasisText(db, ind.l1, args.storeId)}; priced without the Brand Map, which has no single pack for this item`,
+    };
+  }
   const storeAvg = storeAvgUnitCost(db, args.storeId, args.materialId);
-  if (storeAvg > 0) return { value: storeAvg, source: 'store_avg' };
+  if (storeAvg > 0) {
+    return { value: storeAvg, source: 'store_avg', detail: 'this store\'s average recorded cost — NOT landed: no TGBCL indent line with a rate paid is on record for this item, so no levies' };
+  }
   const lastPurchase = lastPurchaseUnitCost(db, args.mat);
   return lastPurchase > 0
-    ? { value: lastPurchase, source: 'last_purchase' }
-    : { value: 0, source: 'none' };
+    ? { value: lastPurchase, source: 'last_purchase', detail: 'the last purchase price — NOT landed: no TGBCL indent line with a rate paid is on record for this item, so no levies' }
+    : { value: 0, source: 'none', detail: 'no cost on record for this item' };
+}
+
+/** The material meta createWithdrawal and the landed preview need, or null. */
+export function loadWithdrawalMaterial(db: Database.Database, id: string): WithdrawalMaterial | null {
+  const m = db.prepare(`
+    SELECT id, name, category, unit, purchase_unit, pack_size, case_size, average_price
+    FROM raw_materials WHERE id = ?
+  `).get(id) as any;
+  if (!m) return null;
+  return {
+    id: m.id, name: m.name, category: m.category, unit: m.unit,
+    purchase_unit: m.purchase_unit, pack_size: m.pack_size, case_size: m.case_size,
+    average_price: m.average_price,
+  };
 }
 
 /** Current on-hand (recipe units) for one material in one store. */
@@ -259,6 +340,27 @@ export function storeMaterialOnHand(db: Database.Database, storeId: string, mate
  * the row on the previous UTC day, i.e. on the wrong side of the closing route.
  * A row for TODAY keeps `now`, exactly as every other writer does, so nothing
  * is ever stamped in the future. */
+/** The withdrawal categories in words — the same labels the register page shows. */
+export const WITHDRAWAL_CATEGORY_LABEL: Record<LqWithdrawalCategory, string> = {
+  management_personal: 'Management / Director personal',
+  staff_welfare: 'Staff welfare',
+  marketing_sampling: 'Marketing / Sampling',
+  breakage_spoilage: 'Breakage / Spoilage',
+  transfer: 'Transfer (non-sale)',
+};
+
+/** The store-ledger note for a withdrawal: the WD ref and the category, and
+ *  NOTHING ELSE. The Liquor Store ledger is read by every store viewer (bar
+ *  staff, the store manager) while this register is admin-only, and the note
+ *  used to carry the person the bottle went to (measured: "Withdrawal
+ *  WD-2026-001 — management_personal (ZZ-LQ Director)") — a director's personal use, named,
+ *  on the bar's own screen. No person, no money, no remarks: the ref is the
+ *  join key an admin follows to the full record (the same rule as the wastage
+ *  co-write's note). Rows already written keep their note. */
+export function withdrawalLedgerNote(ref: string, category: LqWithdrawalCategory): string {
+  return `Withdrawal ${ref} — ${WITHDRAWAL_CATEGORY_LABEL[category] || category} (see the admin Withdrawals register)`;
+}
+
 export function postWithdrawalStock(
   db: Database.Database,
   w: {
@@ -288,7 +390,7 @@ export function postWithdrawalStock(
     quantity: -qty,           // OUT of the store
     unit_cost: 0,             // rule 1: no landed cost on the ledger
     ref: w.ref,
-    notes: w.note || `Withdrawal ${w.ref} (${w.category})`,
+    notes: w.note || withdrawalLedgerNote(w.ref, w.category),
     created_by: w.recorded_by,
     // MOVEMENT RECORD field 7: the business date the bottle left.
     ...(businessDate ? { txn_date: businessDate } : {}),
@@ -352,6 +454,16 @@ const UNIQUE_REF_RE = /UNIQUE constraint failed: lq_withdrawals\.ref/i;
  *  used AND the issue really did exceed the recorded on-hand. */
 export const FORCED_BELOW_ON_HAND_TAG = '[forced below on-hand]';
 
+/** `text` with the forced stamp exactly when `forced`: any copy of the tag in
+ *  the typed text is removed first, then the server's own is appended. Used at
+ *  create and on every remarks edit, so neither a typed remark nor a PATCH can
+ *  add the stamp to a row that was not forced, or take it off one that was. */
+function withForcedStamp(text: string, forced: boolean): string {
+  // Text with no tag in it comes back merely trimmed, as it always was.
+  const typed = String(text || '').split(FORCED_BELOW_ON_HAND_TAG).map(p => p.trim()).filter(Boolean).join(' ');
+  return [typed, forced ? FORCED_BELOW_ON_HAND_TAG : ''].filter(Boolean).join(' ');
+}
+
 /** The co-written wastage row's `reason`. MUST be a member of the wastage rail's
  *  own VALID_REASONS (src/app/api/wastage/route.ts) — a free-text reason is
  *  invisible to that page's filter chips and gives the analyst by-reason report
@@ -384,11 +496,19 @@ export const CO_WRITE_WASTAGE_REASON = 'damage';
  * The toggle stays OFF by default and the page still warns beside it: a
  * breakage normally belongs on the Liquor Store register alone. */
 
+/** The register row as written, plus HOW its landed_unit_cost was resolved.
+ *  The two extra fields are NOT columns — lq_withdrawals has none for the
+ *  basis — so they travel on the POST reply and the audit event only. */
+export interface CreatedWithdrawal extends LqWithdrawal {
+  landed_source: LandedCostSource;
+  landed_basis: string;
+}
+
 export function createWithdrawal(
   db: Database.Database,
   input: CreateWithdrawalInput,
   mat: WithdrawalMaterial,
-): LqWithdrawal {
+): CreatedWithdrawal {
   // ── Validate the shape BEFORE the transaction, with friendly messages. The
   //    schema CHECKs are the backstop; these are the readable front door.
   const category = String(input.category || '') as LqWithdrawalCategory;
@@ -603,9 +723,9 @@ export function createWithdrawal(
 
   // The register's own remarks. A forced issue is stamped ON THE ROW, not only
   // in /audit, so the register itself says why it shows more issued than the
-  // book held.
-  const remarks = [(input.remarks || '').trim(), forcedBelowOnHand ? FORCED_BELOW_ON_HAND_TAG : '']
-    .filter(Boolean).join(' ');
+  // book held. The stamp is the server's to write: a typed copy of it is
+  // dropped, so it appears on exactly the rows that were forced.
+  const remarks = withForcedStamp(input.remarks || '', forcedBelowOnHand);
 
   const insert = db.prepare(`
     INSERT INTO lq_withdrawals
@@ -643,7 +763,7 @@ export function createWithdrawal(
       store_id: input.store_id, material_id: input.material_id,
       qty_recipe_units: qtyRecipe, ref, category, recorded_by: input.recorded_by,
       date,
-      note: `Withdrawal ${ref} — ${category}${input.taken_by ? ` (${input.taken_by})` : ''}`,
+      note: withdrawalLedgerNote(ref, category),
     });
 
     let wastageId = '';
@@ -719,6 +839,7 @@ export function createWithdrawal(
           material_id: row.material_id, material: mat.name, category: row.category,
           cases, bottles, qty_recipe_units: qtyRecipe, recipe_unit: mat.unit,
           landed_unit_cost: landedUnitCost, landed_value: landedValue, landed_source: landed.source,
+          landed_basis: landed.detail,
           mrp_value: mrpValue, recovery_basis: basis, recoverable, recovered,
           excise_register: !!input.excise_register, ledger_id: row.ledger_id,
           wastage_id: row.wastage_id, co_write_wastage: coWrite,
@@ -732,7 +853,7 @@ export function createWithdrawal(
         note: `${store.name}: withdrawal ${row.ref} — ${qtyRecipe} ${mat.unit} ${mat.name}`
           + ` (${category})${recoverable ? `, ₹${recoverable} recoverable` : ''}`,
       });
-      return row;
+      return { ...row, landed_source: landed.source, landed_basis: landed.detail };
     } catch (e: any) {
       lastErr = e;
       if (e && typeof e.message === 'string' && UNIQUE_REF_RE.test(e.message)) continue;
@@ -960,7 +1081,15 @@ export function recordRecovery(db: Database.Database, id: string, u: RecoveryUpd
     if (recovered > recoverable + 1e-9) {
       throw new Error(`Recovered (₹${recovered}) cannot exceed recoverable (₹${recoverable})`);
     }
-    const remarks = u.remarks !== undefined && u.remarks !== null ? String(u.remarks) : cur.remarks;
+    // A remarks edit keeps the "[forced below on-hand]" stamp exactly as the
+    // row has it, whatever the new text says: the stamp is the only mark ON
+    // THE REGISTER that this issue drove the book below what it held, and a
+    // recovery note is no reason to lose it (measured: PATCH { remarks: "paid
+    // in cash" } wrote "paid in cash" over "… [forced below on-hand]"). Nor can
+    // a typed copy of the tag add it to a row that was not forced.
+    const remarks = u.remarks !== undefined && u.remarks !== null
+      ? withForcedStamp(String(u.remarks), String(cur.remarks || '').includes(FORCED_BELOW_ON_HAND_TAG))
+      : cur.remarks;
     const recoverableChanged = Math.abs(recoverable - (Number(cur.recoverable) || 0)) > 1e-9;
 
     if (recoverableChanged) {

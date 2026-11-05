@@ -4,7 +4,7 @@ import { getStoreById, listStores, materialStoreId } from '@/lib/store-engine';
 import { requireWithdrawalsAdmin } from './_lib/guard';
 import {
   createWithdrawal, listWithdrawals, withdrawalSummary, storeMaterialOnHand, WithdrawalRefusal,
-  type WithdrawalMaterial, type CreateWithdrawalInput,
+  loadWithdrawalMaterial, type CreateWithdrawalInput,
 } from '@/lib/liquor-withdrawals';
 import {
   LQ_WITHDRAWAL_CATEGORIES, LQ_RECOVERY_BASIS, type LqWithdrawalCategory,
@@ -22,21 +22,11 @@ import {
  * GET  → { withdrawals, summary, stores, categories, recovery_basis }
  *        query: from, to, category, store_id, outstanding_only=1
  * POST → create one withdrawal (atomic ledger movement + register row).
+ *        → { ok, withdrawal, landed_source, landed_basis } — HOW the frozen
+ *        landed_unit_cost was resolved; the row has no column for it.
+ * GET /api/liquor/withdrawals/landed previews that figure before saving.
  */
 export const dynamic = 'force-dynamic';
-
-function loadMaterial(db: ReturnType<typeof getDb>, id: string): WithdrawalMaterial | null {
-  const m = db.prepare(`
-    SELECT id, name, category, unit, purchase_unit, pack_size, case_size, average_price
-    FROM raw_materials WHERE id = ?
-  `).get(id) as any;
-  if (!m) return null;
-  return {
-    id: m.id, name: m.name, category: m.category, unit: m.unit,
-    purchase_unit: m.purchase_unit, pack_size: m.pack_size, case_size: m.case_size,
-    average_price: m.average_price,
-  };
-}
 
 export async function GET(request: Request) {
   try {
@@ -85,7 +75,7 @@ export async function POST(request: Request) {
     const store = getStoreById(db, storeId);
     if (!store) return Response.json({ error: 'Store not found' }, { status: 404 });
 
-    const mat = loadMaterial(db, materialId);
+    const mat = loadWithdrawalMaterial(db, materialId);
     if (!mat) return Response.json({ error: 'Material not found' }, { status: 404 });
 
     // The material must belong to this store (category-mapped) OR be actually held
@@ -134,8 +124,8 @@ export async function POST(request: Request) {
       confirm_duplicate: !!b.confirm_duplicate,
     };
 
-    const row = createWithdrawal(db, input, mat);
-    return Response.json({ ok: true, withdrawal: row }, { status: 201 });
+    const { landed_source, landed_basis, ...row } = createWithdrawal(db, input, mat);
+    return Response.json({ ok: true, withdrawal: row, landed_source, landed_basis }, { status: 201 });
   } catch (e: any) {
     // A refusal someone must act on elsewhere first (run Migrate; decide the
     // count that already covers this date) — 409 with its code, nothing written.

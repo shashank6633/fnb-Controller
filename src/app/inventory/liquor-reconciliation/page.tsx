@@ -108,7 +108,7 @@ interface Summary {
       depot_equivalent: number | null; excess_total: number | null;
       unreimbursed_staff_spend: number; unknown_depot_count: number; unknown_depot_bottles: number; reopened_claim_count: number;
       depot_figures_visible?: boolean; depot_figures_note?: string | null; pending: Pending };
-    F: SectionF; G: { rows: RateRow[]; moved_lines: number; scanned_lines: number; unmapped_lines: number;
+    F: SectionF; G: { rows: RateRow[]; moved_lines: number | null; scanned_lines: number; unmapped_lines: number;
       /** null when the master rates are withheld (non-admin). */
       total_variance_value: number | null;
       /** false → masterRate / variance / varianceValue are null on every row (TGBCL master is admin-only). */
@@ -134,6 +134,14 @@ const n2 = (v: number | null | undefined, dp = 2) =>
 const pct = (v: number | null | undefined) => v == null ? '—' : `${(Number(v) || 0).toFixed(1)}%`;
 const todayStr = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
 const firstOfMonth = () => todayStr().slice(0, 7) + '-01';
+/** §H shows the withdrawal category in words, as the Withdrawals page does. */
+const WD_CATEGORY_LABEL: Record<string, string> = {
+  management_personal: 'Management / Director personal',
+  staff_welfare: 'Staff welfare',
+  marketing_sampling: 'Marketing / Sampling',
+  breakage_spoilage: 'Breakage / Spoilage',
+  transfer: 'Transfer (non-sale)',
+};
 /** §E shows the claim in words, not the stored token (claimed_pending …). */
 const REIMB_LABEL: Record<string, string> = {
   not_required: 'Not required', claimed_pending: 'Claimed — pending',
@@ -377,13 +385,23 @@ export default function LiquorReconciliationPage() {
                      className="mt-0.5 px-2.5 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-white text-[#2D1B0E]" />
             </label>
           </div>
+          {/* Nothing planned → no figures: a "shortfall" worked out against a ₹0
+              plan is just the balance with a minus sign. A plan the wallet
+              already covers has no shortfall — it shows the surplus instead. */}
           <div className="grid grid-cols-2 gap-2.5">
-            <Stat label="Shortfall" value={inr(S.A2.shortfall)} tone={S.A2.shortfall > 0 ? 'warn' : 'good'} />
-            <Stat label={`Recommended challan (↑₹${n2(S.A2.step, 0)})`} value={inr(S.A2.recommended_challan)} tone="good" />
-            <Stat label="Rounding added" value={inr(S.A2.rounding_add)} />
-            <Stat label="Balance after" value={inr(S.A2.balance_after)} />
+            <Stat label="Shortfall" value={S.A2.planned ? inr(Math.max(0, S.A2.shortfall)) : '—'}
+                  tone={S.A2.planned && S.A2.shortfall > 0 ? 'warn' : 'muted'} />
+            <Stat label={`Recommended challan (↑₹${n2(S.A2.step, 0)})`} value={S.A2.planned ? inr(S.A2.recommended_challan) : '—'}
+                  tone={S.A2.planned ? 'good' : 'muted'} />
+            <Stat label="Rounding added" value={S.A2.planned ? inr(S.A2.rounding_add) : '—'} />
+            <Stat label="Balance after" value={S.A2.planned ? inr(S.A2.balance_after) : '—'} />
           </div>
           {!S.A2.planned && <p className="text-[11px] text-[#B9A896] mt-2">Enter a planned indent to size the next challan.</p>}
+          {S.A2.planned && S.A2.surplus > 0 && (
+            <p className="text-[11px] text-emerald-700 mt-2">
+              The wallet already covers this indent with {inr(S.A2.surplus)} to spare — no challan is needed.
+            </p>
+          )}
         </Panel>
       </div>
 
@@ -581,7 +599,8 @@ export default function LiquorReconciliationPage() {
       {/* §G rate movement */}
       <Panel icon={<ArrowRightLeft className="w-4 h-4" />} title="G · Rate-movement watch" onCsv={() => downloadCsv('G')} pending={S.G.pending}>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-3">
-          <Stat label="Lines moved" value={n2(S.G.moved_lines, 0)} tone={S.G.moved_lines > 0 ? 'warn' : 'good'} />
+          <Stat label="Lines moved" value={S.G.moved_lines === null ? 'admin-only' : n2(S.G.moved_lines, 0)}
+                tone={S.G.moved_lines === null ? 'muted' : S.G.moved_lines > 0 ? 'warn' : 'good'} />
           <Stat label="Lines scanned" value={n2(S.G.scanned_lines, 0)} />
           <Stat label="Unmapped" value={n2(S.G.unmapped_lines, 0)} />
           {/* Withheld ≠ zero ≠ unknown: a manager is told the figure exists and
@@ -596,11 +615,11 @@ export default function LiquorReconciliationPage() {
           : gWithheld && (
             /* A server that withholds but sends no sentence: the cells still say why. */
             <p className="text-[11px] text-[#8B7355] mb-2">
-              Master rate, Variance and Value read “admin-only”: the TGBCL master rate is admin-only, and each of those
-              figures gives it back. The arrow says which way the indent moved.
+              Which lines moved against the TGBCL master is admin-only: the master rate is admin-only, and the list of
+              moved lines gives it back.
             </p>
           )}
-        {S.G.moved_lines > 0 && (canMovement
+        {(S.G.moved_lines ?? 0) > 0 && (canMovement
           ? <ActLink href={MOVEMENT_HREF} text="Review each drift and accept a new rate into the master — Liquor Brand Map · Rate Movement" />
           : (
             <p className="text-[11px] text-[#8B7355] mb-2">
@@ -675,7 +694,7 @@ export default function LiquorReconciliationPage() {
               <tbody>
                 {S.H.buckets.map(b => (
                   <tr key={b.category} className="border-t border-[#F0E4D6]">
-                    <td className="px-2 py-1.5 text-[#2D1B0E]">{b.category}</td>
+                    <td className="px-2 py-1.5 text-[#2D1B0E]">{WD_CATEGORY_LABEL[b.category] || b.category}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{b.count}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">
                       {isLanded
@@ -744,13 +763,13 @@ export default function LiquorReconciliationPage() {
       {/* Dependency panel */}
       <div className="bg-[#FDFBF8] border border-[#E8D5C4] rounded-lg p-3.5">
         <div className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide mb-2 flex items-center gap-1.5">
-          <HelpCircle className="w-3.5 h-3.5" /> Sibling-phase data status
+          <HelpCircle className="w-3.5 h-3.5" /> What each part has to work with
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
           {data.dependencies.map(d => (
             <div key={d.phase} className="flex items-start gap-2 text-xs">
               <span className={`mt-0.5 w-2 h-2 rounded-full shrink-0 ${d.live ? 'bg-emerald-500' : 'bg-[#D9C4B0]'}`} />
-              <span><span className="font-semibold text-[#2D1B0E]">{d.phase} · {d.label}</span> <span className="text-[#6B5744]">— {d.note}</span></span>
+              <span><span className="font-semibold text-[#2D1B0E]">{d.label}</span> <span className="text-[#6B5744]">— {d.note}</span></span>
             </div>
           ))}
         </div>

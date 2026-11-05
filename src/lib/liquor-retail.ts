@@ -821,7 +821,19 @@ export interface ReimburseResult {
  */
 export function closeReimbursementWithPettyCash(
   db: Database,
-  args: { flagId: string; actorEmail: string; outletId: string | null; date?: string; notes?: string; amountOverride?: number | null },
+  args: {
+    flagId: string; actorEmail: string; outletId: string | null; date?: string; notes?: string; amountOverride?: number | null;
+    /**
+     * May the amount-mismatch refusal say HOW the owed total is made up
+     * (bottles × rate paid)? Pass canReadRetailRegister for the caller — the
+     * predicate the POST duplicate refusal uses. The reimburse gate admits the
+     * petty-cash payer (Management or the Store Manager, with the petty-cash
+     * page), who need not be able to read the register, and the rate paid per
+     * bottle is register money. The owed TOTAL is always given: it is the
+     * figure the payer has to pay. Fail closed.
+     */
+    revealBreakdown?: boolean;
+  },
 ): ReimburseResult {
   const flag = db.prepare(`
     SELECT f.*, p.outlet_id AS purchase_outlet_id
@@ -856,9 +868,12 @@ export function closeReimbursementWithPettyCash(
       throw new RetailError('Amount cannot be finer than a paisa (2 decimal places).');
     }
     if (r2(asked) !== owed) {
+      const breakdown = args.revealBreakdown === true
+        ? ` (${flag.bottles} × ${fmtRs(toPaise(Number(flag.rate_paid_per_bottle)))})`
+        : '';
       throw new RetailError(
-        `A payout closes a wine-shop claim only in full. ${fmtRs(toPaise(owed))} is owed `
-        + `(${flag.bottles} × ${fmtRs(toPaise(Number(flag.rate_paid_per_bottle)))}), but ${fmtRs(toPaise(r2(asked)))} was sent. `
+        `A payout closes a wine-shop claim only in full. ${fmtRs(toPaise(owed))} is owed${breakdown}, `
+        + `but ${fmtRs(toPaise(r2(asked)))} was sent. `
         + `There is nowhere on the record to store a part-payment, so closing it for less would erase the rest of the debt `
         + `from the "unreimbursed staff spend" total. Pay the full amount, or reject the claim and settle it outside the cash book.`,
         400, 'amount_mismatch',
@@ -1011,6 +1026,12 @@ export function closeReimbursementWithPettyCash(
 
 /* ── Corrections: the rest of the lifecycle ─────────────────────────────────*/
 
+const readFlag = (db: Database, flagId: string): any => {
+  const flag = db.prepare('SELECT * FROM lq_retail_flags WHERE id = ?').get(flagId) as any;
+  if (!flag) throw new RetailError('That wine-shop record no longer exists.', 404, 'flag_not_found');
+  return flag;
+};
+
 /**
  * Backfill the depot landed rate on a flag recorded before the brand was mapped.
  *
@@ -1022,13 +1043,12 @@ export function closeReimbursementWithPettyCash(
  * Only a flag with NO depot rate can be backfilled. A rate already frozen at
  * entry stays frozen — re-pricing last quarter's emergency buy against today's
  * depot cost is exactly what the freezing rule exists to prevent.
+ *
+ * checkBackfill refuses (writing nothing); writeBackfill writes. They are split
+ * so correctRetailFlag can run EVERY check of a two-part PATCH before EITHER
+ * write — see there.
  */
-export function backfillDepotLanded(
-  db: Database,
-  args: { flagId: string; depotLandedPerBottle: number; actorEmail: string },
-): { flagId: string; depotLandedPerBottle: number; excess: RetailExcess } {
-  const flag = db.prepare('SELECT * FROM lq_retail_flags WHERE id = ?').get(args.flagId) as any;
-  if (!flag) throw new RetailError('That wine-shop record no longer exists.', 404, 'flag_not_found');
+function checkBackfill(flag: any, depotLandedPerBottle: number): { depot: number; excess: RetailExcess } {
   if (Number(flag.depot_landed_per_bottle) > 0) {
     // THE FIGURE IS NOT QUOTED. This refusal reaches anyone with can_procure on
     // the store, for ANY buy (flag ids are on the store ledger's notes), and a
@@ -1043,34 +1063,45 @@ export function backfillDepotLanded(
       409, 'already_priced',
     );
   }
-  const depot = Number(args.depotLandedPerBottle);
+  const depot = Number(depotLandedPerBottle);
   if (!Number.isFinite(depot) || depot <= 0) {
     throw new RetailError('The depot landed cost per bottle must be a number greater than 0.');
   }
-  const excess = computeRetailExcess(Number(flag.rate_paid_per_bottle), r2(depot), Number(flag.bottles));
+  return { depot: r2(depot), excess: computeRetailExcess(Number(flag.rate_paid_per_bottle), r2(depot), Number(flag.bottles)) };
+}
 
-  const run = db.transaction(() => {
-    const res = db.prepare(`
-      UPDATE lq_retail_flags
-         SET depot_landed_per_bottle = ?, excess_per_bottle = ?, excess_total = ?, excess_pct = ?,
-             updated_at = datetime('now')
-       WHERE id = ? AND COALESCE(depot_landed_per_bottle, 0) <= 0
-    `).run(r2(depot), excess.excessPerBottle, excess.excessTotal, excess.excessPct, args.flagId);
-    if (res.changes !== 1) {
-      throw new RetailError('This buy was priced by another action — nothing was changed.', 409, 'raced');
-    }
-    logAuditEvent(db, {
-      event_type: 'liquor_retail.backfill_depot_rate',
-      entity_type: 'lq_retail_flags',
-      entity_id: args.flagId,
-      actor_email: args.actorEmail,
-      before: { depot_landed_per_bottle: Number(flag.depot_landed_per_bottle) || 0, excess_total: Number(flag.excess_total) || 0 },
-      after: { depot_landed_per_bottle: r2(depot), ...excess },
-      note: `Depot rate backfilled for wine-shop bill ${flag.bill_ref || '(no bill no)'} — excess now ${fmtRs(toPaise(excess.excessTotal))} (${excess.excessPct}%)`,
-    });
+/** The backfill's write + audit. Call inside a transaction, after checkBackfill. */
+function writeBackfill(db: Database, flag: any, depot: number, excess: RetailExcess, actorEmail: string): void {
+  const res = db.prepare(`
+    UPDATE lq_retail_flags
+       SET depot_landed_per_bottle = ?, excess_per_bottle = ?, excess_total = ?, excess_pct = ?,
+           updated_at = datetime('now')
+     WHERE id = ? AND COALESCE(depot_landed_per_bottle, 0) <= 0
+  `).run(depot, excess.excessPerBottle, excess.excessTotal, excess.excessPct, flag.id);
+  if (res.changes !== 1) {
+    throw new RetailError('This buy was priced by another action — nothing was changed.', 409, 'raced');
+  }
+  logAuditEvent(db, {
+    event_type: 'liquor_retail.backfill_depot_rate',
+    entity_type: 'lq_retail_flags',
+    entity_id: flag.id,
+    actor_email: actorEmail,
+    before: { depot_landed_per_bottle: Number(flag.depot_landed_per_bottle) || 0, excess_total: Number(flag.excess_total) || 0 },
+    after: { depot_landed_per_bottle: depot, ...excess },
+    note: `Depot rate backfilled for wine-shop bill ${flag.bill_ref || '(no bill no)'} — excess now ${fmtRs(toPaise(excess.excessTotal))} (${excess.excessPct}%)`,
   });
-  run.immediate();
-  return { flagId: args.flagId, depotLandedPerBottle: r2(depot), excess };
+}
+
+export function backfillDepotLanded(
+  db: Database,
+  args: { flagId: string; depotLandedPerBottle: number; actorEmail: string },
+): { flagId: string; depotLandedPerBottle: number; excess: RetailExcess } {
+  return db.transaction(() => {
+    const flag = readFlag(db, args.flagId);
+    const { depot, excess } = checkBackfill(flag, args.depotLandedPerBottle);
+    writeBackfill(db, flag, depot, excess, args.actorEmail);
+    return { flagId: args.flagId, depotLandedPerBottle: depot, excess };
+  }).immediate();
 }
 
 /**
@@ -1083,20 +1114,20 @@ export function backfillDepotLanded(
  * approved could never be paid. All three are correctable here.
  *
  * 'reimbursed' IS NOT WRITABLE HERE, in either direction: it is reached only by
- * a real payout (closeReimbursementWithPettyCash) and left only by deleting that
- * payout, which reopens the claim. That keeps the invariant the whole design
+ * a real payout (closeReimbursementWithPettyCash), and in the running app it is
+ * FINAL. The FK would reopen the claim if the payout row were deleted, but the
+ * petty cash book has no DELETE (petty-cash/route.ts: append-only, corrected by
+ * a visible entry), and a correcting entry there — a 'return' cash-in, or a
+ * Management 'adjustment' — is a separate row that leaves petty_cash_id where
+ * it is. So the refusal below must not send anyone to "delete or reverse" a
+ * payout: neither reopens the claim. That keeps the invariant the whole design
  * rests on — the settled state always has cash behind it.
  */
-export function setReimbursementStatus(
-  db: Database,
-  args: { flagId: string; status: LqReimbursementStatus; actorEmail: string; note?: string },
-): { flagId: string; from: LqReimbursementStatus; to: LqReimbursementStatus } {
-  const flag = db.prepare('SELECT * FROM lq_retail_flags WHERE id = ?').get(args.flagId) as any;
-  if (!flag) throw new RetailError('That wine-shop record no longer exists.', 404, 'flag_not_found');
-  if (!(LQ_REIMBURSEMENT_STATUS as readonly string[]).includes(args.status)) {
+function checkStatus(flag: any, status: string): LqReimbursementStatus {
+  if (!(LQ_REIMBURSEMENT_STATUS as readonly string[]).includes(status)) {
     throw new RetailError(`reimbursement_status must be one of: ${LQ_REIMBURSEMENT_STATUS.join(', ')}.`);
   }
-  if (args.status === 'reimbursed') {
+  if (status === 'reimbursed') {
     throw new RetailError(
       "'reimbursed' is set only by a real petty-cash payout, never typed — use the reimburse action.",
       400, 'reimbursed_not_writable',
@@ -1104,36 +1135,95 @@ export function setReimbursementStatus(
   }
   if (flag.reimbursement_status === 'reimbursed' && flag.petty_cash_id) {
     throw new RetailError(
-      'This claim was closed by a petty-cash payout. Delete or reverse that payout first — the status follows the cash, not the other way round.',
+      'This claim was closed by a petty-cash payout, and that is final: the petty cash book has no delete, and a correcting '
+      + 'entry there (a "Return / refund" cash-in, or a Management "Adjustment") puts the money back in the box as a separate '
+      + 'entry — this claim keeps its payout and stays Reimbursed. The status follows the cash, not the other way round.',
       409, 'payout_backed',
     );
   }
-  if (flag.reimbursement_status === args.status) {
-    throw new RetailError(`This claim is already "${args.status}".`, 409, 'no_change');
+  if (flag.reimbursement_status === status) {
+    throw new RetailError(`This claim is already "${status}".`, 409, 'no_change');
   }
+  return status as LqReimbursementStatus;
+}
 
-  const run = db.transaction(() => {
-    const res = db.prepare(`
-      UPDATE lq_retail_flags
-         SET reimbursement_status = ?, updated_at = datetime('now')
-       WHERE id = ? AND reimbursement_status = ? AND petty_cash_id IS NULL
-    `).run(args.status, args.flagId, flag.reimbursement_status);
-    if (res.changes !== 1) {
-      throw new RetailError('This claim changed under you — nothing was written.', 409, 'raced');
-    }
-    logAuditEvent(db, {
-      event_type: 'liquor_retail.status',
-      entity_type: 'lq_retail_flags',
-      entity_id: args.flagId,
-      actor_email: args.actorEmail,
-      before: { reimbursement_status: flag.reimbursement_status },
-      after: { reimbursement_status: args.status },
-      note: `Wine-shop claim ${flag.bill_ref || '(no bill no)'}: ${flag.reimbursement_status} → ${args.status}`
-        + (args.note ? ` — ${String(args.note).slice(0, 300)}` : ''),
-    });
+/** The status write + audit. Call inside a transaction, after checkStatus. */
+function writeStatus(db: Database, flag: any, status: LqReimbursementStatus, actorEmail: string, note?: string): void {
+  const res = db.prepare(`
+    UPDATE lq_retail_flags
+       SET reimbursement_status = ?, updated_at = datetime('now')
+     WHERE id = ? AND reimbursement_status = ? AND petty_cash_id IS NULL
+  `).run(status, flag.id, flag.reimbursement_status);
+  if (res.changes !== 1) {
+    throw new RetailError('This claim changed under you — nothing was written.', 409, 'raced');
+  }
+  logAuditEvent(db, {
+    event_type: 'liquor_retail.status',
+    entity_type: 'lq_retail_flags',
+    entity_id: flag.id,
+    actor_email: actorEmail,
+    before: { reimbursement_status: flag.reimbursement_status },
+    after: { reimbursement_status: status },
+    note: `Wine-shop claim ${flag.bill_ref || '(no bill no)'}: ${flag.reimbursement_status} → ${status}`
+      + (note ? ` — ${String(note).slice(0, 300)}` : ''),
   });
-  run.immediate();
-  return { flagId: args.flagId, from: flag.reimbursement_status, to: args.status };
+}
+
+export function setReimbursementStatus(
+  db: Database,
+  args: { flagId: string; status: LqReimbursementStatus; actorEmail: string; note?: string },
+): { flagId: string; from: LqReimbursementStatus; to: LqReimbursementStatus } {
+  return db.transaction(() => {
+    const flag = readFlag(db, args.flagId);
+    const to = checkStatus(flag, args.status);
+    writeStatus(db, flag, to, args.actorEmail, args.note);
+    return { flagId: args.flagId, from: flag.reimbursement_status as LqReimbursementStatus, to };
+  }).immediate();
+}
+
+/**
+ * One PATCH, both corrections, ALL OR NOTHING.
+ *
+ * PATCH /api/liquor/retail/[id] takes a depot rate and a claim status in one
+ * body. It used to call backfillDepotLanded and then setReimbursementStatus,
+ * each in its own transaction, so a request whose STATUS was refused (409
+ * no_change / payout_backed, 400 'reimbursed') had already frozen its RATE:
+ * the caller was told "refused" and the record had changed (measured on the
+ * copy: rate 1,200 + status unchanged → 409, and the flag carried depot 1,200
+ * and its excess). Now the flag is read once inside ONE IMMEDIATE transaction,
+ * every check of both parts runs, and only then does either write — so a
+ * refused request writes nothing, rate and audit row included.
+ */
+export function correctRetailFlag(
+  db: Database,
+  args: {
+    flagId: string; actorEmail: string;
+    depotLandedPerBottle?: number | null;
+    status?: string | null; note?: string;
+  },
+): {
+  flagId: string;
+  rate: { depotLandedPerBottle: number; excess: RetailExcess } | null;
+  status: { from: LqReimbursementStatus; to: LqReimbursementStatus } | null;
+} {
+  const hasRate = args.depotLandedPerBottle !== undefined && args.depotLandedPerBottle !== null;
+  const hasStatus = args.status !== undefined && args.status !== null && String(args.status).trim() !== '';
+  if (!hasRate && !hasStatus) throw new RetailError('Nothing to change.', 400, 'nothing_to_change');
+  return db.transaction(() => {
+    const flag = readFlag(db, args.flagId);
+    // EVERY check first …
+    const rate = hasRate ? checkBackfill(flag, Number(args.depotLandedPerBottle)) : null;
+    const to = hasStatus ? checkStatus(flag, String(args.status)) : null;
+    // … then the writes. Neither write touches the column the other's WHERE
+    // reads, so the order between them changes nothing.
+    if (rate) writeBackfill(db, flag, rate.depot, rate.excess, args.actorEmail);
+    if (to) writeStatus(db, flag, to, args.actorEmail, args.note);
+    return {
+      flagId: args.flagId,
+      rate: rate ? { depotLandedPerBottle: rate.depot, excess: rate.excess } : null,
+      status: to ? { from: flag.reimbursement_status as LqReimbursementStatus, to } : null,
+    };
+  }).immediate();
 }
 
 /* ── §E DATA for the L5 Reconciliation Summary ──────────────────────────────*/
@@ -1222,6 +1312,17 @@ export interface RetailExcessSummary {
  * re-querying lq_retail_flags, so a change to these definitions lands in one
  * place.
  *
+ * STORE SCOPE. With `storeId`, the BUYS are that store's too, not only the
+ * depot spend: a floor bar's §E used to list every wine-shop buy in the house
+ * against the floor bar's own depot spend (₹0 — a floor bar receives by
+ * transfer), i.e. 100% "wine-shop share" of buys it never made. A buy belongs
+ * to the store it was BOOKED INTO: its store_stock_ledger row's store_id.
+ * A buy with no ledger row — COST-ONLY (ruling 39), a LEGACY flag (stock went
+ * central), or a ledger cleared by reset-liquor — belongs to its material's own
+ * store (materialStoreId), which is the one store recordWineShopPurchase books
+ * any buy into. lq_retail_flags has no store column. Without `storeId` every
+ * buy is counted, exactly as before.
+ *
  * MANAGEMENT-ONLY DATA. The rows name who fronted money and what they are owed,
  * and the totals are depot spend and the price of running out — the same §E the
  * management-only Reconciliation Summary shows. Every route that returns this
@@ -1243,28 +1344,43 @@ export function retailExcessSummary(
   // row, so reading them off one (the first version) returned NULL for every
   // buy: no material name, no outlet, and an outlet-scoped view that hid them
   // all. The purchases join survives only as a second source for a legacy flag.
-  const rows = db.prepare(`
+  // Every join is on a primary key, so no flag is ever counted twice.
+  const allRows = db.prepare(`
     SELECT f.id, f.purchase_id, f.ledger_id, f.bill_ref, f.date, f.shop_name, f.shop_licence_no,
            f.bottles, f.rate_paid_per_bottle, f.depot_landed_per_bottle,
            f.excess_per_bottle, f.excess_total, f.excess_pct, f.paid_by, f.payment_mode,
            f.reimbursement_status, f.petty_cash_id, f.reason, f.approved_by,
            COALESCE(f.material_id, p.material_id) AS material_id, rm.name AS material_name,
-           COALESCE(f.outlet_id, p.outlet_id)     AS outlet_id
+           rm.category                            AS material_category,
+           COALESCE(f.outlet_id, p.outlet_id)     AS outlet_id,
+           l.store_id                             AS ledger_store_id
       FROM lq_retail_flags f
       LEFT JOIN purchases p     ON p.id = f.purchase_id
       LEFT JOIN raw_materials rm ON rm.id = COALESCE(f.material_id, p.material_id)
+      LEFT JOIN store_stock_ledger l ON l.id = f.ledger_id
      WHERE f.date >= ? AND f.date <= ?
-       ${scoped ? "AND COALESCE(f.outlet_id, p.outlet_id, '') = ?" : ''}
      ORDER BY f.date DESC, f.created_at DESC
-  `).all(...(scoped ? [from, to, String(args.outletId)] : [from, to])) as any[];
+  `).all(from, to) as any[];
+
+  // The store each buy was booked into (see STORE SCOPE above).
+  const storeScope = args.storeId != null && String(args.storeId).trim() !== '' ? String(args.storeId) : null;
+  const ownStore = new Map<string, string | null>();
+  const bookedStore = (f: any): string | null => {
+    if (f.ledger_store_id) return String(f.ledger_store_id);
+    const cat = String(f.material_category ?? '');
+    if (!ownStore.has(cat)) ownStore.set(cat, cat ? materialStoreId(db, { category: cat }) : null);
+    return ownStore.get(cat) ?? null;
+  };
+  const storeRows = storeScope ? allRows.filter((f) => bookedStore(f) === storeScope) : allRows;
 
   // What the outlet filter dropped. A flag recorded with no outlet
   // vanishes from an outlet-scoped view; the caller is told how many, so a screen
-  // can offer "show all outlets" instead of quietly under-reporting.
-  const inRange = scoped
-    ? (db.prepare('SELECT COUNT(*) AS c FROM lq_retail_flags WHERE date >= ? AND date <= ?').get(from, to) as any)?.c ?? 0
-    : rows.length;
-  const hiddenByOutletCount = Math.max(0, Number(inRange) - rows.length);
+  // can offer "show all outlets" instead of quietly under-reporting. Counted
+  // inside the store scope: another store's buys are not "another outlet's".
+  const rows = scoped
+    ? storeRows.filter((f) => String(f.outlet_id ?? '') === String(args.outletId))
+    : storeRows;
+  const hiddenByOutletCount = Math.max(0, storeRows.length - rows.length);
 
   const byStatus: Record<LqReimbursementStatus, number> = {
     not_required: 0, claimed_pending: 0, reimbursed: 0, rejected: 0,
