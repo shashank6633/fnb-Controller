@@ -1073,10 +1073,11 @@ const readFlag = (db: Database, flagId: string): any => {
  */
 function checkBackfill(flag: any, depotLandedPerBottle: number): { depot: number; excess: RetailExcess } {
   if (Number(flag.depot_landed_per_bottle) > 0) {
-    // THE FIGURE IS NOT QUOTED. This refusal reaches anyone with can_procure on
-    // the store, for ANY buy (flag ids are on the store ledger's notes), and a
-    // frozen rate resolved from the Brand Map can BE the TGBCL master per bottle
-    // — admin-only (see RETAIL_DEPOT_WITHHELD_NOTE).
+    // THE FIGURE IS NOT QUOTED. This refusal reaches every manager and HOD the
+    // PATCH gate admits (management only since 2026-11-05; before that, anyone
+    // with can_procure), for ANY buy, and a frozen rate resolved from the Brand
+    // Map can BE the TGBCL master per bottle — admin-only (see
+    // RETAIL_DEPOT_WITHHELD_NOTE).
     // It used to say "already carries a depot rate of ₹760.28": a read-only
     // oracle onto the master, measured for every buy on the copy. Whoever may see
     // the rate sees it on the Wine-shop buys register.

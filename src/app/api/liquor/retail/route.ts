@@ -241,7 +241,10 @@ export async function POST(request: Request) {
           result.depotSource === 'unknown'
             ? 'Depot landed cost is unknown for this item (no TGBCL indent of it with a rate paid is recorded by this date, the TGBCL Brand Map gives no priced pack for it, and no depot rate was supplied) — '
               + 'the excess was recorded as 0 and is excluded from the "price of running out" total. '
-              + `Supply it later with PATCH /api/liquor/retail/${result.flagId} { "depot_landed_per_bottle": … } and the excess is computed then.`
+              // Read verbatim by the RECORDER, who may be the bar storekeeper: name
+              // who can act (owner decision (a) — pricing a saved buy is
+              // management only), not a route they would be refused on.
+              + 'A manager, HOD or admin can price it later on the Liquor Store page → Wine-shop buys → Set depot rate, and the excess is computed then.'
             : '',
         ].filter(Boolean);
         return parts.length ? { warning: parts.join(' ') } : {};

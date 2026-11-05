@@ -31,7 +31,9 @@ import { LQ_RECON_PAGE } from '@/lib/liquor-summary';
  * manager). READING the register is §E money, so it is MANAGEMENT ONLY and
  * needs a page that shows it, the same two halves as the Reconciliation Summary
  * (requireRetailView); its depot rate and excess are ADMIN ONLY on top of that
- * (revealDepotFigures). REIMBURSING a claim moves money out of the petty cash box, so it
+ * (revealDepotFigures). CHANGING a saved buy — pricing it, correcting its claim
+ * — is that same management read gate (requireRetailCorrect; owner decision
+ * (a), 2026-11-05), not the recording one. REIMBURSING a claim moves money out of the petty cash box, so it
  * gates at the petty-cash write level (Management or the Store Manager) AND
  * requires access to the petty-cash page — you may only pay out of a book you
  * may see, exactly as /api/petty-cash itself insists.
@@ -190,6 +192,38 @@ export async function requireSignedInWrite(request: Request): Promise<Gate | Gat
     return { ok: false, status: 403, error: 'CSRF token missing or mismatched. Refresh the page.' };
   }
   return { ok: true, user };
+}
+
+/**
+ * CORRECT gate (PATCH /api/liquor/retail/[id]): signed in + CSRF + the
+ * register's own read gate — MANAGEMENT (Admin, Manager, HOD) and a page that
+ * shows the register. Owner decision (a), 2026-11-05: changing a SAVED buy —
+ * pricing one saved without a depot rate, or correcting its claim — is
+ * management only. It used to follow recording (can_procure), so the bar
+ * storekeeper who fronted the money could mark their own claim "not required"
+ * or set the rate their excess is measured against. Recording a NEW buy is
+ * unchanged (requireRetailRecord). Runs before the record is looked up, so a
+ * refused caller learns nothing about whether the id exists.
+ */
+export async function requireRetailCorrect(request: Request, db: Database): Promise<Gate | GateFail> {
+  const pre = await requireSignedInWrite(request);
+  if (!pre.ok) return pre;
+  const why = retailRegisterRefusal(db, pre.user);
+  if (why === 'not_management') {
+    return {
+      ok: false, status: 403,
+      error: 'Only managers, HODs and admins can change a saved wine-shop buy (its depot rate or its claim). '
+        + 'Recording a new buy is not affected — ask a manager to price or correct this one. Nothing was changed.',
+    };
+  }
+  if (why === 'no_page') {
+    return {
+      ok: false, status: 403,
+      error: 'Your page access does not include the wine-shop register, so you cannot change a buy on it — it is shown on the '
+        + 'Liquor Reconciliation Summary and on the Liquor Store page\'s Wine-shop buys tab. Nothing was changed.',
+    };
+  }
+  return pre;
 }
 
 /**

@@ -1,7 +1,7 @@
 import { getDb } from '@/lib/db';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import { correctRetailFlag, retailErrorResponse } from '@/lib/liquor-retail';
-import { requireRetailRecord, requireSignedInWrite, gateResponse, canReadRetailRegister } from '../_lib/guard';
+import { requireRetailCorrect, gateResponse } from '../_lib/guard';
 
 /**
  * PATCH /api/liquor/retail/[id] — the rest of a wine-shop record's lifecycle.
@@ -36,15 +36,17 @@ import { requireRetailRecord, requireSignedInWrite, gateResponse, canReadRetailR
  * rate already frozen — writes nothing. It used to save the rate and only then
  * refuse the status, answering 409 over a record it had just changed.
  *
- * Gated exactly like recording (can_procure on the material's own store) and
- * CSRF-checked in the guard, because '/api/liquor' is not in the proxy's CSRF
- * prefix list. Reimbursing stays on its own route at the petty-cash write level:
- * correcting a record and moving money are not the same authority.
+ * MANAGEMENT ONLY (owner decision (a), 2026-11-05): Admin, Manager or HOD with
+ * a page that shows the register — requireRetailCorrect, the register's own
+ * read gate. It used to be gated like RECORDING (can_procure on the material's
+ * store), which let the storekeeper who fronted the money re-status their own
+ * claim or set the rate their excess is measured against. Recording a new buy
+ * keeps the can_procure gate (POST /api/liquor/retail). CSRF is checked in the
+ * guard, because '/api/liquor' is not in the proxy's CSRF prefix list.
+ * Reimbursing stays on its own route at the petty-cash write level: correcting
+ * a record and moving money are not the same authority.
  *
- * What it SAYS is narrower than who may call it: a frozen rate is refused
- * without being quoted (backfillDepotLanded), and the recomputed excess is
- * returned only to a viewer the register admits (canReadRetailRegister) —
- * see the hasRate branch.
+ * A frozen rate is still refused without being quoted (backfillDepotLanded).
  */
 export const dynamic = 'force-dynamic';
 
@@ -53,28 +55,14 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const { id } = await params;
     if (!id) return Response.json({ error: 'A wine-shop record id is required.' }, { status: 400 });
 
-    // GATE BEFORE LOOKUP. Sign-in and CSRF first: the record lookup used to run
-    // ahead of every check, so an anonymous caller got 404 "no longer exists"
-    // where it should get 401 — the wrong refusal, and an existence oracle.
-    const pre = await requireSignedInWrite(request);
-    if (!pre.ok) return gateResponse(pre);
-
+    // GATE BEFORE LOOKUP. Sign-in, CSRF and the management gate all run before
+    // the record is read: an anonymous caller gets 401 and a storekeeper 403
+    // whether the id exists or not — never a 404 that confirms it does.
     const db = getDb();
-    // Resolve the record's own material so the gate asks about the store the
-    // bottles were booked into — never a store the caller merely names. The
-    // flag carries it; a LEGACY flag's parent purchase is the second source.
-    const flag = db.prepare(`
-      SELECT f.id, COALESCE(f.material_id, p.material_id) AS material_id
-        FROM lq_retail_flags f
-        LEFT JOIN purchases p ON p.id = f.purchase_id
-       WHERE f.id = ?
-    `).get(id) as { id: string; material_id: string | null } | undefined;
-
-    // A missing record is reported only to someone who could have edited one:
-    // the store gate runs on the liquor store itself, so a signed-in user with
-    // no procure right gets the same 403 whether the id exists or not.
-    const gate = await requireRetailRecord(request, db, flag?.material_id || undefined);
+    const gate = await requireRetailCorrect(request, db);
     if (!gate.ok) return gateResponse(gate);
+
+    const flag = db.prepare('SELECT id FROM lq_retail_flags WHERE id = ?').get(id) as { id: string } | undefined;
     if (!flag) return Response.json({ error: 'That wine-shop record no longer exists.' }, { status: 404 });
 
     const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
@@ -118,14 +106,11 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     if (res.rate) {
       // The rate is the caller's own figure — echoing it tells them nothing.
       out.depot_landed_per_bottle = res.rate.depotLandedPerBottle;
-      // The EXCESS is not: it is the rate paid minus that figure, so it hands
-      // over SOMEONE ELSE'S retail price (measured: a can_procure bartender
-      // outside management priced a colleague's buy at ₹90 and was told excess
-      // ₹60/bottle — paid ₹150). Reading the money behind a buy is a management
-      // authority, never a can_procure one (requireRetailView), so only a
-      // viewer the register itself admits — who sees the rate paid there
-      // already — gets it. The POST duplicate refusal uses the same predicate.
-      if (canReadRetailRegister(db, gate.user)) out.excess = res.rate.excess;
+      // The EXCESS is the rate paid minus that figure. It goes back because the
+      // gate above IS the register's read gate: this caller already sees every
+      // rate paid on the register. (Under the old can_procure gate a bartender
+      // outside management was quoted a colleague's retail price this way.)
+      out.excess = res.rate.excess;
     }
     if (res.status) {
       out.reimbursement_status = res.status.to;

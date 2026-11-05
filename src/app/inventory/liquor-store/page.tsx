@@ -364,11 +364,11 @@ export default function LiquorStorePage() {
   const liquorStoreRow = stores.find(s => String(s.name || '').trim().toUpperCase() === 'LIQUOR STORE');
   const canRetailTab = meMgmt === true && !!liquorStoreRow && !!accessByStore[liquorStoreRow.id]?.can_view;
   /* Pricing an unpriced buy and correcting a claim are PATCH
-     /api/liquor/retail/[id], gated on can_procure on the material's own store.
-     The register spans stores, so the screen offers those two actions to
-     anyone holding can_procure on ANY active store and leaves the per-material
-     decision to the route, whose refusal is shown verbatim. */
-  const canCorrectRetail = Object.values(accessByStore).some(a => a?.can_procure);
+     /api/liquor/retail/[id], MANAGEMENT ONLY (owner decision (a), 2026-11-05):
+     the route's gate is the register's own read gate, which is exactly the
+     test this tab is offered on — so whoever sees the register sees the two
+     buttons, and nobody else is offered an action the route would refuse. */
+  const canCorrectRetail = canRetailTab;
   useEffect(() => {
     if (tab === 'retail' && !canRetailTab) setTab('stock');
   }, [tab, canRetailTab]);
@@ -2301,8 +2301,8 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                  and no depot rate was supplied"). One sentence, in words. */
               <div>
                 Depot landed cost <b>unknown</b> — the excess was <b>not computed</b> for this buy
-                (stored as 0 and left out of the “price of running out” total). A manager can price it
-                later from the <b>Wine-shop buys</b>{' '}tab → <b>Set depot rate</b>.
+                (stored as 0 and left out of the “price of running out” total). A manager, HOD or admin
+                can price it later from the <b>Wine-shop buys</b>{' '}tab → <b>Set depot rate</b>.
               </div>
             ) : (
               <div>

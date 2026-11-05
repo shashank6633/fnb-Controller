@@ -30,9 +30,10 @@
  * excess paid, depot spend and what is owed to named staff. Recording a buy
  * (the Wine-shop Purchase button, can_procure) is a stock authority and does
  * not open it. Inside, two write gates apply:
- *   · Set depot rate / Change claim — PATCH, can_procure on the material's own
- *     store. Offered only when `canCorrect` (the page: can_procure on any active
- *     store); the route decides per material and its refusal is shown verbatim.
+ *   · Set depot rate / Change claim — PATCH, MANAGEMENT ONLY (owner decision
+ *     (a), 2026-11-05): the route's gate is this register's own read gate, so
+ *     the page passes `canCorrect` = the test the tab itself is offered on.
+ *     The bar storekeeper still RECORDS buys (the Wine-shop Purchase button).
  *   · Pay back — the petty-cash gate (Petty Cash page access + Management or
  *     the Store Manager). Not re-implemented here: a refusal comes back as the
  *     route's sentence. Duplicating the rule is how a read path and a write path
@@ -283,7 +284,7 @@ export function RowActions({ r, onAction, canCorrect = true }: {
 export function RegisterView({ summary, rows, materials, onAction, canCorrect = true }: {
   summary: RetailSummary; rows: RetailFlag[]; materials: UnitMat[];
   onAction: (a: Action) => void;
-  /** Offer Set depot rate / Change claim (PATCH, can_procure). */
+  /** Offer Set depot rate / Change claim (PATCH, management only). */
   canCorrect?: boolean;
 }) {
   const mats = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
@@ -428,7 +429,7 @@ function Tile({ label, value, sub, tone = 'muted' }: { label: string; value: str
 
 export default function WineShopRegister({ materials, canCorrect, refreshKey, onFlash }: {
   materials: UnitMat[];
-  /** can_procure on any active store — offers Set depot rate / Change claim. */
+  /** Management with the register (the tab's own test) — offers Set depot rate / Change claim. */
   canCorrect: boolean;
   /** Bumped by the page when the Wine-shop Purchase modal records a buy. */
   refreshKey: number;
@@ -476,8 +477,8 @@ export default function WineShopRegister({ materials, canCorrect, refreshKey, on
           its excess is counted. <b>Change claim</b>{' '}corrects whether anyone is owed. None of these
           changes stock, average price or recipe costs.
           {!canCorrect && (
-            <>{' '}<b>Set depot rate</b>{' '}and <b>Change claim</b>{' '}need purchase rights on the liquor store,
-              which this login does not have — they are not shown.</>
+            <>{' '}<b>Set depot rate</b>{' '}and <b>Change claim</b>{' '}are for managers, HODs and admins only,
+              so they are not shown to this login.</>
           )}
           {summary?.depotFiguresNote && <>{' '}{summary.depotFiguresNote}</>}
         </span>

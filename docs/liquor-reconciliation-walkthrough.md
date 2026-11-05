@@ -55,7 +55,9 @@ or the TGBCL bill charges you already ship (f732956, 3a67ac9); it extends them.
 Access is re-checked on the server for every route, not just in the sidebar: Brand Map and
 Withdrawals are **admin only**, Wallet and Reconciliation are **management** (admin / manager /
 HOD), and the wine-shop button follows the ordinary liquor purchase permission (`can_procure` on
-the liquor store).
+the liquor store). Changing a wine-shop buy once it is saved — pricing one saved without a depot
+rate, or correcting its claim — is **management only** (Admin, Manager, HOD; owner decision
+2026-11-05): the bar storekeeper records the buy, management prices and corrects it.
 
 ---
 
