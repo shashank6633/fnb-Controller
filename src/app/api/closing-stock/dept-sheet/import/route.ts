@@ -611,7 +611,7 @@ export async function POST(request: Request) {
       if (pk === '') {
         errors.push({
           line: records[0].line, label: String(h).trim(),
-          reason: `column "${String(h).trim()}" has no department prefix. This importer needs one column per department (e.g. "${validNames[0] || 'CONTI'} Physical count"). For a one-department file use Closing Stock → upload instead.`,
+          reason: `column "${String(h).trim()}" has no department prefix. This importer needs one column per department (e.g. "${validNames[0] || 'CONTI'} Physical count"). For a one-department file use the upload on Closing Stock — One Department instead.`,
         });
         return;
       }

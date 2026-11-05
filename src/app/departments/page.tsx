@@ -563,7 +563,7 @@ export default function DepartmentsPage() {
                   {areaOptions.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
                 </select>
                 <span className="text-[10px] text-[#8B7355]">
-                  Groups departments for the area totals on Closing Stock. Add, rename or switch off areas under Manage Areas.
+                  Groups departments for the area totals on Closing Stock — One Department. Add, rename or switch off areas under Manage Areas.
                   {pickedArea && pickedAreaRow && !pickedAreaRow.active && (
                     <> <b className="font-medium text-[#8a5a06]">{pickedAreaRow.label} is switched off:</b> this department keeps it, but it can’t be given to another department.</>
                   )}

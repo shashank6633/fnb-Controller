@@ -1465,7 +1465,7 @@ export function amendGrnLines(
                 // brought it in. Stating a cause the schema cannot support sent
                 // admins hunting requisitions that do not exist.
                 + `Where the difference went is not something the book can answer — there is no lot tracking, and the pool may have been short before this delivery ever arrived. `
-                + `Correct the balance with a physical count instead (Inventory → Closing Stock, then approve it on Variance Approvals): a count can move a balance that a receipt can no longer honestly move. Nothing was changed.`,
+                + `Correct the balance with a physical count instead (Inventory → Closing Stock — One Department, counted under Store / Overall, then approve it on Variance Approvals): a count can move a balance that a receipt can no longer honestly move. Nothing was changed.`,
               payload: {
                 materials: blocked.map(x => x.text),
                 materials_detail: blocked.map(x => ({

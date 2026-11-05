@@ -724,7 +724,7 @@ export default function ClosingSheetPage() {
     return (
       <div className="p-6 max-w-3xl mx-auto space-y-3">
         <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
-          <ClipboardCheck className="w-6 h-6 text-[#af4408]" /> Department Closing Sheet
+          <ClipboardCheck className="w-6 h-6 text-[#af4408]" /> Closing Stock — All Departments
         </h1>
         <div className={`rounded-lg p-4 text-sm flex items-center gap-2 ${
           denied ? 'bg-amber-50 border border-amber-200 text-amber-900'
@@ -741,7 +741,7 @@ export default function ClosingSheetPage() {
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex-1 min-w-[240px]">
           <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
-            <ClipboardCheck className="w-6 h-6 text-[#af4408]" /> Department Closing Sheet
+            <ClipboardCheck className="w-6 h-6 text-[#af4408]" /> Closing Stock — All Departments
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5">
             Every active department on one sheet — count each item where it sits.

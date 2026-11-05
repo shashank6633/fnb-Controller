@@ -98,7 +98,7 @@ const deptWord = (n: number) => `${n} department${n === 1 ? '' : 's'}`;
 /** Closing Stock already shows "Store / Overall" for counts with no area; an
  *  area of the same name would put two identical cards side by side. */
 const reservedLabel = (label: string) => label.toLowerCase() === STORE_BUCKET_LABEL.toLowerCase();
-const RESERVED_MSG = `"${STORE_BUCKET_LABEL}" is the name Closing Stock already uses for counts with no area. Pick another name.`;
+const RESERVED_MSG = `"${STORE_BUCKET_LABEL}" is the name Closing Stock — One Department already uses for counts with no area. Pick another name.`;
 /** "its 2 departments keep it" with the verb agreeing, for audit notes. */
 const keepers = (n: number) =>
   n === 0 ? 'no department uses it' : n === 1 ? 'its 1 department keeps it' : `its ${n} departments keep it`;

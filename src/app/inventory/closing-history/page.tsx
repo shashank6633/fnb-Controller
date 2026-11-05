@@ -1738,8 +1738,8 @@ const BydeptTable = memo(function BydeptTable({ data, filtered, onPickDate }: {
             ? 'Clear the item search, or pick another count date.'
             : data.latest_date
               ? 'Pick a date that has a count.'
-              : <>Counts recorded on the{' '}
-                  <Link href="/inventory/closing-sheet" className="text-[#af4408] hover:underline">Department Closing Sheet</Link>{' '}
+              : <>Counts recorded on{' '}
+                  <Link href="/inventory/closing-sheet" className="text-[#af4408] hover:underline">Closing Stock — All Departments</Link>{' '}
                   appear here from the moment they are saved.</>}
         </div>
         {data.latest_date && data.latest_date !== date && (
@@ -2153,9 +2153,9 @@ function EmptyState({ filtered, from, to }: { filtered: boolean; from: string; t
         <>
           No closing stock was recorded between {fmtISTDate(from)} and {fmtISTDate(to)}.
           <div className="text-xs text-[#B9A896] mt-1">
-            Counts recorded on the{' '}
+            Counts recorded on{' '}
             <Link href="/inventory/closing-sheet" className="text-[#af4408] hover:underline">
-              Department Closing Sheet
+              Closing Stock — All Departments
             </Link>{' '}
             appear here from the moment they are saved.
           </div>
