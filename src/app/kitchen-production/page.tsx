@@ -12,20 +12,34 @@
  *   - Open a batch to view its details + full transaction history
  *
  * Data model + API were built in stage A. This page only talks to:
- *   GET  /api/kitchen-production?status=&category=&search=
+ *   GET  /api/kitchen-production?status=&category=&search=&kind=
  *   POST /api/kitchen-production
  *   GET  /api/kitchen-production/[id]
+ *
+ * BREWERY PRODUCTION (owner ruling 114, 2026-11-05) is THIS SAME SCREEN served
+ * at /brewery-production (that page re-exports this one). The URL picks the
+ * variant: Kitchen lists items NOT ticked as Brewery items and their batches;
+ * Brewery lists only ticked items and their batches, and its batch-number box
+ * follows each item's own setting (automatic / typed / serial code + typed).
+ * Same API, same table, same cards, drawer, labels, scan and dashboard — the
+ * split is the opt-in `kind` parameter on the two list calls, nothing else.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
   User as UserIcon, AlertTriangle, CheckCircle2, History, Barcode as BarcodeIcon,
   Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle, ScanLine,
-  LayoutGrid, BarChart3, Trash2, Send, Undo2,
+  LayoutGrid, BarChart3, Trash2, Send, Undo2, Beer,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { canAccessPage, applyHodOnlyOverrides } from '@/lib/page-catalog';
+import {
+  BATCH_NUMBER_MAX, SERIAL_CODE_MAX, BATCH_NUMBER_MODE_LABEL, effectiveBatchNumberMode,
+  normalizeBatchNumberMode, cleanTypedValue, composeBatchNumber, type BatchNumberMode,
+} from '@/lib/production-batch-number';
 import { fmtIST, fmtISTDate, todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { parseDateTime } from '@/lib/production-batch';
 import { bridgePrint, probeBridge, bridgeStatus, listBridgePrinters, type BridgePrinter } from '@/lib/offline-print/bridge-client';
@@ -181,6 +195,10 @@ type FormState = {
   // is a supported save — the field never was mandatory.
   prepared_by: string; department_key: string; storage_location: string;
   recipe_id: string; remarks: string;
+  // Brewery only: what staff typed in the Batch Number box (the whole number,
+  // or — for a serial-code item — just the part after "<code>-"). Never sent
+  // by the Kitchen form.
+  batch_number_entry: string;
 };
 
 const blankForm = (preparedBy = ''): FormState => ({
@@ -190,7 +208,10 @@ const blankForm = (preparedBy = ''): FormState => ({
   shelf_life: '', quantity_produced: '', unit: '',
   prepared_by: preparedBy, department_key: '', storage_location: '',
   recipe_id: '', remarks: '',
+  batch_number_entry: '',
 });
+
+type Variant = 'kitchen' | 'brewery';
 
 // The New Production Batch department dropdown (src/lib/production-departments.ts).
 interface DepartmentOption {
@@ -207,6 +228,27 @@ interface ProductionDeptExtra { id: string; name: string; is_active: number; sor
 interface ProductionItem {
   id: string; name: string; category: string; unit: string;
   shelf_life_hours: number; default_storage_location: string; is_active: number;
+  // Brewery Production (ruling 114). Optional so an older server's rows still type-check.
+  is_brewery?: number;
+  batch_number_mode?: string;
+  batch_serial_code?: string;
+  /** Only when the list was asked for with_last_batch=1 — every status counts. */
+  last_batch?: { batch_number: string; production_date: string; production_time: string; status: string } | null;
+}
+
+/** The batch number the Brewery form will save, or an error to show — same rules as the server. */
+function previewBatchNumber(item: ProductionItem | undefined, entry: string):
+  { mode: BatchNumberMode; value: string; error: string | null } {
+  const mode = effectiveBatchNumberMode(item);
+  if (!item || mode === 'auto') return { mode, value: '', error: null };
+  const c = cleanTypedValue(entry, 'The batch number');
+  if (!c.ok) return { mode, value: '', error: c.error };
+  if (!c.value) return { mode, value: '', error: null };
+  const value = composeBatchNumber(mode, String(item.batch_serial_code || '').trim(), c.value);
+  return {
+    mode, value,
+    error: value.length > BATCH_NUMBER_MAX ? `That is ${value.length} characters — keep the batch number to ${BATCH_NUMBER_MAX} or fewer.` : null,
+  };
 }
 
 // Local-time expiry = production date/time + shelf-life hours (no TZ conversion).
@@ -279,6 +321,11 @@ async function printLabelViaBridge(id: string, opts: PrintOpts = {}): Promise<vo
 
 // ─── Page ───────────────────────────────────────────────────────────────
 export default function KitchenProductionPage() {
+  // /brewery-production renders this same component; the URL picks the list.
+  const pathname = usePathname();
+  const variant: Variant = (pathname || '').startsWith('/brewery-production') ? 'brewery' : 'kitchen';
+  const isBrewery = variant === 'brewery';
+
   const [batches, setBatches] = useState<Batch[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -294,6 +341,14 @@ export default function KitchenProductionPage() {
   const [form, setForm] = useState<FormState>(blankForm());
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  // Brewery form only: whether the error is about the Batch Number (shown under
+  // that box instead of at the foot of the form), and a counter so the same
+  // message set twice is still scrolled into view.
+  const [formErrorField, setFormErrorField] = useState<'batch_number' | null>(null);
+  const [formErrorSeq, setFormErrorSeq] = useState(0);
+  const failForm = (msg: string, field: 'batch_number' | null = null) => {
+    setFormError(msg); setFormErrorField(field); setFormErrorSeq(n => n + 1);
+  };
 
   // Detail drawer
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -315,14 +370,20 @@ export default function KitchenProductionPage() {
   const [justCreated, setJustCreated] = useState<{ id: string; batch_number: string } | null>(null);
 
   // Production Items master (fixed list the create form selects from).
+  // Each page offers only its own items: Kitchen → not ticked as Brewery;
+  // Brewery → ticked, with each item's latest batch for the hint on the form.
   const [pItems, setPItems] = useState<ProductionItem[]>([]);
+  const [pItemsLoaded, setPItemsLoaded] = useState(false);
   const [showItems, setShowItems] = useState(false);
   const loadPItems = useCallback(() => {
-    fetch('/api/kitchen-production/items', { credentials: 'same-origin' })
+    const url = isBrewery
+      ? '/api/kitchen-production/items?kind=brewery&with_last_batch=1'
+      : '/api/kitchen-production/items?kind=kitchen';
+    fetch(url, { credentials: 'same-origin' })
       .then(r => r.json())
-      .then(d => setPItems(Array.isArray(d?.items) ? d.items : []))
+      .then(d => { setPItems(Array.isArray(d?.items) ? d.items : []); setPItemsLoaded(true); })
       .catch(() => {});
-  }, []);
+  }, [isBrewery]);
   useEffect(() => { loadPItems(); }, [loadPItems]);
 
   // Departments for the New Production Batch dropdown, plus whether THIS user may
@@ -331,6 +392,7 @@ export default function KitchenProductionPage() {
   // the server's own write gate so we never render a control that would 403.
   const [deptGroups, setDeptGroups] = useState<DepartmentOptionGroup[]>([]);
   const [canManageProduction, setCanManageProduction] = useState(false);
+  const [manageKnown, setManageKnown] = useState(false);
   const [showProdSettings, setShowProdSettings] = useState(false);
   const loadDepartments = useCallback(() => {
     fetch('/api/kitchen-production/departments', { credentials: 'same-origin' })
@@ -338,10 +400,23 @@ export default function KitchenProductionPage() {
       .then(d => {
         setDeptGroups(Array.isArray(d?.groups) ? d.groups : []);
         setCanManageProduction(!!d?.can_manage);
+        setManageKnown(true);
       })
       .catch(() => {});
   }, []);
   useEffect(() => { loadDepartments(); }, [loadDepartments]);
+
+  // Brewery Production offers only what the server will do for this user:
+  // recording, printing, bulk-printing, item edits and batch actions are
+  // head chef / manager / admin writes (canManageKitchenProduction), so for
+  // anyone else the Brewery screen shows the batches without those buttons.
+  // Kitchen Production keeps its controls exactly as before.
+  const canWrite = !isBrewery || canManageProduction;
+
+  // Signed-in user, for page-access checks on the Brewery screen's links (the
+  // same canAccessPage the sidebar and proxy use).
+  const [meUser, setMeUser] = useState<Parameters<typeof canAccessPage>[1]>(null);
+  const canOpen = (href: string) => (!isBrewery ? true : !!meUser && canAccessPage(href, meUser));
 
   // Toast
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
@@ -365,6 +440,11 @@ export default function KitchenProductionPage() {
       setMeName(n);
       setCanEditPrinter(d?.user?.role === 'admin' || !!d?.user?.can_manage_label_printer);
       setForm(f => (f.prepared_by ? f : { ...f, prepared_by: n }));
+      // Same order and same value as the Sidebar (which applies it too): admin
+      // HOD-gate overrides first, then the user, so a link on the Brewery
+      // screen shows exactly when the proxy would let it open.
+      applyHodOnlyOverrides(d?.hod_only_overrides ?? null);
+      setMeUser(d?.user || null);
     }).catch(() => {});
     fetch('/api/recipes').then(r => r.json()).then(d => {
       const list: any[] = Array.isArray(d) ? d : (d.recipes || d.list || d.items || []);
@@ -440,6 +520,7 @@ export default function KitchenProductionPage() {
       const qs = new URLSearchParams({ status: statusFilter });
       if (category) qs.set('category', category);
       if (search.trim()) qs.set('search', search.trim());
+      qs.set('kind', variant);   // Kitchen and Brewery each list only their own items' batches
       const r = await fetch(`/api/kitchen-production?${qs}`, { credentials: 'same-origin' });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -474,13 +555,49 @@ export default function KitchenProductionPage() {
     return batches.filter(b => inExpiryBucket(b, expiryFilter, now, today, tomorrow));
   }, [batches, expiryFilter]);
 
+  // The Production Dashboard's expiry tiles count Kitchen AND Brewery batches
+  // and link here. So that the number on the tile and the list here never
+  // silently disagree, count the other screen's batches in the same bucket and
+  // say where they are (shown only when there are some).
+  const otherVariant: Variant = isBrewery ? 'kitchen' : 'brewery';
+  const [otherInBucket, setOtherInBucket] = useState(0);
+  useEffect(() => {
+    if (!expiryFilter) { setOtherInBucket(0); return; }
+    let cancelled = false;
+    fetch(`/api/kitchen-production?status=active&kind=${otherVariant}`, { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(j => {
+        if (cancelled) return;
+        const list: Batch[] = Array.isArray(j?.batches) ? j.batches : [];
+        const now = new Date();
+        const today = todayIST();
+        const tomorrow = fmtISTIsoDate(new Date(now.getTime() + 24 * 3600 * 1000));
+        setOtherInBucket(list.filter(b => inExpiryBucket(b, expiryFilter, now, today, tomorrow)).length);
+      })
+      .catch(() => { if (!cancelled) setOtherInBucket(0); });
+    return () => { cancelled = true; };
+  }, [expiryFilter, otherVariant, refreshKey]);
+
   const openNewForm = () => {
     setForm(blankForm(meName));
     setFormError(null);
+    setFormErrorField(null);
     setShowForm(true);
+    // Fresh "last batch" hints every time the Brewery form opens.
+    if (isBrewery) loadPItems();
   };
 
-  const setField = (k: keyof FormState, v: string) => setForm(f => {
+  // Brewery: a Batch Number error goes away once the number is edited or the
+  // item changes, so the live "Will be saved as …" line comes back.
+  const clearBatchNumberError = () => {
+    if (formErrorField === 'batch_number') { setFormError(null); setFormErrorField(null); }
+  };
+
+  const setField = (k: keyof FormState, v: string) => {
+    if (k === 'batch_number_entry') clearBatchNumberError();   // never sent by the Kitchen form
+    setFormField(k, v);
+  };
+  const setFormField = (k: keyof FormState, v: string) => setForm(f => {
     const next: FormState = { ...f, [k]: v };
     // Editing expiry directly makes it "manual" (stops auto-recompute).
     if (k === 'expiry_date' || k === 'expiry_time') next.expiry_manual = true;
@@ -502,11 +619,15 @@ export default function KitchenProductionPage() {
   // edit then sticks).
   const pickItem = (id: string) => {
     const it = pItems.find(x => x.id === id);
-    if (!it) { setForm(f => ({ ...f, production_item_id: '', item_name: '' })); return; }
+    if (id !== form.production_item_id) clearBatchNumberError();
+    // A typed Brewery batch number belongs to the item it was typed for, so a
+    // different item starts with an empty box ('' on Kitchen, which never uses it).
+    if (!it) { setForm(f => ({ ...f, production_item_id: '', item_name: '', batch_number_entry: '' })); return; }
     setForm(f => {
       const exp = expiryFromShelfLife(f.production_date, f.production_time, Number(it.shelf_life_hours) || 0);
       return {
         ...f,
+        batch_number_entry: f.production_item_id === it.id ? f.batch_number_entry : '',
         production_item_id: it.id,
         item_name: it.name,
         category: it.category || f.category,
@@ -521,10 +642,28 @@ export default function KitchenProductionPage() {
   };
 
   const save = async () => {
-    if (!form.production_item_id) { setFormError('Select a Production Item from the list (manage the list via the Items button).'); return; }
+    if (!form.production_item_id) {
+      failForm(isBrewery
+        ? 'Select a Brewery item from the list (items are ticked as Brewery items in Items).'
+        : 'Select a Production Item from the list (manage the list via the Items button).');
+      return;
+    }
     const qty = Number(form.quantity_produced);
-    if (!qty || qty <= 0) { setFormError('Quantity Produced must be greater than 0.'); return; }
-    setSaving(true); setFormError(null);
+    if (!qty || qty <= 0) { failForm('Quantity Produced must be greater than 0.'); return; }
+    if (isBrewery) {
+      // Same rules as the server (src/lib/production-batch-number.ts) so the
+      // chef hears about a blank or bad number before the round trip.
+      const it = pItems.find(x => x.id === form.production_item_id);
+      const pv = previewBatchNumber(it, form.batch_number_entry);
+      if (pv.error) { failForm(pv.error, 'batch_number'); return; }
+      if (pv.mode !== 'auto' && !pv.value) {
+        failForm(pv.mode === 'manual_serial'
+          ? `Type the batch number (the part after ${String(it?.batch_serial_code || '').trim()}-).`
+          : 'Type the batch number — this item\'s batch numbers are typed in, not made by the app.', 'batch_number');
+        return;
+      }
+    }
+    setSaving(true); setFormError(null); setFormErrorField(null);
     try {
       const r = await api('/api/kitchen-production', {
         method: 'POST',
@@ -546,14 +685,26 @@ export default function KitchenProductionPage() {
           storage_location: form.storage_location.trim(),
           recipe_id: form.recipe_id || undefined,
           remarks: form.remarks.trim(),
+          // Brewery form only. The server reads the item's own setting and
+          // ignores this for an automatic item; the Kitchen form never sends it.
+          ...(isBrewery ? { batch_number_entry: form.batch_number_entry } : {}),
         },
       });
       const j = await r.json();
-      if (!r.ok) { setFormError(j.error || 'Failed to save batch'); return; }
+      if (!r.ok) {
+        // Brewery: a refused batch number shows under the Batch Number box, and
+        // the item list is re-read so the form, its setting and the "last
+        // batch" line reflect what the server holds now.
+        const onBatchNumber = isBrewery && (j?.code === 'duplicate_batch_number' || j?.code === 'batch_number');
+        failForm(j.error || 'Failed to save batch', onBatchNumber ? 'batch_number' : null);
+        if (isBrewery) loadPItems();
+        return;
+      }
       setShowForm(false);
       setRefreshKey(k => k + 1);
+      if (isBrewery) loadPItems();   // the "last batch" hint now names this one
       if (j?.batch?.id) setJustCreated({ id: j.batch.id, batch_number: j.batch.batch_number || '' });
-    } catch (e: any) { setFormError(e.message || 'Failed to save batch'); }
+    } catch (e: any) { failForm(e.message || 'Failed to save batch'); }
     finally { setSaving(false); }
   };
 
@@ -562,28 +713,57 @@ export default function KitchenProductionPage() {
       {/* Header */}
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
-            <ChefHat className="w-6 h-6 text-[#af4408]" /> Kitchen Production
-          </h1>
-          <p className="text-xs text-[#6B5744] mt-0.5 max-w-2xl">
-            Log every prepared-item batch and track it through its shelf life. Each batch
-            auto-gets a <b>batch number</b> and <b>barcode</b>. Cards are colour-coded by
-            freshness and flagged <b>FIFO</b> so the oldest batch is used first.
-          </p>
+          {isBrewery ? (
+            <>
+              <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
+                <Beer className="w-6 h-6 text-[#af4408]" /> Brewery Production
+              </h1>
+              <p className="text-xs text-[#6B5744] mt-0.5 max-w-2xl">
+                Log every brewery batch and track it through its shelf life. Only items ticked
+                as <b>Brewery item</b> (in Items) appear here. Each batch auto-gets a <b>barcode</b>;
+                its <b>batch number</b> follows the item’s setting — made by the app, or typed by
+                you. Cards are colour-coded by freshness and flagged <b>FIFO</b> so the oldest
+                batch is used first.
+              </p>
+              {manageKnown && !canWrite && (
+                <p className="text-xs text-[#8B7355] mt-1 max-w-2xl">
+                  You can see brewery batches here. Recording, printing labels and changing
+                  batches or items is for a head chef, manager or admin.
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
+                <ChefHat className="w-6 h-6 text-[#af4408]" /> Kitchen Production
+              </h1>
+              <p className="text-xs text-[#6B5744] mt-0.5 max-w-2xl">
+                Log every prepared-item batch and track it through its shelf life. Each batch
+                auto-gets a <b>batch number</b> and <b>barcode</b>. Cards are colour-coded by
+                freshness and flagged <b>FIFO</b> so the oldest batch is used first.
+              </p>
+            </>
+          )}
         </div>
-        <div className="flex items-center gap-2">
-          <Link href="/kitchen-production/dashboard"
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-            <LayoutGrid className="w-4 h-4" /> <span className="hidden sm:inline">Dashboard</span>
-          </Link>
-          <Link href="/kitchen-production/reports"
-                className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-            <BarChart3 className="w-4 h-4" /> <span className="hidden sm:inline">Reports</span>
-          </Link>
-          <Link href="/kitchen-production/scan"
-                className="px-3 py-2 bg-white border border-[#af4408] hover:bg-[#FFF1E3] text-[#af4408] rounded-lg text-sm font-medium flex items-center gap-2">
-            <ScanLine className="w-4 h-4" /> Scan
-          </Link>
+        <div className={`flex items-center gap-2${isBrewery ? ' flex-wrap' : ''}`}>
+          {canOpen('/kitchen-production/dashboard') && (
+            <Link href="/kitchen-production/dashboard"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+              <LayoutGrid className="w-4 h-4" /> <span className="hidden sm:inline">Dashboard</span>
+            </Link>
+          )}
+          {canOpen('/kitchen-production/reports') && (
+            <Link href="/kitchen-production/reports"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+              <BarChart3 className="w-4 h-4" /> <span className="hidden sm:inline">Reports</span>
+            </Link>
+          )}
+          {canOpen('/kitchen-production/scan') && (
+            <Link href="/kitchen-production/scan"
+                  className="px-3 py-2 bg-white border border-[#af4408] hover:bg-[#FFF1E3] text-[#af4408] rounded-lg text-sm font-medium flex items-center gap-2">
+              <ScanLine className="w-4 h-4" /> Scan
+            </Link>
+          )}
           <button onClick={() => setShowItems(true)}
                   title="Production Items master list"
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
@@ -608,10 +788,12 @@ export default function KitchenProductionPage() {
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
             <RefreshCw className="w-4 h-4" /> <span className="hidden sm:inline">Refresh</span>
           </button>
-          <button onClick={openNewForm}
-                  className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2">
-            <Plus className="w-4 h-4" /> New Production Batch
-          </button>
+          {canWrite && (
+            <button onClick={openNewForm}
+                    className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium flex items-center gap-2">
+              <Plus className="w-4 h-4" /> {isBrewery ? 'New Brewery Batch' : 'New Production Batch'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -651,6 +833,21 @@ export default function KitchenProductionPage() {
             </button>
           </span>
           <span className="text-xs text-[#8B7355]">{visibleBatches.length} match{visibleBatches.length === 1 ? '' : 'es'}</span>
+          {otherInBucket > 0 && (() => {
+            const otherHref = otherVariant === 'brewery' ? '/brewery-production' : '/kitchen-production';
+            const otherName = otherVariant === 'brewery' ? 'Brewery Production' : 'Kitchen Production';
+            const others = `${otherInBucket} more ${otherVariant} batch${otherInBucket === 1 ? '' : 'es'}`;
+            // The other screen's link only when this user may open it.
+            const mayOpen = !!meUser && canAccessPage(otherHref, meUser);
+            return (
+              <span className="text-xs text-[#8B7355]">
+                · {others} in this group {otherInBucket === 1 ? 'is' : 'are'} on{' '}
+                {mayOpen
+                  ? <Link href={`${otherHref}?expiry=${expiryFilter}`} className="text-[#af4408] hover:underline">{otherName}</Link>
+                  : otherName}
+              </span>
+            );
+          })()}
         </div>
       )}
 
@@ -662,7 +859,7 @@ export default function KitchenProductionPage() {
             {selectMode && <> · <span className="font-semibold text-[#af4408]">{selected.size} selected</span></>}
           </div>
           <div className="flex items-center gap-2">
-            {!selectMode ? (
+            {!canWrite ? null : !selectMode ? (
               <button onClick={() => setSelectMode(true)}
                       className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
                 <CheckSquare className="w-4 h-4" /> Select
@@ -698,8 +895,24 @@ export default function KitchenProductionPage() {
       ) : visibleBatches.length === 0 ? (
         <div className="p-10 bg-white border border-[#E8D5C4] rounded-xl text-center text-sm text-[#8B7355]">
           <Package className="w-8 h-8 mx-auto mb-2 text-[#D4B896]" />
-          {expiryFilter
-            ? `No active batches are ${EXPIRY_BUCKET_LABEL[expiryFilter].toLowerCase()}.`
+          {isBrewery ? (
+            expiryFilter
+              ? `No active brewery batches are ${EXPIRY_BUCKET_LABEL[expiryFilter].toLowerCase()}.`
+              : search || category
+                ? 'No batches match your filters.'
+                : pItemsLoaded && pItems.length === 0
+                  ? (canWrite
+                      ? 'No active item is ticked as a Brewery item yet. Open Items, edit an item and tick “Brewery item” — it will then appear here.'
+                      : 'No active item is ticked as a Brewery item yet. A head chef, manager or admin can tick “Brewery item” on an item in Items.')
+                  : statusFilter === 'active'
+                    ? (canWrite
+                        ? 'No active brewery batches yet. Click “New Brewery Batch” to log one.'
+                        : 'No active brewery batches yet.')
+                    : 'No brewery batches recorded yet.'
+          ) : expiryFilter
+            // "kitchen" only once Brewery batches sit in the same group (the
+            // note above names them) — otherwise exactly the words of before.
+            ? `No active ${otherInBucket > 0 ? 'kitchen ' : ''}batches are ${EXPIRY_BUCKET_LABEL[expiryFilter].toLowerCase()}.`
             : search || category
               ? 'No batches match your filters.'
               : statusFilter === 'active'
@@ -720,6 +933,7 @@ export default function KitchenProductionPage() {
               onReprint={() => handlePrint(b.id, true)}
               onPreview={() => setPreviewBatch(b)}
               printing={printingId === b.id}
+              canPrint={canWrite}
             />
           ))}
         </div>
@@ -728,8 +942,10 @@ export default function KitchenProductionPage() {
       {/* New-batch modal */}
       {showForm && (
         <BatchFormModal
+          variant={variant}
           form={form} setField={setField}
           saving={saving} error={formError}
+          errorField={formErrorField} errorSeq={formErrorSeq}
           recipes={recipes}
           pItems={pItems}
           deptGroups={deptGroups}
@@ -748,6 +964,7 @@ export default function KitchenProductionPage() {
           onClose={() => setDetailId(null)}
           onChanged={() => setRefreshKey(k => k + 1)}
           showToast={showToast}
+          canManage={canWrite}
         />
       )}
 
@@ -790,7 +1007,11 @@ export default function KitchenProductionPage() {
 
       {/* Production Items master list */}
       {showItems && (
-        <ProductionItemsModal onClose={() => { setShowItems(false); loadPItems(); }} />
+        <ProductionItemsModal
+          variant={variant}
+          canEdit={canWrite}
+          onClose={() => { setShowItems(false); loadPItems(); }}
+        />
       )}
 
       {/* Production Settings — the department list behind New Production Batch */}
@@ -819,11 +1040,13 @@ export default function KitchenProductionPage() {
 
 // ─── Batch card ─────────────────────────────────────────────────────────
 function BatchCard({
-  batch, onOpen, selectMode, selected, onToggleSelect, onPrint, onReprint, onPreview, printing,
+  batch, onOpen, selectMode, selected, onToggleSelect, onPrint, onReprint, onPreview, printing, canPrint = true,
 }: {
   batch: Batch; onOpen: () => void;
   selectMode: boolean; selected: boolean; onToggleSelect: () => void;
   onPrint: () => void; onReprint: () => void; onPreview: () => void; printing: boolean;
+  /** false only on the Brewery screen for a user the print API would refuse. */
+  canPrint?: boolean;
 }) {
   const tone = EXPIRY_TONE[batch.expiry_status] || EXPIRY_TONE.green;
   const remaining = batch.remaining_quantity ?? Math.max(0, batch.quantity_produced - batch.quantity_consumed);
@@ -871,7 +1094,7 @@ function BatchCard({
 
       {/* Batch # / barcode */}
       <div className="flex items-center gap-2 flex-wrap text-[11px]">
-        <span className="font-mono font-semibold text-[#2D1B0E] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-1.5 py-0.5">
+        <span className="font-mono font-semibold text-[#2D1B0E] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-1.5 py-0.5 break-all">
           {batch.batch_number}
         </span>
         <span className="font-mono text-[#8B7355] flex items-center gap-1">
@@ -910,15 +1133,19 @@ function BatchCard({
 
       {/* Label actions */}
       <div className="flex items-center gap-1.5 border-t border-[#E8D5C4] pt-2" onClick={stop}>
-        <button onClick={onPrint} disabled={printing}
-                className="flex-1 px-2 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-50">
-          {printing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
-          Print label
-        </button>
-        <button onClick={onReprint} disabled={printing} title="Reprint label"
-                className="px-2 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs flex items-center gap-1 disabled:opacity-50">
-          <Copy className="w-3.5 h-3.5" /> Reprint
-        </button>
+        {canPrint && (
+          <>
+            <button onClick={onPrint} disabled={printing}
+                    className="flex-1 px-2 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-50">
+              {printing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Printer className="w-3.5 h-3.5" />}
+              Print label
+            </button>
+            <button onClick={onReprint} disabled={printing} title="Reprint label"
+                    className="px-2 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs flex items-center gap-1 disabled:opacity-50">
+              <Copy className="w-3.5 h-3.5" /> Reprint
+            </button>
+          </>
+        )}
         <button onClick={onPreview} title="Preview label"
                 className="px-2 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-xs flex items-center gap-1">
           <Eye className="w-3.5 h-3.5" /> Preview
@@ -938,10 +1165,15 @@ function QtyChip({ label, value, tone }: { label: string; value: string; tone: s
 }
 
 // ─── New-batch modal ────────────────────────────────────────────────────
-function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGroups, onPickItem, onManageItems, onManageDepartments, onCancel, onSave }: {
+function BatchFormModal({ variant = 'kitchen', form, setField, saving, error, errorField = null, errorSeq = 0, recipes, pItems, deptGroups, onPickItem, onManageItems, onManageDepartments, onCancel, onSave }: {
+  variant?: Variant;
   form: FormState;
   setField: (k: keyof FormState, v: string) => void;
   saving: boolean; error: string | null;
+  /** Brewery only: the error is about the Batch Number box. */
+  errorField?: 'batch_number' | null;
+  /** Bumped every time an error is set, so a repeat is scrolled into view again. */
+  errorSeq?: number;
   recipes: RecipeOpt[];
   pItems: ProductionItem[];
   deptGroups: DepartmentOptionGroup[];
@@ -950,6 +1182,30 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
   onManageDepartments: () => void;
   onCancel: () => void; onSave: () => void;
 }) {
+  const isBrewery = variant === 'brewery';
+  const picked = pItems.find(x => x.id === form.production_item_id);
+  // Brewery: the picked item's own setting decides the Batch Number box.
+  const pv = isBrewery ? previewBatchNumber(picked, form.batch_number_entry) : null;
+  const serialCode = String(picked?.batch_serial_code || '').trim();
+  // Brewery: a refused batch number (blank, already used, too long…) is shown
+  // right under the Batch Number box — in place of "Will be saved as …" — when
+  // that box is on screen; anything else stays at the foot of the form.
+  const batchErr = isBrewery && errorField === 'batch_number' && !!error && !!picked && !!pv && pv.mode !== 'auto'
+    ? error : null;
+  const batchErrShown = !!batchErr;
+  // Staff who type the code themselves in a serial-code item ("ACB-249") would
+  // save "ACB-ACB-249" — say so beside the live line.
+  const typedCodeTwice = !!pv && pv.mode === 'manual_serial' && !!serialCode
+    && form.batch_number_entry.trim().toLowerCase().startsWith(`${serialCode.toLowerCase()}-`);
+  const batchBoxRef = useRef<HTMLDivElement | null>(null);
+  const errorBoxRef = useRef<HTMLDivElement | null>(null);
+  // Brewery: bring every refusal into view — the form body scrolls, so a
+  // message at its foot (or under the Batch Number box at its top) can be out
+  // of sight when Save is pressed. Kitchen Production is left exactly as it was.
+  useEffect(() => {
+    if (!isBrewery || !error) return;
+    (batchErrShown ? batchBoxRef.current : errorBoxRef.current)?.scrollIntoView({ block: 'nearest' });
+  }, [isBrewery, error, errorSeq, batchErrShown]);
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto"
          onClick={onCancel}>
@@ -958,7 +1214,9 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
         {/* Header */}
         <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between sticky top-0 bg-white rounded-t-xl">
           <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
-            <ChefHat className="w-5 h-5 text-[#af4408]" /> New Production Batch
+            {isBrewery
+              ? <><Beer className="w-5 h-5 text-[#af4408]" /> New Brewery Batch</>
+              : <><ChefHat className="w-5 h-5 text-[#af4408]" /> New Production Batch</>}
           </div>
           <button onClick={onCancel} disabled={saving} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50">
             <X className="w-5 h-5" />
@@ -967,9 +1225,61 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
 
         {/* Body */}
         <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
-          {/* Auto-generated notice */}
+          {/* Auto-generated notice (Brewery: the batch number follows the item) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <ReadOnlyField label="Batch Number" />
+            {!isBrewery || !pv ? (
+              <ReadOnlyField label="Batch Number" />
+            ) : !picked ? (
+              <ReadOnlyField label="Batch Number" text="pick the item first" />
+            ) : pv.mode === 'auto' ? (
+              <ReadOnlyField label="Batch Number" />
+            ) : (
+              <div ref={batchBoxRef}>
+              <Field label="Batch Number" required>
+                {pv.mode === 'manual_serial' ? (
+                  <div className="flex items-stretch">
+                    <span className="px-2.5 flex items-center border border-r-0 border-[#E8D5C4] rounded-l-lg bg-[#FFF1E3] text-sm font-mono text-[#6B5744] whitespace-nowrap">
+                      {serialCode}-
+                    </span>
+                    <input value={form.batch_number_entry}
+                           onChange={e => setField('batch_number_entry', e.target.value)}
+                           maxLength={Math.max(1, BATCH_NUMBER_MAX - serialCode.length - 1)}
+                           placeholder="e.g. 248" autoComplete="off"
+                           className={`${inputCls} rounded-l-none font-mono`} />
+                  </div>
+                ) : (
+                  <input value={form.batch_number_entry}
+                         onChange={e => setField('batch_number_entry', e.target.value)}
+                         maxLength={BATCH_NUMBER_MAX}
+                         placeholder="e.g. 248" autoComplete="off"
+                         className={`${inputCls} font-mono`} />
+                )}
+                {batchErr ? (
+                  <span role="alert" className="mt-1 block text-[12px] font-medium text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1">{batchErr}</span>
+                ) : pv.error ? (
+                  <span className="mt-1 block text-[11px] text-red-700">{pv.error}</span>
+                ) : pv.value ? (
+                  <span className="mt-1 block text-[11px] text-[#6B5744]">
+                    Will be saved as <b className="font-mono text-[#2D1B0E] break-all">{pv.value}</b>
+                    {typedCodeTwice && (
+                      <span className="block text-amber-800">
+                        {(() => {
+                          const rest = form.batch_number_entry.trim().slice(serialCode.length + 1).trim();
+                          return `${serialCode}- is already added for you — type only ${rest ? `“${rest}”` : 'the number'}.`;
+                        })()}
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  <span className="mt-1 block text-[11px] text-[#8B7355]">
+                    {pv.mode === 'manual_serial'
+                      ? `Type only the number — ${serialCode}- is added for you.`
+                      : 'Type this batch’s number as the brewery counts it.'}
+                  </span>
+                )}
+              </Field>
+              </div>
+            )}
             <ReadOnlyField label="Barcode" />
           </div>
 
@@ -980,12 +1290,26 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
                 options={pItems.map(it => ({ value: it.id, label: itemLabel(it) }))}
                 value={(() => { const it = pItems.find(x => x.id === form.production_item_id); return it ? itemLabel(it) : ''; })()}
                 onChange={v => onPickItem(v)}
-                placeholder="Type to search items…"
+                placeholder={isBrewery ? 'Type to search brewery items…' : 'Type to search items…'}
                 className={`${inputCls} pr-8`}
               />
+              {/* Brewery: the item's latest batch, so the next number is easy to
+                  get right. Counts every batch of the item, whatever its
+                  status — the same set the duplicate check refuses against. */}
+              {isBrewery && picked && (
+                picked.last_batch ? (
+                  <span className="mt-1 block text-[11px] text-[#6B5744]">
+                    Last batch for this item: <b className="font-mono text-[#2D1B0E] break-all">{picked.last_batch.batch_number || '—'}</b>
+                    {' '}· made {picked.last_batch.production_date ? fmtISTDate(picked.last_batch.production_date) : 'date not recorded'}
+                    <span className="block text-[10px] text-[#8B7355]">Counts every batch of this item, any status, at every outlet.</span>
+                  </span>
+                ) : picked.last_batch === null ? (
+                  <span className="mt-1 block text-[11px] text-[#6B5744]">No batch recorded yet for this item.</span>
+                ) : null
+              )}
               <button type="button" onClick={onManageItems}
                       className="mt-1 text-[11px] text-[#af4408] hover:underline">
-                Item not in the list? Manage items…
+                {isBrewery ? 'Item not in the list? Tick “Brewery item” on it in Items…' : 'Item not in the list? Manage items…'}
               </button>
             </Field>
             <Field label="Category">
@@ -1069,7 +1393,7 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGr
                       rows={2} placeholder="Any notes about this batch…" className={inputCls} />
           </Field>
 
-          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+          {error && !batchErr && <div ref={errorBoxRef} className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
         </div>
 
         {/* Footer */}
@@ -1104,22 +1428,24 @@ function Field({ label, required, children }: { label: string; required?: boolea
   );
 }
 
-function ReadOnlyField({ label }: { label: string }) {
+function ReadOnlyField({ label, text = 'auto-generated on save' }: { label: string; text?: string }) {
   return (
     <div className="block">
       <span className="text-[11px] font-medium text-[#6B5744] mb-1 block">{label}</span>
       <div className="w-full px-2.5 py-2 border border-dashed border-[#E8D5C4] rounded-lg text-sm bg-[#FFF1E3]/50 text-[#8B7355] italic">
-        auto-generated on save
+        {text}
       </div>
     </div>
   );
 }
 
 // ─── Detail drawer ──────────────────────────────────────────────────────
-function BatchDetailDrawer({ id, onClose, onChanged, showToast }: {
+function BatchDetailDrawer({ id, onClose, onChanged, showToast, canManage = true }: {
   id: string; onClose: () => void;
   onChanged?: () => void;
   showToast?: (msg: string, kind?: 'ok' | 'err') => void;
+  /** false only on the Brewery screen for a user the dispose API would refuse. */
+  canManage?: boolean;
 }) {
   const [batch, setBatch] = useState<Batch | null>(null);
   const [txns, setTxns] = useState<Txn[]>([]);
@@ -1188,7 +1514,7 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast }: {
                 <span className={`text-[10px] px-2 py-0.5 rounded border font-medium ${tone.badge}`}>{tone.label}</span>
               </div>
               <div className="flex items-center gap-2 flex-wrap text-[11px] mt-2">
-                <span className="font-mono font-semibold text-[#2D1B0E] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-1.5 py-0.5">
+                <span className="font-mono font-semibold text-[#2D1B0E] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-1.5 py-0.5 break-all">
                   {batch.batch_number}
                 </span>
                 <span className="font-mono text-[#8B7355] flex items-center gap-1">
@@ -1228,7 +1554,11 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast }: {
             )}
 
             {/* Actions */}
-            {canAct ? (
+            {canAct && !canManage ? (
+              <div className="bg-[#FFF1E3]/60 border border-[#E8D5C4] rounded-xl p-3 text-[11px] text-[#8B7355]">
+                Waste, dispose, transfer and return are recorded by a head chef, manager or admin.
+              </div>
+            ) : canAct ? (
               <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
                 <div className="text-[11px] font-medium text-[#8B7355] mb-2">Batch actions</div>
                 <div className="grid grid-cols-2 gap-2">
@@ -1376,7 +1706,7 @@ function DisposeActionModal({ batch, action, remaining, onCancel, onDone }: {
           <div className="text-xs text-[#6B5744]">{meta.blurb}</div>
           <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2 text-xs text-[#6B5744]">
             <span className="font-semibold text-[#2D1B0E]">{batch.item_name}</span>
-            <span className="font-mono ml-2">{batch.batch_number}</span>
+            <span className="font-mono ml-2 break-all">{batch.batch_number}</span>
             <div className="mt-0.5">On hand: <b className="text-emerald-700">{fmtNum(remaining)}{batch.unit ? ' ' + batch.unit : ''}</b></div>
           </div>
           <Field label={`Quantity${batch.unit ? ` (${batch.unit})` : ''}`} required>
@@ -1445,7 +1775,7 @@ function JustCreatedModal({ batchNumber, onClose, onPrint, printing }: {
           <CheckCircle2 className="w-6 h-6 text-emerald-600" />
         </div>
         <div className="font-semibold text-[#2D1B0E]">Batch created</div>
-        {batchNumber && <div className="font-mono text-sm text-[#af4408] mt-1">{batchNumber}</div>}
+        {batchNumber && <div className="font-mono text-sm text-[#af4408] mt-1 break-all">{batchNumber}</div>}
         <p className="text-xs text-[#8B7355] mt-2">Print the label now, or later from the card.</p>
         <div className="flex items-center gap-2 mt-4">
           <button onClick={onClose} disabled={printing}
@@ -1776,13 +2106,24 @@ function PrinterSettingsModal({ onClose, onSaved }: {
 // The fixed list the New Production Batch form selects from. Items are never
 // deleted — deactivating hides them from the picker while old batches keep a
 // valid production_item_id (FIFO groups by that id).
-function ProductionItemsModal({ onClose }: { onClose: () => void }) {
+function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: {
+  onClose: () => void;
+  variant?: Variant;
+  /** false only on the Brewery screen for a user the items API would refuse. */
+  canEdit?: boolean;
+}) {
   const [items, setItems] = useState<ProductionItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const blank = { id: '', name: '', category: '', unit: '', shelf_life_hours: '', default_storage_location: '' };
+  // Brewery fields (ruling 114): the tick defaults OFF — nothing is ever
+  // marked Brewery unless someone ticks it here.
+  const blank = {
+    id: '', name: '', category: '', unit: '', shelf_life_hours: '', default_storage_location: '',
+    is_brewery: false, batch_number_mode: 'auto' as BatchNumberMode, batch_serial_code: '',
+  };
   const [draft, setDraft] = useState<typeof blank>(blank);
+  const draftSerial = cleanTypedValue(draft.batch_serial_code, 'The serial code');
 
   const load = () => {
     fetch('/api/kitchen-production/items?all=1', { credentials: 'same-origin' })
@@ -1795,13 +2136,24 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
 
   const saveDraft = async () => {
     if (!draft.name.trim()) { setError('Item name is required'); return; }
+    if (draft.is_brewery && draft.batch_number_mode === 'manual_serial') {
+      if (!draftSerial.ok) { setError(draftSerial.error); return; }
+      if (!draftSerial.value) { setError('Type the serial code (for example ACB) — "Serial code + number" needs one.'); return; }
+    }
     setSaving(true); setError(null);
     try {
       const body: any = {
         name: draft.name.trim(), category: draft.category.trim(), unit: draft.unit.trim(),
         shelf_life_hours: Number(draft.shelf_life_hours) || 0,
         default_storage_location: draft.default_storage_location.trim(),
+        is_brewery: draft.is_brewery,
       };
+      // The batch-number setting only means anything on a Brewery item; for a
+      // Kitchen item leave whatever is stored alone (the server ignores it).
+      if (draft.is_brewery) {
+        body.batch_number_mode = draft.batch_number_mode;
+        if (draft.batch_number_mode === 'manual_serial') body.batch_serial_code = draft.batch_serial_code;
+      }
       if (draft.id) body.id = draft.id;
       const r = await api('/api/kitchen-production/items', { method: draft.id ? 'PUT' : 'POST', body });
       const j = await r.json();
@@ -1832,12 +2184,27 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
 
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
           <p className="text-xs text-[#8B7355]">
-            The fixed list New Production Batch selects from — each item has an ID that FIFO
+            {variant === 'brewery'
+              ? 'The one fixed item list for Kitchen Production and Brewery Production'
+              : 'The fixed list New Production Batch selects from'} — each item has an ID that FIFO
             groups by, so renaming an item never splits its batch chain. Deactivate instead of
             deleting: old batches keep their item link.
           </p>
+          {/* One list for both screens (ruling 114): the tick decides which one offers the item. */}
+          <p className="text-xs text-[#8B7355]">
+            {variant === 'brewery'
+              ? <>Only items ticked as <b>Brewery item</b> appear on Brewery Production — tick it on anything brewed here. Ticked items no longer appear on Kitchen Production.</>
+              : <>Items ticked as <b>Brewery item</b> appear on Brewery Production instead of here.</>}
+          </p>
+
+          {!canEdit && (
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF1E3]/60 p-2.5 text-xs text-[#8B7355]">
+              Only a head chef, manager or admin can add or change items.
+            </div>
+          )}
 
           {/* Add / edit form */}
+          {canEdit && (
           <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] p-3 space-y-2">
             <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">{draft.id ? 'Edit item' : 'Add item'}</div>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
@@ -1852,17 +2219,64 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
                      placeholder="Shelf life (hours)" className={inputCls} />
               <input value={draft.default_storage_location} onChange={e => setDraft(d => ({ ...d, default_storage_location: e.target.value }))}
                      placeholder="Default storage (e.g. Cold Room 2)" className={inputCls} />
-              <div className="flex items-center gap-2">
-                <button onClick={saveDraft} disabled={saving}
-                        className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
-                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} {draft.id ? 'Save changes' : 'Add item'}
-                </button>
-                {draft.id && (
-                  <button onClick={() => setDraft(blank)} className="px-3 py-2 bg-white border border-[#E8D5C4] text-[#6B5744] rounded-lg text-sm">Cancel</button>
-                )}
+              {/* Brewery tick (ruling 114) — OFF unless someone ticks it. */}
+              <label className="flex items-center gap-2 px-2.5 py-2 border border-[#E8D5C4] rounded-lg bg-white text-sm text-[#2D1B0E] cursor-pointer">
+                <input type="checkbox" checked={draft.is_brewery}
+                       onChange={e => { setDraft(d => ({ ...d, is_brewery: e.target.checked })); setError(er => (er && /serial code/i.test(er) ? null : er)); }}
+                       className="accent-[#af4408]" />
+                Brewery item
+              </label>
+            </div>
+            {draft.is_brewery && (
+              <div className="rounded-lg border border-[#E8D5C4] bg-white p-2.5 space-y-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <label className="block">
+                    <span className="text-[11px] font-medium text-[#6B5744] mb-1 block">Batch number</span>
+                    <select value={draft.batch_number_mode}
+                            onChange={e => { setDraft(d => ({ ...d, batch_number_mode: normalizeBatchNumberMode(e.target.value) })); setError(er => (er && /serial code/i.test(er) ? null : er)); }}
+                            className={inputCls}>
+                      {(['auto', 'manual', 'manual_serial'] as BatchNumberMode[]).map(m => (
+                        <option key={m} value={m}>{BATCH_NUMBER_MODE_LABEL[m]}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {draft.batch_number_mode === 'manual_serial' && (
+                    <label className="block">
+                      <span className="text-[11px] font-medium text-[#6B5744] mb-1 block">Serial code <span className="text-[#af4408]">*</span></span>
+                      <input value={draft.batch_serial_code} maxLength={SERIAL_CODE_MAX}
+                             onChange={e => {
+                               setDraft(d => ({ ...d, batch_serial_code: e.target.value }));
+                               // A refusal about the serial code no longer applies once it is edited.
+                               setError(er => (er && /serial code/i.test(er) ? null : er));
+                             }}
+                             placeholder="e.g. ACB" autoComplete="off" className={`${inputCls} font-mono`} />
+                    </label>
+                  )}
+                </div>
+                <p className="text-[11px] text-[#8B7355]">
+                  {draft.batch_number_mode === 'auto'
+                    ? 'The app makes the batch number on save, the same way Kitchen Production does.'
+                    : draft.batch_number_mode === 'manual'
+                      ? 'Staff type the whole batch number on every batch. A number already used for this item is refused.'
+                      : draftSerial.ok && draftSerial.value
+                        ? <>Staff type only the number — a batch numbered 248 is saved as <b className="font-mono text-[#2D1B0E]">{draftSerial.value}-248</b>. A number already used for this item is refused.</>
+                        : draftSerial.ok
+                          ? 'Type the code once here (for example ACB); staff then type only the number on each batch.'
+                          : <span className="text-red-700">{draftSerial.error}</span>}
+                </p>
               </div>
+            )}
+            <div className="flex items-center gap-2">
+              <button onClick={saveDraft} disabled={saving}
+                      className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} {draft.id ? 'Save changes' : 'Add item'}
+              </button>
+              {draft.id && (
+                <button onClick={() => setDraft(blank)} className="px-3 py-2 bg-white border border-[#E8D5C4] text-[#6B5744] rounded-lg text-sm">Cancel</button>
+              )}
             </div>
           </div>
+          )}
 
           {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
 
@@ -1870,7 +2284,7 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
           {loading ? (
             <div className="py-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
           ) : items.length === 0 ? (
-            <div className="py-8 text-center text-sm text-[#8B7355]">No items yet — add the first one above.</div>
+            <div className="py-8 text-center text-sm text-[#8B7355]">{canEdit ? 'No items yet — add the first one above.' : 'No items yet.'}</div>
           ) : (
             <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
               <table className="w-full text-sm">
@@ -1887,16 +2301,39 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
                 <tbody className="divide-y divide-[#F0E4D6]">
                   {items.map(it => (
                     <tr key={it.id} className={it.is_active ? '' : 'opacity-50'}>
-                      <td className="px-3 py-2 font-medium text-[#2D1B0E]">{it.name}{!it.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}</td>
+                      <td className="px-3 py-2 font-medium text-[#2D1B0E]">
+                        {it.name}{!it.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}
+                        {Number(it.is_brewery) === 1 && (() => {
+                          const m = effectiveBatchNumberMode(it);
+                          const code = String(it.batch_serial_code || '').trim();
+                          return (
+                            <span className="block mt-0.5 text-[10px] font-normal text-[#8B7355]">
+                              <span className="bg-amber-100 text-amber-800 border border-amber-300 px-1.5 py-0.5 rounded-full mr-1">Brewery</span>
+                              Batch no.: {m === 'auto' ? 'automatic' : m === 'manual' ? 'typed by staff' : <span className="font-mono">{code}-…</span>}
+                            </span>
+                          );
+                        })()}
+                      </td>
                       <td className="px-3 py-2 text-[#6B5744]">{it.category || '—'}</td>
                       <td className="px-3 py-2 text-[#6B5744]">{it.unit || '—'}</td>
                       <td className="px-3 py-2 text-right text-[#6B5744]">{it.shelf_life_hours > 0 ? `${it.shelf_life_hours} h` : '—'}</td>
                       <td className="px-3 py-2 text-[#6B5744]">{it.default_storage_location || '—'}</td>
                       <td className="px-3 py-2 text-right whitespace-nowrap">
-                        <button onClick={() => setDraft({ id: it.id, name: it.name, category: it.category || '', unit: it.unit || '', shelf_life_hours: it.shelf_life_hours ? String(it.shelf_life_hours) : '', default_storage_location: it.default_storage_location || '' })}
-                                className="text-[#af4408] hover:underline text-xs font-medium mr-3">Edit</button>
-                        <button onClick={() => toggleActive(it)}
-                                className="text-[#8B7355] hover:underline text-xs font-medium">{it.is_active ? 'Deactivate' : 'Activate'}</button>
+                        {canEdit ? (
+                          <>
+                            <button onClick={() => setDraft({
+                                      id: it.id, name: it.name, category: it.category || '', unit: it.unit || '',
+                                      shelf_life_hours: it.shelf_life_hours ? String(it.shelf_life_hours) : '',
+                                      default_storage_location: it.default_storage_location || '',
+                                      is_brewery: Number(it.is_brewery) === 1,
+                                      batch_number_mode: normalizeBatchNumberMode(it.batch_number_mode),
+                                      batch_serial_code: it.batch_serial_code || '',
+                                    })}
+                                    className="text-[#af4408] hover:underline text-xs font-medium mr-3">Edit</button>
+                            <button onClick={() => toggleActive(it)}
+                                    className="text-[#8B7355] hover:underline text-xs font-medium">{it.is_active ? 'Deactivate' : 'Activate'}</button>
+                          </>
+                        ) : <span className="text-[11px] text-[#8B7355]">—</span>}
                       </td>
                     </tr>
                   ))}
@@ -1999,7 +2436,7 @@ function ProductionSettingsModal({ canManage, onClose }: { canManage: boolean; o
 
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-5">
           <p className="text-xs text-[#8B7355]">
-            What the <b>Department</b> dropdown offers on New Production Batch. Choosing a
+            What the <b>Department</b> dropdown offers on New Production Batch and New Brewery Batch. Choosing a
             department on a batch records who it was made for — it moves no stock and
             debits no department.
           </p>
@@ -2042,7 +2479,7 @@ function ProductionSettingsModal({ canManage, onClose }: { canManage: boolean; o
             <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">Extra lines (production only)</div>
             <p className="text-[11px] text-[#8B7355]">
               Add a line to the dropdown that is <b>not</b> one of the departments above. These
-              appear on New Production Batch and nowhere else — they hold no stock and can
+              appear on New Production Batch and New Brewery Batch and nowhere else — they hold no stock and can
               never receive a requisition. Deactivate instead of deleting: batches that named
               one keep showing it.
             </p>

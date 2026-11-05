@@ -655,6 +655,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // an empty array means "follow role", not "deny all". So every user with
       // no explicit grant now sees these two pages.
       { path: '/kitchen-production',   label: 'Kitchen Production' },
+      // Owner ruling 114 (2026-11-05): the Kitchen Production screen for items
+      // ticked "Brewery item". Same treatment as /kitchen-production above —
+      // a plain page_access grant, no tier flag — and its API is the same
+      // /api/kitchen-production/*, which gates its own writes. A role with an
+      // explicit page list sees it only once the owner ticks it.
+      // Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/brewery-production',   label: 'Brewery Production' },
       { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/butchering',          label: 'Butchering' },

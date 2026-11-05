@@ -120,7 +120,7 @@ export default function KitchenProductionDashboardPage() {
         <div className="flex items-center gap-2">
           <Link href="/kitchen-production"
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-            <ChefHat className="w-4 h-4" /> <span className="hidden sm:inline">Batches</span>
+            <ChefHat className="w-4 h-4" /> <span className="hidden sm:inline">Kitchen batches</span>
           </Link>
           <Link href="/kitchen-production/reports"
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
@@ -222,7 +222,9 @@ export default function KitchenProductionDashboardPage() {
             </Link>
             <Link href="/kitchen-production"
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-              <Package className="w-4 h-4 text-[#af4408]" /> All batches
+              {/* Kitchen Production lists Kitchen items' batches only since
+                  Brewery Production (ruling 114) — this dashboard counts both. */}
+              <Package className="w-4 h-4 text-[#af4408]" /> Kitchen batches
             </Link>
           </div>
         </>

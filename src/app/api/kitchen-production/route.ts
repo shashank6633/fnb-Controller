@@ -2,19 +2,32 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canManageKitchenProduction } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
 import { batchDepartmentMap, resolveBatchDepartment, saveBatchDepartment } from '@/lib/production-departments';
+import { batchNumberKey, resolveTypedBatchNumber } from '@/lib/production-batch-number';
+import { fmtISTDate } from '@/lib/format-date';
 
 /**
  * Kitchen Production — prepared-item batches.
  *
- * GET  /api/kitchen-production?status=active|all&category=&search=
+ * GET  /api/kitchen-production?status=active|all&category=&search=&kind=
  *        → { batches: [ {…columns}, remaining_quantity, expiry_status, batch_age_hours, fifo_priority,
  *                       department_key, department_name, department_id, department_inactive ] }
+ *        kind is OPT-IN (ruling 114, Brewery Production): kind=brewery → only
+ *        batches of items ticked as Brewery items; kind=kitchen → every other
+ *        batch (legacy batches with no item link included). Left out, the list
+ *        is exactly what it always was — scan, dashboard, reports and FSSAI do
+ *        not call this list and are untouched.
  * POST /api/kitchen-production
  *        body: { item_name, category, material_id?, recipe_id?, production_date, production_time,
  *                expiry_date, expiry_time, shelf_life?, quantity_produced, unit, prepared_by,
  *                kitchen_section, storage_location, remarks?,
- *                department_key? | department_id? | production_department_id? }
+ *                department_key? | department_id? | production_department_id?,
+ *                batch_number_entry? }
  *        → { batch }
+ *        batch_number_entry is read ONLY for a Brewery item whose setting is
+ *        typed / serial code + number (the item row decides, never the request);
+ *        every other batch gets its number from buildBatchNumber exactly as
+ *        before and any typed value is ignored. A typed number already used by
+ *        another batch of the SAME item is refused with 409.
  *
  * ── THE DEPARTMENT A BATCH WAS MADE FOR ───────────────────────────────────
  * Optional, and its absence is a first-class state: every batch created before
@@ -99,6 +112,12 @@ export async function GET(request: Request) {
 
     if (status !== 'all') { where.push('status = ?'); params.push(status); }
     if (category) { where.push('category = ?'); params.push(category); }
+    // Opt-in Kitchen / Brewery split (see header). Filtering by item keeps every
+    // item's batches together, so the FIFO ranks below are unchanged per item.
+    const kind = url.searchParams.get('kind') || '';
+    const BREWERY_ITEM_IDS = `SELECT id FROM production_items WHERE is_brewery = 1 AND id IS NOT NULL`;
+    if (kind === 'brewery') where.push(`production_item_id IN (${BREWERY_ITEM_IDS})`);
+    else if (kind === 'kitchen') where.push(`(production_item_id IS NULL OR production_item_id NOT IN (${BREWERY_ITEM_IDS}))`);
     if (search) {
       where.push('(item_name LIKE ? OR barcode LIKE ? OR batch_number LIKE ?)');
       const like = `%${search}%`;
@@ -206,10 +225,31 @@ export async function POST(request: Request) {
     // department keeps whatever it put in kitchen_section — unchanged behaviour.
     const kitchen_section = deptLink ? deptLink.label : String(body?.kitchen_section || '');
 
-    const insert = db.transaction(() => {
+    // Brewery batch number (ruling 114). The ITEM's setting decides: anything
+    // but a Brewery item set to typed / serial code comes back null here and
+    // takes the automatic number below, exactly as before.
+    const typed = resolveTypedBatchNumber(pItem, body?.batch_number_entry);
+    // `code` lets the Brewery form show the message under its Batch Number box.
+    if (typed.error) return Response.json({ error: typed.error, code: 'batch_number' }, { status: 400 });
+
+    const insert = db.transaction((): { id: string } | { duplicate: { batch_number: string; production_date: string; created_at: string } } => {
+      // Already used by another batch of the SAME item → refuse, inside the
+      // same transaction as the insert so two saves cannot both pass. Every
+      // batch of the item counts, whatever its status; other items may reuse
+      // the number.
+      if (typed.batch_number !== null) {
+        const want = batchNumberKey(typed.batch_number);
+        const prior = db.prepare(
+          `SELECT batch_number, production_date, created_at FROM production_batches
+            WHERE production_item_id = ? ORDER BY COALESCE(production_date, '') ASC, created_at ASC, rowid ASC`
+        ).all(production_item_id) as Array<{ batch_number: string; production_date: string; created_at: string }>;
+        const hit = prior.find((b) => batchNumberKey(b.batch_number) === want);
+        if (hit) return { duplicate: hit };
+      }
+
       const id = generateId();
       const barcode = nextBarcode(db);
-      const batch_number = buildBatchNumber(db, item_name, production_date, barcode);
+      const batch_number = typed.batch_number ?? buildBatchNumber(db, item_name, production_date, barcode);
 
       db.prepare(
         `INSERT INTO production_batches (
@@ -263,10 +303,19 @@ export async function POST(request: Request) {
         '',
       );
 
-      return id;
+      return { id };
     });
 
-    const id = insert();
+    const result = insert();
+    if ('duplicate' in result) {
+      const d = result.duplicate;
+      const made = fmtISTDate(d.production_date || d.created_at, { fallback: 'date not recorded' });
+      return Response.json({
+        error: `Batch ${d.batch_number} already exists for ${item_name} (made ${made}). Nothing was saved.`,
+        code: 'duplicate_batch_number',
+      }, { status: 409 });
+    }
+    const id = result.id;
     const row = db.prepare('SELECT * FROM production_batches WHERE id = ?').get(id) as ProductionBatch;
     const now = new Date();
     const dep = batchDepartmentMap(db, [id]).get(id);

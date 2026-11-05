@@ -9,6 +9,7 @@ import {
   ShoppingCart,
   Package,
   ChefHat,
+  Beer,
   Upload,
   BarChart3,
   ChevronLeft,
@@ -382,6 +383,9 @@ const navTree: NavEntry[] = [
     icon: ChefHat,
     items: [
       { kind: "link", label: "Kitchen Production", href: "/kitchen-production", icon: ChefHat },
+      // Owner ruling 114 — Kitchen Production's screen for items ticked
+      // "Brewery item". Twin of the page-catalog.ts row with the same href.
+      { kind: "link", label: "Brewery Production", href: "/brewery-production", icon: Beer },
       { kind: "link", label: "Production Dashboard", href: "/kitchen-production/dashboard", icon: LayoutGrid },
       { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
       { kind: "link", label: "Butchering",         href: "/butchering",         icon: Scissors },
