@@ -8,9 +8,21 @@
  *     GET /api/reports/purchases (isManagement-gated); CSV built client-side.
  *     Reconciles with the Purchases page (same data set).
  *
- *  2. Purchase log (itemwise) — one row per ITEM per BILL from all three
+ *  2. Purchase log (itemwise) — since owner ruling 115 (2026-11-05) it opens on
+ *     ITEM-WISE PURCHASES: one line per `purchases` row, the very rows the
+ *     Summary adds up, so every money column foots to the Summary card of the
+ *     same name; downloads as a four-sheet Excel file built server-side. Reads
+ *     GET /api/reports/purchase-itemwise. The old three-document log below is
+ *     kept, unchanged, as the secondary "All documents (audit)" view.
+ *
+ *     All documents (audit) — one row per ITEM per BILL from all three
  *     document sources (purchases / purchase orders / GRN bills) in ONE downloadable
  *     file. Reads GET /api/reports/purchase-log.
+ *
+ * RULING 115 ON THE SUMMARY TAB: the first card is the GRAND TOTAL ("Total
+ * Purchases"), with the booked cost as its sub-line, and every bar list ranks,
+ * shows and adds up by Grand Total, its % share taken of that headline. The
+ * breakdown CSVs keep every column; only their row order follows Grand Total.
  *
  * WHY THE LOG SHOWS THREE SEPARATE TOTALS AND NEVER A GRAND TOTAL ACROSS THEM:
  * receiving a purchase order writes BOTH a GRN and `purchases` rows — the same
@@ -94,9 +106,17 @@ import {
 // ACCEPTED value (the GRN Inward Register's basis) — the shared wording for
 // saying so, used by the Purchases register too.
 import { acceptedBaseRowNote, acceptedBaseTotalNote } from '@/lib/purchase-gst-base';
+// Owner ruling 115 (2026-11-05): the item-wise list's column spec, shared with
+// the server route that builds its Excel file, and the card-figure sizing that
+// keeps every number inside its card at every width.
+import {
+  ITEMWISE_MONEY_COLUMNS, ITEMWISE_RATE_TITLE, billMatchSentence, billsDoNot,
+  type ItemwiseResponse, type ItemwiseRow,
+} from '@/lib/purchase-itemwise-columns';
+import { fitFigureStyle } from '@/lib/fit-figure';
 import {
   ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays,
-  ScrollText, Info, Loader2, BarChart3, Sigma, Receipt, Truck,
+  ScrollText, Info, Loader2, BarChart3, Sigma, Receipt, Truck, FileSpreadsheet, CheckCircle2,
 } from 'lucide-react';
 
 interface Row extends PurchaseChargeRow { spend: number; count: number; [k: string]: any }
@@ -110,6 +130,10 @@ interface Row extends PurchaseChargeRow { spend: number; count: number; [k: stri
 interface BreakdownSpec {
   k: 'month' | 'vendor' | 'category' | 'super_category' | 'payment_mode';
   title: string;
+  /** The rows' own word, plural — "All 32 vendors together …" under the bar list. */
+  plural: string;
+  /** …and singular — "The 1 month: …" when the list has one row. */
+  singular: string;
   /** The row field carrying the dimension's own label. */
   keyName: string;
   icon: React.ReactNode;
@@ -460,8 +484,9 @@ function downloadCsv(filename: string, header: string[], rows: (string | number)
  * empty report is exactly when the reader most needs to be told that 2,165 rows
  * are sitting just outside the window they picked.
  */
-function ReconciliationPanel({ recon, bills, onWiden }: {
-  recon: Reconciliation; bills?: BillIdentity; onWiden: () => void;
+function ReconciliationPanel({ recon, bills, grandTotal, onWiden }: {
+  /** summary.total_amount — the headline card's own figure, printed beside the booked one (agreed with the owner 2026-11-07). */
+  recon: Reconciliation; bills?: BillIdentity; grandTotal: number | null; onWiden: () => void;
 }) {
   const bad = !recon.balanced;
   const gapRows = recon.source.rows - recon.shown.rows;
@@ -476,24 +501,42 @@ function ReconciliationPanel({ recon, bills, onWiden }: {
       </div>
 
       <div className="p-4 space-y-3">
-        {/* The two figures being compared, side by side, always. */}
-        <div className="grid grid-cols-2 gap-3">
-          <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFCF8] px-3 py-2.5">
-            {/* BOTH FIGURES ARE SPEND, and the sub-lines say so. This panel
+        {/* The two figures being compared, side by side — stacked until the
+            panel is 36rem wide (round 3). Side by side on a phone the boxes
+            were ~140px, too narrow for "(Grand Total) ₹45,74,951.78" below, so
+            "(Grand Total)" ended a line alone (measured at 375-414px). From
+            36rem each box has 258px of text width, room for the whole
+            "Total Purchases (Grand Total) ₹1,15,09,145.38" (ruling 115 d). */}
+        <div className="@container">
+        <div className="grid grid-cols-1 @xl:grid-cols-2 gap-3">
+          <div className="@container min-w-0 rounded-xl border border-[#E8D5C4] bg-[#FFFCF8] px-3 py-2.5">
+            {/* BOTH FIGURES ARE SPEND (booked into stock), and the sub-lines say so. This panel
                 compares goods value against goods value — it is a row-coverage
                 proof, not a bill total. Since the charge columns landed, the
                 page also carries a GRAND TOTAL (what is payable, tax included),
                 which is a LARGER number; an unlabelled ₹ here would read as a
                 report that disagrees with its own footer. */}
+            {/* Sized off the box (ruling 115 d): a fixed text-lg spilled a lakh
+                figure out of a narrow box. */}
             <p className="text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">Shown on this page</p>
-            <p className="text-lg font-bold tabular-nums">{fmtINR(recon.shown.rupees)}</p>
-            <p className="text-[11px] text-[#6B5744]">{fmtNum(recon.shown.rows)} purchase rows · spend (goods value)</p>
+            <p className="font-bold tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(fmtINR(recon.shown.rupees), 1.125)}>{fmtINR(recon.shown.rupees)}</p>
+            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.shown.rows)} purchase row${recon.shown.rows === 1 ? '' : 's'} · booked into stock (goods value)`}</p>
+            {/* AGREED WITH THE OWNER 2026-11-07: the booked figure above sat next
+                to a larger headline and read like a mismatch. This line names the
+                headline's own figure (summary.total_amount, formatted as the card
+                formats it) so the two read as two different things. No new
+                query; the row reconciliation above and below is unchanged.
+                "(Grand Total)" and its amount are one inline-block: they move to
+                a new line together, and split (at a space, never inside the
+                figure) only where the box is narrower than the pair. */}
+            <p className="text-[11px] text-[#6B5744] mt-1.5 pt-1.5 border-t border-dashed border-[#E8D5C4]">Total Purchases <span className="inline-block">{`(Grand Total) ${fmtSignedINR(grandTotal)}`}</span> incl. GST and charges = the figure at the top</p>
           </div>
-          <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFCF8] px-3 py-2.5">
+          <div className="@container min-w-0 rounded-xl border border-[#E8D5C4] bg-[#FFFCF8] px-3 py-2.5">
             <p className="text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">In the source (all purchases)</p>
-            <p className="text-lg font-bold tabular-nums">{fmtINR(recon.source.rupees)}</p>
-            <p className="text-[11px] text-[#6B5744]">{fmtNum(recon.source.rows)} purchase rows · spend (goods value)</p>
+            <p className="font-bold tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(fmtINR(recon.source.rupees), 1.125)}>{fmtINR(recon.source.rupees)}</p>
+            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.source.rows)} purchase row${recon.source.rows === 1 ? '' : 's'} · booked into stock (goods value)`}</p>
           </div>
+        </div>
         </div>
 
         {/* The verdict — never left for the reader to work out by subtraction. */}
@@ -784,18 +827,32 @@ export default function PurchaseReportPage() {
    * are EXACTLY the ones the pre-change export had, in the same order — the
    * charge columns are appended by appendChargeCsvHeader / appendChargeCsvRow.
    */
-  const breakdowns: BreakdownSpec[] = useMemo(() => ([
-    { k: 'month', title: 'Month', keyName: 'month', icon: <CalendarDays className="w-4 h-4" />,
-      rows: data?.by_month || [], file: `purchases-by-month_${from}_${to}.csv`, head: ['Month', 'Spend', 'Purchases'] },
-    { k: 'vendor', title: 'Vendor', keyName: 'vendor', icon: <Building2 className="w-4 h-4" />, limit: 12,
-      rows: data?.by_vendor || [], file: `purchases-by-vendor_${from}_${to}.csv`, head: ['Vendor', 'Spend', 'Purchases'] },
-    { k: 'category', title: 'Category', keyName: 'category', icon: <Package className="w-4 h-4" />, limit: 12,
-      rows: data?.by_category || [], file: `purchases-by-category_${from}_${to}.csv`, head: ['Category', 'Spend', 'Purchases'] },
-    { k: 'super_category', title: 'Super-category', keyName: 'super_category', icon: <Package className="w-4 h-4" />,
-      rows: data?.by_super_category || [], file: `purchases-by-supercategory_${from}_${to}.csv`, head: ['Super-category', 'Spend', 'Purchases'] },
-    { k: 'payment_mode', title: 'Payment Mode', keyName: 'payment_mode', icon: <TrendingUp className="w-4 h-4" />,
-      rows: data?.by_payment_mode || [], file: `purchases-by-payment_${from}_${to}.csv`, head: ['Payment Mode', 'Spend', 'Purchases'] },
-  ]), [data, from, to]);
+  /*
+   * OWNER RULING 115 (2026-11-05): THE LISTS RANK BY GRAND TOTAL. The server
+   * still orders vendor / category / super-category / payment mode by booked
+   * spend (its SQL is shared with nothing here and stays as it was); the page
+   * re-ranks them by Grand Total — what was actually bought, tax and charges in
+   * — so the bar list, the charge table and the CSV all read in the order of the
+   * headline card. A stable sort: equal Grand Totals keep the server's order.
+   * Months stay in calendar order — a month list ranked by size is not a
+   * timeline. Every column of every CSV is unchanged; only the row order moved.
+   */
+  const breakdowns: BreakdownSpec[] = useMemo(() => {
+    const byGrandTotal = (rows: Row[] | undefined) =>
+      [...(rows || [])].sort((a, b) => (Number(b.total_amount) || 0) - (Number(a.total_amount) || 0));
+    return [
+      { k: 'month', title: 'Month', plural: 'months', singular: 'month', keyName: 'month', icon: <CalendarDays className="w-4 h-4" />,
+        rows: data?.by_month || [], file: `purchases-by-month_${from}_${to}.csv`, head: ['Month', 'Spend', 'Purchases'] },
+      { k: 'vendor', title: 'Vendor', plural: 'vendors', singular: 'vendor', keyName: 'vendor', icon: <Building2 className="w-4 h-4" />, limit: 12,
+        rows: byGrandTotal(data?.by_vendor), file: `purchases-by-vendor_${from}_${to}.csv`, head: ['Vendor', 'Spend', 'Purchases'] },
+      { k: 'category', title: 'Category', plural: 'categories', singular: 'category', keyName: 'category', icon: <Package className="w-4 h-4" />, limit: 12,
+        rows: byGrandTotal(data?.by_category), file: `purchases-by-category_${from}_${to}.csv`, head: ['Category', 'Spend', 'Purchases'] },
+      { k: 'super_category', title: 'Super-category', plural: 'super-categories', singular: 'super-category', keyName: 'super_category', icon: <Package className="w-4 h-4" />,
+        rows: byGrandTotal(data?.by_super_category), file: `purchases-by-supercategory_${from}_${to}.csv`, head: ['Super-category', 'Spend', 'Purchases'] },
+      { k: 'payment_mode', title: 'Payment Mode', plural: 'payment modes', singular: 'payment mode', keyName: 'payment_mode', icon: <TrendingUp className="w-4 h-4" />,
+        rows: byGrandTotal(data?.by_payment_mode), file: `purchases-by-payment_${from}_${to}.csv`, head: ['Payment Mode', 'Spend', 'Purchases'] },
+    ];
+  }, [data, from, to]);
 
   /**
    * One export path for a dimension, whichever button is pressed.
@@ -854,7 +911,8 @@ export default function PurchaseReportPage() {
             rather than answer. On live data that moment is inside the same
             spinner the page already showed. */}
         {view === 'log' && (windowKnown
-          ? <PurchaseLog from={from} to={to} setFrom={setFrom} setTo={setTo} vendors={data?.vendors || []} presets={presets} />
+          ? <LogTab from={from} to={to} setFrom={setFrom} setTo={setTo}
+              vendors={data?.vendors || []} categories={data?.categories || []} presets={presets} />
           : <div className="text-sm text-[#8B7355] py-8 text-center animate-pulse">Loading purchase log…</div>)}
 
         {view === 'summary' && (<>
@@ -898,19 +956,33 @@ export default function PurchaseReportPage() {
 
         {data && s && (
           <>
-            {/* Summary cards */}
-            <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-              {/* NOT the Subtotal and NOT the Grand total — both of those are on
-                  the charge cards directly below, and this one is neither. The
-                  label says "booked cost" so the three cannot be read as the same
-                  figure: this is what was recorded into stock, and it is what
-                  stock valuation reconciles against. 2026-09-11. */}
-              <Card icon={<TrendingUp className="w-4 h-4" />} label="Total Spend (booked cost)" value={fmtINR(s.total_spend)}
-                sub="what we recorded into stock — goods only" tone="accent" />
+            {/* Summary cards. Ruling 115 (d): the row re-flows on the width it
+                ACTUALLY has, not the window's — with the sidebar open a 1024px
+                window leaves ~650px, and five cards there were 121px wide. Two,
+                then three from 576px, six tracks from 896px of room. The
+                headline card takes TWO tracks at every width, so the headline
+                is never the smallest figure in its row (it was 14px beside 20px
+                counts at 1280px) and every row is full: H H / P V / I E on a
+                phone, H H P / V I E, then H H P V I E. */}
+            <div className="@container">
+            <div className="grid grid-cols-2 @xl:grid-cols-3 @4xl:grid-cols-6 gap-3">
+              {/* OWNER RULING 115 (2026-11-05): THE HEADLINE IS THE GRAND TOTAL.
+                  "The Total Cost Booked Cost Should be Grand Total." This card
+                  read "Total Spend (booked cost)" — goods only, what was recorded
+                  into stock — and the owner reads the first card as what October's
+                  purchases came to. It now prints summary.total_amount, the SAME
+                  figure as the Grand Total card at the end of the strip below
+                  (Subtotal − Discount + every tax and charge), and the booked
+                  cost stays on the card as its sub-line, unchanged: it is still
+                  what stock valuation reconciles against. Every bar list below
+                  adds up to this figure. */}
+              <Card icon={<TrendingUp className="w-4 h-4" />} label="Total Purchases (Grand Total)" value={fmtSignedINR(s.total_amount)}
+                sub={<>incl. GST and every charge · <span className="inline-block">{`booked into stock ${fmtINR(s.total_spend)}`}</span></>} tone="accent" className="col-span-2" />
               <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases" value={fmtNum(s.purchase_count)} sub={`${fmtNum(s.day_count)} days`} />
               <Card icon={<Building2 className="w-4 h-4" />} label="Vendors" value={fmtNum(s.vendor_count)} />
               <Card icon={<Package className="w-4 h-4" />} label="Items" value={fmtNum(s.item_count)} />
               <Card icon={<AlertTriangle className="w-4 h-4" />} label="Emergency Spend" value={fmtINR(s.emergency_spend)} sub={`${fmtNum(s.emergency_count)} purchases`} tone={s.emergency_spend > 0 ? 'warn' : undefined} />
+            </div>
             </div>
 
             {/*
@@ -966,6 +1038,7 @@ export default function PurchaseReportPage() {
               <ReconciliationPanel
                 recon={data.reconciliation}
                 bills={data.bill_identity}
+                grandTotal={s.total_amount}
                 /* "Show everything" must mean EVERYTHING, in both directions.
                    Capping the far end at today left a future-dated bill — a
                    delivery entered ahead of its date, which this app allows —
@@ -1016,17 +1089,20 @@ export default function PurchaseReportPage() {
                   a column into the middle of one of these lists — somebody's
                   saved pivot points at column C.
                 */}
+                {/* RULING 115: each list shows, ranks and adds up by GRAND TOTAL,
+                    its % share is of the headline card, and its foot says what
+                    the whole list adds up to — the Total Purchases figure. */}
                 <div className="grid lg:grid-cols-2 gap-4">
                   {breakdowns.filter(b => b.k !== 'payment_mode').map(b => (
-                    <BarTable key={b.k} title={`Spend by ${b.title}`} icon={b.icon} keyName={b.keyName}
-                      rows={b.rows} total={s.total_spend} limit={b.limit} onExport={() => exportBreakdown(b)} />
+                    <BarTable key={b.k} title={`Purchases by ${b.title}`} plural={b.plural} singular={b.singular} icon={b.icon} keyName={b.keyName}
+                      rows={b.rows} total={Number(s.total_amount) || 0} limit={b.limit} onExport={() => exportBreakdown(b)} />
                   ))}
                 </div>
 
                 {data.by_payment_mode.length > 0 && (() => {
                   const b = breakdowns.find(x => x.k === 'payment_mode')!;
-                  return <BarTable title={`Spend by ${b.title}`} icon={b.icon} keyName={b.keyName}
-                    rows={b.rows} total={s.total_spend} onExport={() => exportBreakdown(b)} />;
+                  return <BarTable title={`Purchases by ${b.title}`} plural={b.plural} singular={b.singular} icon={b.icon} keyName={b.keyName}
+                    rows={b.rows} total={Number(s.total_amount) || 0} onExport={() => exportBreakdown(b)} />;
                 })()}
 
                 {/* THE CHARGE COLUMNS ON SCREEN — the owner's four, per dimension,
@@ -1158,10 +1234,427 @@ export default function PurchaseReportPage() {
                 word on the page. With a Subtotal and a Grand Total beside it,
                 "invoice total" reads like one of those two, so the three are
                 named apart here instead. */}
-            <p className="text-[11px] text-[#8B7355]">Spend = the booked cost of the purchase entries in the range — goods only, what stock valuation uses, and the figure the Purchases page shows. Subtotal = the same goods at the price the bill charges for them. Grand Total = what is payable to the vendor: subtotal − discount + every tax and charge. {data.vendor && `Vendor: ${data.vendor}. `}{data.category && `Category: ${data.category}.`}</p>
+            {/* RULING 115: the headline and the lists are the Grand Total now,
+                so this line names that first. One line of text, no entity, no
+                interpolation beside a source newline (see the SWC notes below). */}
+            {/* Round 2: the sentences about the bar lists, the charge table and the
+                item table are said only when those are on screen — an empty
+                window shows none of them (same test as the branch above). */}
+            <p className="text-[11px] text-[#8B7355]">Total Purchases = the Grand Total: what is payable to the vendors — subtotal − discount + every tax and charge. {s.total_spend === 0 ? '' : 'The bar lists and the taxes, cess and transport table above add up to it, and list vendors, categories, super-categories and payment modes largest Grand Total first (months stay in calendar order); their CSV files keep every column they had, Spend included, and only the order of their rows now follows the Grand Total. The Item-wise Purchase Report table keeps its own sort. '}Spend (booked into stock) = the booked cost of the purchase entries in the range — goods only, what stock valuation uses, and the figure the Purchases page shows. Subtotal = the same goods at the price the bill charges for them. {data.vendor && `Vendor: ${data.vendor}. `}{data.category && `Category: ${data.category}.`}</p>
           </>
         )}
         </>)}
+      </div>
+    </div>
+  );
+}
+
+/* ───────────────────── Purchase log tab: the two views ─────────────────────
+ * OWNER RULING 115 (2026-11-05). He downloaded this tab's file, added up its
+ * Grand Total column for October and got ~₹1.36 crore against a Summary of
+ * ₹45.7 lakh — "some Entries are Double". Nothing was saved twice: that file
+ * lists the purchase order, the GRN bill AND the purchase entry for the same
+ * goods, so any column added down counts one delivery two or three times.
+ *
+ * So the tab now OPENS on ITEM-WISE PURCHASES — one line per item bought, the
+ * very lines the Summary adds up, each money column footing to its Summary
+ * card — and the three-document log is kept, unchanged, one click away as
+ * "All documents (audit)" for checking documents against each other.
+ */
+function LogTab({ from, to, setFrom, setTo, vendors, categories, presets }: {
+  from: string; to: string; setFrom: (v: string) => void; setTo: (v: string) => void;
+  vendors: string[]; categories: string[]; presets: PresetChip[];
+}) {
+  const [mode, setMode] = useState<'itemwise' | 'audit'>('itemwise');
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={() => setMode('itemwise')}
+          className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold border transition-colors ${
+            mode === 'itemwise' ? 'bg-[#2D1B0E] text-white border-[#2D1B0E]' : 'bg-white text-[#2D1B0E] border-[#E8D5C4] hover:bg-[#FFF1E3]'}`}>
+          <Package className="w-3.5 h-3.5" /> Item-wise purchases
+        </button>
+        {/* Deliberately the quieter button: it is the audit trail, not a total. */}
+        <button onClick={() => setMode('audit')}
+          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-medium border transition-colors ${
+            mode === 'audit' ? 'bg-[#F4EFE9] text-[#2D1B0E] border-[#CDB9A4]' : 'bg-transparent text-[#8B7355] border-dashed border-[#D9C6B2] hover:bg-[#FFF1E3]'}`}>
+          <ScrollText className="w-3.5 h-3.5" /> All documents (audit)
+        </button>
+        <p className="text-[11px] text-[#8B7355] basis-full sm:basis-auto">
+          {mode === 'itemwise'
+            ? 'One line per item bought. With no item filter set, every money column adds up to the Summary tab for the same dates and filters (the Summary has no item filter).'
+            : 'Purchase orders, GRN bills and purchase entries side by side, for checking documents. The same goods appear more than once here — never add these up.'}
+        </p>
+      </div>
+      {mode === 'itemwise'
+        ? <ItemwisePurchases from={from} to={to} setFrom={setFrom} setTo={setTo} vendors={vendors} categories={categories} presets={presets} />
+        : <PurchaseLog from={from} to={to} setFrom={setFrom} setTo={setTo} vendors={vendors} presets={presets} />}
+    </div>
+  );
+}
+
+/** Rows the browser paints before asking — same cap and same reason as the audit log's ROW_PAINT_CAP below. */
+const ITEMWISE_PAINT_CAP = 600;
+
+/** The money columns before GST %, and after it — the order the Excel file uses. */
+const IW_BEFORE_PCT = ITEMWISE_MONEY_COLUMNS.filter(c => c.key === 'subtotal' || c.key === 'discount' || c.key === 'taxable');
+const IW_AFTER_PCT = ITEMWISE_MONEY_COLUMNS.filter(c => !IW_BEFORE_PCT.includes(c));
+/** Date … Rate: the text/quantity columns before the money. The footer's label spans these. */
+const IW_LEAD_HEADS: { label: string; right?: boolean; title?: string }[] = [
+  { label: 'Date' }, { label: 'Vendor' }, { label: 'Vendor Bill No' }, { label: 'GRN No' }, { label: 'Our Invoice ID' },
+  { label: 'Item' }, { label: 'SKU' }, { label: 'Category' }, { label: 'Qty', right: true }, { label: 'Purchase Unit' },
+  { label: 'Rate', right: true, title: ITEMWISE_RATE_TITLE },
+];
+
+/**
+ * ITEM-WISE PURCHASES — the Purchase log tab's default view (ruling 115).
+ *
+ * Reads /api/reports/purchase-itemwise: one line per `purchases` row in the
+ * window, through the Summary's own FROM / WHERE, so the footer IS the Summary
+ * cards. The server also checks that, figure by figure, on every load and the
+ * page prints the verdict — green with the Grand Total, or red naming what
+ * disagrees. Vendor and category are the Summary's exact-match filters (not
+ * the audit log's "contains"), because the point is that the two agree.
+ */
+function ItemwisePurchases({ from, to, setFrom, setTo, vendors, categories, presets }: {
+  from: string; to: string; setFrom: (v: string) => void; setTo: (v: string) => void;
+  vendors: string[]; categories: string[]; presets: PresetChip[];
+}) {
+  const [vendor, setVendor] = useState('');
+  const [category, setCategory] = useState('');
+  const [materialId, setMaterialId] = useState('');
+  const [materials, setMaterials] = useState<MaterialLite[]>([]);
+  const [materialsError, setMaterialsError] = useState(false);
+  const [data, setData] = useState<ItemwiseResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [downloading, setDownloading] = useState(false);
+  const [paintAll, setPaintAll] = useState(false);
+  /** Only the latest request may paint — a slow answer for old filters must not overwrite a newer one. */
+  const seq = useRef(0);
+
+  // Item filter needs ids — the same list, and the same non-fatal failure, as the audit log.
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/inventory?scope=all', { cache: 'no-store' });
+        if (!res.ok) { setMaterialsError(true); return; }
+        const j = await res.json();
+        setMaterials(Array.isArray(j.materials) ? j.materials : []);
+      } catch { setMaterialsError(true); }
+    })();
+  }, []);
+
+  const qs = useCallback((format: 'json' | 'xlsx') => {
+    const p = new URLSearchParams({ from, to, format });
+    if (vendor) p.set('vendor', vendor);
+    if (category) p.set('category', category);
+    if (materialId) p.set('material_id', materialId);
+    return p.toString();
+  }, [from, to, vendor, category, materialId]);
+
+  const load = useCallback(async () => {
+    const my = ++seq.current;
+    setLoading(true); setError(''); setPaintAll(false);
+    try {
+      const res = await fetch(`/api/reports/purchase-itemwise?${qs('json')}`, { cache: 'no-store' });
+      if (my !== seq.current) return;
+      // A failed load must never look like "no purchases" — clear the rows and say why.
+      if (res.status === 401) { setError('Sign in required.'); setData(null); return; }
+      if (res.status === 403) { setError('Management only — you don’t have access to purchase reports.'); setData(null); return; }
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as { error?: string }));
+        if (my !== seq.current) return;
+        setError(j?.error || `Failed to load the item-wise purchases (HTTP ${res.status}).`); setData(null); return;
+      }
+      const j = (await res.json()) as ItemwiseResponse;
+      if (my !== seq.current) return;
+      setData({ ...j, rows: Array.isArray(j.rows) ? j.rows : [] });
+    } catch {
+      if (my === seq.current) { setError('Network error — please try again.'); setData(null); }
+    } finally {
+      if (my === seq.current) setLoading(false);
+    }
+  }, [qs]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const download = async () => {
+    setDownloading(true); setError('');
+    try {
+      const res = await fetch(`/api/reports/purchase-itemwise?${qs('xlsx')}`, { cache: 'no-store' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as { error?: string }));
+        setError(j?.error || (res.status === 403 ? 'Management only — download refused.' : `Download failed (HTTP ${res.status}).`));
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `purchases-itemwise-${from}_${to}.xlsx`; a.click();
+      URL.revokeObjectURL(url);
+    } catch { setError('Network error — download failed.'); }
+    finally { setDownloading(false); }
+  };
+
+  const rows = data?.rows || [];
+  const shown = paintAll ? rows : rows.slice(0, ITEMWISE_PAINT_CAP);
+  const t = data?.totals;
+  const proof = data?.proof;
+  const colCount = IW_LEAD_HEADS.length + ITEMWISE_MONEY_COLUMNS.length + 1;
+  const itemFilter = !!data?.material_id;
+  const bad = proof ? proof.checks.filter(c => !c.ok) : [];
+  const bc = data?.bill_check;
+  const fmtCheck = (kind: 'money' | 'count', v: number) => (kind === 'money' ? fmtSignedINR(v) : fmtNum(v));
+  // Composed as whole strings: no interpolation ever sits beside a source newline (SWC).
+  // The sentence names its BASIS — the dates and the vendor / category the
+  // server applied — because the Summary tab keeps filters of its own, and a
+  // bare "= Summary Grand Total" would point at whatever that tab shows.
+  const iwFilters = [data?.vendor && `vendor ${data.vendor}`, data?.category && `category ${data.category}`].filter(Boolean).join(' and ');
+  // One line reads "this 1 line", never "these 1 line"; no lines at all says
+  // plainly that there is nothing to add up (round 2).
+  const iwLines = proof ? (proof.lines === 1 ? 'this 1 line' : `these ${fmtNum(proof.lines)} lines`) : '';
+  const proofText = proof
+    ? (proof.lines === 0
+      ? (itemFilter
+        ? `No purchase lines for this item in these dates${iwFilters ? ` with ${iwFilters}` : ''} — nothing to add up.`
+        : iwFilters
+          ? `No purchase lines in these dates with ${iwFilters} — nothing to add up.`
+          : 'No purchase lines in these dates (all vendors, all categories) — nothing to add up.')
+      : itemFilter
+      ? `Grand Total of ${iwLines} = ${fmtSignedINR(proof.grand_total)} — the Summary’s own arithmetic gives the same for this item${iwFilters ? ` with ${iwFilters}` : ''} (the Summary tab has no item filter). Every money column below adds up the same way (Taxable Value = Subtotal − Discount).`
+      : iwFilters
+        ? `Grand Total of ${iwLines} = ${fmtSignedINR(proof.grand_total)} = the Summary’s Grand Total for these dates with ${iwFilters} (set the same filter on the Summary tab to see it). Every money column below adds up to its Summary figure the same way (Taxable Value = Subtotal − Discount).`
+        : `Grand Total of ${iwLines} = ${fmtSignedINR(proof.grand_total)} = Summary Grand Total for these dates (all vendors, all categories). Every money column below adds up to its Summary figure (Taxable Value = Subtotal − Discount).`)
+    : '';
+  const billText = bc
+    ? (bc.compared
+      ? (bc.differences.length === 0
+        ? billMatchSentence(bc, false, fmtNum)
+        : `${billsDoNot(bc.differences.length, fmtNum)} match the Purchase Bill Summary for the same dates — report it.`)
+      // Round 3: with no lines there are no bills, and why bills were not
+      // compared says nothing — the sentence above already says so plainly.
+      : (bc.bills === 0 ? '' : bc.reason))
+    : '';
+
+  return (
+    <div className="space-y-4">
+      {/* Filters — the shared window, then this view's own vendor / category / item. */}
+      <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm p-4 space-y-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="block"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">From</span>
+            <input type="date" value={from} onChange={e => e.target.value && setFrom(e.target.value)} className="mt-1 block px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+          <label className="block"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">To</span>
+            <input type="date" value={to} onChange={e => e.target.value && setTo(e.target.value)} className="mt-1 block px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+          <label className="block min-w-[160px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Vendor</span>
+            <select value={vendor} onChange={e => setVendor(e.target.value)} className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]">
+              <option value="">All vendors</option>{vendors.map(v => <option key={v} value={v}>{v}</option>)}
+            </select></label>
+          <label className="block min-w-[160px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Category</span>
+            <select value={category} onChange={e => setCategory(e.target.value)} className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]">
+              <option value="">All categories</option>{categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select></label>
+          <div className="block min-w-[240px] flex-1"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Item</span>
+            <div className="mt-1"><MaterialTypeahead materials={materials} value={materialId} onPick={setMaterialId} compact={false} showStock={false} placeholder="All items — type name, SKU or category…" /></div>
+            {materialsError && <p className="text-[10px] text-amber-700 mt-0.5">Item list didn’t load — showing all items.</p>}</div>
+          <button onClick={download} disabled={downloading || !data}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white">
+            {downloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileSpreadsheet className="w-3.5 h-3.5" />} Download Excel
+          </button>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {presets.map(p => (
+            <button key={p.label} onClick={p.apply} title={p.title}
+              className={`px-3 py-1.5 rounded-lg text-xs border text-left ${p.active
+                ? 'bg-[#af4408] text-white border-[#af4408]'
+                : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'}`}>
+              <span className="block font-semibold">{p.label}</span>
+              <span className={`block text-[10px] tabular-nums ${p.active ? 'text-white/85' : 'text-[#8B7355]'}`}>{p.window}</span>
+            </button>
+          ))}
+          {(vendor || category || materialId) && (
+            <button onClick={() => { setVendor(''); setCategory(''); setMaterialId(''); }}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-white text-[#af4408] border-[#E8D5C4] hover:bg-[#FFF1E3]">Clear filters</button>
+          )}
+        </div>
+      </div>
+
+      {error && <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800">{error}</div>}
+
+      {/* THE PROOF — computed on the server from the same query, every load. */}
+      {proof && (proof.ok ? (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm text-emerald-900 flex gap-2">
+          <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-emerald-700" />
+          <div className="min-w-0">
+            <p><strong>{proofText}</strong></p>
+            {billText && <p className={`text-[12px] mt-1 ${bc?.compared && bc.differences.length > 0 ? 'text-red-800 font-semibold' : 'text-emerald-800'}`}>{billText}</p>}
+          </div>
+        </div>
+      ) : (
+        <div className="bg-red-50 border-2 border-red-300 rounded-xl px-4 py-3 text-sm text-red-900 flex gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+          <div className="min-w-0">
+            <p><strong>These lines do not add up to the Summary.</strong> Report it — do not reconcile it by hand. The figures that differ:</p>
+            <ul className="mt-1 space-y-0.5 font-mono text-[12px]">
+              {bad.map(c => <li key={c.figure}>{`${c.figure}: lines ${fmtCheck(c.kind, c.lines)} vs Summary ${fmtCheck(c.kind, c.summary)}`}</li>)}
+            </ul>
+          </div>
+        </div>
+      ))}
+
+      {/* Round 3: the row re-flows on the width it actually has, so a label
+          and its amount ("booked into stock ₹44,21,109.49") always share one
+          line: one card per row on a phone, two from 28rem of room, four from
+          56rem. In four columns from the window's 768px the cards had ~126px of
+          text width and "booked into stock" ended a line alone (measured at
+          768, 1024, 375 and 320px). The Taxes pairs stay inline-blocks, so
+          when both cannot share a line the second pair moves down whole. */}
+      {data && t && (
+        <div className="@container">
+        <div className="grid grid-cols-1 @md:grid-cols-2 @4xl:grid-cols-4 gap-3">
+          <Card icon={<ShoppingCart className="w-4 h-4" />} label="Lines" value={fmtNum(data.lines)}
+            sub={`${fmtNum(data.bills)} bill${data.bills === 1 ? '' : 's'} · ${fmtNum(data.days)} day${data.days === 1 ? '' : 's'}`} />
+          <Card icon={<Package className="w-4 h-4" />} label="Subtotal" value={fmtSignedINR(t.subtotal)}
+            sub={`less discount ${fmtSignedINR(t.discount)}`} />
+          <Card icon={<Receipt className="w-4 h-4" />} label="Taxes (CGST+SGST)" value={fmtSignedINR(r2(t.cgst + t.sgst))}
+            sub={<><span className="inline-block">{`CGST ${fmtSignedINR(t.cgst)}\u00A0·`}</span>{' '}<span className="inline-block">{`SGST ${fmtSignedINR(t.sgst)}`}</span></>} />
+          <Card icon={<Sigma className="w-4 h-4" />} label="Grand Total" value={fmtSignedINR(t.grand_total)}
+            sub={`booked into stock ${fmtSignedINR(t.booked)}`} tone="accent" />
+        </div>
+        </div>
+      )}
+
+      {data && data.understated_lines > 0 && (
+        <div className="bg-red-50 border-2 border-red-300 rounded-xl px-4 py-3 text-sm text-red-900 flex gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+          {/* Round 3: plural forms for many lines, and only the GRN line's own
+              tax and charges are missing — a charge stored on the purchase row
+              itself (a delivery share) still shows on the line. */}
+          <p>{data.understated_lines === 1
+            ? '1 line was booked from a goods receipt whose GRN line (the bill document) has since been deleted. The tax and any charges recorded only on that GRN line are missing, so the Grand Total is UNDERSTATED by an amount that cannot be known from here — the Summary shows the same short figure. Do not pay a vendor against it; report it.'
+            : `${fmtNum(data.understated_lines)} lines were booked from goods receipts whose GRN lines (the bill documents) have since been deleted. The tax and any charges recorded only on those GRN lines are missing, so the Grand Total is UNDERSTATED by an amount that cannot be known from here — the Summary shows the same short figure. Do not pay a vendor against it; report it.`}</p>
+        </div>
+      )}
+
+      {data?.truncated && (
+        <div className="bg-[#af4408] text-white rounded-xl px-4 py-3 text-sm font-semibold flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {`Only the first ${fmtNum(data.row_cap)} of ${fmtNum(data.lines)} lines were sent to the screen. The totals and the Excel file still cover every line — narrow the dates or filters to see the rest here.`}
+        </div>
+      )}
+
+      <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <h2 className="text-sm font-bold flex items-center gap-2"><span className="text-[#af4408]"><Package className="w-4 h-4" /></span>
+            Item-wise purchases — one line per item bought
+            <span className="text-[11px] text-[#8B7355] font-normal">{`(${fmtNum(data?.lines ?? 0)} line${(data?.lines ?? 0) === 1 ? '' : 's'})`}</span></h2>
+          {loading && <span className="text-xs text-[#8B7355] inline-flex items-center gap-1.5"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…</span>}
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm whitespace-nowrap">
+            <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
+              {IW_LEAD_HEADS.map((h, i) => (
+                <th key={h.label} className={`py-2 ${i === 0 ? 'pr-3' : 'px-3'}${h.right ? ' text-right' : ''}`} title={h.title}>{h.label}</th>
+              ))}
+              {IW_BEFORE_PCT.map(c => <th key={c.key} className="py-2 px-3 text-right" title={c.title}>{c.header}</th>)}
+              <th className="py-2 px-3 text-right" title="GST charged on this line as a % of the value it was charged on. Shows — where no GST was recorded, never 0%.">GST %</th>
+              {IW_AFTER_PCT.map(c => (
+                <th key={c.key} className={`py-2 ${c.key === 'booked' ? 'pl-3' : 'px-3'} text-right${c.key === 'grand_total' ? ' text-[#af4408]' : ''}`} title={c.title}>{c.header}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {loading && rows.length === 0 ? (
+                <tr><td colSpan={colCount} className="py-6 text-center text-[#8B7355] animate-pulse">Loading item-wise purchases…</td></tr>
+              ) : rows.length === 0 ? (
+                <tr><td colSpan={colCount} className="py-6 text-center text-[#8B7355]">{error ? 'Not loaded — see the message above.' : 'No purchases match these dates and filters.'}</td></tr>
+              ) : shown.map((r: ItemwiseRow, i) => (
+                <tr key={i} className={`border-b border-[#F7EEE3] last:border-0 ${r.unlinked ? 'bg-amber-50' : ''}`}>
+                  <td className="py-2 pr-3 text-[#6B5744] tabular-nums">{r.date || '—'}</td>
+                  <td className="py-2 px-3 font-medium">{r.vendor || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.bill_no || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.grn_no || '—'}</td>
+                  <td className="py-2 px-3 text-[#6B5744]">{r.invoice_id || '—'}</td>
+                  <td className="py-2 px-3 font-medium whitespace-normal min-w-[180px]">{r.item || '—'}</td>
+                  <td className="py-2 px-3 text-[11px] text-[#8B7355]">{r.sku || '—'}</td>
+                  <td className="py-2 px-3 text-[#8B7355]">{r.category || '—'}</td>
+                  <td className="py-2 px-3 text-right tabular-nums">{fmtQty(r.qty)}</td>
+                  <td className="py-2 px-3 text-[#8B7355]">{r.unit || '—'}</td>
+                  <td className="py-2 px-3 text-right tabular-nums">{fmtINR(r.rate)}</td>
+                  {IW_BEFORE_PCT.map(c => <td key={c.key} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(r[c.key])}</td>)}
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                      title={r.understated
+                        ? `GST unknown: this line was booked from a goods receipt whose GRN line (the bill document) has since been deleted, so its GST cannot be read from here.${r.gst_percent == null ? ' Shown as —, never 0%.' : ''}`
+                        : r.gst_percent == null ? 'No GST was recorded on this line — shown as —, never 0%.' : (r.gst_base_accepted ? acceptedBaseRowNote(undefined, undefined, true) : undefined)}>
+                    {fmtTaxPercent(r.gst_percent)}
+                  </td>
+                  {IW_AFTER_PCT.map(c => {
+                    const v = r[c.key];
+                    if (c.key === 'grand_total') {
+                      return (
+                        <td key={c.key} className={`py-2 px-3 text-right tabular-nums font-bold ${r.understated ? 'text-red-700' : 'text-[#af4408]'}`}
+                            title={r.understated ? 'UNDERSTATED — this line was booked from a goods receipt whose GRN line has been deleted, so the tax and any charges recorded only on that GRN line are missing. Report it.' : undefined}>
+                          {fmtSignedINR(v)}
+                          {r.understated && <span className="block text-[10px] font-bold">UNDERSTATED</span>}
+                        </td>
+                      );
+                    }
+                    return (
+                      <td key={c.key} className={`py-2 ${c.key === 'booked' ? 'pl-3' : 'px-3'} text-right tabular-nums ${
+                        c.signed && v < 0 ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}`}>{fmtSignedINR(v)}</td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+            {/* THE FOOTER IS THE SUMMARY. Server totals over EVERY line in the
+                window, not a sum of the rows painted above — so with the row cap
+                it can exceed what is on screen, and it says so. */}
+            {t && rows.length > 0 && (
+              <tfoot className="border-t-2 border-[#E8D5C4]">
+                <tr className="bg-[#FFFBF6] text-[12px]">
+                  <td colSpan={IW_LEAD_HEADS.length} className="py-2 pr-3 text-right font-bold text-[#6B5744]">
+                    {(data?.lines ?? 0) === 1 ? 'TOTAL · the 1 line' : `TOTAL · all ${fmtNum(data?.lines ?? 0)} lines`}
+                  </td>
+                  {IW_BEFORE_PCT.map(c => <td key={c.key} className="py-2 px-3 text-right tabular-nums font-bold">{fmtSignedINR(t[c.key])}</td>)}
+                  <td className="py-2 px-3" title="A rate is not added up." />
+                  {IW_AFTER_PCT.map(c => (
+                    <td key={c.key} className={`py-2 ${c.key === 'booked' ? 'pl-3' : 'px-3'} text-right tabular-nums font-bold${c.key === 'grand_total' ? ' text-[#af4408]' : ''}`}>{fmtSignedINR(t[c.key])}</td>
+                  ))}
+                </tr>
+                <tr>
+                  <td colSpan={colCount} className="pt-2 text-[11px] text-[#8B7355] whitespace-normal leading-relaxed">
+                    {/* Round 3: "not only the rows painted above" is said only when
+                        some lines really are not painted (screen cap or server cap). */}
+                    {(data?.lines ?? 0) === 1
+                      ? 'Totals are over the 1 line in these dates and filters.'
+                      : shown.length < (data?.lines ?? 0)
+                        ? `Totals are over all ${fmtNum(data?.lines ?? 0)} lines in these dates and filters, not only the rows painted above.`
+                        : `Totals are over all ${fmtNum(data?.lines ?? 0)} lines in these dates and filters.`}
+                  </td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+
+        {rows.length > shown.length && (
+          <div className="pt-3 flex flex-wrap items-center gap-2 text-xs text-[#8B7355]">
+            <Info className="w-3.5 h-3.5 shrink-0" />
+            {`Showing the first ${fmtNum(shown.length)} of ${fmtNum(rows.length)} lines on screen — the Excel file has all of them.`}
+            <button onClick={() => setPaintAll(true)} className="px-2.5 py-1 rounded-md border border-[#E8D5C4] text-[#af4408] hover:bg-[#FFF1E3] font-semibold">{`Show all ${fmtNum(rows.length)}`}</button>
+          </div>
+        )}
+      </div>
+
+      {/* WHAT A LINE IS, in plain words. Every sentence is a whole string (no
+          interpolation beside a source newline, no HTML entity — SWC). */}
+      <div className="text-[11px] text-[#8B7355] leading-relaxed space-y-1">
+        <p>One line = one item on one purchase entry. With no item filter set, these are the same lines the Summary tab adds up for the same dates and filters, nothing added and nothing left out. Purchase orders are not listed — an order is not a purchase — and goods received against a PO appear once, with the GRN bill’s tax and charges on the line, so nothing is counted twice.</p>
+        <p>Grand Total = Subtotal − Discount + CGST + SGST + both cesses + TCS + Delivery + MRP Round-off: what is payable to the vendor. Booked into stock = what was recorded into stock for the line, exactly as stored — the figure stock valuation uses; on goods received against a PO it can be lower than the Subtotal: where the discount was taken off the booked rate, or where part of the delivery was rejected at the door (the GRN bill’s Subtotal counts everything received). Rate is the rate booked into stock, so on those lines Qty × Rate can differ from the Subtotal. GST % shows — where no GST was recorded, never 0% (in the Excel file that cell is empty).</p>
+        <p>As on the Summary tab: some older bills were entered in bulk from a vendor sheet with the tax already inside the line total and never split out. Those lines show no GST of their own, so their Subtotal includes that tax.</p>
+        {data && data.part_rejected_lines > 0 && <p>{`GST %: ${acceptedBaseTotalNote(data.part_rejected_lines, true)}`}</p>}
+        <p>Download Excel gives this list plus Date-wise, Bill-wise and Totals sheets, each adding up to the same figures. To see purchase orders, GRN bills and purchase entries side by side, use All documents (audit) above.</p>
       </div>
     </div>
   );
@@ -1594,7 +2087,7 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                 entity and a newline, so its leading space was dropped. Caught by
                 reading the rendered DOM, not by tsc — which type-checks it clean.
                 Keep the literal glyphs. */}
-            {' '}<strong>Goods value</strong> here is the booked cost — the Summary tab calls that <em>Total Spend</em>, not <em>Subtotal</em>.
+            {' '}<strong>Goods value</strong> here is the booked cost — the Summary tab shows that as <em>booked into stock</em> under <em>Total Purchases</em>, not as <em>Subtotal</em>.
             <strong> Grand Total</strong> here counts only the tax each purchase row carries itself, so on a bill received against a PO
             it can come out <strong>lower</strong> than the Summary’s <em>Grand Total</em>, which reads that bill’s tax off the GRN.
             Use the <strong>Summary</strong> tab for what is payable to a vendor; use this log to see which document each line came from.
@@ -1979,34 +2472,54 @@ function ChargeCards({ s }: { s: Report['summary'] }) {
       = Grand Total. Measured on the live period: 6928486.40 − 2280 + 5482.80
       + 2425.40 + 8 + 72 − 1 = 6934193.60, exactly the last card.
     */
-    <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-8 gap-3">
+    /*
+      RULING 115 (d), 2026-11-05: TWO ROWS OF FOUR, NOT ONE ROW OF EIGHT. The page
+      is never wider than 1280px, so eight cards in a row left each ~143px and
+      the owner saw "₹44,21,404.73" and "₹45,74,951.78" spill out of the Subtotal
+      and Grand Total cards. Four to a row from tablet width up, two on a phone
+      (where Taxes and Cess take a row each — round 3, below); the strip still
+      reads in formula order, left to right, top to bottom, and
+      each figure is sized off its own card (see Card).
+    */
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
       {/* FIRST, because it is the base everything after it is added to. */}
       <Card icon={<Package className="w-4 h-4" />} label="Subtotal (goods)" value={fmtSignedINR(s.bill_value)}
         sub="the ingredients and goods, as billed" />
       {/* NEGATED ON PURPOSE — see above. fmtSignedINR renders the true minus. */}
       <Card icon={<Sigma className="w-4 h-4" />} label="Less: Discount" value={fmtSignedINR(-(Number(s.discount) || 0))}
         sub="taken off the subtotal" />
-      <Card icon={<Receipt className="w-4 h-4" />} label="Taxes (CGST+SGST)" value={fmtSignedINR(taxes)}
-        sub={`CGST ${fmtSignedINR(s.cgst)} · SGST ${fmtSignedINR(s.sgst)}`} />
+      {/* Round 3: Taxes and Cess carry two label-and-amount pairs, so below
+          640px they take the whole row (they sit 3rd and 4th, so the strip
+          still reads in formula order). Half a 320px phone left ~100px of
+          text width and "GST comp. ₹2,425.40" needs more, so "GST comp." ended
+          a line alone (measured, All time). */}
+      <Card icon={<Receipt className="w-4 h-4" />} label="Taxes (CGST+SGST)" value={fmtSignedINR(taxes)} className="col-span-2 sm:col-span-1"
+        sub={<><span className="inline-block">{`CGST ${fmtSignedINR(s.cgst)}\u00A0·`}</span>{' '}<span className="inline-block">{`SGST ${fmtSignedINR(s.sgst)}`}</span></>} />
       {/* TWO cess figures behind one card, never one merged number — the two
           levies sit on different taxable bases and a return filed on the sum
-          would be wrong. The table below gives each its own column. */}
-      <Card icon={<Receipt className="w-4 h-4" />} label="Cess" value={fmtSignedINR(cess)}
-        sub={`GST comp. ${fmtSignedINR(s.compensation_cess)} · Spl. excise ${fmtSignedINR(s.special_excise_cess)}`} />
+          would be wrong. The table below gives each its own column.
+          Round 2: each label and its amount is one inline-block, so when the
+          two pairs cannot share a line the second moves down whole; a no-break
+          space alone let break-words split the figure ("less discount ₹0.0" /
+          "0" at 320px, measured). The separating dot rides at the end of the
+          first pair, held to its amount by a no-break space, so it never sits
+          on a line of its own. */}
+      <Card icon={<Receipt className="w-4 h-4" />} label="Cess" value={fmtSignedINR(cess)} className="col-span-2 sm:col-span-1"
+        sub={<><span className="inline-block">{`GST comp. ${fmtSignedINR(s.compensation_cess)}\u00A0·`}</span>{' '}<span className="inline-block">{`Spl. excise ${fmtSignedINR(s.special_excise_cess)}`}</span></>} />
       <Card icon={<Receipt className="w-4 h-4" />} label="TCS" value={fmtSignedINR(s.tcs)}
         sub="tax collected at source, as billed" />
       <Card icon={<Truck className="w-4 h-4" />} label="Transport / Delivery" value={fmtSignedINR(s.delivery_charges)}
         sub="recorded only — never inside a rate" />
       {/* SIGNED. A bill rounded DOWN shows −₹x here and must never read +₹x. */}
       <Card icon={<Sigma className="w-4 h-4" />} label="MRP Round-off" value={fmtSignedINR(s.mrp_round_off)}
-        sub={Number(s.mrp_round_off) < 0 ? 'negative — rounded down on the bill' : 'signed: a rounded-down bill reads −'} />
+        sub={Number(s.mrp_round_off) < 0 ? 'negative — rounded down on the bill' : 'signed: a rounded-down bill reads\u00A0−'} />
       {/* The sub-label names the BASE, because it is the Subtotal and not Spend
           on a PO receipt, and a reader who assumes otherwise cannot foot the
           card. It points at the Subtotal card rather than repeating its rupees:
           the same figure printed twice under two names is what this rename set
           out to end. */}
       <Card icon={<Sigma className="w-4 h-4" />} label="Grand Total" value={fmtSignedINR(s.total_amount)}
-        sub="payable to the vendor — add the seven cards to its left" tone="accent" />
+        sub="payable to the vendor — the seven cards before it, added up" tone="accent" />
     </div>
   );
 }
@@ -2351,27 +2864,57 @@ function ChargeBreakdown({ breakdowns, summary, footing, onExport }: {
   );
 }
 
-function Card({ icon, label, value, sub, tone }: { icon: React.ReactNode; label: string; value: string; sub?: string; tone?: 'accent' | 'warn' }) {
+/**
+ * A summary card. RULING 115 (d): the card is a size CONTAINER and its figure is
+ * sized off the card's own width (fitFigureStyle, src/lib/fit-figure.ts), never
+ * wrapped and never cut — so "₹45,74,951.78" fits whether eight cards share a
+ * row or two do on a phone. The label and sub-line wrap; the figure is capped
+ * at the old text-xl, so a short figure looks exactly as it did.
+ *
+ * The icon sits INLINE in the label, not in a flex column beside it, so a
+ * label's second line runs the card's full width and a word like
+ * "(CGST+SGST)" moves down whole instead of being split in a 320px card.
+ * `className` places the card in its grid (the headline's two tracks).
+ */
+function Card({ icon, label, value, sub, tone, className = '' }: { icon: React.ReactNode; label: string; value: string; sub?: React.ReactNode; tone?: 'accent' | 'warn'; className?: string }) {
   const ring = tone === 'accent' ? 'border-[#af4408]/30 bg-[#FFF6EE]' : tone === 'warn' ? 'border-amber-200 bg-amber-50' : 'border-[#E8D5C4] bg-white';
   return (
-    <div className={`rounded-xl border shadow-sm p-3.5 ${ring}`}>
-      <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide flex items-center gap-1.5"><span className="text-[#af4408]">{icon}</span>{label}</p>
-      <p className="text-xl font-bold mt-1 text-[#2D1B0E]">{value}</p>
-      {sub && <p className="text-[11px] text-[#8B7355] mt-0.5">{sub}</p>}
+    <div className={`@container min-w-0 rounded-xl border shadow-sm p-3.5 ${ring} ${className}`}>
+      <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide break-words"><span className="inline-block align-[-4px] mr-1.5 text-[#af4408]">{icon}</span>{label}</p>
+      <p className="font-bold mt-1 text-[#2D1B0E] tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(value)}>{value}</p>
+      {sub && <p className="text-[11px] text-[#8B7355] mt-0.5 break-words">{sub}</p>}
     </div>
   );
 }
 
-function BarTable({ title, icon, keyName, rows, total, limit, onExport }: {
-  title: string; icon: React.ReactNode; keyName: string; rows: Row[]; total: number; limit?: number; onExport: () => void;
+/**
+ * One bar list of the Summary. RULING 115 (2026-11-05): it shows, ranks (the
+ * rows arrive ranked — see the `breakdowns` memo) and adds up by GRAND TOTAL,
+ * `total_amount`, and its % share is of the headline Total Purchases card
+ * (`total`). Its foot adds up EVERY row, the hidden "+N more" included, and
+ * says so against the headline — in red, naming both figures, if they ever
+ * disagree. Before this ruling the list summed booked spend while the owner
+ * read the page's first card as the period's purchases.
+ */
+function BarTable({ title, plural, singular, icon, keyName, rows, total, limit, onExport }: {
+  title: string; plural: string; singular: string; icon: React.ReactNode; keyName: string; rows: Row[]; total: number; limit?: number; onExport: () => void;
 }) {
+  const gt = (r: Row) => Number(r.total_amount) || 0;
   const shown = limit ? rows.slice(0, limit) : rows;
-  const max = Math.max(1, ...rows.map(r => r.spend));
+  const max = Math.max(1, ...rows.map(gt));
+  const sum = r2(rows.reduce((n, r) => n + gt(r), 0));
+  const adds = Math.round(sum * 100) === Math.round((Number(total) || 0) * 100);
+  // One row reads "The 1 month", never "All 1 months".
+  const one = rows.length === 1;
+  const all = one ? `The 1 ${singular}` : `All ${fmtNum(rows.length)} ${plural}`;
   return (
     <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5">
-      <div className="flex items-center justify-between gap-2 mb-3">
-        <h2 className="text-sm font-bold flex items-center gap-2"><span className="text-[#af4408]">{icon}</span>{title}</h2>
-        <button onClick={onExport} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3] text-xs"><Download className="w-3 h-3" /> CSV</button>
+      <div className="flex items-start justify-between gap-2 mb-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-bold flex items-center gap-2"><span className="text-[#af4408]">{icon}</span>{title}</h2>
+          <p className="text-[11px] text-[#8B7355] mt-0.5">Grand Total, incl. GST and charges · (share of Total Purchases · purchase lines)</p>
+        </div>
+        <button onClick={onExport} className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-[#E8D5C4] text-[#6B5744] hover:bg-[#FFF1E3] text-xs"><Download className="w-3 h-3" /> CSV</button>
       </div>
       {shown.length === 0 ? <p className="text-sm text-[#B8A48E] py-4 text-center">No data.</p> : (
         <div className="space-y-2">
@@ -2379,12 +2922,15 @@ function BarTable({ title, icon, keyName, rows, total, limit, onExport }: {
             <div key={i}>
               <div className="flex items-baseline justify-between gap-2 text-sm">
                 <span className="truncate font-medium">{r[keyName]}</span>
-                <span className="shrink-0 tabular-nums">{fmtINR(r.spend)} <span className="text-[11px] text-[#8B7355]">({total > 0 ? Math.round((r.spend / total) * 100) : 0}% · {fmtNum(r.count)})</span></span>
+                <span className="shrink-0 tabular-nums">{fmtSignedINR(gt(r))} <span className="text-[11px] text-[#8B7355]">({total > 0 ? Math.round((gt(r) / total) * 100) : 0}% · {fmtNum(r.count)})</span></span>
               </div>
-              <div className="h-2 bg-[#FAF3EA] rounded-full overflow-hidden mt-0.5"><div className="h-full bg-[#af4408] rounded-full" style={{ width: `${Math.max(2, Math.round((r.spend / max) * 100))}%` }} /></div>
+              <div className="h-2 bg-[#FAF3EA] rounded-full overflow-hidden mt-0.5"><div className="h-full bg-[#af4408] rounded-full" style={{ width: `${Math.max(2, Math.round((gt(r) / max) * 100))}%` }} /></div>
             </div>
           ))}
           {limit && rows.length > limit && <p className="text-[11px] text-[#8B7355] pt-1">+{rows.length - limit} more — export CSV for the full list.</p>}
+          {adds
+            ? <p className="text-[11px] text-[#6B5744] pt-1 border-t border-dashed border-[#F0E4D6]">{`${all}${one ? '' : ' together'}: ${fmtSignedINR(sum)} — the Total Purchases figure at the top.`}</p>
+            : <p className="text-[11px] font-semibold text-red-800 bg-red-50 border border-red-200 rounded-md px-2 py-1">{`${all} ${one ? 'adds' : 'add'} up to ${fmtSignedINR(sum)}, but Total Purchases is ${fmtSignedINR(total)}. Report it — do not reconcile it by hand.`}</p>}
         </div>
       )}
     </div>
