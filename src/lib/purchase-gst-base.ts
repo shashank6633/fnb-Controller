@@ -100,13 +100,19 @@ export function gstBaseAcceptedSql(pAlias = 'p', glAlias = 'gl'): string {
  * Per-row hover clause: why this rate is not tax ÷ (subtotal − discount).
  * Figures, when the surface has them, are pre-formatted by the caller (₹
  * glyphs), so the wording is shared and the formatting stays the page's.
+ *
+ * `orByCorrection` (ruling 115, round 3 — the item-wise list only): the same
+ * widening as acceptedBaseTotalNote's, so the row hover and the total note on
+ * that screen say the same thing. Left out, the sentence is exactly what the
+ * Purchases register and the audit log have always printed.
  */
-export function acceptedBaseRowNote(acceptedValue?: string, receivedValue?: string): string {
+export function acceptedBaseRowNote(acceptedValue?: string, receivedValue?: string, orByCorrection = false): string {
   const acc = acceptedValue ? `${acceptedValue} ` : '';
   const rcv = receivedValue
     ? `the ${receivedValue} received, which stays the Subtotal and the base of Grand Total (Total Inward)`
     : 'the value received';
-  return `THIS ROW: part of this delivery was rejected at the door, so the rate is struck on the ${acc}`
+  const how = orByCorrection ? 'rejected (at the door or by a later correction)' : 'rejected at the door';
+  return `THIS ROW: part of this delivery was ${how}, so the rate is struck on the ${acc}`
     + `ACCEPTED value (less discount) — the value GST was charged on, exactly as the GRN Inward Register strikes it — `
     + `and not on ${rcv}. `
     + 'Reports → Purchase Report (Summary) and the Purchase Bill Summary still divide this line by the received '
@@ -116,10 +122,17 @@ export function acceptedBaseRowNote(acceptedValue?: string, receivedValue?: stri
 /**
  * Footer / totals clause, said only when n > 0: the one way this rate can
  * differ from the Summary's and the Bill Summary's for the same purchases.
+ *
+ * `orByCorrection` (ruling 115, round 2 — the item-wise list and its Excel
+ * file only): the count behind `n` also holds lines whose accepted quantity a
+ * later GRN correction lowered (src/lib/grn-reversal.ts), so those callers say
+ * "part-rejected (at the door or by a later correction)". Left out, the
+ * sentence is exactly what every other surface has always printed.
  */
-export function acceptedBaseTotalNote(n: number): string {
+export function acceptedBaseTotalNote(n: number, orByCorrection = false): string {
   if (!(n > 0)) return '';
-  return `${n} line${n === 1 ? ' was' : 's were'} part-rejected at the door: ${n === 1 ? 'its' : 'their'} rate is `
+  const how = orByCorrection ? 'part-rejected (at the door or by a later correction)' : 'part-rejected at the door';
+  return `${n} line${n === 1 ? ' was' : 's were'} ${how}: ${n === 1 ? 'its' : 'their'} rate is `
     + 'struck on the ACCEPTED value, as the GRN Inward Register strikes it. Reports → Purchase Report (Summary) '
     + `and the Purchase Bill Summary still divide ${n === 1 ? 'that line' : 'those lines'} by the RECEIVED value, so `
     + 'their Tax % for the same purchases reads lower. Every rupee figure (CGST, SGST, Tax Value, Grand Total) is '

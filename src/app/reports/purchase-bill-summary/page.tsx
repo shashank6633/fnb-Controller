@@ -140,6 +140,8 @@ import {
   TAX_PERCENT_LABEL, TAX_PERCENT_TITLE,
   taxAppliedPercent, fmtTaxPercent, taxAppliedNote,
 } from '@/lib/tax-applied';
+// Ruling 115 (d): a card's figure sized off its own card — client-safe, no imports.
+import { fitFigureStyle } from '@/lib/fit-figure';
 import {
   ReceiptText, Building2, Download, Loader2, Info, AlertTriangle,
   ShoppingCart, TrendingUp, Layers, CalendarDays, ChevronRight, ChevronDown, Users,
@@ -1008,7 +1010,13 @@ export default function PurchaseBillSummaryPage() {
             of the same name is a different thing: one bill's own arithmetic.) */}
         {t && (
           <div className="space-y-2">
-            <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+            {/* Ruling 115 (d): the row re-flows on the width it ACTUALLY has, not
+                the window's — with the sidebar open a 1280px window leaves ~900px,
+                and six cards there were 141px wide for a crore figure. Two, then
+                three from 576px of room, six only from 1024px. Each figure is
+                sized off its card. */}
+            <div className="@container">
+            <div className="grid grid-cols-2 @xl:grid-cols-3 @5xl:grid-cols-6 gap-3">
               {/* NEVER ONE "BILLS" NUMBER IN THE DAY VIEW. `t.bills` is a count of
                   GROUPS, and on live 308 of those 350 groups are vendor day-runs
                   with no bill number anywhere. Printing "Bills 350" above a table
@@ -1049,6 +1057,7 @@ export default function PurchaseBillSummaryPage() {
               <Card icon={<Building2 className="w-4 h-4" />} label="Of which PO/GRN receipts"
                 value={fmtINR(num(t.po_receipt_value))}
                 sub={`${fmtNum(num(t.po_receipt_bills))} bill${num(t.po_receipt_bills) === 1 ? '' : 's'} · ${fmtNum(num(t.po_receipt_lines))} lines · their share of the grand total`} />
+            </div>
             </div>
             {/* `basis` is the API's own guard against misreading the grand total.
                 Print it verbatim — do not paraphrase it into something shorter. */}
@@ -1117,7 +1126,7 @@ export default function PurchaseBillSummaryPage() {
               Goods" — that sub-line is gone. */}
           <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
             <span><strong>Booked cost (spend) is not the same as the Subtotal.</strong> It is what we recorded into stock, exactly as stored — the figure stock
-              valuation and the Purchase Report’s <em>Spend</em> are built on. On a PO receipt the rate we booked can already have the discount taken off it,
+              valuation is built on, and the one the Purchase Report shows as <em>booked into stock</em> under <em>Total Purchases</em>. On a PO receipt the rate we booked can already have the discount taken off it,
               while the bill was written on the full price; the Subtotal is that full price, which is why the grand total is built on the Subtotal and the
               discount gets taken off once, in the Discount column, instead of twice.{t && num(t.bill_value) !== num(t.goods) && (
                 <> Across this period the two differ by <strong>{fmtINR(num(t.bill_value) - num(t.goods))}</strong>.</>
@@ -1282,7 +1291,7 @@ export default function PurchaseBillSummaryPage() {
                     is built on. The sub-line is gone; what survives under booked
                     cost is only the in-rate discount, which no column carries. */}
                 <th className="py-2 px-3 text-right whitespace-normal w-[118px] min-w-[118px]"
-                  title="BOOKED COST = SPEND. The line values exactly as we recorded them into stock — this is the figure that feeds stock valuation and the one the Purchase Report calls Spend. It is NOT the Subtotal and NOT what we pay: on a PO receipt the rate we booked can already have the discount taken off it, while the bill was written on the full price.">
+                  title="BOOKED COST = SPEND. The line values exactly as we recorded them into stock — this is the figure that feeds stock valuation and the one the Purchase Report shows as “booked into stock” under Total Purchases. It is NOT the Subtotal and NOT what we pay: on a PO receipt the rate we booked can already have the discount taken off it, while the bill was written on the full price.">
                   Booked cost <span className="normal-case font-normal text-[#B8A48E]">(spend)</span></th>
                 {/* THE SUBTOTAL — the owner's "actual price and total value of
                     the goods we're buying". It sits immediately left of the
@@ -1820,13 +1829,19 @@ export default function PurchaseBillSummaryPage() {
   );
 }
 
+/**
+ * A period card. Owner ruling 115 (d), 2026-11-05: the card is a size CONTAINER
+ * and its figure is sized off the card's own width (src/lib/fit-figure.ts) —
+ * never wrapped, never cut — so a lakh or crore figure stays inside the card at
+ * every width. Same rule, same helper, as the Purchase Report's cards.
+ */
 function Card({ icon, label, value, sub, tone }: { icon: React.ReactNode; label: string; value: string; sub?: string; tone?: 'accent' | 'warn' }) {
   const ring = tone === 'accent' ? 'border-[#af4408]/30 bg-[#FFF6EE]' : tone === 'warn' ? 'border-amber-200 bg-amber-50' : 'border-[#E8D5C4] bg-white';
   return (
-    <div className={`rounded-xl border shadow-sm p-3.5 ${ring}`}>
-      <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide flex items-center gap-1.5"><span className="text-[#af4408]">{icon}</span>{label}</p>
-      <p className="text-xl font-bold mt-1 text-[#2D1B0E]">{value}</p>
-      {sub && <p className="text-[11px] text-[#8B7355] mt-0.5">{sub}</p>}
+    <div className={`@container min-w-0 rounded-xl border shadow-sm p-3.5 ${ring}`}>
+      <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide flex items-start gap-1.5"><span className="text-[#af4408] shrink-0">{icon}</span><span className="min-w-0 break-words">{label}</span></p>
+      <p className="font-bold mt-1 text-[#2D1B0E] tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(value)}>{value}</p>
+      {sub && <p className="text-[11px] text-[#8B7355] mt-0.5 break-words">{sub}</p>}
     </div>
   );
 }

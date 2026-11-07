@@ -1649,8 +1649,11 @@ export function getPurchaseLog(
 
 /** BILL KEY — restated from purchase-bill-summary.ts:1086-1092 (billKeyExpr,
  *  with fromPoReceiptSql :1016-1021 inlined) and checked against it per bill on
- *  every request. 'group' mode — the Bill Summary's default (:1173-1174). */
-const BILL_KEY_SQL = `CASE
+ *  every request. 'group' mode — the Bill Summary's default (:1173-1174).
+ *  Exported (ruling 115) so the item-wise Excel's Bill-wise sheet groups lines
+ *  with this SAME key instead of a third copy; that sheet is checked against
+ *  the Bill Summary per bill too (src/lib/purchase-itemwise.ts). */
+export const BILL_KEY_SQL = `CASE
         WHEN (TRIM(COALESCE(p.grn_id, '')) <> '' AND EXISTS (
               SELECT 1 FROM goods_receipt_notes g_src
                WHERE g_src.id = TRIM(p.grn_id)

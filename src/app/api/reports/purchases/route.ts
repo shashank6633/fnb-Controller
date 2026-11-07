@@ -5,7 +5,7 @@ import {
   buildPurchaseReconciliation, buildBillIdentityCoverage,
 } from '@/lib/purchase-reconciliation';
 import {
-  effectiveChargeSumsSql, chargeSourceCountsSql, grnLineJoinSql, withGrnCharges,
+  withGrnCharges,
   chargeSums, PURCHASE_CHARGE_COLUMNS,
 } from '@/lib/purchase-charges';
 // TAX ACTUALLY CHARGED — the two extra sums behind the "Tax % Applied (GST)"
@@ -13,7 +13,15 @@ import {
 // LINES ONLY, so a vendor billed at 18% reads 18.00% instead of a blended
 // 0.01% over 2,165 rows of which 7 carry tax. Built from the same effective
 // rail as the charges above — never SUM(p.cgst). See src/lib/tax-applied.ts.
-import { effectiveTaxAppliedSumsSql, taxAppliedSums } from '@/lib/tax-applied';
+// (The SQL fragment itself now sits in purchaseReportChargesSql() below.)
+import { taxAppliedSums } from '@/lib/tax-applied';
+// OWNER RULING 115 (2026-11-05): the WHERE, the base FROM, the charge sums and
+// the period aggregate below were MOVED — text unchanged — into one module that
+// the item-wise list (/api/reports/purchase-itemwise) builds on as well, so its
+// lines add up to these cards BY CONSTRUCTION rather than by a second copy.
+import {
+  purchaseReportBase, purchaseReportChargesSql, purchaseReportSummarySql,
+} from '@/lib/purchase-report-base';
 // The span of dates that actually have purchases, and the window that covers
 // all of them. Shared with /api/reports/purchase-bill-summary so the two
 // reports can never disagree about what "all time" means. See the block comment
@@ -210,28 +218,15 @@ export async function GET(req: Request) {
     // Shared WHERE + params for every aggregate (date range + optional filters).
     //
     // RULING 2 (2026-09-10): both optional filters compare TRIM'd on BOTH sides.
-    // The dropdowns feeding them are built from TRIM(vendor) / TRIM(category)
-    // below, so an untrimmed comparison here could offer the user a value that
-    // then matches zero rows and empties the whole report with no explanation.
-    const where: string[] = ['p.date >= ?', 'p.date <= ?'];
-    const params: any[] = [from, to];
-    if (vendor) { where.push('LOWER(TRIM(p.vendor)) = LOWER(TRIM(?))'); params.push(vendor); }
-    if (category) { where.push('LOWER(TRIM(COALESCE(rm.category, \'\'))) = LOWER(TRIM(?))'); params.push(category); }
-    const W = where.join(' AND ');
-
     // RULING 1 (2026-09-10): LEFT JOIN. An unlinked material must cost the row
-    // its NAME, never its existence. See the header. If you change this line,
+    // its NAME, never its existence. See the header. If you change the join,
     // `reconciliation.unexplained` starts reporting the rows you lose.
+    // RULING 6 (2026-09-10): the grn_line LEFT JOIN rides in the SAME base.
     //
-    // RULING 6 (2026-09-10): the grn_line LEFT JOIN rides in the SAME base, so
-    // every aggregate on this page sees the charges on the same rows it counts.
-    // It CANNOT fan out — grn_line is keyed 1:1 on purchase_id by construction
-    // (see grnChargeCteSql) — which is what lets `spend` and `count` stay
-    // byte-identical while the charge columns change underneath them.
-    const base = `FROM purchases p
-        LEFT JOIN raw_materials rm ON p.material_id = rm.id
-        ${grnLineJoinSql('p', 'gl')}
-       WHERE ${W}`;
+    // All three now live in purchaseReportBase() (src/lib/purchase-report-base.ts),
+    // text unchanged, because the item-wise list must read exactly these rows.
+    // No item filter here: the Summary has none.
+    const { base, params } = purchaseReportBase({ from, to, vendor, category });
 
     /**
      * RULING 4 (2026-09-10): the eight recorded-only bill charges, summed with
@@ -257,10 +252,7 @@ export async function GET(req: Request) {
      * and `unpaired_mirror_rows` (a mirror whose GRN line is gone — the one
      * case that still blanks a cell instead of printing ₹0).
      */
-    const CHARGES = `
-        ${effectiveChargeSumsSql('p', 'gl')},
-        ${chargeSourceCountsSql('p', 'gl')},
-        ${effectiveTaxAppliedSumsSql('p', 'gl')}`;
+    const CHARGES = purchaseReportChargesSql();
 
     /**
      * Every statement below is wrapped in the grn_line CTE. It is prepared once
@@ -270,18 +262,9 @@ export async function GET(req: Request) {
      */
     const q = (sql: string) => db.prepare(withGrnCharges(sql));
 
-    const summary = q(`
-      SELECT
-        COUNT(*)                                        AS purchase_count,
-        COALESCE(SUM(p.total_price), 0)                 AS total_spend,
-        COUNT(DISTINCT p.vendor)                        AS vendor_count,
-        COUNT(DISTINCT p.material_id)                   AS item_count,
-        COUNT(DISTINCT p.date)                          AS day_count,
-        COALESCE(SUM(CASE WHEN p.is_emergency = 1 THEN p.total_price ELSE 0 END), 0) AS emergency_spend,
-        COALESCE(SUM(CASE WHEN p.is_emergency = 1 THEN 1 ELSE 0 END), 0)             AS emergency_count,
-        ${CHARGES}
-      ${base}
-    `).get(...params) as any;
+    // The period aggregate behind every card — shared, text unchanged, with the
+    // item-wise list, which checks its own line sums against this very figure.
+    const summary = q(purchaseReportSummarySql(base)).get(...params) as any;
 
     // Every breakdown below selects `spend` and `count` EXACTLY as it always
     // did — same expression, same alias, same GROUP BY, same ORDER BY — and
