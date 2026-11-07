@@ -644,7 +644,7 @@ export default function KitchenProductionPage() {
   const save = async () => {
     if (!form.production_item_id) {
       failForm(isBrewery
-        ? 'Select a Brewery item from the list (items are ticked as Brewery items in Items).'
+        ? 'Select a Brewery item from the list (bring an item here with Activate for Brewery in Items).'
         : 'Select a Production Item from the list (manage the list via the Items button).');
       return;
     }
@@ -719,8 +719,8 @@ export default function KitchenProductionPage() {
                 <Beer className="w-6 h-6 text-[#af4408]" /> Brewery Production
               </h1>
               <p className="text-xs text-[#6B5744] mt-0.5 max-w-2xl">
-                Log every brewery batch and track it through its shelf life. Only items ticked
-                as <b>Brewery item</b> (in Items) appear here. Each batch auto-gets a <b>barcode</b>;
+                Log every brewery batch and track it through its shelf life. Only items activated
+                for Brewery (in <b>Items</b>) appear here. Each batch auto-gets a <b>barcode</b>;
                 its <b>batch number</b> follows the item’s setting — made by the app, or typed by
                 you. Cards are colour-coded by freshness and flagged <b>FIFO</b> so the oldest
                 batch is used first.
@@ -902,8 +902,8 @@ export default function KitchenProductionPage() {
                 ? 'No batches match your filters.'
                 : pItemsLoaded && pItems.length === 0
                   ? (canWrite
-                      ? 'No active item is ticked as a Brewery item yet. Open Items, edit an item and tick “Brewery item” — it will then appear here.'
-                      : 'No active item is ticked as a Brewery item yet. A head chef, manager or admin can tick “Brewery item” on an item in Items.')
+                      ? 'No item is active on Brewery yet. Open Items and press “Activate for Brewery” on an item — it will then appear here.'
+                      : 'No item is active on Brewery yet. A head chef, manager or admin can activate items for Brewery in Items.')
                   : statusFilter === 'active'
                     ? (canWrite
                         ? 'No active brewery batches yet. Click “New Brewery Batch” to log one.'
@@ -1309,7 +1309,7 @@ function BatchFormModal({ variant = 'kitchen', form, setField, saving, error, er
               )}
               <button type="button" onClick={onManageItems}
                       className="mt-1 text-[11px] text-[#af4408] hover:underline">
-                {isBrewery ? 'Item not in the list? Tick “Brewery item” on it in Items…' : 'Item not in the list? Manage items…'}
+                {isBrewery ? 'Item not in the list? Activate it for Brewery in Items…' : 'Item not in the list? Manage items…'}
               </button>
             </Field>
             <Field label="Category">
@@ -2116,14 +2116,19 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // Brewery fields (ruling 114): the tick defaults OFF — nothing is ever
-  // marked Brewery unless someone ticks it here.
+  // Brewery fields (ruling 114): an existing item is never marked Brewery unless
+  // someone ticks it. A NEW item starts ticked only on the Brewery screen (ruling
+  // 116) — on the Kitchen screen the tick still defaults OFF.
   const blank = {
     id: '', name: '', category: '', unit: '', shelf_life_hours: '', default_storage_location: '',
-    is_brewery: false, batch_number_mode: 'auto' as BatchNumberMode, batch_serial_code: '',
+    is_brewery: variant === 'brewery', batch_number_mode: 'auto' as BatchNumberMode, batch_serial_code: '',
   };
   const [draft, setDraft] = useState<typeof blank>(blank);
   const draftSerial = cleanTypedValue(draft.batch_serial_code, 'The serial code');
+  // Brewery screen only (ruling 116): the "Not on Brewery" search and the row
+  // whose Activate / Remove is in flight.
+  const [otherSearch, setOtherSearch] = useState('');
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = () => {
     fetch('/api/kitchen-production/items?all=1', { credentials: 'same-origin' })
@@ -2172,6 +2177,36 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
     } catch (e: any) { setError(e?.message || 'Failed to update'); }
   };
 
+  // Ruling 116 — the Brewery screen's Activate for Brewery / Remove from Brewery.
+  // Only the tick changes; the batch lists follow the tick, so the item's
+  // batches move screens with it. Activating also switches a deactivated item
+  // back on, since it is being picked for use here.
+  const setBrewery = async (it: ProductionItem, on: boolean) => {
+    const msg = on
+      ? `Activate "${it.name}" for Brewery?\n\nIt moves from Kitchen Production to Brewery Production — its batches move with it.${it.is_active ? '' : '\nIt is inactive now and will be switched on.'}`
+      : `Remove "${it.name}" from Brewery?\n\nIt goes back to Kitchen Production — its batches move with it.`;
+    if (!window.confirm(msg)) return;
+    setError(null); setBusyId(it.id);
+    try {
+      const body: { id: string; is_brewery: boolean; is_active?: boolean } = { id: it.id, is_brewery: on };
+      if (on && !it.is_active) body.is_active = true;
+      const r = await api('/api/kitchen-production/items', { method: 'PUT', body });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); setError(j.error || `HTTP ${r.status}`); return; }
+      load();
+    } catch (e: any) { setError(e?.message || 'Failed to update'); }
+    finally { setBusyId(null); }
+  };
+
+  // Kitchen screen: the whole list, as always. Brewery screen: its own items in
+  // the table, every other item in the "Not on Brewery" list under it.
+  const isBreweryList = variant === 'brewery';
+  const listed = isBreweryList ? items.filter(it => Number(it.is_brewery) === 1) : items;
+  const others = isBreweryList ? items.filter(it => Number(it.is_brewery) !== 1) : [];
+  const otherQ = otherSearch.trim().toLowerCase();
+  const othersShown = otherQ
+    ? others.filter(it => `${it.name} ${it.category || ''}`.toLowerCase().includes(otherQ))
+    : others;
+
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
       <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden" style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
@@ -2193,7 +2228,7 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
           {/* One list for both screens (ruling 114): the tick decides which one offers the item. */}
           <p className="text-xs text-[#8B7355]">
             {variant === 'brewery'
-              ? <>Only items ticked as <b>Brewery item</b> appear on Brewery Production — tick it on anything brewed here. Ticked items no longer appear on Kitchen Production.</>
+              ? <>Only items <b>On Brewery</b> appear on Brewery Production. To bring an item here, find it under <b>Not on Brewery</b> and press <b>Activate for Brewery</b> — it then leaves Kitchen Production, with its batches. A new item added here starts as a Brewery item.</>
               : <>Items ticked as <b>Brewery item</b> appear on Brewery Production instead of here.</>}
           </p>
 
@@ -2286,6 +2321,15 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
           ) : items.length === 0 ? (
             <div className="py-8 text-center text-sm text-[#8B7355]">{canEdit ? 'No items yet — add the first one above.' : 'No items yet.'}</div>
           ) : (
+            <>
+            {isBreweryList && (
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-[#8B7355] -mb-2">On Brewery ({listed.length})</div>
+            )}
+            {listed.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-[#E8D5C4] py-6 px-3 text-center text-sm text-[#8B7355]">
+                No item is on Brewery yet{canEdit ? ' — activate one below, or add a new one above.' : '.'}
+              </div>
+            ) : (
             <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
               <table className="w-full text-sm">
                 <thead className="bg-[#FFF1E3] text-[11px] uppercase tracking-wide text-[#8B7355]">
@@ -2299,7 +2343,7 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#F0E4D6]">
-                  {items.map(it => (
+                  {listed.map(it => (
                     <tr key={it.id} className={it.is_active ? '' : 'opacity-50'}>
                       <td className="px-3 py-2 font-medium text-[#2D1B0E]">
                         {it.name}{!it.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}
@@ -2330,6 +2374,10 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
                                       batch_serial_code: it.batch_serial_code || '',
                                     })}
                                     className="text-[#af4408] hover:underline text-xs font-medium mr-3">Edit</button>
+                            {isBreweryList && (
+                              <button onClick={() => setBrewery(it, false)} disabled={busyId === it.id}
+                                      className="text-[#8B7355] hover:underline text-xs font-medium mr-3 disabled:opacity-50">Remove from Brewery</button>
+                            )}
                             <button onClick={() => toggleActive(it)}
                                     className="text-[#8B7355] hover:underline text-xs font-medium">{it.is_active ? 'Deactivate' : 'Activate'}</button>
                           </>
@@ -2340,6 +2388,49 @@ function ProductionItemsModal({ onClose, variant = 'kitchen', canEdit = true }: 
                 </tbody>
               </table>
             </div>
+            )}
+
+            {/* Brewery screen (ruling 116): every other item, each one press away
+                from Brewery. No Edit / Deactivate here — those stay with the
+                Kitchen screen, so nobody switches a Kitchen item off from Brewery. */}
+            {isBreweryList && (
+              <div className="rounded-xl border border-[#E8D5C4] overflow-hidden">
+                <div className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-[#8B7355]">Not on Brewery ({others.length})</div>
+                  <div className="relative sm:w-64">
+                    <Search className="w-4 h-4 text-[#8B7355] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input value={otherSearch} onChange={e => setOtherSearch(e.target.value)}
+                           placeholder="Search item…" aria-label="Search items not on Brewery"
+                           className={`${inputCls} pl-8 bg-white`} />
+                  </div>
+                </div>
+                {othersShown.length === 0 ? (
+                  <div className="py-6 px-3 text-center text-sm text-[#8B7355]">
+                    {others.length === 0 ? 'Every item is on Brewery.' : `No item matches “${otherSearch.trim()}”.`}
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-[#F0E4D6]">
+                    {othersShown.map(it => (
+                      <li key={it.id} className="px-3 py-2 flex items-center gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-medium text-[#2D1B0E] break-words">
+                            {it.name}{!it.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}
+                          </div>
+                          <div className="text-[11px] text-[#8B7355]">{[it.category, it.unit].filter(Boolean).join(' · ') || '—'}</div>
+                        </div>
+                        {canEdit && (
+                          <button onClick={() => setBrewery(it, true)} disabled={busyId === it.id}
+                                  className="shrink-0 px-3 py-1.5 rounded-lg border border-[#af4408] text-[#af4408] hover:bg-[#af4408] hover:text-white text-xs font-semibold disabled:opacity-50">
+                            {busyId === it.id ? <Loader2 className="w-3.5 h-3.5 animate-spin inline" /> : 'Activate for Brewery'}
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            </>
           )}
         </div>
       </div>
