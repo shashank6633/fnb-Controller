@@ -31,6 +31,7 @@
 import { getDb, generateId } from './db';
 import { parseDateTime, ProductionBatch } from './production-batch';
 import { fmtISTIsoDate, todayIST } from './format-date';
+import { breweryItemIds } from './brewery-beer';
 
 const H = 3_600_000;
 const RECIPIENT = 'chef,kitchen_manager,store_manager,admin';
@@ -87,6 +88,10 @@ export async function checkKitchenExpiry(triggeredBy: 'cron' | 'manual' = 'cron'
     );
 
     const pending: { key: string; kind: string; title: string; body: string }[] = [];
+    // Blind beer (ruling 121): a Brewery batch's alert does not say how much is
+    // left — its recipients include roles that may not see that figure, and the
+    // text also goes to Slack. Kitchen alerts are unchanged.
+    const brewIds = breweryItemIds(db);
 
     const txn = db.transaction(() => {
       for (const b of rows) {
@@ -126,8 +131,11 @@ export async function checkKitchenExpiry(triggeredBy: 'cron' | 'manual' = 'cron'
 
         for (const kind of kinds) {
           const title = `⏰ ${b.item_name} expires in ${hours < 24 ? hours.toFixed(1) + 'h' : Math.round(hours / 24) + 'd'} (${b.batch_number})`;
+          const isBeer = !!b.production_item_id && brewIds.has(String(b.production_item_id));
           const body = `Batch ${b.batch_number} of ${b.item_name} expires ${expLabel}. ` +
-                       `${remaining}${unit ? ' ' + unit : ''} still on hand — use or dispose.`;
+                       (isBeer
+                         ? 'Beer is still on hand — use or dispose.'
+                         : `${remaining}${unit ? ' ' + unit : ''} still on hand — use or dispose.`);
 
           const rIn = insertNotif.run(
             generateId(), kind, dedupKey, null, b.item_name, b.expiry_date,

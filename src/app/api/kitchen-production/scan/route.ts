@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
+import { beerBlindFor } from '@/lib/brewery-beer';
 
 /**
  * POST /api/kitchen-production/scan
@@ -67,7 +68,9 @@ export async function POST(request: Request) {
       shelf_life_remaining: shelfLifeRemaining(row.expiry_date, row.expiry_time, now),
     };
 
-    return Response.json({ batch });
+    // Blind beer (ruling 121): the batch AND its FIFO "use first" hints —
+    // see src/lib/brewery-beer.ts.
+    return Response.json({ batch: beerBlindFor(db, me).batch(batch) });
   } catch (e: any) {
     console.error('POST /api/kitchen-production/scan failed:', e);
     return Response.json({ error: e?.message || 'Failed to record scan' }, { status: 500 });

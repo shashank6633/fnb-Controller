@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
+import { beerBlindFor } from '@/lib/brewery-beer';
 
 /**
  * GET /api/kitchen-production/by-barcode?barcode=PROD000145
@@ -54,7 +55,8 @@ export async function GET(request: Request) {
       shelf_life_remaining: shelfLifeRemaining(row.expiry_date, row.expiry_time, now),
     };
 
-    return Response.json({ batch });
+    // Blind beer (ruling 121) — see src/lib/brewery-beer.ts.
+    return Response.json({ batch: beerBlindFor(db, me).batch(batch) });
   } catch (e: any) {
     console.error('GET /api/kitchen-production/by-barcode failed:', e);
     return Response.json({ error: e?.message || 'Failed to look up barcode' }, { status: 500 });

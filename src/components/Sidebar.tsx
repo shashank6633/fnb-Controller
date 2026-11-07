@@ -401,6 +401,9 @@ const navTree: NavEntry[] = [
       // Owner ruling 114 — Kitchen Production's screen for items ticked
       // "Brewery item". Twin of the page-catalog.ts row with the same href.
       { kind: "link", label: "Brewery Production", href: "/brewery-production", icon: Beer },
+      // Owner rulings 118/120 — Brewery closing (beer per batch + malts / hops).
+      // Twin of the page-catalog.ts row with the same href.
+      { kind: "link", label: "Brewery Closing Stock", href: "/brewery-closing", icon: ClipboardList },
       { kind: "link", label: "Production Dashboard", href: "/kitchen-production/dashboard", icon: LayoutGrid },
       { kind: "link", label: "Scan Batch",         href: "/kitchen-production/scan", icon: ScanLine },
       { kind: "link", label: "Butchering",         href: "/butchering",         icon: Scissors },

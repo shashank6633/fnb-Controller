@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
 import { batchDepartment } from '@/lib/production-departments';
+import { beerBlindFor } from '@/lib/brewery-beer';
 
 /**
  * GET /api/kitchen-production/[id]
@@ -37,9 +38,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
 
     const transactions = db.prepare(
       `SELECT * FROM batch_transactions WHERE batch_id = ? ORDER BY created_at DESC, rowid DESC`
-    ).all(id);
+    ).all(id) as { type?: unknown }[];
 
-    return Response.json({ batch, transactions });
+    // Blind beer (ruling 121): for a Brewery batch, a viewer below manager / HOD
+    // gets neither the used / left figures nor the history amounts that add up
+    // to them. See src/lib/brewery-beer.ts.
+    const blind = beerBlindFor(db, me);
+    return Response.json({ batch: blind.batch(batch), transactions: blind.transactions(row, transactions) });
   } catch (e: any) {
     console.error('GET /api/kitchen-production/[id] failed:', e);
     return Response.json({ error: e?.message || 'Failed to load batch' }, { status: 500 });

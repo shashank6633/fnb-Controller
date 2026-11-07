@@ -12,6 +12,7 @@ import {
   fssaiAppAudit, str,
 } from '@/lib/fssai-server';
 import { expiryStatus, shelfLifeRemaining } from '@/lib/production-batch';
+import { beerBlindFor } from '@/lib/brewery-beer';
 import {
   P5_LIST_LIMIT, num, nullableInt, readBusinessDate, readClock,
   p5VisibilityClause, p5CanSee, attachP5Files, readP5AttachmentIndex,
@@ -197,6 +198,7 @@ export async function GET(request: Request) {
        * problem, and it is counted separately below so it cannot hide. */
       const rows = db.prepare(
         `SELECT b.id, b.batch_number, b.barcode, b.item_name, b.category, b.material_id,
+                b.production_item_id,
                 b.production_date, b.production_time, b.expiry_date, b.expiry_time,
                 b.quantity_produced, b.quantity_consumed, b.unit, b.storage_location,
                 b.kitchen_section, b.prepared_by, b.status,
@@ -214,6 +216,9 @@ export async function GET(request: Request) {
       ).all() as any[];
 
       const now = new Date();
+      // Blind beer (ruling 121): a Brewery batch's litres left go only to admin,
+      // manager and HOD — src/lib/brewery-beer.ts. Kitchen batches unchanged.
+      const blind = beerBlindFor(db, me);
       const batches = rows.map((b) => {
         /* THE NEAR-EXPIRY WINDOW IS PER ITEM WHERE THE OWNER HAS SET ONE. A
          * 3-day warning on milk is useless and on canned tomatoes is noise, so
@@ -233,7 +238,10 @@ export async function GET(request: Request) {
           production_date: String(b.production_date || ''),
           expiry_date: String(b.expiry_date || ''),
           expiry_time: String(b.expiry_time || ''),
-          remaining_quantity: Math.max(0, (Number(b.quantity_produced) || 0) - (Number(b.quantity_consumed) || 0)),
+          remaining_quantity: blind.hidden(b)
+            ? null
+            : Math.max(0, (Number(b.quantity_produced) || 0) - (Number(b.quantity_consumed) || 0)),
+          quantities_hidden: blind.hidden(b),
           unit: String(b.unit || ''),
           storage_location: String(b.storage_location || ''),
           kitchen_section: String(b.kitchen_section || ''),

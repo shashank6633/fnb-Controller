@@ -32,7 +32,7 @@ import {
   ChefHat, Plus, Loader2, RefreshCw, Search, X, Package, Clock, MapPin,
   User as UserIcon, AlertTriangle, CheckCircle2, History, Barcode as BarcodeIcon,
   Printer, Settings, Eye, Copy, CheckSquare, Square, Save, CheckCircle, ScanLine,
-  LayoutGrid, BarChart3, Trash2, Send, Undo2, Beer,
+  LayoutGrid, BarChart3, Trash2, Send, Undo2, Beer, ClipboardList,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { canAccessPage, applyHodOnlyOverrides } from '@/lib/page-catalog';
@@ -47,6 +47,8 @@ import { labelPreview, LABEL_FIELD_KEYS } from '@/lib/tspl-label';
 import type { LabelPrinterConfig, LabelBatch, LabelFieldKey } from '@/lib/tspl-label';
 import LabelCanvas from '@/components/LabelCanvas';
 import Combobox from '@/components/Combobox';
+import BatchTagScanner from '@/components/BatchTagScanner';
+import { readBatchTag } from '@/lib/brewery-tag';
 
 // Representative batch used to render the live label-design preview.
 const SAMPLE_LABEL_BATCH: LabelBatch = {
@@ -81,7 +83,9 @@ interface Batch {
   expiry_time: string;
   shelf_life: string;
   quantity_produced: number;
-  quantity_consumed: number;
+  /** null with quantities_hidden: a Brewery batch whose used / left figures this
+   *  viewer may not see (ruling 121) — the server leaves them out. */
+  quantity_consumed: number | null;
   unit: string;
   prepared_by: string;
   kitchen_section: string;
@@ -90,7 +94,8 @@ interface Batch {
   status: string;
   created_at: string;
   updated_at: string;
-  remaining_quantity: number;
+  remaining_quantity: number | null;
+  quantities_hidden?: boolean;
   expiry_status: 'green' | 'yellow' | 'red';
   batch_age_hours: number;
   fifo_priority: number | null;
@@ -105,8 +110,9 @@ interface Batch {
 interface Txn {
   id: string;
   type: string;
-  quantity: number;
-  balance_quantity: number;
+  /** null on a hidden Brewery batch (ruling 121) — see Batch.quantities_hidden. */
+  quantity: number | null;
+  balance_quantity: number | null;
   user: string;
   department: string;
   remarks: string;
@@ -117,6 +123,13 @@ interface RecipeOpt { id: string; name: string; }
 // ─── Helpers ────────────────────────────────────────────────────────────
 const fmtNum = (v: number) =>
   (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+
+/** What a batch has left, or null when the server hid it (Brewery, ruling 121). */
+const leftOf = (b: Batch): number | null =>
+  b.quantities_hidden ? null : (b.remaining_quantity ?? Math.max(0, b.quantity_produced - (b.quantity_consumed ?? 0)));
+/** "12 L", or "Hidden" for a figure the server left out. */
+const qtyText = (v: number | null, unit: string) =>
+  v == null ? 'Hidden' : `${fmtNum(v)}${unit ? ' ' + unit : ''}`;
 
 // production_time / expiry_time are bare local wall-clock "HH:mm" strings from
 // the form. Format to 12-hour WITHOUT any timezone conversion (the shared IST
@@ -764,6 +777,13 @@ export default function KitchenProductionPage() {
               <ScanLine className="w-4 h-4" /> Scan
             </Link>
           )}
+          {/* Brewery Closing — beer per batch + malts / hops (ruling 118). */}
+          {isBrewery && canOpen('/brewery-closing') && (
+            <Link href="/brewery-closing"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+              <ClipboardList className="w-4 h-4" /> <span className="hidden sm:inline">Closing Stock</span>
+            </Link>
+          )}
           <button onClick={() => setShowItems(true)}
                   title="Production Items master list"
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
@@ -1049,7 +1069,7 @@ function BatchCard({
   canPrint?: boolean;
 }) {
   const tone = EXPIRY_TONE[batch.expiry_status] || EXPIRY_TONE.green;
-  const remaining = batch.remaining_quantity ?? Math.max(0, batch.quantity_produced - batch.quantity_consumed);
+  const remaining = leftOf(batch);
   const stop = (e: React.MouseEvent) => e.stopPropagation();
   return (
     <div onClick={() => (selectMode ? onToggleSelect() : onOpen())}
@@ -1105,8 +1125,8 @@ function BatchCard({
       {/* Quantities */}
       <div className="grid grid-cols-3 gap-2 text-center">
         <QtyChip label="Produced" value={`${fmtNum(batch.quantity_produced)}${batch.unit ? ' ' + batch.unit : ''}`} tone="text-[#6B5744]" />
-        <QtyChip label="Consumed" value={`${fmtNum(batch.quantity_consumed)}${batch.unit ? ' ' + batch.unit : ''}`} tone="text-amber-700" />
-        <QtyChip label="Remaining" value={`${fmtNum(remaining)}${batch.unit ? ' ' + batch.unit : ''}`} tone="text-emerald-700" />
+        <QtyChip label="Consumed" value={qtyText(batch.quantities_hidden ? null : batch.quantity_consumed, batch.unit)} tone="text-amber-700" />
+        <QtyChip label="Remaining" value={qtyText(remaining, batch.unit)} tone="text-emerald-700" />
       </div>
 
       {/* Meta */}
@@ -1199,6 +1219,21 @@ function BatchFormModal({ variant = 'kitchen', form, setField, saving, error, er
     && form.batch_number_entry.trim().toLowerCase().startsWith(`${serialCode.toLowerCase()}-`);
   const batchBoxRef = useRef<HTMLDivElement | null>(null);
   const errorBoxRef = useRef<HTMLDivElement | null>(null);
+  // Brewery: scan the brewery's own batch tag into the Batch Number box (ruling
+  // 119). src/lib/brewery-tag.ts decides; Save still runs every usual check.
+  const [tagScanOpen, setTagScanOpen] = useState(false);
+  const [tagNote, setTagNote] = useState<string | null>(null);
+  const onTagRead = (text: string): string | null => {
+    const r = readBatchTag(text, pItems, form.production_item_id || null);
+    if (!r.ok) return r.error;
+    if (r.itemId !== form.production_item_id) onPickItem(r.itemId);
+    setField('batch_number_entry', r.entry);   // after the pick, which empties the box
+    const it = pItems.find(x => x.id === r.itemId);
+    setTagNote(r.switchedItem
+      ? `The tag is for ${it?.name || 'another item'} — the item was changed to match. Check it before saving.`
+      : `Read from the tag: ${text.trim()}`);
+    return null;
+  };
   // Brewery: bring every refusal into view — the form body scrolls, so a
   // message at its foot (or under the Batch Number box at its top) can be out
   // of sight when Save is pressed. Kitchen Production is left exactly as it was.
@@ -1225,6 +1260,17 @@ function BatchFormModal({ variant = 'kitchen', form, setField, saving, error, er
 
         {/* Body */}
         <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+          {isBrewery && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <button type="button" onClick={() => { setTagNote(null); setTagScanOpen(true); }} disabled={saving}
+                      className="px-3 py-1.5 border border-[#af4408] text-[#af4408] hover:bg-[#FFF1E3] rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                <ScanLine className="w-4 h-4" /> Scan batch tag
+              </button>
+              <span className="text-[11px] text-[#8B7355]">
+                {tagNote || 'Fills the Batch Number from the brewery’s tag — camera or handheld scanner.'}
+              </span>
+            </div>
+          )}
           {/* Auto-generated notice (Brewery: the batch number follows the item) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {!isBrewery || !pv ? (
@@ -1408,6 +1454,9 @@ function BatchFormModal({ variant = 'kitchen', form, setField, saving, error, er
             Save Batch
           </button>
         </div>
+        {/* Inside the card on purpose: the card stops clicks, so closing the
+            scanner never reaches the backdrop that cancels this form. */}
+        {tagScanOpen && <BatchTagScanner onRead={onTagRead} onClose={() => setTagScanOpen(false)} />}
       </div>
     </div>
   );
@@ -1480,7 +1529,9 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast, canManage = true
   };
 
   const tone = batch ? (EXPIRY_TONE[batch.expiry_status] || EXPIRY_TONE.green) : EXPIRY_TONE.green;
-  const remaining = batch ? (batch.remaining_quantity ?? Math.max(0, batch.quantity_produced - batch.quantity_consumed)) : 0;
+  // 0 for a hidden batch: its viewer is below manager / HOD, so the actions that
+  // read this (Waste / Dispose) are not offered to them at all (canManage).
+  const remaining = batch ? (leftOf(batch) ?? 0) : 0;
   const canAct = !!batch && batch.status === 'active';
 
   return (
@@ -1526,8 +1577,8 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast, canManage = true
             {/* Fields */}
             <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
               <Detail label="Produced" value={`${fmtNum(batch.quantity_produced)}${batch.unit ? ' ' + batch.unit : ''}`} />
-              <Detail label="Consumed" value={`${fmtNum(batch.quantity_consumed)}${batch.unit ? ' ' + batch.unit : ''}`} />
-              <Detail label="Remaining" value={`${fmtNum(batch.remaining_quantity)}${batch.unit ? ' ' + batch.unit : ''}`} strong />
+              <Detail label="Consumed" value={qtyText(batch.quantities_hidden ? null : batch.quantity_consumed, batch.unit)} />
+              <Detail label="Remaining" value={qtyText(leftOf(batch), batch.unit)} strong />
               <Detail label="Status" value={batch.status} capitalize />
               <Detail label="Production" value={fmtDateTimeParts(batch.production_date, batch.production_time)} />
               <Detail label="Expiry" value={batch.expiry_date ? fmtDateTimeParts(batch.expiry_date, batch.expiry_time) : '—'} />
@@ -1615,10 +1666,14 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast, canManage = true
                         </div>
                       </div>
                       <div className="text-right shrink-0">
-                        <div className="font-mono text-sm font-semibold text-[#2D1B0E]">
-                          {t.type === 'consumed' ? '-' : '+'}{fmtNum(t.quantity)}
-                        </div>
-                        <div className="text-[10px] text-[#8B7355]">bal {fmtNum(t.balance_quantity)}</div>
+                        {t.quantity != null && (
+                          <div className="font-mono text-sm font-semibold text-[#2D1B0E]">
+                            {t.type === 'consumed' ? '-' : '+'}{fmtNum(t.quantity)}
+                          </div>
+                        )}
+                        {t.balance_quantity != null && (
+                          <div className="text-[10px] text-[#8B7355]">bal {fmtNum(t.balance_quantity)}</div>
+                        )}
                       </div>
                     </div>
                   ))}

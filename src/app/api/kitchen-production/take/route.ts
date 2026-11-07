@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
+import { beerBlindFor } from '@/lib/brewery-beer';
 
 /**
  * POST /api/kitchen-production/take
@@ -45,10 +46,17 @@ export async function POST(request: Request) {
     }
 
     const now = new Date();
+    // Blind beer (ruling 121): for a Brewery batch, a viewer below manager / HOD
+    // is told the take is too big — never how much is left.
+    const blind = beerBlindFor(db, me);
     const available = Math.max(0, (row.quantity_produced || 0) - (row.quantity_consumed || 0));
     if (quantity > available + 1e-9) {
       return Response.json(
-        { error: `Only ${available} ${row.unit || ''} left in this batch — cannot take ${quantity}`.trim() },
+        {
+          error: blind.hidden(row)
+            ? `That is more than this batch has left — cannot take ${quantity}${row.unit ? ' ' + row.unit : ''}. Ask your HOD or manager.`
+            : `Only ${available} ${row.unit || ''} left in this batch — cannot take ${quantity}`.trim(),
+        },
         { status: 400 },
       );
     }
@@ -77,14 +85,14 @@ export async function POST(request: Request) {
     const { fifo_priority, fifo_use_first } = computeFifo(db, updated, outletId, now);
 
     return Response.json({
-      batch: {
+      batch: blind.batch({
         ...enriched,
         fifo_priority,
         fifo_use_first,
         shelf_life_remaining: shelfLifeRemaining(updated.expiry_date, updated.expiry_time, now),
-      },
+      }),
       taken: quantity,
-      remaining: balance,
+      remaining: blind.hidden(updated) ? null : balance,
       completed: newStatus === 'consumed',
     });
   } catch (e: any) {

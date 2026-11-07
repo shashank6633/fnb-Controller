@@ -4,6 +4,7 @@ import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
 import { batchDepartmentMap, resolveBatchDepartment, saveBatchDepartment } from '@/lib/production-departments';
 import { batchNumberKey, resolveTypedBatchNumber } from '@/lib/production-batch-number';
 import { fmtISTDate } from '@/lib/format-date';
+import { beerBlindFor } from '@/lib/brewery-beer';
 
 /**
  * Kitchen Production — prepared-item batches.
@@ -137,6 +138,11 @@ export async function GET(request: Request) {
     // as every batch made before this feature.
     const deptMap = batchDepartmentMap(db, rows.map((b) => b.id));
 
+    // Blind beer (ruling 121): a Brewery batch's used / left figures go only to
+    // admin, manager and HOD — whatever `kind` was asked for. Kitchen batches
+    // are untouched. See src/lib/brewery-beer.ts.
+    const blind = beerBlindFor(db, me);
+
     // fifo_priority: rank ACTIVE batches of the same item oldest-first (1,2,3…).
     const fifoCounter: Record<string, number> = {};
     const batches = rows.map((b) => {
@@ -149,14 +155,14 @@ export async function GET(request: Request) {
         fifo_priority = fifoCounter[key];
       }
       const dep = deptMap.get(b.id);
-      return {
+      return blind.batch({
         ...enriched,
         fifo_priority,
         department_id: dep?.department_id ?? null,
         department_key: dep?.department_key ?? null,
         department_name: dep?.department_name ?? '',
         department_inactive: dep?.department_inactive ?? false,
-      };
+      });
     });
 
     return Response.json({ batches });

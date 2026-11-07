@@ -61,7 +61,9 @@ interface BoardBatch {
   category: string;
   production_date: string;
   expiry_date: string;
-  remaining_quantity: number;
+  /** null for a Brewery batch the viewer may not see the litres of (ruling 121). */
+  remaining_quantity: number | null;
+  quantities_hidden?: boolean;
   unit: string;
   storage_location: string;
   kitchen_section: string;
@@ -457,7 +459,7 @@ function BoardTab({
                     </div>
                     <p className="text-sm font-semibold mt-1.5">{b.item_name}</p>
                     <p className="text-xs text-[#6B5744] mt-0.5">
-                      {b.remaining_quantity} {b.unit} left · {b.storage_location || 'no location recorded'}
+                      {b.remaining_quantity == null ? 'amount left hidden' : `${b.remaining_quantity} ${b.unit} left`} · {b.storage_location || 'no location recorded'}
                     </p>
                     <p className="text-xs mt-1">
                       {b.expiry_date
@@ -501,7 +503,9 @@ function BoardTab({
                         <td className="px-4 py-2 align-top font-mono text-xs text-[#6B5744]">
                           {b.barcode || b.batch_number || '—'}
                         </td>
-                        <td className="px-4 py-2 align-top text-xs">{b.remaining_quantity} {b.unit}</td>
+                        <td className="px-4 py-2 align-top text-xs">
+                          {b.remaining_quantity == null ? <span className="text-[#8B7355]">hidden</span> : <>{b.remaining_quantity} {b.unit}</>}
+                        </td>
                         <td className="px-4 py-2 align-top text-xs text-[#6B5744]">
                           {b.storage_location || <span className="text-[#8B7355]">not recorded</span>}
                         </td>

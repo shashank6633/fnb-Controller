@@ -4720,6 +4720,31 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('production_items brewery columns failed:', e); }
 
+  // Brewery Closing — beer counts (owner rulings 118/120, 2026-11-07). A NEW
+  // table, created only when missing; no existing row is read or written. A
+  // count is a dated RECORD of the litres found in one Brewery batch — it never
+  // changes production_batches (an admin corrects a batch with Waste/Dispose).
+  // One row per (date, batch): saving the same batch again on the same date
+  // replaces the figure and the counter. See src/lib/brewery-beer.ts.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS brewery_beer_counts (
+        id                 TEXT PRIMARY KEY,
+        outlet_id          TEXT,
+        count_date         TEXT NOT NULL,
+        batch_id           TEXT NOT NULL,
+        production_item_id TEXT,
+        counted_qty        REAL NOT NULL,
+        unit               TEXT NOT NULL DEFAULT '',
+        counted_by         TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (count_date, batch_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_brewery_beer_counts_date ON brewery_beer_counts(count_date);
+    `);
+  } catch (e) { console.error('brewery_beer_counts schema failed:', e); }
+
   // ── AKAN CRM (ported from the standalone Flask app) ───────────────────────
   // AI assistant / training / quiz / guest-quiz for the Front Office & GRE team.
   // Users are THIS app's users (users.id TEXT) — the Flask app's own users table

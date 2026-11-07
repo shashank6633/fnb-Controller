@@ -56,13 +56,18 @@ interface Batch {
   expiry_time: string;
   shelf_life: string;
   quantity_produced: number;
-  quantity_consumed: number;
+  /** null with quantities_hidden: a Brewery batch whose used / left figures this
+   *  viewer may not see (ruling 121) — the server leaves them out. */
+  quantity_consumed: number | null;
   unit: string;
   prepared_by: string;
   kitchen_section: string;
   storage_location: string;
   status: string;
-  remaining_quantity: number;
+  remaining_quantity: number | null;
+  quantities_hidden?: boolean;
+  /** Set by the server on every Brewery batch, whoever asks (ruling 121). */
+  is_brewery_batch?: boolean;
   expiry_status: 'green' | 'yellow' | 'red';
   batch_age_hours: number;
   fifo_priority: number | null;
@@ -71,7 +76,7 @@ interface Batch {
     barcode: string; batch_number: string;
     production_date: string; production_time: string;
     expiry_date: string; storage_location: string;
-    remaining_quantity: number; unit: string; shelf_life_remaining: string;
+    remaining_quantity: number | null; unit: string; shelf_life_remaining: string;
   }>;
   shelf_life_remaining: string;
 }
@@ -85,6 +90,21 @@ type ScanResult =
 // ─── Helpers ────────────────────────────────────────────────────────────
 const fmtNum = (v: number) =>
   (Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+
+/** Blind beer (ruling 121) on a SHARED device: Recent scans keeps each answer as
+ *  the server gave it, so a manager's earlier scan of a Brewery batch still
+ *  carries its litres. A viewer below manager / HOD sees those figures hidden,
+ *  exactly as the server would have sent them. Kitchen batches are untouched. */
+function blindForViewer(b: Batch, seesBeer: boolean): Batch {
+  if (seesBeer || !b.is_brewery_batch || b.quantities_hidden) return b;
+  return {
+    ...b,
+    quantity_consumed: null,
+    remaining_quantity: null,
+    quantities_hidden: true,
+    fifo_use_first: b.fifo_use_first?.map(f => ({ ...f, remaining_quantity: null })),
+  };
+}
 
 // production_time / expiry_time are bare local "HH:mm" strings — format to
 // 12-hour WITHOUT any timezone conversion (matches the list page).
@@ -141,6 +161,16 @@ export default function KitchenScanPage() {
   const [online, setOnline] = useState(true);
 
   useEffect(() => { continuousRef.current = continuous; }, [continuous]);
+
+  // Admin / manager / HOD see Brewery used / left figures (ruling 121). Starts
+  // false — a stored figure stays hidden until we know who is looking.
+  const [seesBeer, setSeesBeer] = useState(false);
+  useEffect(() => {
+    fetch('/api/auth/me').then(r => r.json()).then(d => {
+      const u = d?.user;
+      setSeesBeer(!!u && (u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef));
+    }).catch(() => setSeesBeer(false));
+  }, []);
 
   // ── queue/history/online state ────────────────────────────────────────
   const refreshQueueState = useCallback(async () => {
@@ -513,7 +543,9 @@ export default function KitchenScanPage() {
 
       {/* Result */}
       {result && (
-        <ResultPanel result={result} online={online} onClose={() => setResult(null)}
+        <ResultPanel
+          result={result.status === 'found' ? { ...result, batch: blindForViewer(result.batch, seesBeer) } : result}
+          online={online} onClose={() => setResult(null)}
           onBatchUpdate={(batch) => setResult(r => (r && r.status === 'found' ? { ...r, batch } : r))} />
       )}
 
@@ -671,7 +703,8 @@ function ResultPanel({ result, online, onClose, onBatchUpdate }: {
                 <div>{f.batch_number} · prepared {f.production_date} {f.production_time}</div>
                 <div>
                   {f.storage_location ? <>📍 {f.storage_location} · </> : null}
-                  {fmtNum(f.remaining_quantity)}{f.unit ? ' ' + f.unit : ''} left · {f.shelf_life_remaining}
+                  {f.remaining_quantity == null ? null : <>{fmtNum(f.remaining_quantity)}{f.unit ? ' ' + f.unit : ''} left · </>}
+                  {f.shelf_life_remaining}
                 </div>
                 {b.fifo_use_first!.length > 1 && (
                   <div className="text-amber-700">+{b.fifo_use_first!.length - 1} more older batch{b.fifo_use_first!.length > 2 ? 'es' : ''} before this one</div>
@@ -708,9 +741,12 @@ function ResultPanel({ result, online, onClose, onBatchUpdate }: {
         {/* Quantities */}
         <div className="grid grid-cols-3 gap-2 text-center">
           <QtyChip label="Produced" value={`${fmtNum(b.quantity_produced)}${b.unit ? ' ' + b.unit : ''}`} tone="text-[#6B5744]" />
-          <QtyChip label="Consumed" value={`${fmtNum(b.quantity_consumed)}${b.unit ? ' ' + b.unit : ''}`} tone="text-amber-700" />
-          <QtyChip label="Remaining" value={`${fmtNum(b.remaining_quantity)}${b.unit ? ' ' + b.unit : ''}`} tone="text-emerald-700" />
+          <QtyChip label="Consumed" value={b.quantity_consumed == null ? 'Hidden' : `${fmtNum(b.quantity_consumed)}${b.unit ? ' ' + b.unit : ''}`} tone="text-amber-700" />
+          <QtyChip label="Remaining" value={b.remaining_quantity == null ? 'Hidden' : `${fmtNum(b.remaining_quantity)}${b.unit ? ' ' + b.unit : ''}`} tone="text-emerald-700" />
         </div>
+        {b.quantities_hidden && (
+          <div className="text-[11px] text-[#8B7355] -mt-2">Used and left amounts of Brewery batches are shown to managers and HODs only.</div>
+        )}
 
         {/* Take stock — partial draw-down from THIS batch; auto-completes at 0 */}
         <TakeStock b={b} online={online} onUpdated={onBatchUpdate} />
@@ -769,7 +805,10 @@ function TakeStock({ b, online, onUpdated }: {
   const [taking, setTaking] = useState(false);
   const [note, setNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
-  if (b.status !== 'active' || b.remaining_quantity <= 0) {
+  // A hidden (Brewery, blind) batch has no figure here — the server alone
+  // decides whether a take is too big, and says so without naming what's left.
+  const left = b.remaining_quantity;
+  if (b.status !== 'active' || (left != null && left <= 0)) {
     // Batch just completed (or was already inactive) — keep showing the outcome.
     return note ? (
       <div className={`rounded-lg px-3 py-2 text-sm font-medium ${note.kind === 'ok' ? 'bg-emerald-50 border border-emerald-200 text-emerald-800' : 'bg-red-50 border border-red-200 text-red-700'}`}>
@@ -782,7 +821,7 @@ function TakeStock({ b, online, onUpdated }: {
   const take = async () => {
     const q = Number(qty);
     if (!Number.isFinite(q) || q <= 0) { setNote({ kind: 'err', text: 'Enter a quantity greater than 0.' }); return; }
-    if (q > b.remaining_quantity + 1e-9) { setNote({ kind: 'err', text: `Only ${fmtNum(b.remaining_quantity)}${unitSfx} left in this batch.` }); return; }
+    if (left != null && q > left + 1e-9) { setNote({ kind: 'err', text: `Only ${fmtNum(left)}${unitSfx} left in this batch.` }); return; }
     if (!online) { setNote({ kind: 'err', text: 'You are offline — taking stock needs a connection.' }); return; }
     if (b.expiry_status === 'red' && !window.confirm('This batch is EXPIRED — it should be disposed, not used. Take from it anyway?')) return;
     if ((b.fifo_priority ?? 1) > 1) {
@@ -802,7 +841,9 @@ function TakeStock({ b, online, onUpdated }: {
         kind: 'ok',
         text: j.completed
           ? `Took ${fmtNum(j.taken)}${unitSfx} — batch fully used, marked completed ✓`
-          : `Took ${fmtNum(j.taken)}${unitSfx} — ${fmtNum(j.remaining)}${unitSfx} left`,
+          : j.remaining == null
+            ? `Took ${fmtNum(j.taken)}${unitSfx} ✓`
+            : `Took ${fmtNum(j.taken)}${unitSfx} — ${fmtNum(j.remaining)}${unitSfx} left`,
       });
       onUpdated(j.batch as Batch);
     } catch (e: any) {
@@ -818,7 +859,7 @@ function TakeStock({ b, online, onUpdated }: {
           type="number" inputMode="decimal" min={0} step="any" value={qty}
           onChange={(e) => setQty(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') take(); }}
-          placeholder={`e.g. 3 (max ${fmtNum(b.remaining_quantity)})`}
+          placeholder={left == null ? 'e.g. 3' : `e.g. 3 (max ${fmtNum(left)})`}
           className="flex-1 min-w-0 border border-[#D4B896] rounded-lg px-3 py-2 text-sm bg-white"
         />
         {b.unit && <span className="text-sm text-[#6B5744] shrink-0">{b.unit}</span>}

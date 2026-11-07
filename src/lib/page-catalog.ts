@@ -719,6 +719,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // explicit page list sees it only once the owner ticks it.
       // Twin of the Sidebar.tsx row with the same href — change both.
       { path: '/brewery-production',   label: 'Brewery Production' },
+      // Owner rulings 118/120 (2026-11-07): Brewery closing — beer counted per
+      // batch (a record, never a stock change) + the Brewery department's malts /
+      // hops count + Beer in hand. A plain grant like the row above; the API
+      // (/api/kitchen-production/brewery-closing) checks this same page itself,
+      // and expected litres stay admin / manager / HOD server-side whoever opens
+      // it. Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/brewery-closing',      label: 'Brewery Closing Stock' },
       { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/butchering',          label: 'Butchering' },
