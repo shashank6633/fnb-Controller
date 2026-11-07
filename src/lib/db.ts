@@ -4699,6 +4699,27 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('production_items schema failed:', e); }
 
+  // Brewery Production (owner ruling 114, 2026-11-05) — three ADDITIVE columns
+  // on the Production Items master, added only when missing so a second boot
+  // changes nothing. Their defaults are exactly today's behaviour: is_brewery 0
+  // (a Kitchen Production item), batch_number_mode 'auto' (buildBatchNumber),
+  // no serial code. NOTHING here marks any item as Brewery — the owner ticks
+  // them himself in Items — and no existing row is written. The server reads
+  // the batch-number setting off this row (src/lib/production-batch-number.ts),
+  // and ignores it for any item that is not ticked as Brewery.
+  try {
+    const piCols = db.prepare('PRAGMA table_info(production_items)').all() as { name: string }[];
+    if (!piCols.some((c) => c.name === 'is_brewery')) {
+      db.exec(`ALTER TABLE production_items ADD COLUMN is_brewery INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!piCols.some((c) => c.name === 'batch_number_mode')) {
+      db.exec(`ALTER TABLE production_items ADD COLUMN batch_number_mode TEXT NOT NULL DEFAULT 'auto'`);
+    }
+    if (!piCols.some((c) => c.name === 'batch_serial_code')) {
+      db.exec(`ALTER TABLE production_items ADD COLUMN batch_serial_code TEXT NOT NULL DEFAULT ''`);
+    }
+  } catch (e) { console.error('production_items brewery columns failed:', e); }
+
   // ── AKAN CRM (ported from the standalone Flask app) ───────────────────────
   // AI assistant / training / quiz / guest-quiz for the Front Office & GRE team.
   // Users are THIS app's users (users.id TEXT) — the Flask app's own users table
