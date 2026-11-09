@@ -17,7 +17,7 @@ import { ATT, STAFF_STATE_LABEL, type Lang } from '@/lib/valet/i18n';
 import { normTagCode } from '@/lib/valet/config';
 import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, Modal, LiveBadge, StateChip,
-  useValetContext, useLive, useCmd, useNow, countdown, ago, hhmm,
+  useValetContext, useLive, useCmd, useNow, useAsk, countdown, ago, hhmm,
 } from '../ui';
 
 interface Card {
@@ -50,6 +50,7 @@ export default function AttendantPage() {
   const cmd = useCmd(outletId, live.reload);
   const now = useNow(1000);
   const [modal, setModal] = useState<null | { kind: string; card?: Card; data?: { sid: string; paired?: boolean } }>(null);
+  const { ask, askEl } = useAsk();
   const close = useCallback(() => setModal(null), []);
   const me = ctx?.user.id;
 
@@ -89,7 +90,7 @@ export default function AttendantPage() {
                     <>
                       <span className="text-sm text-[#6B5744] flex-1">{L('on_shift')} · {ago(v.shift!.started_at, now)}</span>
                       <Btn kind="ghost" onClick={() => void cmd.run('shift.break', { on: !onBreak })} disabled={cmd.busy}><Coffee size={15} className="inline mr-1" aria-hidden />{onBreak ? L('end_break') : L('take_break')}</Btn>
-                      <Btn kind="ghost" onClick={() => { if (confirm(`${L('end_shift')}?`)) void cmd.run('shift.end'); }} disabled={cmd.busy}><LogOut size={15} className="inline mr-1" aria-hidden />{L('end_shift')}</Btn>
+                      <Btn kind="ghost" onClick={async () => { if (await ask({ title: `${L('end_shift')}?`, confirmText: L('end_shift'), danger: true }) !== null) void cmd.run('shift.end'); }} disabled={cmd.busy}><LogOut size={15} className="inline mr-1" aria-hidden />{L('end_shift')}</Btn>
                     </>
                   )}
                 </div>
@@ -198,6 +199,7 @@ export default function AttendantPage() {
         </div>
       </Gate>
 
+      {askEl}
       {modal?.kind === 'checkin' && v ? <CheckinModal v={v} outletId={outletId} userId={me || ''} onClose={close} onDone={(sid, paired) => { live.reload(); setModal({ kind: 'issued', data: { sid, paired } }); }} /> : null}
       {modal?.kind === 'issued' && modal.data ? <IssuedModal outletId={outletId} sessionId={modal.data.sid} paired={!!modal.data.paired} onClose={close} /> : null}
       {modal?.kind === 'pass' && modal.card ? <IssuedModal outletId={outletId} sessionId={modal.card.id} onClose={close} start="qr" /> : null}

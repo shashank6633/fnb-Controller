@@ -343,6 +343,53 @@ export function Gate({ ctxError, ctx, children }: { ctxError: string; ctx: Valet
   return <>{children}</>;
 }
 
+// ── in-app questions (replaces window.prompt/confirm: native dialogs look
+// foreign, behave badly on phones, and cannot enforce "a reason is required") ──
+
+export interface AskOptions {
+  title: string;
+  /** Omit for a yes/no confirmation. */
+  label?: string;
+  placeholder?: string;
+  initial?: string;
+  /** Minimum characters for the answer (a recorded reason uses 5). */
+  min?: number;
+  confirmText?: string;
+  danger?: boolean;
+  inputMode?: 'text' | 'numeric';
+}
+
+function AskModal({ o, onDone }: { o: AskOptions; onDone: (v: string | null) => void }) {
+  const [v, setV] = useState(o.initial ?? '');
+  const isText = o.label !== undefined;
+  const min = o.min ?? 0;
+  const ok = !isText || v.trim().length >= min;
+  return (
+    <Modal title={o.title} onClose={() => onDone(null)}>
+      <form onSubmit={e => { e.preventDefault(); if (ok) onDone(isText ? v.trim() : ''); }} className="space-y-3">
+        {isText ? (
+          <Field label={o.label!} hint={min >= 3 ? `At least ${min} characters — it is recorded.` : undefined}>
+            <input className={inputCls} value={v} onChange={e => setV(e.target.value)} placeholder={o.placeholder} autoFocus inputMode={o.inputMode} maxLength={300} />
+          </Field>
+        ) : null}
+        <div className="flex gap-2 justify-end">
+          <Btn kind="ghost" onClick={() => onDone(null)}>Cancel</Btn>
+          <Btn type="submit" kind={o.danger ? 'danger' : 'primary'} disabled={!ok}>{o.confirmText || 'OK'}</Btn>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/** `const { ask, askEl } = useAsk();` — render {askEl}, then `await ask({...})`
+ *  resolves to the answer ('' for a confirmed yes/no) or null when cancelled. */
+export function useAsk() {
+  const [req, setReq] = useState<null | { o: AskOptions; resolve: (v: string | null) => void }>(null);
+  const ask = useCallback((o: AskOptions) => new Promise<string | null>(resolve => setReq({ o, resolve })), []);
+  const askEl = req ? <AskModal key={req.o.title} o={req.o} onDone={v => { req.resolve(v); setReq(null); }} /> : null;
+  return { ask, askEl };
+}
+
 /** QR rendered in the browser (lazy-loaded 'qrcode'); the text never leaves the device. */
 export function QrImage({ text, size = 220, label }: { text: string; size?: number; label: string }) {
   const [src, setSrc] = useState('');

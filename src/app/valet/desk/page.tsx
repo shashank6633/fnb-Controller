@@ -47,7 +47,7 @@ export default function DeskPage() {
               <div className="flex-1"><Field label="Tag number, ticket number, or last 4 of the plate">
                 <input className={`${inputCls} text-lg`} value={q} onChange={e => setQ(e.target.value)} autoFocus autoCapitalize="characters" />
               </Field></div>
-              <Btn type="submit" big disabled={q.trim().length < 2}><Search size={18} aria-hidden /><span className="sr-only">Search</span></Btn>
+              <Btn type="submit" big disabled={!q.trim()}><Search size={18} aria-hidden /><span className="sr-only">Search</span></Btn>
             </form>
           </Panel>
           <ErrorNote message={err || cmd.err} />

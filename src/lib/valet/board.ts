@@ -284,7 +284,8 @@ export function attendantView(db: DB, ov: OutletValet, actor: Actor, now: Date =
     server_time: at, shift,
     my_tasks: mine,
     unparked: cards.filter(c => c.state === 'CHECKED_IN' || (c.state === 'PARKING' && !mine.includes(c))),
-    at_gate: cards.filter(c => c.state === 'READY_AT_GATE' || c.state === 'RELOCATING'),
+    // A car I am moving to holding is MY task (shown there), not a gate card.
+    at_gate: cards.filter(c => (c.state === 'READY_AT_GATE' || c.state === 'RELOCATING') && !mine.includes(c)),
     holding: cards.filter(c => c.state === 'HOLDING_NEAR_GATE'),
     // For tag lookup (scan a tag → its car). Car details only — no guest contact.
     parked: cards.filter(c => c.state === 'PARKED'),

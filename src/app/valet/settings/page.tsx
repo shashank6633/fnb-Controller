@@ -10,7 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Printer, RotateCcw, Save } from 'lucide-react';
 import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, QrImage,
-  useValetContext, valetCmd,
+  useValetContext, valetCmd, useAsk, type AskOptions,
 } from '../ui';
 
 // The config is edited as loose JSON and normalised by the server (parseConfig).
@@ -37,6 +37,7 @@ export default function ValetSettingsPage() {
     setData(j); setErr('');
   }, [outletId]);
   useEffect(() => { void load(); }, [load]);
+  const { ask, askEl } = useAsk();
   const run = async (cmd: string, body: Record<string, unknown> = {}, ok = 'Saved.') => {
     setErr(''); setMsg('');
     try { await valetCmd(outletId, cmd, body); setMsg(ok); await load(); return true; }
@@ -53,23 +54,25 @@ export default function ValetSettingsPage() {
           {msg ? <InfoNote>{msg}</InfoNote> : null}
           {!data ? <p className="text-sm text-[#8B7355]">Loading…</p> : (
             <>
-              <OutletSwitch data={data} run={run} />
-              <EntryQr data={data} run={run} />
+              <OutletSwitch data={data} run={run} ask={ask} />
+              <EntryQr data={data} run={run} ask={ask} />
               <Zones data={data} run={run} />
-              <Tags data={data} run={run} />
+              <Tags data={data} run={run} ask={ask} />
               {data.can_admin ? <Rules data={data} run={run} /> : <InfoNote>Valet rules (hours, timers, required fields) are set by the owner/admin.</InfoNote>}
               {data.can_admin && data.staff ? <Staff data={data} run={run} /> : null}
             </>
           )}
         </div>
       </Gate>
+      {askEl}
     </div>
   );
 }
 
 type Run = (cmd: string, body?: Record<string, unknown>, ok?: string) => Promise<boolean>;
+type Ask = (o: AskOptions) => Promise<string | null>;
 
-function OutletSwitch({ data, run }: { data: SettingsData; run: Run }) {
+function OutletSwitch({ data, run, ask }: { data: SettingsData; run: Run; ask: Ask }) {
   return (
     <Panel title="Valet at this outlet">
       <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -77,8 +80,8 @@ function OutletSwitch({ data, run }: { data: SettingsData; run: Run }) {
           {data.enabled ? 'Valet is ON. Staff can check cars in and guests can use their pass.' : 'Valet is OFF. Nobody can check a car in here until it is switched on.'}
         </p>
         {data.can_admin ? (
-          <Btn kind={data.enabled ? 'ghost' : 'ok'} onClick={() => {
-            if (data.enabled && !confirm('Switch valet OFF for this outlet? Cars already checked in stay on the board, but no new check-ins or guest requests will be accepted.')) return;
+          <Btn kind={data.enabled ? 'ghost' : 'ok'} onClick={async () => {
+            if (data.enabled && await ask({ title: 'Switch valet OFF for this outlet? Cars already checked in stay on the board, but no new check-ins or guest requests will be accepted.', confirmText: 'Switch OFF', danger: true }) === null) return;
             void run('settings.enable', { enabled: !data.enabled }, data.enabled ? 'Valet switched off.' : 'Valet switched on.');
           }}>{data.enabled ? 'Switch OFF' : 'Switch ON'}</Btn>
         ) : <span className="text-xs text-[#8B7355]">Only the owner/admin can switch this.</span>}
@@ -87,7 +90,7 @@ function OutletSwitch({ data, run }: { data: SettingsData; run: Run }) {
   );
 }
 
-function EntryQr({ data, run }: { data: SettingsData; run: Run }) {
+function EntryQr({ data, run, ask }: { data: SettingsData; run: Run; ask: Ask }) {
   const [origin, setOrigin] = useState('');
   useEffect(() => { setOrigin(window.location.origin); }, []);
   if (!data.entry_path) {
@@ -104,8 +107,8 @@ function EntryQr({ data, run }: { data: SettingsData; run: Run }) {
           <div className="flex gap-2 flex-wrap print:hidden">
             <Btn kind="ghost" onClick={() => window.print()}><Printer size={14} className="inline mr-1" aria-hidden />Print</Btn>
             {data.can_admin ? (
-              <Btn kind="ghost" onClick={() => {
-                if (!confirm('Make a NEW check-in link? Every printed QR and NFC card for this outlet stops working until replaced.')) return;
+              <Btn kind="ghost" onClick={async () => {
+                if (await ask({ title: 'Make a NEW check-in link? Every printed QR and NFC card for this outlet stops working until replaced.', confirmText: 'Make new link', danger: true }) === null) return;
                 void run('settings.entry_rotate', {}, 'New check-in link created. Replace the printed QR / NFC cards.');
               }}><RotateCcw size={14} className="inline mr-1" aria-hidden />New link</Btn>
             ) : null}
@@ -158,7 +161,7 @@ function Zones({ data, run }: { data: SettingsData; run: Run }) {
   );
 }
 
-function Tags({ data, run }: { data: SettingsData; run: Run }) {
+function Tags({ data, run, ask }: { data: SettingsData; run: Run; ask: Ask }) {
   const [from, setFrom] = useState('1');
   const [to, setTo] = useState('50');
   const [prefix, setPrefix] = useState('');
@@ -182,7 +185,7 @@ function Tags({ data, run }: { data: SettingsData; run: Run }) {
             <span className="text-[10px]">{t.status === 'in_use' ? `on car (${(t.on_car || '').toLowerCase().replace(/_/g, ' ')})` : t.status}</span>
             {t.status !== 'in_use' ? (
               <select aria-label={`Change status of tag ${t.code}`} className="ml-1 rounded border border-[#E8D5C4] text-[10px]" value=""
-                onChange={e => { const v = e.target.value; if (!v) return; const reason = v === 'available' ? 'back in service' : prompt(`Why is tag ${t.code} ${v}?`) || ''; void run('tag.status', { tag_id: t.id, status: v, reason }, `Tag ${t.code} → ${v}.`); }}>
+                onChange={async e => { const v = e.target.value; if (!v) return; const reason = v === 'available' ? 'back in service' : await ask({ title: `Tag ${t.code} → ${v}`, label: 'Why? (recorded)', min: 3, confirmText: 'Save' }); if (reason === null) return; void run('tag.status', { tag_id: t.id, status: v, reason }, `Tag ${t.code} → ${v}.`); }}>
                 <option value="">…</option>
                 {['available', 'disabled', 'lost', 'retired'].filter(s => s !== t.status).map(s => <option key={s} value={s}>{s}</option>)}
               </select>

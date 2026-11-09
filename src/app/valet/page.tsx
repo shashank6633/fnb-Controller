@@ -12,7 +12,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Bell, CheckCircle2, Clock, LayoutGrid, List, Search, Users, Siren } from 'lucide-react';
 import {
   PageHead, OutletPicker, Gate, Panel, Btn, inputCls, ErrorNote, InfoNote, Modal, LiveBadge, StateChip,
-  useValetContext, useLive, useCmd, useNow, countdown, ago, hhmm,
+  useValetContext, useLive, useCmd, useNow, useAsk, countdown, ago, hhmm,
 } from './ui';
 import { HandoverModal, IssuedModal } from './modals';
 
@@ -177,6 +177,7 @@ function Metrics({ b }: { b: Board }) {
 }
 
 function Exceptions({ b, cmd, openCar, now }: { b: Board; cmd: ReturnType<typeof useCmd>; openCar: (id: string) => void; now: number }) {
+  const { ask, askEl } = useAsk();
   const total = b.exceptions.length + b.alerts.length + b.incidents.length;
   if (!total) return <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900"><CheckCircle2 size={14} className="inline mr-1" aria-hidden />No exceptions right now.</div>;
   return (
@@ -208,15 +209,16 @@ function Exceptions({ b, cmd, openCar, now }: { b: Board; cmd: ReturnType<typeof
             <span className="text-[#6B5744] truncate max-w-[40ch]">{i.description}</span><span className="text-xs text-[#8B7355]">{i.reported_by_name}, {ago(i.created_at, now)} ago</span>
             <span className="ml-auto flex gap-1">
               {i.session_id ? <Btn kind="ghost" onClick={() => openCar(i.session_id!)}>Open</Btn> : null}
-              <Btn kind="ghost" onClick={() => {
-                const res = prompt('How was it resolved? (recorded)'); if (!res) return;
-                const hold = confirm('Keep this car\'s record and photos past the normal retention (incident hold)?');
-                void cmd.run('incident.resolve', { incident_id: i.id, resolution: res, retention_hold: hold });
+              <Btn kind="ghost" onClick={async () => {
+                const res = await ask({ title: 'Resolve incident', label: 'How was it resolved?', min: 5, confirmText: 'Next' }); if (res === null) return;
+                const hold = await ask({ title: 'Keep this car\'s record and photos past normal retention (incident hold)?', confirmText: 'Yes, keep (hold)' });
+                void cmd.run('incident.resolve', { incident_id: i.id, resolution: res, retention_hold: hold !== null });
               }}>Resolve</Btn>
             </span>
           </li>
         ))}
       </ul>
+      {askEl}
     </section>
   );
 }
@@ -307,9 +309,10 @@ function ListView({ cards, now, onOpen }: { cards: Card[]; now: number; onOpen: 
 function TeamPanel({ b, cmd, now }: { b: Board; cmd: ReturnType<typeof useCmd>; now: number }) {
   const tone: Record<string, string> = { available: 'bg-emerald-50 text-emerald-800', busy: 'bg-amber-50 text-amber-800', break: 'bg-sky-50 text-sky-800', off: 'bg-stone-100 text-stone-600' };
   const hn = b.handover_note;
+  const { ask, askEl } = useAsk();
   return (
     <Panel title={<><Users size={14} className="inline mr-1" aria-hidden />Team</>} right={
-      <Btn kind="ghost" onClick={() => { const note = prompt('Shift handover note for the next Valet Head (cars, keys and open issues are added automatically):'); if (note !== null) void cmd.run('handover_note.create', { note }); }}>Write shift handover</Btn>
+      <Btn kind="ghost" onClick={async () => { const note = await ask({ title: 'Shift handover', label: 'Note for the next Valet Head (cars, keys and open issues are added automatically)', min: 0, confirmText: 'Save handover' }); if (note !== null) void cmd.run('handover_note.create', { note }); }}>Write shift handover</Btn>
     }>
       {hn ? (
         <div className="mb-2 rounded-lg bg-[#FFF1E3] p-2 text-xs">
@@ -330,7 +333,7 @@ function TeamPanel({ b, cmd, now }: { b: Board; cmd: ReturnType<typeof useCmd>; 
                   <td className="pr-2 text-xs">{t.active_tasks.map(a => a.tag_code).join(', ') || (t.moving ? 'moving a car' : '—')}</td>
                   <td className="pr-2">{t.keys_held || '—'}</td>
                   <td className="pr-2">{t.parks_today} / {t.fetches_today}</td>
-                  <td className="text-right">{t.status !== 'off' ? <button type="button" className="text-xs font-semibold text-[#af4408]" onClick={() => { if (confirm(`End ${t.name}'s shift? Their keys and cars must be handed over first.`)) void cmd.run('shift.end', { user_id: t.user_id, note: 'ended by Valet Head' }); }}>End shift</button> : null}</td>
+                  <td className="text-right">{t.status !== 'off' ? <button type="button" className="text-xs font-semibold text-[#af4408]" onClick={async () => { if (await ask({ title: `End ${t.name}'s shift? Their keys and cars must be handed over first.`, confirmText: 'End shift', danger: true }) !== null) void cmd.run('shift.end', { user_id: t.user_id, note: 'ended by Valet Head' }); }}>End shift</button> : null}</td>
                 </tr>
               ))}
             </tbody>
@@ -338,6 +341,7 @@ function TeamPanel({ b, cmd, now }: { b: Board; cmd: ReturnType<typeof useCmd>; 
         </div>
       )}
       <p className="mt-1 text-[11px] text-[#8B7355]">Updated {ago(b.server_time, now)} ago.</p>
+      {askEl}
     </Panel>
   );
 }
@@ -361,7 +365,9 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
   const c = d?.card;
   const p = c?.pickup;
   const onShift = b.team.filter(t => t.status === 'available' || t.status === 'busy');
-  const ask = (label: string) => { const v = prompt(label); return v && v.trim().length >= 5 ? v.trim() : (v === null ? null : (alert('Please write at least a few words — it is recorded.'), null)); };
+  const { ask: askRaw, askEl } = useAsk();
+  /** A recorded reason: at least 5 characters, enforced on screen. */
+  const ask = (title: string) => askRaw({ title, label: 'Reason (recorded)', min: 5, confirmText: 'Continue' });
   void isAdmin;
   return (
     <Modal title={c ? `Tag ${c.tag_code || c.ticket_no}` : 'Car'} onClose={onClose} wide>
@@ -380,7 +386,7 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
             {c.fetched_by_name ? <div>Fetched by {c.fetched_by_name}</div> : null}
             <div>Guest: {c.guest_name || '—'} {c.mobile_masked ? <span className="font-mono">{c.mobile_masked}</span> : null}
               {c.mobile_masked && !reveal ? <button type="button" className="ml-2 text-xs font-semibold text-[#af4408]" onClick={async () => {
-                const why = ask('Why do you need to contact the guest? (recorded)'); if (!why) return;
+                const why = await ask('Why do you need to contact the guest?'); if (why === null) return;
                 const r = await cmd.run<{ guest_name: string; guest_mobile: string }>('contact.reveal', { session_id: c.id, reason: why }); if (r) setReveal(r);
               }}>Show number</button> : null}
               {reveal ? <a className="ml-2 font-mono font-bold text-[#af4408]" href={`tel:${reveal.guest_mobile}`}>{reveal.guest_mobile}</a> : null}
@@ -402,54 +408,54 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
               </div>
               <div className="mt-2 flex flex-wrap gap-2">
                 {['QUEUED', 'ASSIGNED', 'IN_PROGRESS'].includes(p.state) ? (
-                  <select aria-label="Assign to" className={`${inputCls} w-auto`} value="" onChange={e => {
+                  <select aria-label="Assign to" className={`${inputCls} w-auto`} value="" onChange={async e => {
                     const uid = e.target.value; if (!uid) return;
-                    const reason = p.state === 'QUEUED' ? '' : ask('Why reassign? (recorded)');
-                    if (p.state !== 'QUEUED' && !reason) return;
+                    const reason = p.state === 'QUEUED' ? '' : await ask('Why reassign this car?');
+                    if (reason === null) return;
                     void cmd.run('pickup.assign', { pickup_id: p.id, version: p.version, user_id: uid, reason });
                   }}>
                     <option value="">{p.state === 'QUEUED' ? 'Assign to…' : 'Reassign to…'}</option>
                     {onShift.filter(t => t.user_id !== p.assigned_user_id).map(t => <option key={t.user_id} value={t.user_id}>{t.name} ({t.status})</option>)}
                   </select>
                 ) : null}
-                {['SCHEDULED', 'QUEUED', 'ASSIGNED'].includes(p.state) ? <Btn kind="ghost" onClick={() => {
-                  const n = prompt('Priority (0 normal, 1–3 higher):', String(Math.min(3, p.priority + 1))); if (n === null) return;
-                  const why = ask('Why? (recorded)'); if (!why) return;
+                {['SCHEDULED', 'QUEUED', 'ASSIGNED'].includes(p.state) ? <Btn kind="ghost" onClick={async () => {
+                  const n = await askRaw({ title: 'Change priority', label: 'Priority (0 normal, 1–3 higher)', initial: String(Math.min(3, p.priority + 1)), min: 1, inputMode: 'numeric', confirmText: 'Next' }); if (n === null) return;
+                  const why = await ask('Why change the priority?'); if (why === null) return;
                   void cmd.run('pickup.priority', { pickup_id: p.id, version: p.version, priority: Number(n), reason: why });
                 }}>Priority</Btn> : null}
-                {['QUEUED', 'ASSIGNED', 'IN_PROGRESS'].includes(p.state) ? <Btn kind="ghost" onClick={() => {
-                  const r = prompt('New estimate in minutes from now, e.g. 10-15 (blank = back to automatic):'); if (r === null) return;
-                  const why = ask('Why? (shown to nobody but recorded)'); if (!why) return;
+                {['QUEUED', 'ASSIGNED', 'IN_PROGRESS'].includes(p.state) ? <Btn kind="ghost" onClick={async () => {
+                  const r = await askRaw({ title: 'Adjust the estimate', label: 'Minutes from now, e.g. 10-15 (leave blank to go back to automatic)', min: 0, confirmText: 'Next' }); if (r === null) return;
+                  const why = await ask('Why adjust the estimate?'); if (why === null) return;
                   const m = r.match(/(\d+)\s*[-–]\s*(\d+)/);
                   void cmd.run('pickup.eta', m ? { pickup_id: p.id, version: p.version, low_min: Number(m[1]), high_min: Number(m[2]), reason: why } : { pickup_id: p.id, version: p.version, clear: true, reason: why });
                 }}>Adjust ETA</Btn> : null}
-                {['SCHEDULED', 'QUEUED', 'ASSIGNED', 'IN_PROGRESS', 'READY'].includes(p.state) ? <Btn kind="ghost" onClick={() => {
-                  const why = ask('Cancel this pickup — why? (recorded)'); if (!why) return;
+                {['SCHEDULED', 'QUEUED', 'ASSIGNED', 'IN_PROGRESS', 'READY'].includes(p.state) ? <Btn kind="ghost" onClick={async () => {
+                  const why = await ask('Cancel this pickup — why?'); if (why === null) return;
                   void cmd.run('pickup.cancel', { pickup_id: p.id, reason: why, return_to: 'park' });
                 }}>Cancel pickup</Btn> : null}
-                {p.state === 'ASSIGNED' ? <Btn kind="ghost" onClick={() => { const why = ask('Put back in the queue — why?'); if (why) void cmd.run('pickup.unassign', { pickup_id: p.id, version: p.version, reason: why }); }}>Back to queue</Btn> : null}
+                {p.state === 'ASSIGNED' ? <Btn kind="ghost" onClick={async () => { const why = await ask('Put back in the queue — why?'); if (why !== null) void cmd.run('pickup.unassign', { pickup_id: p.id, version: p.version, reason: why }); }}>Back to queue</Btn> : null}
               </div>
             </Panel>
           ) : ['PARKED', 'HOLDING_NEAR_GATE', 'CHECKED_IN', 'PARKING'].includes(c.state) ? (
-            <Btn onClick={() => { if (confirm('Request this car now on the guest\'s behalf? Only do this if the guest asked.')) void cmd.run('pickup.request', { session_id: c.id, when: 'now', guest_confirmed: true, idempotency_key: `head:${c.id}:${Math.floor(Date.now() / 60000)}` }); }}>Request pickup for guest</Btn>
+            <Btn onClick={async () => { if (await askRaw({ title: 'Request this car now on the guest\'s behalf? Only do this if the guest asked.', confirmText: 'Yes — the guest asked' }) !== null) void cmd.run('pickup.request', { session_id: c.id, when: 'now', guest_confirmed: true, idempotency_key: `head:${c.id}:${Math.floor(Date.now() / 60000)}` }); }}>Request pickup for guest</Btn>
           ) : null}
           <div className="flex flex-wrap gap-2">
             {c.state === 'READY_AT_GATE' ? <Btn kind="ok" onClick={() => setSub('handover')}>Verify handover / recovery</Btn> : null}
             {!['HANDED_OVER', 'VOIDED'].includes(c.state) ? <>
               <Btn kind="ghost" onClick={() => setSub('pass')}>Pass QR</Btn>
               <Btn kind="ghost" onClick={() => setSub('claim')}>Claim receipt</Btn>
-              <select aria-label="Move keys" className={`${inputCls} w-auto`} value="" onChange={e => {
+              <select aria-label="Move keys" className={`${inputCls} w-auto`} value="" onChange={async e => {
                 const v = e.target.value; if (!v) return;
-                if (v === 'rack') { const rack = prompt('Rack / hook (e.g. R1 / 7):') || ''; const [r, h] = rack.split('/').map(s => s.trim()); void cmd.run('key.transfer', { session_id: c.id, version: c.version, to: 'rack', key_rack: r, key_hook: h || '' }); }
+                if (v === 'rack') { const rack = await askRaw({ title: 'Keys to the rack', label: 'Rack / hook, e.g. R1 / 7', min: 1, confirmText: 'Move keys' }); if (rack === null) return; const [r, h] = rack.split('/').map(s => s.trim()); void cmd.run('key.transfer', { session_id: c.id, version: c.version, to: 'rack', key_rack: r, key_hook: h || '' }); }
                 else if (v === 'desk') void cmd.run('key.transfer', { session_id: c.id, version: c.version, to: 'desk' });
                 else void cmd.run('key.transfer', { session_id: c.id, version: c.version, to: 'attendant', to_user_id: v });
               }}>
                 <option value="">Move keys to…</option><option value="rack">Rack</option><option value="desk">Desk</option>
                 {onShift.map(t => <option key={t.user_id} value={t.user_id}>{t.name}</option>)}
               </select>
-              <Btn kind="ghost" onClick={() => { const code = prompt('New key tag number:'); if (!code) return; const why = ask('Why replace the tag?'); if (!why) return; void cmd.run('tag.replace', { session_id: c.id, new_code: code, old_status: 'disabled', reason: why }); }}>Replace tag</Btn>
-              <Btn kind="ghost" onClick={() => { const desc = ask('Describe the incident (recorded):'); if (!desc) return; void cmd.run('incident.create', { session_id: c.id, kind: 'other', description: desc }); }}>Record incident</Btn>
-              <Btn kind="danger" onClick={() => { const why = ask('Void this record — why? (test entry / duplicate). History is kept.'); if (!why) return; void cmd.run('session.void', { session_id: c.id, version: c.version, reason: why, is_test: /test/i.test(why) }).then(() => onClose()); }}>Void record</Btn>
+              <Btn kind="ghost" onClick={async () => { const code = await askRaw({ title: 'Replace tag', label: 'New key tag number', min: 1, confirmText: 'Next' }); if (code === null) return; const why = await ask('Why replace the tag?'); if (why === null) return; void cmd.run('tag.replace', { session_id: c.id, new_code: code, old_status: 'disabled', reason: why }); }}>Replace tag</Btn>
+              <Btn kind="ghost" onClick={async () => { const desc = await askRaw({ title: 'Record an incident', label: 'What happened? (recorded)', min: 5, confirmText: 'Record' }); if (desc === null) return; void cmd.run('incident.create', { session_id: c.id, kind: 'other', description: desc }); }}>Record incident</Btn>
+              <Btn kind="danger" onClick={async () => { const why = await ask('Void this record — why? (test entry / duplicate). History is kept.'); if (why === null) return; void cmd.run('session.void', { session_id: c.id, version: c.version, reason: why, is_test: /test/i.test(why) }).then(() => onClose()); }}>Void record</Btn>
             </> : null}
           </div>
           {d ? (
@@ -467,6 +473,7 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
       {sub === 'handover' && c ? <HandoverModal card={c} outletId={outletId} isHead onClose={() => setSub('')} onDone={() => { setSub(''); void load(); reload(); }} /> : null}
       {sub === 'pass' && c ? <IssuedModal outletId={outletId} sessionId={c.id} start="qr" onClose={() => setSub('')} /> : null}
       {sub === 'claim' && c ? <IssuedModal outletId={outletId} sessionId={c.id} start="claim" onClose={() => setSub('')} /> : null}
+      {askEl}
     </Modal>
   );
 }
