@@ -304,10 +304,11 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
       </div>
       <ErrorNote message={cmd.err} />
       {mode === 'code' && !pending ? (
-        <div className="space-y-2">
-          <Field label="Guest's 6-digit pairing code"><input className={`${inputCls} text-2xl tracking-[.3em] font-bold`} inputMode="numeric" maxLength={6} value={pairing} onChange={e => setPairing(e.target.value.replace(/\D/g, ''))} autoFocus /></Field>
-          <Btn big className="w-full" onClick={() => void findCode()} disabled={pairing.length !== 6 || cmd.busy}>Find guest</Btn>
-        </div>
+        // A form, so the phone keyboard's "Go" / Enter finds the guest too.
+        <form className="space-y-2" onSubmit={e => { e.preventDefault(); if (pairing.length === 6 && !cmd.busy) void findCode(); }}>
+          <Field label="Guest's 6-digit pairing code"><input className={`${inputCls} text-2xl tracking-[.3em] font-bold`} inputMode="numeric" enterKeyHint="go" maxLength={6} value={pairing} onChange={e => setPairing(e.target.value.replace(/\D/g, ''))} autoFocus /></Field>
+          <Btn type="submit" big className="w-full" disabled={pairing.length !== 6 || cmd.busy}>Find guest</Btn>
+        </form>
       ) : pending?.source === 'paper_claim' ? (
         <PaperClaimConfirm outletId={outletId} request={pending} onDone={ok => { if (ok) onClose(); }} />
       ) : (

@@ -17,7 +17,7 @@
 import type { DB, Actor, OutletValet, SessionRow, PickupRow } from './core';
 import { fail, guestActor, loadOutletValet, activePickup, notify, withTx, newId, logEvent, getSession } from './core';
 import { DEVICE_COOKIE, sha256, randomToken, rateLimit } from './credentials';
-import { nowIso, addMinutes, maskPlate, nextClose, cleanText } from './config';
+import { nowIso, addMinutes, maskPlate, nextClose, cleanText, withinServiceHours } from './config';
 import { isHeld } from './states';
 import { etaFor, promoteDue } from './queue';
 import { createPendingCheckin, expirePending } from './ops-arrival';
@@ -80,14 +80,19 @@ function requireGrant(db: DB, deviceId: string, sessionId: unknown): SessionRow 
 }
 
 /** Later-time choices within service hours and the outlet's window. */
-function laterSlots(ov: OutletValet, now: Date): string[] {
+export function laterSlots(ov: OutletValet, now: Date): string[] {
   const p = ov.cfg.pickup;
   if (!p.later) return [];
   const step = p.later_step_minutes;
   const first = Math.ceil((now.getTime() + 15 * 60_000) / (step * 60_000)) * step * 60_000;
   const last = Math.min(now.getTime() + p.later_max_minutes * 60_000, nextClose(now, ov.cfg).getTime());
   const out: string[] = [];
-  for (let t = first; t <= last && out.length < 48; t += step * 60_000) out.push(new Date(t).toISOString());
+  // Offer only times resolveTarget() accepts: inside service hours (so none
+  // after closing — when a car is still held past close, and not the closing
+  // minute itself, which counts as closed).
+  for (let t = first; t <= last && out.length < 48; t += step * 60_000) {
+    if (withinServiceHours(new Date(t), ov.cfg)) out.push(new Date(t).toISOString());
+  }
   return out;
 }
 

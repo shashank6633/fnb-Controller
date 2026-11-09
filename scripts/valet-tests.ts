@@ -664,6 +664,13 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     const late = new Date('2026-11-09T18:45:00Z');   // 00:15 IST
     eq(caught(() => pk.resolveTarget(ov(), 'at', new Date('2026-11-09T19:40:00Z').toISOString(), late))?.code, 'outside_hours', 'booking past closing refused');
     ok(caught(() => pk.resolveTarget(ov(), 'at', new Date('2026-11-09T19:15:00Z').toISOString(), late)) === null, 'booking 00:45 IST before a 01:00 close accepted');
+    // The guest pass may only OFFER times the server accepts (found in the browser at 04:00 IST).
+    for (const [when, label] of [[at(0), '20:00 IST'], [late, '00:15 IST']] as const) {
+      const slots: string[] = guest.laterSlots(ov(), when);
+      ok(slots.length > 0 && slots.every(x => caught(() => pk.resolveTarget(ov(), 'at', x, when)) === null), `every later slot offered at ${label} is accepted (${slots.length} slots)`);
+    }
+    ok(!guest.laterSlots(ov(), late).includes('2026-11-09T19:30:00.000Z'), 'the closing minute (01:00) itself is not offered');
+    eq(guest.laterSlots(ov(), new Date('2026-11-09T22:00:00Z')), [], 'after closing (03:30 IST) no later times are offered');
     const sid = checkin('a1', 'N1', new Date('2026-11-09T19:10:00Z'));
     eq(sess(sid).business_date, '2026-11-09', 'a car checked in at 00:40 IST carries the previous business date');
     eq(cfgm.parseConfig({ dwell_minutes: 7 }).dwell_minutes, 3, 'dwell outside 2/3/5/10 falls back to 3');
