@@ -74,27 +74,42 @@ plain-language checklists, never "Done".
 - Commits: … f8c207e, 2bbc122. tsc clean (`--incremental false`). valet-tests 232/0. Gate earlier: suites
   identical to origin/main baseline; next build OK. origin/main merged in at ee4d521 (59d764e, clean).
 
-## 3. In progress
+## 3. In progress — increment 2
 
-- Nothing half-done. Next = increment 2.
+DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
+- worker.ts (20 s tick, armed in instrumentation.ts; prod or ENABLE_SCHEDULER=1 only) → promote due, expire,
+  escalations.ts (unclaimed/long fetch/outside/dwell/no staff; deduped; auto-resolved; shown inside the
+  matching board exception with a separate "Seen" acknowledgement), notify.ts outbox, closing.ts, retention.ts.
+- notify.ts: verified identity = guest sends "VALET <code>" from their phone (pass button → wa.me link);
+  consent recorded; STOP opt-out; NOW → pickup only when exactly one car matches (else staff alert);
+  honest statuses (sent ≠ delivered; delivered/read/failed only from the SIGNED webhook; no backwards moves;
+  stale replays ignored; provider events deduped); bounded retries 1/5/15 min → failed on the board;
+  obsolete messages cancelled; SIMULATOR whenever the outlet's real-send switch is off, WhatsApp/template
+  is missing, or the process is not production (VALET_ALLOW_DEV_SEND=1 overrides for a developer only).
+  ⚠ The prod DB copy carries LIVE WhatsApp creds (Interakt key + token): tests disable fetch + overwrite
+  creds on the copy; browser harness must keep outlet real-send OFF (default) — dev never sends anyway.
+- Webhook hook in src/app/api/whatsapp/webhook/route.ts: valet ingest only when auth.enforced (signature
+  checked with a configured app secret). Prod has NO app secret today → valet ignores WhatsApp events until
+  the owner pastes it (noted for the owner).
+- Simulator route /api/valet/simulator (admin; refused when live) + message log /api/valet/messages + Settings UI.
+- Photos (media.ts, /api/valet/media): byte-sniffed JPEG/PNG/WebP, 2 MB, 6/car, private no-store route,
+  attendant/head only, progress + retry upload, head drawer strip; counts toward the photo policy.
+- Reports (reports.ts, /api/valet/reports, /valet/reports page + catalog/sidebar rows): definitions,
+  denominators, immediate vs booked kept apart, shift-hours filter, outlet scoping, formula-safe CSV.
 
-## 4. Exact next steps (increment 2)
+## 4. Exact next steps
 
-1. Valet worker (`src/lib/valet/worker.ts`, 20 s tick, armed in instrumentation.ts next to the scheduler,
-   same prod-only/ENABLE_SCHEDULER rule): promote due pickups, expire pending, escalations (unclaimed 5 min,
-   long fetch, outside waiting, dwell overrun, no staff) as deduped valet_alerts that auto-resolve.
-2. Notification outbox `valet_notifications` + adapters: in-app (always), WhatsApp via src/lib/whatsapp.ts
-   template sends ONLY when configured + consent + verified identity; otherwise a clearly labelled SIMULATOR.
-   Webhook ingest: delivery statuses + button replies (dedupe provider event ids, reject replay, verify
-   signature with the existing app-secret logic). Failed-delivery view on the board.
-3. Photos: `valet_media` BLOB store (≤6, ≤1.5 MB after client resize, magic-byte check), upload with
-   progress/retry from the attendant, authorised short-lived view route, damage annotation.
-4. Reports `/valet/reports` + CSV (safe CSV: formula-injection guard), definitions + denominators.
-5. Paper ticket books + bill-folder/table QR entry (pending verification; stub confirmation before dispatch).
-6. FNB links: table/order/booking/customer on a session; cashier/host buttons (guest-confirmed request);
-   bill print/settle offers a prompt only. Must not change existing POS flows (impact-check first).
-7. Closing-rush mode; retention job (redact valet-only PII + photos after N months, incident holds).
-8. Re-run gate vs origin/main; browser scenarios for each; owner note.
+1. Paper tickets: ticket books (head), ticket validation at check-in when paper mode is on, guest
+   bill-folder/table entry (`/valet-pass?e=…&paper=1`) → pending verification ('paper') or a claim on an
+   existing session ('paper_claim') that staff confirm by inspecting the physical stub. Tests.
+2. FNB links: link a car to a table's CURRENT open order (order_id survives table transfer), desk lookup by
+   table, a self-contained Valet chip on /cashier (renders nothing unless valet enabled + host capability;
+   request only after guest confirmation; never automatic). Impact-check /cashier first. Tests.
+3. Browser pass for part 2 (photos upload, simulator link + NOW reply, reports, settings) on the harness
+   (blank the WA creds in that copy first). Gate vs origin/main (fetch first). Owner note.
+4. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
+   adapter/simulator (devices, authenticated ingestion, dedupe, health). Docs (setup, templates, hardware,
+   shift guide, deploy/rollback, env example). Final checklist.
 
 ## 4b. Follow-ups noticed (not valet scope — for the owner)
 
