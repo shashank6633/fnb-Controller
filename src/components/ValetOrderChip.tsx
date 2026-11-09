@@ -50,7 +50,7 @@ export default function ValetOrderChip({ orderId }: { orderId: string }) {
     } finally { setBusy(false); }
   };
   return (
-    <div className="mx-4 mt-3 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2 text-sm" aria-label="Valet">
+    <div className="mx-4 my-3 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2 text-sm" aria-label="Valet">
       <div className="flex items-center gap-1.5 font-semibold text-[#6B5744]"><CarFront className="w-4 h-4" /> Valet</div>
       {d.cars.map(c => (
         <div key={c.id} className="mt-1.5 flex flex-wrap items-center gap-2">

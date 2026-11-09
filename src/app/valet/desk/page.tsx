@@ -18,6 +18,7 @@ import { PaperClaimConfirm } from '../modals';
 interface Hit {
   id: string; state: string; tag_code: string; ticket_no: string; plate: string; make: string; model: string; colour: string;
   pickup: null | { id: string; state: string; target_at: string; scheduled: boolean; eta: { low_min: number | null; high_min: number | null; note: string; ahead: number | null } };
+  dining: null | { order_number: number | null; table_number: string; status: string; merged: boolean };
 }
 
 export default function DeskPage() {
@@ -45,7 +46,7 @@ export default function DeskPage() {
         <div className="mt-3 space-y-3">
           <Panel>
             <form className="flex gap-2 items-end" onSubmit={e => { e.preventDefault(); void search(); }}>
-              <div className="flex-1"><Field label="Tag number, ticket number, or last 4 of the plate">
+              <div className="flex-1"><Field label="Tag number, ticket number, table number, or last 4 of the plate">
                 <input className={`${inputCls} text-lg`} value={q} onChange={e => setQ(e.target.value)} autoFocus autoCapitalize="characters" />
               </Field></div>
               <Btn type="submit" big disabled={!q.trim()}><Search size={18} aria-hidden /><span className="sr-only">Search</span></Btn>
@@ -61,6 +62,9 @@ export default function DeskPage() {
                 <div>
                   <div className="text-3xl font-extrabold">{h.tag_code || h.ticket_no}</div>
                   <div className="text-sm text-[#6B5744]">{[h.colour, h.make, h.model].filter(Boolean).join(' ')} · {h.plate}</div>
+                  {/* Says why a table search found this car. */}
+                  {h.dining && !h.dining.merged && h.dining.status === 'open'
+                    ? <div className="text-sm text-[#6B5744]">{h.dining.table_number ? `Table ${h.dining.table_number}` : 'Parcel'} · bill #{h.dining.order_number ?? '?'}</div> : null}
                 </div>
                 <StateChip state={h.pickup && ['ASSIGNED', 'IN_PROGRESS', 'QUEUED', 'SCHEDULED'].includes(h.pickup.state) ? h.pickup.state : h.state} />
               </div>
