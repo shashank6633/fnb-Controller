@@ -220,8 +220,14 @@ export function headBoard(db: DB, ov: OutletValet, now: Date = new Date()) {
   const availableStaff = team.filter(t => t.status === 'available').length;
   const queuedCount = active.filter(c => c.pickup?.state === 'QUEUED').length;
 
-  const alerts = db.prepare(`SELECT id, session_id, pickup_id, kind, message, created_at, acknowledged_at FROM valet_alerts
-                             WHERE outlet_id = ? AND resolved_at IS NULL ORDER BY created_at`).all(ov.outlet_id) as Record<string, unknown>[];
+  const allAlerts = db.prepare(`SELECT id, session_id, pickup_id, kind, message, created_at, acknowledged_at FROM valet_alerts
+                                WHERE outlet_id = ? AND resolved_at IS NULL ORDER BY created_at`).all(ov.outlet_id) as
+    { id: string; session_id: string | null; pickup_id: string | null; kind: string; message: string; created_at: string; acknowledged_at: string | null }[];
+  // Worker escalations (esc_*) are shown INSIDE the matching exception card, so
+  // one problem is one card; their acknowledgement ("Seen") is tracked apart
+  // from anyone taking the task (spec §8).
+  const escAlerts = allAlerts.filter(a => a.kind.startsWith('esc_'));
+  const alerts = allAlerts.filter(a => !a.kind.startsWith('esc_'));
   const incidents = db.prepare(`SELECT i.id, i.session_id, i.kind, i.description, i.reported_by_name, i.created_at, s.tag_code
                                 FROM valet_incidents i LEFT JOIN valet_vehicle_sessions s ON s.id = i.session_id
                                 WHERE i.outlet_id = ? AND i.status = 'open' ORDER BY i.created_at`).all(ov.outlet_id) as Record<string, unknown>[];
@@ -233,7 +239,8 @@ export function headBoard(db: DB, ov: OutletValet, now: Date = new Date()) {
     unparked_long: 'Arrival not parked after 15 min', missing_location: 'Parked car with no zone',
     missing_key: 'Keys on rack with no rack/hook', keys_with_absent: 'Keys with someone who is off shift',
   };
-  const exceptions: { kind: string; message: string; session_id?: string; pickup_id?: string | null; tag_code?: string; since?: string | null }[] = [];
+  const exceptions: { kind: string; message: string; session_id?: string; pickup_id?: string | null; tag_code?: string; since?: string | null;
+    alert_id?: string; acknowledged_at?: string | null }[] = [];
   for (const c of active) for (const f of c.flags) {
     if (f === 'dwell_expired' && c.flags.includes('dwell_overrun')) continue;
     exceptions.push({ kind: f, message: FLAG_WORDS[f] || f, session_id: c.id, pickup_id: c.pickup?.id ?? null, tag_code: c.tag_code,
@@ -245,6 +252,20 @@ export function headBoard(db: DB, ov: OutletValet, now: Date = new Date()) {
   if (gate.capacity !== null && gate.occupied >= gate.capacity) exceptions.push({ kind: 'gate_full', message: `Gate is full (${gate.occupied}/${gate.capacity}) — readiness estimates are slower` });
   if (holding.capacity !== null && holding.occupied >= holding.capacity) exceptions.push({ kind: 'holding_full', message: `Holding is full (${holding.occupied}/${holding.capacity}) — park extra cars back in the lot` });
   for (const t of team) if (t.status === 'off' && t.keys_held > 0) exceptions.push({ kind: 'staff_unavailable', message: `${t.name} is off shift but still holds keys for ${t.keys_held} car(s)` });
+  const ESC_FOR: Record<string, string> = { unclaimed_overdue: 'esc_unclaimed', long_fetch: 'esc_long_fetch', outside_waiting: 'esc_outside', dwell_overrun: 'esc_dwell', no_staff: 'esc_no_staff' };
+  for (const ex of exceptions) {
+    const k = ESC_FOR[ex.kind];
+    if (!k) continue;
+    const a = escAlerts.find(x => x.kind === k && (k === 'esc_no_staff' || (k === 'esc_dwell' ? x.session_id === ex.session_id : x.pickup_id === ex.pickup_id)));
+    if (a) { ex.alert_id = a.id; ex.acknowledged_at = a.acknowledged_at; }
+  }
+  // Failed guest messages: actionable, and never silently "sent".
+  const failed = db.prepare(`SELECT n.kind, n.last_error, n.failed_at, n.session_id, s.tag_code FROM valet_notifications n
+                             LEFT JOIN valet_vehicle_sessions s ON s.id = n.session_id
+                             WHERE n.outlet_id = ? AND n.status = 'failed' AND n.failed_at >= ? ORDER BY n.failed_at DESC LIMIT 10`)
+    .all(ov.outlet_id, addMinutes(now, -12 * 60)) as { kind: string; last_error: string; failed_at: string; session_id: string | null; tag_code: string | null }[];
+  for (const f of failed) exceptions.push({ kind: 'notify_failed', message: `WhatsApp "${f.kind}" message failed (${f.last_error.slice(0, 80)}) — tell the guest in person`,
+    session_id: f.session_id ?? undefined, tag_code: f.tag_code ?? undefined, since: f.failed_at });
 
   const durations = durationStats(db, ov.outlet_id, null, ov.cfg, now);
   return {

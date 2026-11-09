@@ -24,6 +24,8 @@ import { createPendingCheckin, expirePending } from './ops-arrival';
 import {
   requestPickup, cancelPickup, reschedulePickup, guestOutside, issueHandoverCode, raiseAlert,
 } from './ops-pickup';
+import { startLink, linkState } from './notify';
+import { buildWaMeLink } from '@/lib/whatsapp';
 
 export interface GuestDevice { id: string; lang: string }
 
@@ -114,6 +116,9 @@ function passView(db: DB, ov: OutletValet, s: SessionRow, now: Date) {
     can_request: !p && ['CHECKED_IN', 'PARKING', 'PARKED', 'HOLDING_NEAR_GATE', 'RELOCATING'].includes(s.state),
     can_show_code: s.state === 'READY_AT_GATE' || (!!p && ['ASSIGNED', 'IN_PROGRESS', 'READY'].includes(p.state)),
     options: { now: ov.cfg.pickup.now, in5: ov.cfg.pickup.in5, in10: ov.cfg.pickup.in10, later: laterSlots(ov, now) },
+    // WhatsApp updates are offered only when the venue has set its number; the
+    // guest's own number is never shown or stored here.
+    wa: { available: !!ov.cfg.notifications.whatsapp_number, ...linkState(db, s.id) },
   };
 }
 
@@ -257,6 +262,14 @@ export function guestAct(
         logEvent(db, { outlet_id: o.outlet_id, session_id: s.id, event_type: 'guest.help', actor, at: nowIso(now) });
       });
       return done('help', { help_phone: o.cfg.help_phone });
+    }
+    case 'wa_link': {
+      if (!o.cfg.notifications.whatsapp_number) fail(409, 'not_available', 'WhatsApp updates are not set up at this venue.');
+      if (!rateLimit(db, `guest-walink:${dev.id}`, 6, 600, now)) fail(429, 'slow_down', 'Please wait a moment.');
+      const r = startLink(db, o, s.id, now);
+      if (r.linked) return { body: { ok: true, linked: true } };
+      return { body: { ok: true, linked: false, code: r.code, expires_at: r.expires_at,
+        link: buildWaMeLink(o.cfg.notifications.whatsapp_number, `VALET ${r.code}`) } };
     }
     case 'code': {
       const v = passView(db, o, getSession(db, s.id, o.outlet_id), now);

@@ -25,6 +25,7 @@ import {
   setOutletEnabled, saveConfig, rotateEntryToken, zoneSave, tagsAdd, tagSetStatus, tagReplace, staffAssign,
   handoverNoteCreate, handoverNoteAck,
 } from './ops-admin';
+import { enqueue, cancelForSession } from './notify';
 
 // Untyped JSON from the client: every handler validates the fields it reads.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -128,17 +129,32 @@ export const COMMANDS: Record<string, CommandDef> = {
   } },
   'relocate.start':  { need: 'attendant', run: c => ({ ...relocateStart(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, s(c.body.reason), c.now), session_id: s(c.body.session_id) }) },
   'hold.confirm':    { need: 'attendant', run: c => ({ ...holdConfirm(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, c.body, c.now), session_id: s(c.body.session_id) }) },
-  'handover':        { need: 'attendant', limit: [20, 60], run: c => handover(c.db, c.ov, c.actor, s(c.body.session_id), c.body, c.now) },
+  'handover':        { need: 'attendant', limit: [20, 60], run: c => {
+    const r = handover(c.db, c.ov, c.actor, s(c.body.session_id), c.body, c.now);
+    cancelForSession(c.db, r.session_id, 'car handed over', c.now);   // stop obsolete guest messages
+    return r;
+  } },
 
   // ── head controls
-  'session.void':    { need: 'head', run: c => ({ ...voidSession(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, s(c.body.reason), !!c.body.is_test, c.now), session_id: s(c.body.session_id) }) },
+  'session.void':    { need: 'head', run: c => {
+    const r = voidSession(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, s(c.body.reason), !!c.body.is_test, c.now);
+    cancelForSession(c.db, s(c.body.session_id), 'record voided', c.now);
+    return { ...r, session_id: s(c.body.session_id) };
+  } },
   'pickup.priority': { need: 'head', run: c => {
     const p = getPickup(c.db, c.body.pickup_id, c.ov.outlet_id);
     return { ...setPriority(c.db, c.ov, c.actor, p.id, c.body.version, c.body.priority, s(c.body.reason), c.now), pickup_id: p.id, session_id: p.session_id };
   } },
   'pickup.eta':      { need: 'head', run: c => {
     const p = getPickup(c.db, c.body.pickup_id, c.ov.outlet_id);
-    return { ...adjustEta(c.db, c.ov, c.actor, p.id, c.body.version, c.body, c.now), pickup_id: p.id, session_id: p.session_id };
+    const r = adjustEta(c.db, c.ov, c.actor, p.id, c.body.version, c.body, c.now);
+    // Tell a WhatsApp-linked guest the new range (only when one was set, not on clear).
+    if (!c.body.clear) {
+      const tag = (c.db.prepare('SELECT tag_code FROM valet_vehicle_sessions WHERE id = ?').get(p.session_id) as { tag_code: string } | undefined)?.tag_code || '';
+      enqueue(c.db, { outlet_id: c.ov.outlet_id, session_id: p.session_id, pickup_id: p.id, kind: 'eta_changed',
+        dedupe: `eta:${p.id}:${c.now.getTime()}`, params: [tag, `${Math.round(Number(c.body.low_min))}-${Math.round(Number(c.body.high_min))}`] }, c.now);
+    }
+    return { ...r, pickup_id: p.id, session_id: p.session_id };
   } },
   'incident.create': { need: 'attendant', limit: [20, 60], run: c => ({ ...incidentCreate(c.db, c.ov, c.actor, c.body, c.now), session_id: c.body.session_id ? s(c.body.session_id) : null }) },
   'incident.resolve':{ need: 'head', run: c => incidentResolve(c.db, c.ov, c.actor, c.body, c.now) },

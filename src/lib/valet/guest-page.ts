@@ -94,7 +94,7 @@ var lastKey='';
 function render(){
   // Redraw ONLY when something shown has changed. A blind redraw on every poll
   // wiped a half-typed check-in form and reset the time picker mid-choice.
-  var key=JSON.stringify([L,S.err,S.info,S.busy,S.sel,S.done,S.offline,S.code,S.codeFor,S.entryInfo,S.data]);
+  var key=JSON.stringify([L,S.err,S.info,S.busy,S.sel,S.done,S.offline,S.code,S.codeFor,S.entryInfo,S.data,S.wa]);
   if(key===lastKey){setNet();return}lastKey=key;
   document.documentElement.lang=L;document.getElementById('langbtn').textContent=T('lang');
   var app=document.getElementById('app');app.textContent='';setNet();
@@ -152,6 +152,11 @@ function renderPass(app,p,multi){
     app.appendChild(r)}
   else if(p.can_request){var h=el('div','card');if(p.state==='HOLDING_NEAR_GATE'){h.appendChild(el('h2',null,T('holding_title')));h.appendChild(el('p','mute',T('holding_body')))}else h.appendChild(el('h2',null,T('get_car')));
     renderOptions(h,p,'pickup');app.appendChild(h)}
+  if(p.wa&&p.wa.available){var w=el('div','card');
+    if(p.wa.linked){w.appendChild(el('p',null,'✓ '+T('wa_on')))}
+    else if(S.wa&&S.wa.code&&S.wa.for===p.session_id){w.appendChild(el('p',null,T('wa_how')));w.appendChild(el('div','big',S.wa.code));var a2=el('a','btn',T('wa_open'));a2.href=S.wa.link;a2.target='_blank';a2.rel='noopener';a2.style.textAlign='center';a2.style.lineHeight='52px';a2.style.textDecoration='none';w.appendChild(a2)}
+    else{var wb=el('button','btn2',T('wa_get'));wb.type='button';wb.disabled=S.busy;wb.onclick=function(){act('wa_link',{session_id:p.session_id}).then(function(j){if(j&&j.code){S.wa={code:j.code,link:j.link,for:p.session_id};render()}})};w.appendChild(wb)}
+    app.appendChild(w)}
   var hb=el('button','help',T('help'));hb.type='button';hb.onclick=function(){act('help',{session_id:p.session_id}).then(function(j){S.info=T('help_sent');render()})};app.appendChild(hb);
   if(S.info){app.appendChild(el('div','note',S.info))}
   if(p.help_phone){var a=el('a',null,T('call_venue')+' '+p.help_phone);a.href='tel:'+p.help_phone.replace(/[^\\d+]/g,'');var pp=el('p');pp.appendChild(a);app.appendChild(pp)}

@@ -37,7 +37,7 @@ interface Board {
   metrics: { immediate_wait: Stat; scheduled_lateness: Stat; retrieval_estimate: { p50: number; p90: number; n: number; basis: string } };
   pending: { id: string; pairing_code: string; plate: string; make: string; colour: string; created_at: string; expires_at: string; guest_name: string }[];
   cards: Card[]; completed: Card[];
-  exceptions: { kind: string; message: string; session_id?: string; tag_code?: string; since?: string | null }[];
+  exceptions: { kind: string; message: string; session_id?: string; tag_code?: string; since?: string | null; alert_id?: string; acknowledged_at?: string | null }[];
   alerts: { id: string; session_id: string | null; kind: string; message: string; created_at: string; acknowledged_at: string | null }[];
   incidents: { id: string; session_id: string | null; kind: string; description: string; reported_by_name: string; created_at: string; tag_code: string | null }[];
   team: Team[];
@@ -200,7 +200,10 @@ function Exceptions({ b, cmd, openCar, now }: { b: Board; cmd: ReturnType<typeof
             <AlertTriangle size={14} className="text-red-700" aria-hidden />
             {e.tag_code ? <b className="font-mono">{e.tag_code}</b> : null}<span>{e.message}</span>
             {e.since ? <span className="text-xs text-[#8B7355]">{ago(e.since, now)}</span> : null}
-            {e.session_id ? <span className="ml-auto"><Btn kind="ghost" onClick={() => openCar(e.session_id!)}>Open</Btn></span> : null}
+            <span className="ml-auto flex gap-1">
+              {e.alert_id && !e.acknowledged_at ? <Btn kind="ghost" onClick={() => void cmd.run('alert.ack', { alert_id: e.alert_id })}>Seen</Btn> : e.acknowledged_at ? <span className="text-[11px] text-[#8B7355] self-center">seen</span> : null}
+              {e.session_id ? <Btn kind="ghost" onClick={() => openCar(e.session_id!)}>Open</Btn> : null}
+            </span>
           </li>
         ))}
         {b.incidents.map(i => (

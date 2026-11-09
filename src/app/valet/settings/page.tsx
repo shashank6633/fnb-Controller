@@ -7,6 +7,7 @@
  * enforces this — the read-only sections below are a courtesy, not the gate).
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api } from '@/lib/api';
 import { Printer, RotateCcw, Save } from 'lucide-react';
 import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, QrImage,
@@ -60,6 +61,7 @@ export default function ValetSettingsPage() {
               <Tags data={data} run={run} ask={ask} />
               {data.can_admin ? <Rules data={data} run={run} /> : <InfoNote>Valet rules (hours, timers, required fields) are set by the owner/admin.</InfoNote>}
               {data.can_admin && data.staff ? <Staff data={data} run={run} /> : null}
+              <Messages outletId={outletId} canAdmin={data.can_admin} />
             </>
           )}
         </div>
@@ -264,7 +266,29 @@ function Rules({ data, run }: { data: SettingsData; run: Run }) {
             <Field label="Guest check-in code valid (min)"><input className={inputCls} inputMode="numeric" value={c.pending_checkin_minutes} onChange={e => num('pending_checkin_minutes', e.target.value)} /></Field>
             <Field label="Quiet device warning (min)"><input className={inputCls} inputMode="numeric" value={c.stale_device_minutes} onChange={e => num('stale_device_minutes', e.target.value)} /></Field>
           </div>
-          <Field label="Keep valet-only guest details (months, max 12)" hint="Applied by the retention job (next increment). This is a setting, not automatic legal compliance."><input className={inputCls} inputMode="numeric" value={c.retention_months} onChange={e => num('retention_months', e.target.value)} /></Field>
+          <Field label="Keep valet-only guest details (months, max 12)" hint="After this, plate, guest name/number and photos are removed by the daily cleanup (cars with an incident hold are kept). A setting, not automatic legal compliance."><input className={inputCls} inputMode="numeric" value={c.retention_months} onChange={e => num('retention_months', e.target.value)} /></Field>
+          <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">Closing time</h3>
+          {box('closing_rush.enabled', 'Before closing, ask WhatsApp-linked guests when they want their car', c.closing_rush?.enabled)}
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="Start asking (minutes before close, 30–45)"><input className={inputCls} inputMode="numeric" value={c.closing_rush?.lead_minutes} onChange={e => num('closing_rush.lead_minutes', e.target.value)} /></Field>
+            <Field label="Guests asked per batch"><input className={inputCls} inputMode="numeric" value={c.closing_rush?.batch_size} onChange={e => num('closing_rush.batch_size', e.target.value)} /></Field>
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 border-t border-[#F0E4D6] pt-3 space-y-2">
+        <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355]">Guest WhatsApp messages</h3>
+        <p className="text-xs text-[#8B7355]">Guests choose WhatsApp updates on their own pass and send a short code from their phone — that is what proves the number and records their consent. Messages use your approved WhatsApp templates (names only here; secrets stay in Settings → Integrations → WhatsApp). Until real sending is switched on, every message goes to the simulator below and nothing is sent.</p>
+        {box('notifications.whatsapp', 'Send REAL WhatsApp messages from this outlet', c.notifications?.whatsapp)}
+        <Field label="Venue WhatsApp number guests message (with country code)"><input className={inputCls} value={c.notifications?.whatsapp_number} onChange={e => set('notifications.whatsapp_number', e.target.value)} inputMode="tel" placeholder="+91…" /></Field>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {(['linked', 'ready', 'holding', 'eta_changed', 'closing_prompt'] as const).map(k => (
+            <Field key={k} label={`Template for “${({ linked: 'pass linked', ready: 'car ready at gate', holding: 'car moved to holding', eta_changed: 'new estimate', closing_prompt: 'closing-time question' } as Record<string, string>)[k]}”`}>
+              <div className="flex gap-1">
+                <input className={inputCls} value={c.notifications?.templates?.[k]?.name || ''} onChange={e => set(`notifications.templates.${k}.name`, e.target.value)} placeholder="approved template name" />
+                <input className={`${inputCls} w-20`} value={c.notifications?.templates?.[k]?.lang || 'en'} onChange={e => set(`notifications.templates.${k}.lang`, e.target.value)} aria-label="language code" />
+              </div>
+            </Field>
+          ))}
         </div>
       </div>
     </Panel>
@@ -294,6 +318,61 @@ function Staff({ data, run }: { data: SettingsData; run: Run }) {
           </table>
         </div>
       )}
+    </Panel>
+  );
+}
+
+interface MsgRow { id: string; kind: string; status: string; attempts: number; last_error: string; created_at: string; sent_at: string | null; delivered_at: string | null; template_name: string; tag_code: string | null }
+
+function Messages({ outletId, canAdmin }: { outletId: string; canAdmin: boolean }) {
+  const [d, setD] = useState<null | { mode: string; reason: string; rows: MsgRow[] }>(null);
+  const [phone, setPhone] = useState('');
+  const [text, setText] = useState('');
+  const [note, setNote] = useState('');
+  const load = useCallback(async () => {
+    const r = await fetch(`/api/valet/messages?outlet=${encodeURIComponent(outletId)}`, { cache: 'no-store' });
+    if (r.ok) setD(await r.json());
+  }, [outletId]);
+  useEffect(() => { void load(); }, [load]);
+  const sim = async (body: Record<string, unknown>) => {
+    setNote('');
+    const r = await api('/api/valet/simulator', { method: 'POST', body: { outlet_id: outletId, ...body } });
+    const j = await r.json().catch(() => ({}));
+    setNote(r.ok ? (j.did ? `Simulated: ${j.did.join(', ') || 'no effect'}` : 'Worker pass done.') : (j.error || 'Failed'));
+    await load();
+  };
+  if (!d) return null;
+  return (
+    <Panel title="Guest messages" right={<Btn kind="ghost" onClick={() => void load()}>Refresh</Btn>}>
+      <div className={`mb-2 rounded-lg px-3 py-2 text-sm font-semibold ${d.mode === 'live' ? 'bg-emerald-50 text-emerald-900' : 'bg-amber-50 text-amber-900'}`}>
+        {d.mode === 'live' ? 'LIVE — messages are sent through WhatsApp.' : `SIMULATOR — nothing is sent. ${d.reason}`}
+      </div>
+      {canAdmin && d.mode !== 'live' ? (
+        <div className="mb-3 grid sm:grid-cols-4 gap-2 items-end rounded-lg border border-dashed border-amber-300 p-2">
+          <Field label="Simulate a guest's message — from (test number)"><input className={inputCls} value={phone} onChange={e => setPhone(e.target.value)} placeholder="91900000000" /></Field>
+          <Field label="Text (e.g. VALET ABC123, NOW, STOP)"><input className={inputCls} value={text} onChange={e => setText(e.target.value)} /></Field>
+          <Btn onClick={() => void sim({ action: 'inbound', phone, text })} disabled={!phone || !text}>Simulate message</Btn>
+          <Btn kind="ghost" onClick={() => void sim({ action: 'tick' })}>Run valet worker now</Btn>
+        </div>
+      ) : null}
+      {note ? <InfoNote>{note}</InfoNote> : null}
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-left text-xs text-[#8B7355]"><tr><th className="py-1 pr-2">When</th><th className="pr-2">Tag</th><th className="pr-2">Message</th><th className="pr-2">Status</th><th>Detail</th></tr></thead>
+          <tbody>
+            {d.rows.map(r => (
+              <tr key={r.id} className="border-t border-[#F0E4D6] align-top">
+                <td className="py-1 pr-2 whitespace-nowrap text-xs">{new Date(r.created_at).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' })}</td>
+                <td className="pr-2">{r.tag_code || '—'}</td>
+                <td className="pr-2">{r.kind.replace('_', ' ')}</td>
+                <td className="pr-2"><span className={`rounded px-1.5 text-xs font-semibold ${r.status === 'failed' ? 'bg-red-100 text-red-800' : r.status === 'simulated' ? 'bg-amber-100 text-amber-900' : r.status === 'delivered' || r.status === 'read' ? 'bg-emerald-100 text-emerald-900' : 'bg-stone-100'}`}>{r.status}</span></td>
+                <td className="text-xs text-[#6B5744]">{r.last_error || (r.template_name ? `template ${r.template_name}` : '')}</td>
+              </tr>
+            ))}
+            {!d.rows.length ? <tr><td colSpan={5} className="py-2 text-[#8B7355]">No guest messages yet. Messages are only queued for guests who linked WhatsApp on their pass.</td></tr> : null}
+          </tbody>
+        </table>
+      </div>
     </Panel>
   );
 }
