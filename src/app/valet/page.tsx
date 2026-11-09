@@ -54,7 +54,7 @@ const LANES: { key: string; label: string }[] = [
 const FLAG_TEXT: Record<string, string> = {
   unclaimed_overdue: 'Waiting, nobody on it', scheduled_late: 'Booked time passed', long_fetch: 'Long fetch', outside_waiting: 'Guest outside waiting',
   change_request: 'Guest change request', handoff_open: 'Handoff not confirmed', uncertain: 'Attendant quiet', dwell_overrun: 'Gate overrun',
-  dwell_expired: 'Gate time up', unparked_long: 'Not parked 15m+', missing_location: 'No zone', missing_key: 'Rack/hook missing', keys_with_absent: 'Keys with absent staff',
+  dwell_expired: 'Gate time up', unparked_long: 'Not parked 15m+', missing_location: 'No zone', missing_key: 'Rack/hook missing', keys_with_absent: 'Keys with off-shift staff',
 };
 
 export default function HeadDashboard() {
@@ -131,8 +131,8 @@ export default function HeadDashboard() {
 function Tile({ label, value, tone = '', hint }: { label: string; value: React.ReactNode; tone?: string; hint?: string }) {
   return (
     <div className={`rounded-xl border px-3 py-2 ${tone || 'border-[#E8D5C4] bg-white'}`} title={hint}>
-      <div className="text-[11px] font-semibold uppercase tracking-wide opacity-75">{label}</div>
-      <div className="text-2xl font-extrabold leading-tight">{value}</div>
+      <div className="text-[11px] font-semibold uppercase tracking-wide opacity-75 truncate">{label}</div>
+      <div className="text-2xl font-extrabold leading-tight whitespace-nowrap">{value}</div>
     </div>
   );
 }
@@ -141,9 +141,9 @@ const occ = (o: { capacity: number | null; occupied: number }) => o.capacity ===
 function Counts({ b }: { b: Board }) {
   const c = b.counts;
   return (
-    <div className="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-12 gap-2">
+    <div className="grid grid-cols-3 sm:grid-cols-4 xl:grid-cols-6 2xl:grid-cols-12 gap-2">
       <Tile label="Arrivals" value={c.arrivals} hint="Cars checked in this service date (void/test excluded)" />
-      <Tile label="Check-in" value={c.pending_checkin} hint="Guests waiting for an attendant to confirm their pairing code" />
+      <Tile label="Guest codes" value={c.pending_checkin} hint="Guests who checked in on their phone and are waiting for an attendant to confirm their pairing code" />
       <Tile label="Parked" value={c.parked} />
       <Tile label="Scheduled" value={c.scheduled} />
       <Tile label="Unclaimed" value={c.unclaimed} tone={c.unclaimed ? 'border-amber-300 bg-amber-50' : ''} />

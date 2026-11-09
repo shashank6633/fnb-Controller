@@ -29,9 +29,14 @@ const ZXING_FORMATS = [
 /** The camera re-reads the same tag many times a second; one read per tag per 2 s. */
 const DUP_WINDOW_MS = 2000;
 
-export default function BatchTagScanner({ onRead, onClose }: {
+export default function BatchTagScanner({ onRead, onClose, title = 'Scan batch tag', placeholder = 'e.g. ACB-248', hint }: {
   onRead: (text: string) => string | null;
   onClose: () => void;
+  /** Optional wording for other callers (Valet Parking). Kitchen callers pass
+   *  none, so their screen is unchanged. */
+  title?: string;
+  placeholder?: string;
+  hint?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const controlsRef = useRef<{ stop: () => void } | null>(null);
@@ -196,7 +201,7 @@ export default function BatchTagScanner({ onRead, onClose }: {
            onClick={(e) => e.stopPropagation()}>
         <div className="px-4 py-3 border-b border-[#E8D5C4] flex items-center justify-between">
           <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
-            <ScanLine className="w-5 h-5 text-[#af4408]" /> Scan batch tag
+            <ScanLine className="w-5 h-5 text-[#af4408]" /> {title}
           </div>
           <button type="button" onClick={() => { stopCamera(); onClose(); }}
                   className="text-[#8B7355] hover:text-[#2D1B0E]" aria-label="Close">
@@ -226,7 +231,7 @@ export default function BatchTagScanner({ onRead, onClose }: {
             <label className="block text-[11px] text-[#6B5744]">Or scan with a handheld scanner (or type the tag) and press Enter</label>
             <div className="flex gap-2">
               <input value={typed} onChange={(e) => { setTyped(e.target.value); setError(null); }}
-                     autoFocus autoComplete="off" placeholder="e.g. ACB-248"
+                     autoFocus autoComplete="off" placeholder={placeholder}
                      className="flex-1 min-w-0 px-3 py-2 border border-[#D4B896] rounded-lg text-sm font-mono" />
               <button type="submit" disabled={!typed.trim()}
                       className="px-3 py-2 border border-[#af4408] text-[#af4408] rounded-lg text-sm font-semibold disabled:opacity-40">
@@ -238,7 +243,7 @@ export default function BatchTagScanner({ onRead, onClose }: {
             <div role="alert" className="text-[12px] font-medium text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1.5">{error}</div>
           )}
           <p className="text-[10px] text-[#8B7355]">
-            The tag fills the Batch Number box (and picks the item when the tag starts with its serial code). Nothing is saved until you press Save.
+            {hint ?? 'The tag fills the Batch Number box (and picks the item when the tag starts with its serial code). Nothing is saved until you press Save.'}
           </p>
         </div>
       </div>

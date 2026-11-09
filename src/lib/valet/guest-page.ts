@@ -90,7 +90,12 @@ function poll(){return api('/api/valet-guest/state').then(function(d){S.offline=
 function pass(){var ps=(S.data&&S.data.passes)||[];if(ps.length===1)return ps[0];return ps.find(function(p){return p.session_id===S.sel})||null}
 var STATE_PILL={CHECKED_IN:'p-info',PARKING:'p-info',PARKED:'p-ok',RETRIEVING:'p-warn',READY_AT_GATE:'p-ok',RELOCATING:'p-warn',HOLDING_NEAR_GATE:'p-warn'};
 var STATE_ICON={CHECKED_IN:'⟳',PARKING:'⟳',PARKED:'✓',RETRIEVING:'→',READY_AT_GATE:'★',RELOCATING:'↺',HOLDING_NEAR_GATE:'◷'};
+var lastKey='';
 function render(){
+  // Redraw ONLY when something shown has changed. A blind redraw on every poll
+  // wiped a half-typed check-in form and reset the time picker mid-choice.
+  var key=JSON.stringify([L,S.err,S.info,S.busy,S.sel,S.done,S.offline,S.code,S.codeFor,S.entryInfo,S.data]);
+  if(key===lastKey){setNet();return}lastKey=key;
   document.documentElement.lang=L;document.getElementById('langbtn').textContent=T('lang');
   var app=document.getElementById('app');app.textContent='';setNet();
   var ps=(S.data&&S.data.passes)||[];var p=pass();
@@ -112,7 +117,8 @@ function renderNoPass(app){
   if(ENTRY&&S.entryInfo&&S.entryInfo.ok){if(!S.entryInfo.enabled){app.appendChild(el('div','note',T('venue_off')));return}renderCheckin(app);return}
   var c2=el('div','card');c2.appendChild(el('h2',null,T('no_pass')));c2.appendChild(el('p','mute',T('no_pass_body')));app.appendChild(c2);
 }
-function field(f,key,name,req,type,auto){var w=document.createDocumentFragment();var lb=el('label',null,T(key)+(req?' *':''));lb.htmlFor='f_'+name;w.appendChild(lb);var i=el('input');i.id='f_'+name;i.name=name;i.type=type||'text';i.autocomplete=auto||'off';if(req)i.required=true;if(name==='plate'){i.autocapitalize='characters';i.maxLength=16}else i.maxLength=60;w.appendChild(i);f.appendChild(w)}
+function field(f,key,name,req,type,auto){var w=document.createDocumentFragment();var lb=el('label',null,T(key)+(req?' *':''));lb.htmlFor='f_'+name;w.appendChild(lb);var i=el('input');i.id='f_'+name;i.name=name;i.type=type||'text';i.autocomplete=auto||'off';if(req)i.required=true;if(name==='plate'){i.autocapitalize='characters';i.maxLength=16}else i.maxLength=60;
+  S.form=S.form||{};i.value=S.form[name]||'';i.oninput=function(){S.form[name]=i.value};w.appendChild(i);f.appendChild(w)}
 function renderCheckin(app){var r=(S.entryInfo&&S.entryInfo.required)||{};var c=el('div','card');c.appendChild(el('h1',null,T('checkin_title')));
   var f=el('form');field(f,'plate','plate',true);field(f,'make','make',!!r.make);field(f,'model','model',!!r.model);field(f,'colour','colour',!!r.colour);
   field(f,'name_opt','guest_name',!!r.guest_name,'text','name');field(f,'mobile_opt','guest_mobile',!!r.guest_mobile,'tel','tel');
@@ -150,7 +156,7 @@ function renderPass(app,p,multi){
   if(S.info){app.appendChild(el('div','note',S.info))}
   if(p.help_phone){var a=el('a',null,T('call_venue')+' '+p.help_phone);a.href='tel:'+p.help_phone.replace(/[^\\d+]/g,'');var pp=el('p');pp.appendChild(a);app.appendChild(pp)}
 }
-function renderOptions(box,p,cmd){var o=p.options;var g=el('div','grid');
+function renderOptions(box,p,cmd){var o=p.options;if(cmd==='reschedule')box.appendChild(el('p','mute',T('reschedule')+':'));var g=el('div','grid');
   function add(key,when){var b=el('button',key==='now'?'btn':'btn2',T(key));b.type='button';b.disabled=S.busy;b.onclick=function(){act(cmd,{session_id:p.session_id,when:when,idempotency_key:cmd+':'+p.session_id+':'+when+':'+Math.floor(Date.now()/60000)})};g.appendChild(b)}
   if(cmd==='pickup'&&o.now)add('now','now');if(o.in5)add('in5','in5');if(o.in10)add('in10','in10');box.appendChild(g);
   if(o.later&&o.later.length){var lb=el('label',null,T('choose_time'));lb.htmlFor='later_'+cmd;box.appendChild(lb);var s=el('select');s.id='later_'+cmd;var z=el('option',null,T('later'));z.value='';s.appendChild(z);

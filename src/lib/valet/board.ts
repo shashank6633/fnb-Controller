@@ -9,7 +9,7 @@
  */
 import type { DB, Actor, OutletValet, SessionRow, PickupRow } from './core';
 import { laneFor, BOARD_LANES } from './states';
-import { nowIso, addMinutes, minutesBetween, businessDate, maskMobile, maskPlate } from './config';
+import { nowIso, addMinutes, minutesBetween, businessDate, maskMobile, maskPlate, normTagCode } from './config';
 import { promoteDue, eligibleQueue, etaFor, capacityOf, availableAttendants, durationStats, type Eta } from './queue';
 import { expirePending, keyDesc } from './ops-arrival';
 
@@ -39,7 +39,7 @@ function zoneNames(db: DB, outletId: string): Map<string, { name: string; kind: 
 
 function toCard(
   db: DB, ov: OutletValet, s: SessionRow, p: PickupRow | null, zones: Map<string, { name: string; kind: string }>,
-  now: Date, ctx: { queue: PickupRow[]; attendants: number; staleUsers: Set<string> }, audience: 'head' | 'attendant' | 'desk',
+  now: Date, ctx: { queue: PickupRow[]; attendants: number; staleUsers: Set<string>; offShift: Set<string> }, audience: 'head' | 'attendant' | 'desk',
 ): Card {
   const at = nowIso(now);
   const cfg = ov.cfg;
@@ -47,7 +47,10 @@ function toCard(
   const eta = p ? etaFor(db, p, s.zone_id, s.state, cfg, now, { queue: ctx.queue, attendants: ctx.attendants }) : null;
   if (p) {
     if (p.state === 'QUEUED' && p.queued_at && (minutesBetween(p.queued_at, at) ?? 0) >= cfg.escalation.unclaimed_min) flags.push('unclaimed_overdue');
-    if (p.state !== 'READY' && p.target_at < at && (minutesBetween(p.target_at, at) ?? 0) >= cfg.escalation.unclaimed_min && p.release_at < p.target_at) flags.push('scheduled_late');
+    // BOOKED requests only (release after the request, the metrics' definition) —
+    // a request-now is never "late against its booking"; it is unclaimed_overdue.
+    const booked = p.release_at > p.requested_at;
+    if (booked && p.state !== 'READY' && p.target_at < at && (minutesBetween(p.target_at, at) ?? 0) >= cfg.escalation.unclaimed_min) flags.push('scheduled_late');
     if (p.state === 'IN_PROGRESS' && p.started_at && (minutesBetween(p.started_at, at) ?? 0) >= cfg.escalation.fetching_min) flags.push('long_fetch');
     if (p.guest_outside_at && p.state !== 'READY' && (minutesBetween(p.guest_outside_at, at) ?? 0) >= cfg.escalation.outside_wait_min) flags.push('outside_waiting');
     if (p.change_request && !p.change_ack_at) flags.push('change_request');
@@ -59,7 +62,9 @@ function toCard(
   if ((s.state === 'CHECKED_IN' || s.state === 'PARKING') && (minutesBetween(s.checked_in_at, at) ?? 0) >= 15) flags.push('unparked_long');
   if ((s.state === 'PARKED' || s.state === 'HOLDING_NEAR_GATE') && !s.zone_id) flags.push('missing_location');
   if (['PARKED', 'HOLDING_NEAR_GATE'].includes(s.state) && s.key_location === 'rack' && !s.key_rack && !s.key_hook) flags.push('missing_key');
-  if (s.key_location === 'attendant' && s.key_custodian_id && ctx.staleUsers.has(s.key_custodian_id) && !['HANDED_OVER', 'VOIDED'].includes(s.state)) flags.push('keys_with_absent');
+  // Keys with an attendant whose phone is merely locked are normal; keys with
+  // someone who is OFF SHIFT are not (they may have gone home with them).
+  if (s.key_location === 'attendant' && s.key_custodian_id && ctx.offShift.has(s.key_custodian_id) && !['HANDED_OVER', 'VOIDED'].includes(s.state)) flags.push('keys_with_absent');
 
   const card: Card = {
     id: s.id, version: s.version, state: s.state, lane: laneFor(s.state, p?.state ?? null),
@@ -93,8 +98,9 @@ function toCard(
   return card;
 }
 
-/** Users whose valet device has gone quiet (or who are not on shift at all). */
-function staleUserSet(db: DB, ov: OutletValet, now: Date): Set<string> {
+/** Holders of work or keys whose valet device has gone quiet, and (offShift)
+ *  holders who are not on shift at this outlet at all. */
+function staleUserSet(db: DB, ov: OutletValet, now: Date): { stale: Set<string>; offShift: Set<string> } {
   const cutoff = addMinutes(now, -ov.cfg.stale_device_minutes);
   const open = db.prepare(`SELECT user_id, last_seen_at FROM valet_shifts WHERE outlet_id = ? AND ended_at IS NULL`).all(ov.outlet_id) as
     { user_id: string; last_seen_at: string | null }[];
@@ -103,24 +109,25 @@ function staleUserSet(db: DB, ov: OutletValet, now: Date): Set<string> {
                               UNION SELECT DISTINCT key_custodian_id FROM valet_vehicle_sessions WHERE outlet_id = ? AND key_location = 'attendant'
                               AND key_custodian_id IS NOT NULL AND state NOT IN ('HANDED_OVER','VOIDED')`).all(ov.outlet_id, ov.outlet_id) as { u: string }[];
   const stale = new Set<string>();
+  const offShift = new Set<string>();
   for (const { u } of holders) {
-    if (!onShift.has(u)) { stale.add(u); continue; }
+    if (!onShift.has(u)) { stale.add(u); offShift.add(u); continue; }
     const seen = onShift.get(u);
     if (!seen || seen < cutoff) stale.add(u);
   }
-  return stale;
+  return { stale, offShift };
 }
 
 function loadCards(db: DB, ov: OutletValet, now: Date, audience: 'head' | 'attendant' | 'desk', where: string, params: unknown[]): Card[] {
   const zones = zoneNames(db, ov.outlet_id);
   const queue = eligibleQueue(db, ov.outlet_id);
   const attendants = availableAttendants(db, ov.outlet_id);
-  const staleUsers = staleUserSet(db, ov, now);
+  const { stale: staleUsers, offShift } = staleUserSet(db, ov, now);
   const sessions = db.prepare(`SELECT * FROM valet_vehicle_sessions WHERE outlet_id = ? AND ${where}`).all(ov.outlet_id, ...params) as SessionRow[];
   if (!sessions.length) return [];
   const pickups = db.prepare(`SELECT * FROM valet_pickups WHERE outlet_id = ? AND state IN ('SCHEDULED','QUEUED','ASSIGNED','IN_PROGRESS','READY')`).all(ov.outlet_id) as PickupRow[];
   const bySession = new Map(pickups.map(p => [p.session_id, p]));
-  return sessions.map(s => toCard(db, ov, s, bySession.get(s.id) ?? null, zones, now, { queue, attendants, staleUsers }, audience));
+  return sessions.map(s => toCard(db, ov, s, bySession.get(s.id) ?? null, zones, now, { queue, attendants, staleUsers, offShift }, audience));
 }
 
 function pct(sorted: number[], p: number): number | null {
@@ -224,7 +231,7 @@ export function headBoard(db: DB, ov: OutletValet, now: Date = new Date()) {
     handoff_open: 'Reassigned car not yet confirmed', uncertain: 'Attendant holding a car has gone quiet (no handoff)',
     dwell_overrun: 'Car waiting at the gate past its time', dwell_expired: 'Gate time is up — move to holding?',
     unparked_long: 'Arrival not parked after 15 min', missing_location: 'Parked car with no zone',
-    missing_key: 'Keys on rack with no rack/hook', keys_with_absent: 'Keys with someone who is off shift or quiet',
+    missing_key: 'Keys on rack with no rack/hook', keys_with_absent: 'Keys with someone who is off shift',
   };
   const exceptions: { kind: string; message: string; session_id?: string; pickup_id?: string | null; tag_code?: string; since?: string | null }[] = [];
   for (const c of active) for (const f of c.flags) {
@@ -295,10 +302,13 @@ export function attendantView(db: DB, ov: OutletValet, actor: Actor, now: Date =
 export function deskLookup(db: DB, ov: OutletValet, q: string, now: Date = new Date()) {
   promoteDue(db, ov.outlet_id, now);
   const t = String(q || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (t.length < 2) return [];
+  if (!t) return [];
+  // Tag by its normalised key (so "2" finds tag "02"), ticket exact, plate by
+  // its last 4+ characters. Never a listing without a query.
   return loadCards(db, ov, now, 'desk',
-    `state NOT IN ('HANDED_OVER','VOIDED') AND (upper(replace(replace(tag_code,'-',''),' ','')) = ? OR upper(ticket_no) = ? OR (length(?) >= 4 AND plate_norm LIKE '%' || ?)) LIMIT 10`,
-    [t, t, t, t]);
+    `state NOT IN ('HANDED_OVER','VOIDED') AND (tag_id IN (SELECT id FROM valet_tags WHERE outlet_id = valet_vehicle_sessions.outlet_id AND code_norm = ?)
+       OR upper(ticket_no) = ? OR (length(?) >= 4 AND plate_norm LIKE '%' || ?)) LIMIT 10`,
+    [normTagCode(t), t, t, t]);
 }
 
 /** One car in full for staff: card + timeline + custody trail. */

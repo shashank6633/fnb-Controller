@@ -11,7 +11,7 @@ import { Btn, Field, inputCls, ErrorNote, InfoNote, Modal, QrImage, useCmd, hhmm
 
 export interface HandoverCard { id: string; version: number; tag_code: string }
 
-export function IssuedModal({ outletId, sessionId, onClose, start }: { outletId: string; sessionId: string; onClose: () => void; start?: 'qr' | 'claim' }) {
+export function IssuedModal({ outletId, sessionId, onClose, start, paired }: { outletId: string; sessionId: string; onClose: () => void; start?: 'qr' | 'claim'; paired?: boolean }) {
   const cmd = useCmd(outletId);
   const [link, setLink] = useState<string>('');
   const [claim, setClaim] = useState<null | Record<string, string>>(null);
@@ -32,7 +32,8 @@ export function IssuedModal({ outletId, sessionId, onClose, start }: { outletId:
       <ErrorNote message={cmd.err} />
       {!link && !claim ? (
         <div className="space-y-2">
-          <p className="text-sm text-[#6B5744]">Checked in. How will the guest get their car back?</p>
+          {paired ? <InfoNote>Checked in. The guest&apos;s phone already shows their pass — nothing more to do. A claim receipt is only needed if their phone may die.</InfoNote>
+            : <p className="text-sm text-[#6B5744]">Checked in. How will the guest get their car back?</p>}
           <Btn big className="w-full" onClick={() => void showQr()}><QrCode size={18} className="inline mr-1.5" aria-hidden />Guest scans a QR on my phone</Btn>
           <Btn big kind="ghost" className="w-full" onClick={() => void doClaim()}><Printer size={18} className="inline mr-1.5" aria-hidden />No phone — print a claim receipt</Btn>
           <Btn kind="ghost" className="w-full" onClick={onClose}>Skip for now</Btn>
@@ -126,7 +127,8 @@ export function HandoverModal({ card, outletId, isHead, onClose, onDone }: { car
         ) : null}
         <Btn big kind="ok" className="w-full" onClick={() => void go()} disabled={cmd.busy || !tag.trim()}>Hand over the car</Btn>
       </div>
-      {scan ? <BatchTagScanner onClose={() => setScan(false)} onRead={(t) => { setTag(t.trim()); setScan(false); return null; }} /> : null}
+      {scan ? <BatchTagScanner onClose={() => setScan(false)} title="Scan the key tag in your hand" placeholder="Tag number" hint="Scan or type the tag on the keys you are handing over."
+        onRead={(t) => { setTag(t.trim()); setScan(false); return null; }} /> : null}
     </Modal>
   );
 }

@@ -182,9 +182,13 @@ export function nextClose(at: Date, cfg: Pick<ValetConfig, 'hours'>): Date {
 export function normPlate(p: string | null | undefined): string {
   return String(p || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 16);
 }
-/** Tag key: upper-case, no spaces/dashes, leading zeros kept ("042" ≠ "42" on a printed tag). */
+/** Tag key: upper-case, no spaces/dashes. A purely NUMERIC tag drops its
+ *  leading zeros, so "2", "02" and "002" are the same tag — attendants type
+ *  "2" for the tag printed "02" (measured in the browser). The unique index on
+ *  code_norm then also stops "7" and "07" ever being two different tags. */
 export function normTagCode(c: string | null | undefined): string {
-  return String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  const s = String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  return /^\d+$/.test(s) ? (s.replace(/^0+/, '') || '0') : s;
 }
 /** Plate as shown to a guest: only the last four characters. */
 export function maskPlate(p: string | null | undefined): string {

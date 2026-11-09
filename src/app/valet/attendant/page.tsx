@@ -14,6 +14,7 @@ import { KeyRound, Car, ScanLine, AlertTriangle, LogIn, LogOut, Coffee, Printer,
 import BatchTagScanner from '@/components/BatchTagScanner';
 import { HandoverModal, IssuedModal } from '../modals';
 import { ATT, STAFF_STATE_LABEL, type Lang } from '@/lib/valet/i18n';
+import { normTagCode } from '@/lib/valet/config';
 import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, Modal, LiveBadge, StateChip,
   useValetContext, useLive, useCmd, useNow, countdown, ago, hhmm,
@@ -48,7 +49,7 @@ export default function AttendantPage() {
   const v = live.data;
   const cmd = useCmd(outletId, live.reload);
   const now = useNow(1000);
-  const [modal, setModal] = useState<null | { kind: string; card?: Card; data?: { sid: string } }>(null);
+  const [modal, setModal] = useState<null | { kind: string; card?: Card; data?: { sid: string; paired?: boolean } }>(null);
   const close = useCallback(() => setModal(null), []);
   const me = ctx?.user.id;
 
@@ -56,7 +57,7 @@ export default function AttendantPage() {
     if (!v) return null;
     const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
     const all = [...v.my_tasks, ...v.unparked, ...v.at_gate, ...v.holding, ...v.parked];
-    return all.find(c => c.tag_code.toUpperCase().replace(/[^A-Z0-9]/g, '') === t || (c.ticket_no && c.ticket_no.toUpperCase() === t)) || null;
+    return all.find(c => normTagCode(c.tag_code) === normTagCode(t) || (c.ticket_no && c.ticket_no.toUpperCase() === t)) || null;
   };
 
   const onShift = !!v?.shift && v.shift.outlet_id === outletId;
@@ -197,8 +198,8 @@ export default function AttendantPage() {
         </div>
       </Gate>
 
-      {modal?.kind === 'checkin' && v ? <CheckinModal v={v} outletId={outletId} userId={me || ''} onClose={close} onDone={(sid) => { live.reload(); setModal({ kind: 'issued', data: { sid } }); }} /> : null}
-      {modal?.kind === 'issued' && modal.data ? <IssuedModal outletId={outletId} sessionId={modal.data.sid} onClose={close} /> : null}
+      {modal?.kind === 'checkin' && v ? <CheckinModal v={v} outletId={outletId} userId={me || ''} onClose={close} onDone={(sid, paired) => { live.reload(); setModal({ kind: 'issued', data: { sid, paired } }); }} /> : null}
+      {modal?.kind === 'issued' && modal.data ? <IssuedModal outletId={outletId} sessionId={modal.data.sid} paired={!!modal.data.paired} onClose={close} /> : null}
       {modal?.kind === 'pass' && modal.card ? <IssuedModal outletId={outletId} sessionId={modal.card.id} onClose={close} start="qr" /> : null}
       {modal?.kind === 'claim' && modal.card ? <IssuedModal outletId={outletId} sessionId={modal.card.id} onClose={close} start="claim" /> : null}
       {modal?.kind === 'park' && modal.card && v ? <ParkModal v={v} card={modal.card} outletId={outletId} mode="park" onClose={close} onDone={() => { close(); live.reload(); }} /> : null}
@@ -207,7 +208,10 @@ export default function AttendantPage() {
       {modal?.kind === 'handover' && modal.card ? <HandoverModal card={modal.card} outletId={outletId} isHead={!!ctx?.user.head} onClose={close} onDone={() => { close(); live.reload(); }} /> : null}
       {modal?.kind === 'problem' && v ? <ProblemModal v={v} outletId={outletId} onClose={close} /> : null}
       {modal?.kind === 'scan' ? (
-        <BatchTagScanner onClose={close} onRead={(text) => {
+        // The scanner calls onClose after a successful read too — close only the
+        // scanner, never the car dialog the read just opened.
+        <BatchTagScanner onClose={() => setModal(m => (m?.kind === 'scan' ? null : m))} title="Find a car by its key tag" placeholder="Tag number, e.g. 14"
+          hint="Scan the QR/barcode on the key tag, or type the number and press Enter." onRead={(text) => {
           const c = findByTag(text);
           if (!c) return 'No car here with that tag.';
           setModal({ kind: 'car', card: c });
@@ -253,7 +257,7 @@ function TaskCard({ c, children, extra, L, SL, now, me }: { c: Card; children?: 
   );
 }
 
-function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outletId: string; userId: string; onClose: () => void; onDone: (sid: string) => void }) {
+function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outletId: string; userId: string; onClose: () => void; onDone: (sid: string, paired: boolean) => void }) {
   const draftKey = `fnb:valet:draft:${userId}`;
   const [mode, setMode] = useState<'code' | 'manual'>('manual');
   const [f, setF] = useState({ plate: '', make: '', model: '', colour: '', guest_name: '', guest_mobile: '', tag_code: '', notes: '', duplicate_plate_note: '' });
@@ -276,8 +280,8 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
   const submit = async () => {
     const body: Record<string, unknown> = { ...f };
     if (pending) body.request_id = pending.id;
-    const r = await cmd.run<{ session_id: string }>('checkin.create', body);
-    if (r?.session_id) { try { localStorage.removeItem(draftKey); } catch { /* ignore */ } onDone(r.session_id); }
+    const r = await cmd.run<{ session_id: string; paired?: boolean }>('checkin.create', body);
+    if (r?.session_id) { try { localStorage.removeItem(draftKey); } catch { /* ignore */ } onDone(r.session_id, !!r.paired); }
   };
   useEffect(() => { if (/already on an active car/.test(cmd.err)) setDup(true); }, [cmd.err]);
   const findCode = async () => {
@@ -320,7 +324,8 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
           <p className="text-[11px] text-[#8B7355]">The car and tag details (not the guest&apos;s name or number) are kept on this phone for 30 minutes in case the screen closes.</p>
         </div>
       )}
-      {scan ? <BatchTagScanner onClose={() => setScan(false)} onRead={(t) => { setF(x => ({ ...x, tag_code: t.trim().slice(0, 12) })); setScan(false); return null; }} /> : null}
+      {scan ? <BatchTagScanner onClose={() => setScan(false)} title="Scan the key tag" placeholder="Tag number" hint="Scan or type the tag you are putting on the keys."
+        onRead={(t) => { setF(x => ({ ...x, tag_code: t.trim().slice(0, 12) })); setScan(false); return null; }} /> : null}
     </Modal>
   );
 }
@@ -416,7 +421,7 @@ function ProblemModal({ v, outletId, onClose }: { v: View; outletId: string; onC
   const [done, setDone] = useState(false);
   const cmd = useCmd(outletId);
   const all = [...v.my_tasks, ...v.unparked, ...v.at_gate, ...v.holding, ...v.parked];
-  const car = all.find(c => c.tag_code.toUpperCase() === tag.toUpperCase().trim());
+  const car = tag.trim() ? all.find(c => normTagCode(c.tag_code) === normTagCode(tag)) : undefined;
   return (
     <Modal title="Report a problem" onClose={onClose}>
       <ErrorNote message={cmd.err} />

@@ -174,7 +174,7 @@ export function PageHead({ title, subtitle, right, ctx }: { title: string; subti
   return (
     <header className="sticky top-12 lg:top-0 z-20 -mx-3 sm:-mx-5 lg:-mx-8 px-3 sm:px-5 lg:px-8 py-2.5 bg-[#FFF8F0]/95 backdrop-blur border-b border-[#E8D5C4]">
       <div className="flex items-start gap-3 flex-wrap">
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 basis-full sm:basis-auto sm:flex-1">
           <h1 className="text-lg font-extrabold leading-tight text-[#2D1B0E] truncate">{title}</h1>
           {subtitle ? <div className="text-[11px] text-[#8B7355] leading-tight mt-0.5">{subtitle}</div> : null}
         </div>
