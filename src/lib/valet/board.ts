@@ -318,7 +318,7 @@ export function attendantView(db: DB, ov: OutletValet, actor: Actor, now: Date =
     keys_with_me: keysWithMe,
     zones: db.prepare(`SELECT id, name, kind, capacity FROM valet_zones WHERE outlet_id = ? AND is_active = 1 ORDER BY kind, sort_order, name`).all(ov.outlet_id),
     config: { dwell_minutes: ov.cfg.dwell_minutes, max_tasks: ov.cfg.max_tasks_per_attendant, photos_min: ov.cfg.photos.min,
-      photo_exception: ov.cfg.photos.allow_exception, required: ov.cfg.required, gate_label: ov.cfg.pickup_gate_label },
+      photo_exception: ov.cfg.photos.allow_exception, required: ov.cfg.required, gate_label: ov.cfg.pickup_gate_label, paper: ov.cfg.paper.enabled },
     capacity: { gate: capacityOf(db, ov.outlet_id, 'gate'), holding: capacityOf(db, ov.outlet_id, 'holding') },
   };
 }

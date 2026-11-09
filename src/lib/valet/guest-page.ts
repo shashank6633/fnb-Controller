@@ -106,7 +106,7 @@ function render(){
   if(!S.data&&!S.offline){app.appendChild(el('p','mute','…'));return}
   if(!ps.length){renderNoPass(app);return}
   if(ps.length>1&&!p){var c=el('div','card');c.appendChild(el('h2',null,T('choose_car')));c.appendChild(el('p','mute',T('select_car_note')));
-    ps.forEach(function(x){var b=el('button','btn2');b.type='button';b.textContent=(x.tag_code?T('tag')+' '+x.tag_code+' · ':'')+(x.vehicle||x.plate_masked)+' · '+T('st_'+x.state);b.onclick=function(){S.sel=x.session_id;S.code=null;render()};c.appendChild(b)});app.appendChild(c);return}
+    ps.forEach(function(x){var b=el('button','btn2');b.type='button';b.textContent=(x.tag_code?T(x.is_ticket?'ticket':'tag')+' '+x.tag_code+' · ':'')+(x.vehicle||x.plate_masked)+' · '+T('st_'+x.state);b.onclick=function(){S.sel=x.session_id;S.code=null;render()};c.appendChild(b)});app.appendChild(c);return}
   renderPass(app,p,ps.length>1);
 }
 function renderNoPass(app){
@@ -130,7 +130,7 @@ function renderPaper(app){var c=el('div','card');c.appendChild(el('h1',null,T('p
   f.onsubmit=function(ev){ev.preventDefault();var fd=new FormData(f);var o={e:ENTRY};fd.forEach(function(v,k){o[k]=String(v)});act('paper',o)};c.appendChild(f);app.appendChild(c)}
 function renderPass(app,p,multi){
   if(multi){var back=el('button','btn2','← '+T('choose_car'));back.type='button';back.onclick=function(){S.sel=null;S.code=null;render()};app.appendChild(back)}
-  var c=el('div','card');var top=el('div','row');var l=el('div');l.appendChild(el('div','tag',T('tag')));l.appendChild(el('div','tagno',p.tag_code||'—'));top.appendChild(l);
+  var c=el('div','card');var top=el('div','row');var l=el('div');l.appendChild(el('div','tag',T(p.is_ticket?'ticket':'tag')));l.appendChild(el('div','tagno',p.tag_code||'—'));top.appendChild(l);
   var pill=el('span','pill '+(STATE_PILL[p.state]||'p-info'));pill.appendChild(el('span',null,STATE_ICON[p.state]||'•'));pill.appendChild(el('span',null,T('st_'+p.state)));pill.setAttribute('role','status');top.appendChild(pill);c.appendChild(top);
   c.appendChild(el('p','veh',[p.vehicle,p.plate_masked].filter(Boolean).join(' · ')));app.appendChild(c);
   var pk=p.pickup;

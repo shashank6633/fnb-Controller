@@ -251,7 +251,7 @@ export function PaperClaimConfirm({ outletId, request, onDone }: {
   return (
     <div className="space-y-2">
       <InfoNote>
-        Paper ticket <b>{request.ticket_no}</b> — this car is already parked{request.claim_tag ? <> (tag <b>{request.claim_tag}</b>)</> : null}.
+        Paper ticket <b>{request.ticket_no}</b> — this car is already with the valet team{request.claim_tag ? <> (tag <b>{request.claim_tag}</b>)</> : null}.
         A ticket number can be guessed: <b>look at the guest&apos;s paper stub</b> before giving them the pass.
       </InfoNote>
       <ErrorNote message={cmd.err} />

@@ -106,6 +106,7 @@ function passView(db: DB, ov: OutletValet, s: SessionRow, now: Date) {
     session_id: s.id,
     venue_name: ov.cfg.venue_name || ov.outlet_name,
     tag_code: s.tag_code || s.ticket_no,
+    is_ticket: !s.tag_code && !!s.ticket_no,   // label it "Ticket", not "Tag"
     plate_masked: maskPlate(s.plate),
     vehicle: [s.colour, s.make, s.model].filter(Boolean).join(' '),
     state: s.state,

@@ -403,7 +403,7 @@ function TicketBooks({ data, run }: { data: SettingsData; run: Run }) {
         <Field label="Prefix (letters, optional)"><input className={inputCls} value={prefix} onChange={e => setPrefix(e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3))} /></Field>
         <Field label="First number"><input className={inputCls} inputMode="numeric" value={a} onChange={e => setA(e.target.value.replace(/\D/g, ''))} /></Field>
         <Field label="Last number"><input className={inputCls} inputMode="numeric" value={b} onChange={e => setB(e.target.value.replace(/\D/g, ''))} /></Field>
-        <Btn onClick={() => void run('ticket_book.add', { prefix, first_no: Number(a), last_no: Number(b) }, 'Ticket book added.')} disabled={!a || !b}>Add book</Btn>
+        <Btn onClick={async () => { if (await run('ticket_book.add', { prefix, first_no: Number(a), last_no: Number(b) }, 'Ticket book added.')) { setPrefix(''); setA(''); setB(''); } }} disabled={!a || !b}>Add book</Btn>
       </div>
     </Panel>
   );

@@ -34,7 +34,7 @@ interface View {
   my_tasks: Card[]; unparked: Card[]; at_gate: Card[]; holding: Card[]; parked: Card[];
   queue: { waiting: number; scheduled: number }; keys_with_me: { id: string; tag_code: string; state: string }[];
   zones: { id: string; name: string; kind: string; capacity: number | null }[];
-  config: { dwell_minutes: number; max_tasks: number; photos_min: number; photo_exception: boolean; required: Record<string, boolean>; gate_label: string };
+  config: { dwell_minutes: number; max_tasks: number; photos_min: number; photo_exception: boolean; required: Record<string, boolean>; gate_label: string; paper?: boolean };
 }
 
 const DRAFT_TTL = 30 * 60_000;
@@ -265,7 +265,7 @@ function TaskCard({ c, children, extra, L, SL, now, me }: { c: Card; children?: 
 function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outletId: string; userId: string; onClose: () => void; onDone: (sid: string, paired: boolean) => void }) {
   const draftKey = `fnb:valet:draft:${userId}`;
   const [mode, setMode] = useState<'code' | 'manual'>('manual');
-  const [f, setF] = useState({ plate: '', make: '', model: '', colour: '', guest_name: '', guest_mobile: '', tag_code: '', notes: '', duplicate_plate_note: '' });
+  const [f, setF] = useState({ plate: '', make: '', model: '', colour: '', guest_name: '', guest_mobile: '', tag_code: '', ticket_no: '', notes: '', duplicate_plate_note: '' });
   const [pairing, setPairing] = useState('');
   const [pending, setPending] = useState<null | Record<string, string>>(null);
   const [dup, setDup] = useState(false);
@@ -279,9 +279,12 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
   }, [draftKey]);
   useEffect(() => {
     // Draft holds vehicle fields + tag only — never the guest's name or number.
-    try { localStorage.setItem(draftKey, JSON.stringify({ savedAt: Date.now(), data: { plate: f.plate, make: f.make, model: f.model, colour: f.colour, tag_code: f.tag_code } })); } catch { /* ignore */ }
-  }, [draftKey, f.plate, f.make, f.model, f.colour, f.tag_code]);
+    try { localStorage.setItem(draftKey, JSON.stringify({ savedAt: Date.now(), data: { plate: f.plate, make: f.make, model: f.model, colour: f.colour, tag_code: f.tag_code, ticket_no: f.ticket_no } })); } catch { /* ignore */ }
+  }, [draftKey, f.plate, f.make, f.model, f.colour, f.tag_code, f.ticket_no]);
   const req = v.config.required;
+  // Paper outlets: the car may carry a paper ticket, a key tag, or both — the
+  // server needs at least one and checks the ticket against the registered books.
+  const paper = v.config.paper === true;
   const submit = async () => {
     const body: Record<string, unknown> = { ...f };
     if (pending) body.request_id = pending.id;
@@ -313,12 +316,15 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
         <PaperClaimConfirm outletId={outletId} request={pending} onDone={ok => { if (ok) onClose(); }} />
       ) : (
         <div className="space-y-2">
-          {pending ? <InfoNote>Guest check-in found ({pending.source === 'paper' ? 'paper ticket' : 'phone'}). Check the car matches, then put a key tag on the keys.{pending.has_mobile ? ' Guest left a mobile number.' : ''}</InfoNote> : null}
+          {pending ? <InfoNote>{pending.source === 'paper'
+            ? <>Paper ticket <b>{pending.ticket_no}</b> — check the guest&apos;s stub shows this number and the car matches, then check in.</>
+            : <>Guest check-in found (phone). Check the car matches, then put a key tag on the keys.</>}{pending.has_mobile ? ' Guest left a mobile number.' : ''}</InfoNote> : null}
           <div className="grid grid-cols-2 gap-2">
             <div className="col-span-2 flex gap-2 items-end">
-              <div className="flex-1">{inp('tag_code', 'Key tag number', true, { inputMode: 'text', autoCapitalize: 'characters', className: `${inputCls} text-xl font-bold` })}</div>
+              <div className="flex-1">{inp('tag_code', paper ? 'Key tag number (or use the paper ticket)' : 'Key tag number', !paper, { inputMode: 'text', autoCapitalize: 'characters', className: `${inputCls} text-xl font-bold` })}</div>
               <Btn kind="ghost" onClick={() => setScan(true)}><ScanLine size={16} aria-hidden /><span className="sr-only">Scan tag</span></Btn>
             </div>
+            {paper && pending?.source !== 'paper' ? <div className="col-span-2">{inp('ticket_no', 'Paper ticket number (from the ticket book)', false, { autoCapitalize: 'characters', maxLength: 12 })}</div> : null}
             {inp('plate', 'Number plate', req.plate, { autoCapitalize: 'characters', maxLength: 16 })}
             {inp('colour', 'Colour', req.colour)}
             {inp('make', 'Make', req.make)}
