@@ -78,6 +78,15 @@ const S = (name: string) => { section = name; console.log(`== ${name}`); };
   const { ValetError } = core;
   const db = getDb();
 
+  // NO NETWORK in this suite. The database is a copy of PRODUCTION and carries
+  // live WhatsApp credentials; any accidental real send must fail loudly here,
+  // and the credentials are replaced with fake ones on this copy as well.
+  (globalThis as any).fetch = async () => { throw new Error('network disabled in valet tests'); };
+  for (const [k, v] of [['wa_api_provider', 'meta_cloud'], ['wa_phone_number_id', 'TEST-ONLY'], ['wa_access_token', 'TEST-ONLY'], ['wa_interakt_api_key', '']]) {
+    db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(k, v);
+  }
+  delete process.env.VALET_ALLOW_DEV_SEND;
+
   const uid = (p = 'zzvt') => `${p}-${Math.random().toString(36).slice(2, 10)}`;
   // 20:00 IST on 9 Nov 2026 — inside the default 11:00–01:00 service hours.
   const T0 = new Date('2026-11-09T14:30:00.000Z');
@@ -722,6 +731,180 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     const m = board.requestToReady(db, ov(), '2026-11-09');
     ok(m.immediate_wait.n >= 3 && m.immediate_wait.p90 !== null && m.immediate_wait.max >= m.immediate_wait.p90, `request-to-ready metrics with a denominator (n=${m.immediate_wait.n})`);
     eq(board.requestToReady(db, ov(), '2026-11-10').immediate_wait.n, 0, 'another business date has its own denominator');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  S('Q escalations');
+  {
+    const esc = require(path.join(WT, 'src/lib/valet/escalations.ts'));
+    // Outlet B: enable it for this section; nobody on shift there.
+    run('admin', { cmd: 'settings.enable', outlet_id: OB, enabled: true }, at(800));
+    const ovB = () => core.loadOutletValet(db, OB);
+    const zB = (run('admin', { cmd: 'zone.save', outlet_id: OB, name: 'ZZ B lot', kind: 'parking', capacity: 10 }, at(800)) as any).zone_id;
+    const sB = arr.checkinCreate(db, ovB(), A('admin'), { plate: 'TS09QQ0001', tag_code: 'Q1' }, at(800)).session_id;
+    arr.parkConfirm(db, ovB(), A('admin'), sB, sess(sB).version, { zone_id: zB, key_location: 'desk' }, at(800));
+    const qp = pk.requestPickup(db, ovB(), core.SYSTEM, { session_id: sB, when: 'now' }, 'guest', at(801)).pickup;
+    let r = esc.runEscalations(db, ovB(), at(803));
+    eq(r.raised, 1, 'no staff on shift → escalated at once');
+    r = esc.runEscalations(db, ovB(), at(807));
+    eq(r.raised, 1, 'unclaimed past 5 min → escalated');
+    r = esc.runEscalations(db, ovB(), at(808));
+    eq(r.raised, 0, 'repeat pass raises nothing (deduped)');
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM valet_alerts WHERE outlet_id = ? AND resolved_at IS NULL AND dedupe_key LIKE 'esc:%'`).get(OB) as any).n, 2, 'two open escalations');
+    pk.cancelPickup(db, ovB(), core.SYSTEM, qp.id, 'guest left', at(809));
+    r = esc.runEscalations(db, ovB(), at(810));
+    eq(r.resolved, 2, 'both auto-resolved once the request is gone');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  S('R notifications');
+  {
+    const nt = require(path.join(WT, 'src/lib/valet/notify.ts'));
+    const sid = checkin('a1', 'R1', at(900)); park('a1', sid, at(900));
+    eq(nt.enqueue(db, { outlet_id: OA, session_id: sid, kind: 'ready', dedupe: 'x1', params: [] }, at(900)), false, 'no verified identity → nothing queued (a typed number is not enough)');
+    const link = nt.startLink(db, ov(), sid, at(901));
+    ok(/^[0-9A-Z]{6}$/.test(link.code), 'link code issued');
+    eq(nt.startLink(db, ov(), sid, at(902)).code, link.code, 'asking again returns the same code');
+    const payload = (from: string, text: string, id: string) => JSON.stringify({ entry: [{ changes: [{ value: { messages: [{ id, from, text: { body: text } }] } }] }] });
+    eq(nt.ingestWhatsApp(db, payload('919000000001', 'VALET ZZZZZZ', 'm0'), at(903), { simulated: true }), ['link: unknown or expired code'], 'wrong code links nothing');
+    eq(nt.ingestWhatsApp(db, payload('919000000001', `valet ${link.code.toLowerCase()}`, 'm1'), at(903), { simulated: true }), ['linked'], 'guest message with the code verifies the number');
+    eq(nt.ingestWhatsApp(db, payload('919000000001', `VALET ${link.code}`, 'm1'), at(903), { simulated: true }), [], 'same provider message id again → ignored (dedupe)');
+    const ident = db.prepare(`SELECT phone, verified_how, consent_at FROM valet_msg_identities WHERE session_id = ?`).get(sid) as any;
+    ok(ident.phone === '+919000000001' && ident.verified_how === 'inbound_message' && ident.consent_at, 'identity verified with consent recorded');
+    eq(nt.linkState(db, sid), { linked: true, opted_out: false }, 'pass shows linked');
+    // Simulator: real sending off for the outlet → 'simulated', never 'sent', and the transport is never called.
+    let calls = 0;
+    const fake = async () => { calls++; return { ok: true, provider: 'meta_cloud', message_id: `wamid.${calls}` }; };
+    let d = await nt.deliverDue(db, at(904), fake);
+    ok(d.simulated >= 1 && calls === 0, 'outlet sending OFF → simulated; nothing sent');
+    ok(String((db.prepare(`SELECT last_error FROM valet_notifications WHERE session_id = ? AND kind = 'linked'`).get(sid) as any).last_error).startsWith('SIMULATED'), 'labelled SIMULATED — nothing was sent');
+    // Switch real sending on + name templates: still simulated off-production.
+    const cfgOn = { ...ov().cfg, notifications: { whatsapp: true, whatsapp_number: '+910000000000', templates: { linked: { name: 'valet_linked', lang: 'en' }, ready: { name: 'valet_ready', lang: 'en' }, holding: { name: 'valet_holding', lang: 'en' }, eta_changed: { name: 'valet_eta', lang: 'en' }, closing_prompt: { name: 'valet_closing', lang: 'en' } } } };
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: cfgOn }, at(905));
+    ok(nt.simulationReason(ov(), 'ready').includes('not the live server'), 'non-production process refuses real sends');
+    process.env.VALET_ALLOW_DEV_SEND = '1';
+    eq(nt.simulationReason(ov(), 'ready'), '', 'with the developer switch + config + template → would send');
+    // Ready message: queued by the state hook, sent through the (fake) transport.
+    const pr = pk.requestPickup(db, ov(), core.SYSTEM, { session_id: sid, when: 'now' }, 'guest', at(906)).pickup;
+    pk.assignPickup(db, ov(), A('head'), pr.id, pick(pr.id).version, users.a1.id, '', at(906));   // this exact car (older requests are still queued)
+    pk.startFetch(db, ov(), A('a1'), pr.id, pick(pr.id).version, at(906));
+    pk.markReady(db, ov(), A('a1'), pr.id, pick(pr.id).version, { gate_zone_id: ZG, override_reason: 'test gate overflow' }, at(910));
+    eq(nt.queueStateMessages(db, ov(), at(910)) >= 1, true, 'ready message queued');
+    eq(nt.queueStateMessages(db, ov(), at(910.2)), 0, 'not queued twice');
+    d = await nt.deliverDue(db, at(910.5), fake);
+    const rm = db.prepare(`SELECT status, provider_message_id, delivered_at FROM valet_notifications WHERE session_id = ? AND kind = 'ready'`).get(sid) as any;
+    eq([rm.status, rm.delivered_at], ['sent', null], 'accepted by provider = "sent", NOT delivered');
+    const st = (id: string, status: string, ts: number) => JSON.stringify({ entry: [{ changes: [{ value: { statuses: [{ id, status, timestamp: String(Math.floor(ts / 1000)) }] } }] }] });
+    nt.ingestWhatsApp(db, st(rm.provider_message_id, 'delivered', at(911).getTime()), at(911));
+    eq((db.prepare(`SELECT status FROM valet_notifications WHERE provider_message_id = ?`).get(rm.provider_message_id) as any).status, 'delivered', 'delivered only from the provider webhook');
+    nt.ingestWhatsApp(db, st(rm.provider_message_id, 'sent', at(911.5).getTime()), at(911.5));
+    eq((db.prepare(`SELECT status FROM valet_notifications WHERE provider_message_id = ?`).get(rm.provider_message_id) as any).status, 'delivered', 'a late "sent" never moves it backwards');
+    eq(nt.ingestWhatsApp(db, st(rm.provider_message_id, 'read', at(-20000).getTime()), at(912)).length, 0, 'stale (replayed) status ignored');
+    // Failure ladder: 3 attempts with backoff, then failed + on the board.
+    const sid2 = checkin('a2', 'R2', at(920)); park('a2', sid2, at(920));
+    const l2 = nt.startLink(db, ov(), sid2, at(920));
+    nt.ingestWhatsApp(db, payload('919000000002', `VALET ${l2.code}`, 'm2'), at(920), { simulated: true });
+    const bad = async () => ({ ok: false, reason: 'send_failed', detail: 'HTTP 500' });
+    await nt.deliverDue(db, at(921), bad);
+    let row = db.prepare(`SELECT status, attempts, next_attempt_at FROM valet_notifications WHERE session_id = ? AND kind = 'linked'`).get(sid2) as any;
+    eq([row.status, row.attempts], ['queued', 1], 'first failure → retry queued');
+    await nt.deliverDue(db, at(921.5), bad);
+    eq((db.prepare(`SELECT attempts FROM valet_notifications WHERE session_id = ? AND kind = 'linked'`).get(sid2) as any).attempts, 1, 'not retried before its backoff');
+    await nt.deliverDue(db, at(923), bad); await nt.deliverDue(db, at(940), bad);
+    row = db.prepare(`SELECT status, attempts FROM valet_notifications WHERE session_id = ? AND kind = 'linked'`).get(sid2) as any;
+    eq([row.status, row.attempts], ['failed', 3], 'bounded: failed after 3 attempts');
+    ok(board.headBoard(db, ov(), at(941)).exceptions.some((e: any) => e.kind === 'notify_failed'), 'failed message shown on the board');
+    // Obsolete messages stop: car handed over before delivery.
+    const c2 = pk.issueHandoverCode(db, sid, at(912));
+    nt.enqueue(db, { outlet_id: OA, session_id: sid, kind: 'ready', dedupe: 'ready-again', params: [] }, at(912));
+    pk.handover(db, ov(), A('a1'), sid, { tag_code: 'R1', method: 'guest_code', code: c2.code }, at(912.2));
+    d = await nt.deliverDue(db, at(912.5), fake);
+    ok(d.cancelled >= 1, 'queued message for a handed-over car is cancelled, not sent');
+    // Replies: NOW with one car → request; STOP → opt-out + cancel.
+    const before = calls;
+    eq(nt.ingestWhatsApp(db, payload('919000000002', 'now', 'm3'), at(950)), ['pickup requested'], 'NOW from the verified number requests that car');
+    ok(core.activePickup(db, sid2), 'pickup exists');
+    eq(nt.ingestWhatsApp(db, payload('919000000002', 'NOW', 'm4'), at(950.5)), ['pickup already active'], 'repeat NOW → same request');
+    eq(nt.ingestWhatsApp(db, payload('919000000099', 'NOW', 'm5'), at(951)), ['inbound from unknown number — ignored'], 'unknown number cannot request a car');
+    // Two cars on one number → never guess.
+    const sid3 = checkin('a2', 'R3', at(952)); park('a2', sid3, at(952));
+    const l3 = nt.startLink(db, ov(), sid3, at(952));
+    nt.ingestWhatsApp(db, payload('919000000002', `VALET ${l3.code}`, 'm6'), at(952), { simulated: true });
+    eq(nt.ingestWhatsApp(db, payload('919000000002', 'NOW', 'm7'), at(953)), ['pickup request ambiguous — staff alerted'], 'two cars → staff alerted, nothing requested');
+    eq(core.activePickup(db, sid3), null, 'second car NOT requested by guesswork');
+    eq(nt.ingestWhatsApp(db, payload('919000000002', 'STOP', 'm8'), at(954)), ['opt-out (2)'], 'STOP opts the number out');
+    eq(nt.enqueue(db, { outlet_id: OA, session_id: sid3, kind: 'ready', dedupe: 'after-stop', params: [] }, at(955)), false, 'nothing queued after opt-out');
+    ok(calls === before, 'replies never call the transport');
+    delete process.env.VALET_ALLOW_DEV_SEND;
+    // The real webhook route acts ONLY on a signed, enforced request.
+    const hook = require(path.join(WT, 'src/app/api/whatsapp/webhook/route.ts'));
+    const sid4 = checkin('a1', 'R4', at(960)); park('a1', sid4, at(960));
+    const l4 = nt.startLink(db, ov(), sid4, new Date());
+    const body4 = payload('919000000004', `VALET ${l4.code}`, `m-${uid()}`);
+    db.prepare(`DELETE FROM settings WHERE key = 'wa_app_secret'`).run();
+    for (const k of ['WA_APP_SECRET', 'META_APP_SECRET', 'WHATSAPP_APP_SECRET']) delete process.env[k];
+    await hook.POST(new Request('http://localhost/api/whatsapp/webhook', { method: 'POST', body: body4 }));
+    eq((db.prepare(`SELECT verified_at FROM valet_msg_identities WHERE session_id = ?`).get(sid4) as any).verified_at, null, 'unsigned webhook (no app secret) → valet ignores it');
+    const crypto = require('crypto');
+    db.prepare(`INSERT INTO settings (key, value) VALUES ('wa_app_secret', 'zz-test-secret') ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run();
+    const bad4 = await hook.POST(new Request('http://localhost/api/whatsapp/webhook', { method: 'POST', body: body4, headers: { 'x-hub-signature-256': 'sha256=' + 'a'.repeat(64) } }));
+    eq(bad4.status, 401, 'wrong signature refused');
+    const sig = 'sha256=' + crypto.createHmac('sha256', 'zz-test-secret').update(Buffer.from(body4)).digest('hex');
+    const good = await hook.POST(new Request('http://localhost/api/whatsapp/webhook', { method: 'POST', body: body4, headers: { 'x-hub-signature-256': sig } }));
+    eq(good.status, 200, 'signed webhook accepted');
+    ok((db.prepare(`SELECT verified_at FROM valet_msg_identities WHERE session_id = ?`).get(sid4) as any).verified_at, 'signed webhook links the pass');
+    db.prepare(`DELETE FROM settings WHERE key = 'wa_app_secret'`).run();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  S('S retention');
+  {
+    const ret = require(path.join(WT, 'src/lib/valet/retention.ts'));
+    const old = new Date('2025-09-01T12:00:00Z'), now = new Date('2026-11-09T00:30:00Z');   // 06:00 IST
+    const mk = (tag: string) => {
+      const id = arr.checkinCreate(db, ov(), A('admin'), { plate: `TS09RT${tag}`, tag_code: tag, guest_name: 'Old Guest', guest_mobile: '+919800000000' }, old).session_id;
+      db.prepare(`INSERT INTO valet_media (id, outlet_id, session_id, mime, size_bytes, sha256, data, captured_at) VALUES (?,?,?, 'image/jpeg', 3, 'x', X'FFD8FF', ?)`).run(uid('zzm'), OA, id, old.toISOString());
+      pk.voidSession(db, ov(), A('head'), id, sess(id).version, 'old test record for retention', true, old);
+      return id;
+    };
+    const plain = mk('RT1'), heldId = mk('RT2');
+    adm.incidentCreate(db, ov(), A('head'), { session_id: heldId, kind: 'damage', description: 'Scratch dispute pending' }, old);
+    const inc = db.prepare(`SELECT id FROM valet_incidents WHERE session_id = ?`).get(heldId) as any;
+    adm.incidentResolve(db, ov(), A('head'), { incident_id: inc.id, resolution: 'Insurance claim open', retention_hold: true }, old);
+    const ordersBefore = (db.prepare('SELECT COUNT(*) AS n FROM orders').get() as any).n;
+    const r = ret.runRetention(db, ov(), now);
+    ok(r.ran && r.sessions >= 1 && r.photos >= 1 && r.held >= 1, `retention ran (${JSON.stringify(r)})`);
+    const p1 = sess(plain);
+    ok(p1.plate === '' && p1.guest_name === '' && p1.guest_mobile === '' && p1.redacted_at, 'old car: plate + guest details removed');
+    eq((db.prepare(`SELECT data IS NULL AS gone, deleted_reason FROM valet_media WHERE session_id = ?`).get(plain) as any), { gone: 1, deleted_reason: 'retention' }, 'old photo bytes removed, record kept');
+    ok(sess(heldId).guest_mobile === '+919800000000' && !sess(heldId).redacted_at, 'incident hold: kept intact');
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM valet_events WHERE session_id = ?`).get(plain) as any).n >= 2, true, 'operational audit kept');
+    eq((db.prepare('SELECT COUNT(*) AS n FROM orders').get() as any).n, ordersBefore, 'shared FNB records untouched');
+    eq(ret.runRetention(db, ov(), now).ran, false, 'once per outlet per day');
+    ok(sess(checkin('a1', 'RT3', now)).plate !== '', 'a current car is never touched');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  S('T closing rush');
+  {
+    const nt = require(path.join(WT, 'src/lib/valet/notify.ts'));
+    const cl = require(path.join(WT, 'src/lib/valet/closing.ts'));
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, closing_rush: { enabled: true, lead_minutes: 40, batch_size: 2 }, notifications: { ...ov().cfg.notifications, whatsapp: false } } }, at(1000));
+    const close = new Date('2026-11-09T19:30:00Z');   // 01:00 IST
+    const before = new Date(close.getTime() - 30 * 60_000), early = new Date(close.getTime() - 60 * 60_000);
+    const ids: string[] = [];
+    for (const t of ['CR1', 'CR2', 'CR3']) {
+      const id = checkin('head', t, early); park('head', id, early); ids.push(id);
+      const l = nt.startLink(db, ov(), id, early);
+      nt.ingestWhatsApp(db, JSON.stringify({ entry: [{ changes: [{ value: { messages: [{ id: `cr-${t}`, from: `9190000001${ids.length}`, text: { body: `VALET ${l.code}` } }] } }] }] }), early, { simulated: true });
+    }
+    eq(cl.runClosingRush(db, ov(), early).window, false, 'outside the 40-minute window → nothing');
+    const first = cl.runClosingRush(db, ov(), before);
+    ok(first.window && first.prompted >= 1 && first.prompted <= 2, `batch size respected (${first.prompted} of 3)`);
+    const second = cl.runClosingRush(db, ov(), new Date(before.getTime() + 60_000));
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM valet_notifications WHERE kind = 'closing_prompt' AND outlet_id = ?`).get(OA) as any).n, first.prompted + second.prompted, 'every prompt counted is one row');
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM (SELECT session_id FROM valet_notifications WHERE kind = 'closing_prompt' GROUP BY session_id HAVING COUNT(*) > 1)`).get() as any).n, 0, 'no guest asked twice');
+    eq(ids.map(id => core.activePickup(db, id)).filter(Boolean).length, 0, 'a prompt never creates a pickup by itself');
   }
 
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
