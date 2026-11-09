@@ -58,6 +58,16 @@ export interface SessionUser {
    *  ticked, and the canHrFull() API gates (src/lib/hr.ts). HR Settings and
    *  every non-HR admin surface stay admin-only. */
   can_full_hr_access: boolean;
+  /** VALET PARKING capabilities (roles.valet_head / valet_attendant /
+   *  valet_host). ROLE-ONLY and ACTIVE-ROLE-ONLY, like can_full_hr_access, and
+   *  resolved by their OWN fail-closed query in getCurrentUser (a missing
+   *  column or a deactivated role = false, never an error for the whole
+   *  session). Necessary but not sufficient: the page must also be ticked, and
+   *  every valet API also checks the user's valet outlet assignment. An admin
+   *  holds all three implicitly via hasValetCap() (src/lib/valet/caps.ts). */
+  valet_head: boolean;
+  valet_attendant: boolean;
+  valet_host: boolean;
   /** JSON-stringified array of allowed page paths. null = full access (backward compat). */
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
@@ -138,8 +148,10 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     return null;
   }
   const hasRole = !!row.role_id && !!row.role_base;
+  const valet = resolveValetRoleCaps(db, hasRole ? row.role_id : null);
   return {
     id: row.id, email: row.email, name: row.name,
+    ...valet,
     // Tier: the assigned role's base_role wins (kept correct even if the role's
     // tier was edited after assignment); falls back to the legacy users.role.
     role: ((hasRole ? row.role_base : row.role) as UserRole) || 'staff',
@@ -181,6 +193,29 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     can_request_discount: (hasRole ? row.role_base : row.role) === 'admin' ? true : (hasRole && !!row.role_can_discount),
     max_discount_pct: (hasRole ? row.role_base : row.role) === 'admin' ? 100 : (hasRole ? (Number(row.role_max_discount) || 0) : 0),
   };
+}
+
+/**
+ * VALET capabilities for an assigned role, in their OWN query — deliberately
+ * NOT columns in getCurrentUser's SELECT. That SELECT runs for every request in
+ * the app: naming a column there that a swallowed migration failed to add would
+ * throw and sign EVERYONE out. Here a missing column, a missing role or a
+ * deactivated role all resolve to false (fail closed), and nothing else about
+ * the session changes. `AND is_active = 1` matches proxy.ts's capability
+ * queries: deactivating a role revokes its capabilities while its tier and page
+ * map keep governing (see the NOTE in getCurrentUser).
+ */
+function resolveValetRoleCaps(
+  db: ReturnType<typeof getDb>, roleId: string | null,
+): { valet_head: boolean; valet_attendant: boolean; valet_host: boolean } {
+  const none = { valet_head: false, valet_attendant: false, valet_host: false };
+  if (!roleId) return none;
+  try {
+    const r = db.prepare('SELECT valet_head, valet_attendant, valet_host FROM roles WHERE id = ? AND is_active = 1')
+      .get(roleId) as { valet_head?: number; valet_attendant?: number; valet_host?: number } | undefined;
+    if (!r) return none;
+    return { valet_head: r.valet_head === 1, valet_attendant: r.valet_attendant === 1, valet_host: r.valet_host === 1 };
+  } catch { return none; }
 }
 
 /** Can this user approve requisitions (dine-in + party)? Admin always true.
@@ -268,6 +303,9 @@ export async function verifyApprover(email: string, password: string): Promise<S
   const hasRole = !!row.role_id && !!row.role_base;
   return {
     id: row.id, email: row.email, name: row.name,
+    // An on-the-spot approver login authorises a table operation and nothing
+    // else, so it carries no valet capability (valet resolves from the session).
+    valet_head: false, valet_attendant: false, valet_host: false,
     role: ((hasRole ? row.role_base : row.role) as UserRole) || 'staff',
     role_id: row.role_id || null, role_name: row.role_name || null,
     position: row.position || '', department_id: row.department_id || null,

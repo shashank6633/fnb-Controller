@@ -20,6 +20,8 @@
 // reached for `@/lib/db` would drag better-sqlite3 into the browser. Keep it
 // that way. The dependency is one-way — access.ts must never import this file.
 import { canOpenFeedbackFloor, isFeedbackPath } from './feedback/access';
+// Valet capability predicate — imports nothing, same bundle rule as above.
+import { hasValetCap, type ValetNeed } from './valet/caps';
 
 /**
  * The user shape every gate in this file reads. Structural, not `SessionUser`,
@@ -57,6 +59,12 @@ export interface CatalogUser {
    *  the page's own `hrFullCap` flag, a Manager-tier or HOD user, and the page
    *  ticked by its exact path. Absent/false ⇒ nothing changes anywhere. */
   can_full_hr_access?: boolean;
+  /** Valet capabilities (roles.valet_head / valet_attendant / valet_host) for
+   *  the assigned, ACTIVE role. Read by ONE gate: valetCapAllows(), and only on
+   *  a row carrying `valetCap`. Absent/false ⇒ every valet row stays shut. */
+  valet_head?: boolean;
+  valet_attendant?: boolean;
+  valet_host?: boolean;
 }
 
 export interface PageEntry {
@@ -185,6 +193,20 @@ export interface PageEntry {
    * floor pages must not be among them.
    */
   greOnly?: boolean;
+
+  /**
+   * VALET PARKING tier gate. A non-admin needs the named valet capability on
+   * their ASSIGNED, ACTIVE role (hasValetCap in src/lib/valet/caps.ts — a Valet
+   * Head also satisfies 'attendant' and 'host'), WHATEVER their page map says.
+   * Runs with the other tier gates, BEFORE the null-map grant, so a legacy
+   * full-access login (role_id NULL) never reaches a valet screen.
+   *
+   * Like financeCap / hrFullCap it is NECESSARY, NOT SUFFICIENT: the page must
+   * also be in the role's page list. And it is not the security boundary —
+   * every /api/valet/* route checks the capability AND the user's valet outlet
+   * assignment itself (src/lib/valet/access.ts).
+   */
+  valetCap?: ValetNeed;
 }
 
 export interface PageSection {
@@ -383,6 +405,22 @@ export const PAGE_CATALOG: PageSection[] = [
       // full-access staff are locked out too. Widening it later is a one-word
       // change; starting narrow is the reversible direction.
       { path: '/feedback/analytics',  label: 'Feedback Analytics', mgmtOnly: true },
+    ],
+  },
+  // VALET PARKING (docs/valet/DESIGN.md §2). Every row carries `valetCap`, a
+  // tier gate resolved from the assigned role's valet capability — so the
+  // whole section is invisible and shut to everyone until the owner ticks a
+  // capability in Settings → Roles AND the pages in that role's page list.
+  // Sidebar.tsx carries a twin of every row (the sidebar-vs-catalog rule).
+  // Each row is its OWN entry, so bestEntry()'s longest-prefix walk judges
+  // /valet/attendant by the attendant gate, never by /valet's head gate.
+  {
+    label: 'Valet Parking',
+    pages: [
+      { path: '/valet',               label: 'Valet Head Dashboard', valetCap: 'head' },
+      { path: '/valet/attendant',     label: 'Valet Attendant',      valetCap: 'attendant' },
+      { path: '/valet/desk',          label: 'Valet Desk (Host / Cashier)', valetCap: 'host' },
+      { path: '/valet/settings',      label: 'Valet Settings',       valetCap: 'head' },
     ],
   },
   {
@@ -1330,6 +1368,19 @@ export function isAdminOnlyPath(pathname: string): boolean {
 export function isGreOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.greOnly;
 }
+/** Is `pathname` under a valet catalog row? proxy.ts uses this to decide when
+ *  to resolve the valet capabilities at all (a separate fail-closed query). */
+export function isValetCapPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.valetCap;
+}
+/** The valet tier gate: true for any row without `valetCap`; otherwise the user
+ *  must hold that capability (admin always does). Same longest-prefix walk as
+ *  every other flag, so /valet/attendant is judged by its own row. */
+export function valetCapAllows(user: CatalogUser | null, pathname: string): boolean {
+  const need = bestEntry(pathname)?.valetCap;
+  if (!need) return true;
+  return hasValetCap(user, need);
+}
 
 /**
  * Does this role's `page_access` list say ANYTHING about the Guest Feedback
@@ -1549,7 +1600,11 @@ export function firstAllowedPath(user: CatalogUser | null): string {
         // mgmtOnly above — omit it and a role whose map holds only the five
         // HR-capability pages lands on '/login' and bounces (ruling #90).
         && !(p.adminOnly && user.role !== 'admin' && !hrFullCapOpens(user, p.path))
-        && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
+        && !(p.greOnly && !canOpenFeedbackFloor(user))
+        // valetCap is the fifth tier test here, for the reason given above: a
+        // role whose map holds only valet pages must not be sent to one it
+        // cannot open (proxy.ts resolves the capability before calling this).
+        && !(p.valetCap && !hasValetCap(user, p.valetCap))) return p.path;
     }
   }
   return '/login';
@@ -1604,6 +1659,11 @@ export function canAccessPage(
   // every user until a role is assigned, so a mis-ordered check would have
   // opened these pages to all 8 null-map users instead of closing them.
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+
+  // Valet Parking rows: the assigned, active role must carry the row's valet
+  // capability. Before the null-map grant, like the four tier gates above, so a
+  // legacy full-access login can never open a valet screen by default.
+  if (!valetCapAllows(user, pathname)) return false;
 
   // Owner, 2026-10-28: Guest Feedback follows the role's ticks like every other
   // page — the module no longer opens its own door for a list that never mentions it.
@@ -1767,6 +1827,7 @@ export function canAccessPageStrict(
   // hrFullCapOpens(): the ONE exception to adminOnly — see canAccessPage.
   if (isAdminOnlyPath(pathname) && !hrFullCapOpens(user, pathname)) return false;
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+  if (!valetCapAllows(user, pathname)) return false;
   // Kept in sync with canAccessPage deliberately: this function is MEASURED,
   // not wired up, and the day it is wired up the feedback module must not
   // silently go back to 403ing every management role whose list predates it.

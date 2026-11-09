@@ -26,6 +26,11 @@ interface Role {
    *  page-catalog.ts) and their admin-only HR actions, for a Manager-tier or
    *  HOD role. Not a tier — see page-catalog.ts hrFullCap / hr.ts canHrFull. */
   can_full_hr_access: number;
+  /** Valet Parking capabilities — tier gates on the 'Valet Parking' catalog
+   *  rows (page-catalog.ts valetCap). Role-only; default OFF. */
+  valet_head?: number;
+  valet_attendant?: number;
+  valet_host?: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -59,6 +64,7 @@ const blankDraft = () => ({
   can_view_finance_reports: false,
   can_manage_label_printer: false,
   can_full_hr_access: false,
+  valet_head: false, valet_attendant: false, valet_host: false,
   pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
@@ -101,6 +107,8 @@ export default function RolesAdmin() {
       // Seeded from the role for the same reason again: leaving it out would
       // silently REVOKE "Full HR access" the next time the role is saved.
       can_full_hr_access: !!role.can_full_hr_access,
+      // Seeded from the role, same reason as above: save() writes the whole draft.
+      valet_head: !!role.valet_head, valet_attendant: !!role.valet_attendant, valet_host: !!role.valet_host,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -156,6 +164,9 @@ export default function RolesAdmin() {
         can_view_finance_reports: draft.can_view_finance_reports,
         can_manage_label_printer: draft.can_manage_label_printer,
         can_full_hr_access: draft.can_full_hr_access,
+        valet_head: draft.valet_head,
+        valet_attendant: draft.valet_attendant,
+        valet_host: draft.valet_host,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
         can_request_discount: draft.can_request_discount,
         max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
@@ -314,7 +325,27 @@ export default function RolesAdmin() {
                     </label>
                   );
                 })()}
+                {/* Valet Parking (docs/valet/DESIGN.md §2). Each one lifts the
+                    valetCap gate on its Valet pages only; the role must ALSO have
+                    those pages ticked below, and each person must be assigned to
+                    an outlet in Valet Settings → Staff. Defaults off on every role. */}
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.valet_head} onChange={(e) => setDraft({ ...draft, valet_head: e.target.checked })} /> Valet Head (runs the valet board)
+                </label>
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.valet_attendant} onChange={(e) => setDraft({ ...draft, valet_attendant: e.target.checked })} /> Valet Attendant (parks and fetches cars)
+                </label>
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.valet_host} onChange={(e) => setDraft({ ...draft, valet_host: e.target.checked })} /> Valet Desk (host / cashier can request a guest&apos;s car)
+                </label>
               </div>
+              <p className="-mt-1 text-[11px] text-[#8B7355]">
+                The three <strong>Valet</strong> ticks open the matching Valet Parking screens — Head Dashboard and
+                Valet Settings for a <strong>Valet Head</strong>, the Attendant screen for an <strong>Attendant</strong>,
+                the Valet Desk for <strong>Valet Desk</strong> (a Valet Head may use all three). The role must ALSO
+                have those pages ticked in its page list below, and each person must be assigned to their outlet in
+                <strong> Valet Settings → Staff</strong>. Attendants never see guest phone numbers, history or reports.
+              </p>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
               </p>

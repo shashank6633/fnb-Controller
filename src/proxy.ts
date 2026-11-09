@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { canAccessPage, firstAllowedPath, isFinanceCapPath, isHrFullCapPath } from '@/lib/page-catalog';
+import { canAccessPage, firstAllowedPath, isFinanceCapPath, isHrFullCapPath, isValetCapPath } from '@/lib/page-catalog';
 import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
 import {
@@ -178,7 +178,24 @@ const CSRF_REQUIRED_PREFIXES = [
   // write; it does nothing about WHO is signed in. That is the route's own job
   // (canUseFeedback / isReadOnlyFeedbackUser in src/lib/feedback.ts).
   '/api/feedback',
+  // Valet Parking STAFF API (docs/valet/DESIGN.md). Trailing slash on purpose:
+  // the PUBLIC guest API lives at /api/valet-guest/*, which a bare '/api/valet'
+  // would also match — harmless (isPublic returns first) but misleading.
+  // Every valet staff write goes through src/lib/api.ts, which sets the header.
+  '/api/valet/',
 ];
+
+// Valet Parking GUEST surface — an EXACT list, never a prefix. These are the
+// only public valet paths; each self-authenticates (httpOnly device cookie, a
+// same-origin + custom-header CSRF check on writes, and database rate limits —
+// src/lib/valet/guest.ts). Static routes only, no dynamic segment beneath them,
+// so the encoded-'..' note on decodePathname() below cannot apply.
+const VALET_GUEST_PATHS = new Set([
+  '/valet-pass',                 // the guest pass + guest-led check-in page (HTML)
+  '/api/valet-guest/state',      // GET: this browser's own passes
+  '/api/valet-guest/entry',      // GET: venue name for a public check-in token
+  '/api/valet-guest/act',        // POST: check-in, activate, pickup, outside, help, code
+]);
 
 // Print PAGES that must render without bouncing through /login — the four paths
 // the old `pathname.includes('/print')` test actually existed for, now spelled out
@@ -231,6 +248,8 @@ function isPublic(pathname: string): boolean {
   // available — so POST is public + CSRF-exempt. It's rate-limited, size-capped
   // and write-only; the GET/PATCH admin console self-checks role==='admin'.
   if (pathname === '/api/error-report') return true;
+  // Valet guest pass: guests have no account. Exact paths only (see the set).
+  if (VALET_GUEST_PATHS.has(pathname)) return true;
 
   // ───────────────────────── HARD FLOOR — /api/ stops here ─────────────────────────
   // Every deliberately-public API route is named ABOVE this line, one by one.
@@ -460,6 +479,10 @@ export function proxy(req: NextRequest) {
         // Same rule, same reason: "Full HR access" (ruling #90) is resolved by
         // its own fail-CLOSED query below, never by the fail-open SELECT above.
         can_full_hr_access: false,
+        // Valet capabilities: same rule again — resolveValet() below.
+        valet_head: false,
+        valet_attendant: false,
+        valet_host: false,
       } : undefined;
       // ── FINANCE CAPABILITY, resolved in a SEPARATE, FAIL-CLOSED query.
       //
@@ -519,6 +542,22 @@ export function proxy(req: NextRequest) {
         } catch { user.can_full_hr_access = false; }
       };
       if (isHrFullCapPath(pathname)) resolveHrFull();
+      // ── VALET PARKING capabilities — the HR block's twin, same three rules:
+      // its own query (never the fail-open SELECT above), fail CLOSED, active
+      // role only. Mirrors resolveValetRoleCaps() in auth.ts exactly, so the
+      // page gate and the /api/valet/* gates cannot disagree. Run only on the
+      // valet rows, and before the fallback below (firstAllowedPath tests it).
+      const resolveValet = () => {
+        if (!user || !row.role_id || !row.role_base) return;
+        try {
+          const v = db.prepare('SELECT valet_head, valet_attendant, valet_host FROM roles WHERE id = ? AND is_active = 1')
+            .get(row.role_id) as { valet_head?: number; valet_attendant?: number; valet_host?: number } | undefined;
+          user.valet_head = v?.valet_head === 1;
+          user.valet_attendant = v?.valet_attendant === 1;
+          user.valet_host = v?.valet_host === 1;
+        } catch { user.valet_head = false; user.valet_attendant = false; user.valet_host = false; }
+      };
+      if (isValetCapPath(pathname)) resolveValet();
       // ── Guest Feedback ONLY: an unresolved session is a REFUSAL, not a pass.
       // Measured 2026-09-22 on this branch, port 3924: with a made-up cookie
       // value (`fnb_session=zzgc-NO-SUCH-TOKEN`) all four feedback pages
@@ -600,6 +639,7 @@ export function proxy(req: NextRequest) {
         // above — otherwise a role whose map holds ONLY those pages would be
         // sent to /login. One PK lookup, and only on a refusal.
         if (!isHrFullCapPath(pathname)) resolveHrFull();
+        if (!isValetCapPath(pathname)) resolveValet();
         const fallback = firstAllowedPath(user);
         // Don't redirect to the same path we just blocked (would loop)
         if (fallback === pathname) {

@@ -20,6 +20,9 @@ import { resolveRecipePrice } from './recipe-price';
 // to import STATICALLY: recipe-cost imports only './units', which imports nothing
 // at all, so both are leaves and neither can close a cycle back into db.ts.
 import { convertForCosting, ingredientLineCost } from './recipe-cost';
+// VALET PARKING schema. Safe to import STATICALLY: valet/schema imports only
+// `import type Database`, so it is a leaf and cannot close a cycle.
+import { applyValetSchema } from './valet/schema';
 
 const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
 
@@ -9919,6 +9922,12 @@ function initializeSchema(db: Database.Database) {
     // string, two callers, no drift.
     createGuestFeedbackSchema(db);
   } catch (e) { console.error('guest-feedback schema failed:', e); }
+
+  // VALET PARKING (valet_ tables + three role-only capability columns, DEFAULT
+  // 0, no backfill). Per-statement inside the module — one bad statement logs
+  // its own name and never abandons the rest. docs/valet/DESIGN.md.
+  try { applyValetSchema(db); }
+  catch (e) { console.error('valet schema failed:', e); }
 }
 
 /* ── FSSAI COMPLIANCE (fssai_) ─────────────────────────────────────────────

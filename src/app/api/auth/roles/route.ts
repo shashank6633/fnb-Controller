@@ -96,7 +96,7 @@ export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   const { name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, can_view_finance_reports, can_manage_label_printer, can_full_hr_access, description, sort_order,
-          can_request_discount, max_discount_pct } = await req.json();
+          can_request_discount, max_discount_pct, valet_head, valet_attendant, valet_host } = await req.json();
   const nm = String(name || '').trim();
   if (!nm) return Response.json({ error: 'Role name is required' }, { status: 400 });
   if (!VALID_BASE.includes(base_role)) return Response.json({ error: `tier must be one of ${VALID_BASE.join(', ')}` }, { status: 400 });
@@ -127,6 +127,13 @@ export async function POST(req: Request) {
          can_full_hr_access ? 1 : 0,
          Number(sort_order) || 50, String(description || ''),
          can_request_discount ? 1 : 0, clampPct(max_discount_pct));
+  // VALET capabilities, written by a SEPARATE statement so the INSERT above
+  // keeps its counted 16-column / 16-value shape untouched (see its comment).
+  // Only when one was ticked; the name is unique (checked above).
+  if (valet_head || valet_attendant || valet_host) {
+    db.prepare('UPDATE roles SET valet_head = ?, valet_attendant = ?, valet_host = ? WHERE lower(name) = lower(?)')
+      .run(valet_head ? 1 : 0, valet_attendant ? 1 : 0, valet_host ? 1 : 0, nm);
+  }
   return Response.json({ success: true, id: info.lastInsertRowid }, { status: 201 });
 }
 
@@ -134,7 +141,7 @@ export async function PUT(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
   const { id, name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, can_view_finance_reports, can_manage_label_printer, can_full_hr_access, description, sort_order,
-          can_request_discount, max_discount_pct } = await req.json();
+          can_request_discount, max_discount_pct, valet_head, valet_attendant, valet_host } = await req.json();
   if (!id) return Response.json({ error: 'id required' }, { status: 400 });
   if (base_role != null && !VALID_BASE.includes(base_role)) {
     return Response.json({ error: `tier must be one of ${VALID_BASE.join(', ')}` }, { status: 400 });
@@ -170,6 +177,11 @@ export async function PUT(req: Request) {
   if (sort_order !== undefined)              { sets.push('sort_order = ?'); params.push(Number(sort_order) || 0); }
   if (can_request_discount !== undefined)    { sets.push('can_request_discount = ?'); params.push(can_request_discount ? 1 : 0); }
   if (max_discount_pct !== undefined)        { sets.push('max_discount_pct = ?'); params.push(clampPct(max_discount_pct)); }
+  // Valet Parking capabilities — written only when the editor sends the key,
+  // never defaulted on, never seeded (roles are the owner's to set).
+  if (valet_head !== undefined)              { sets.push('valet_head = ?'); params.push(valet_head ? 1 : 0); }
+  if (valet_attendant !== undefined)         { sets.push('valet_attendant = ?'); params.push(valet_attendant ? 1 : 0); }
+  if (valet_host !== undefined)              { sets.push('valet_host = ?'); params.push(valet_host ? 1 : 0); }
   if (sets.length === 0) return Response.json({ error: 'nothing to update' }, { status: 400 });
   sets.push(`updated_at = datetime('now')`);
   params.push(id);

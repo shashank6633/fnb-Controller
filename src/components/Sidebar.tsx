@@ -97,6 +97,10 @@ import {
   FolderCheck,
   Recycle,
   UserCheck,
+  // Valet Parking section (Settings2 above is reused for its settings row).
+  CarFront,
+  KeyRound,
+  ConciergeBell,
   type LucideIcon,
 } from "lucide-react";
 
@@ -192,6 +196,23 @@ const navTree: NavEntry[] = [
       // Management-only (page-catalog mgmtOnly) — canAccessPage hides this row
       // for everyone else, the same way it hides Idle Tables above.
       { kind: "link", label: "Feedback Analytics", href: "/feedback/analytics", icon: BarChart3 },
+    ],
+  },
+
+  // Valet Parking — every href is a twin of a row in the 'Valet Parking'
+  // section of page-catalog.ts (sidebar-vs-catalog rule: edit both). Each of
+  // those rows carries the catalog's `valetCap` tier flag, so canAccessPage
+  // hides this whole section until the owner ticks a valet capability on a
+  // role in Settings → Roles. Reads me.valet_* — see the `me` type below.
+  {
+    kind: "section",
+    label: "Valet Parking",
+    icon: CarFront,
+    items: [
+      { kind: "link", label: "Valet Head Dashboard", href: "/valet",           icon: CarFront },
+      { kind: "link", label: "Valet Attendant",      href: "/valet/attendant", icon: KeyRound },
+      { kind: "link", label: "Valet Desk",           href: "/valet/desk",      icon: ConciergeBell },
+      { kind: "link", label: "Valet Settings",       href: "/valet/settings",  icon: Settings2 },
     ],
   },
 
@@ -753,6 +774,11 @@ export default function Sidebar() {
     // (Payroll, Documents, Exits, Geofences, Biometric) vanish from the nav of
     // the very role granted them while the proxy still lets the URL through.
     can_full_hr_access?: boolean;
+    // Read by canAccessPage's valetCap gate. Same reason again: drop these and
+    // the Valet Parking rows vanish for the very roles granted them.
+    valet_head?: boolean;
+    valet_attendant?: boolean;
+    valet_host?: boolean;
   } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
