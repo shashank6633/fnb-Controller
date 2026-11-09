@@ -405,11 +405,17 @@ export function getPurchaseItemwise(f: ItemwiseFilters, dbArg?: DatabaseT.Databa
   // only some of the lines the Bill Summary adds up for it.
   let bill_check: ItemwiseBillCheck;
   if (vendor || category || materialId) {
+    // One bill reads "the 1 bill here … was not", never "each bill … bills were not".
+    const one = bill_rows.length === 1;
     bill_check = {
       compared: false,
       reason: category || materialId
-        ? 'A category or item filter is on, so each bill here holds only its matching lines; bills were not compared one by one with the Purchase Bill Summary, which adds up every line of a bill.'
-        : 'A vendor filter is on, and the Purchase Bill Summary matches a vendor by any part of its name, so bills were not compared one by one with it.',
+        ? (one
+          ? 'A category or item filter is on, so the 1 bill here holds only its matching lines; it was not compared with the Purchase Bill Summary, which adds up every line of a bill.'
+          : 'A category or item filter is on, so each bill here holds only its matching lines; bills were not compared one by one with the Purchase Bill Summary, which adds up every line of a bill.')
+        : (one
+          ? 'A vendor filter is on, and the Purchase Bill Summary matches a vendor by any part of its name, so the 1 bill here was not compared with it.'
+          : 'A vendor filter is on, and the Purchase Bill Summary matches a vendor by any part of its name, so bills were not compared one by one with it.'),
       bills: bill_rows.length, matched: 0, differences: [],
     };
   } else {

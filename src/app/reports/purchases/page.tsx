@@ -520,7 +520,8 @@ function ReconciliationPanel({ recon, bills, grandTotal, onWiden }: {
                 figure out of a narrow box. */}
             <p className="text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">Shown on this page</p>
             <p className="font-bold tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(fmtINR(recon.shown.rupees), 1.125)}>{fmtINR(recon.shown.rupees)}</p>
-            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.shown.rows)} purchase row${recon.shown.rows === 1 ? '' : 's'} · booked into stock (goods value)`}</p>
+            {/* "(goods value)" is one inline-block, so it never splits as "(goods / value)". */}
+            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.shown.rows)} purchase row${recon.shown.rows === 1 ? '' : 's'} · booked into stock `}<span className="inline-block">(goods value)</span></p>
             {/* AGREED WITH THE OWNER 2026-11-07: the booked figure above sat next
                 to a larger headline and read like a mismatch. This line names the
                 headline's own figure (summary.total_amount, formatted as the card
@@ -534,7 +535,7 @@ function ReconciliationPanel({ recon, bills, grandTotal, onWiden }: {
           <div className="@container min-w-0 rounded-xl border border-[#E8D5C4] bg-[#FFFCF8] px-3 py-2.5">
             <p className="text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">In the source (all purchases)</p>
             <p className="font-bold tabular-nums whitespace-nowrap leading-snug" style={fitFigureStyle(fmtINR(recon.source.rupees), 1.125)}>{fmtINR(recon.source.rupees)}</p>
-            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.source.rows)} purchase row${recon.source.rows === 1 ? '' : 's'} · booked into stock (goods value)`}</p>
+            <p className="text-[11px] text-[#6B5744]">{`${fmtNum(recon.source.rows)} purchase row${recon.source.rows === 1 ? '' : 's'} · booked into stock `}<span className="inline-block">(goods value)</span></p>
           </div>
         </div>
         </div>
@@ -978,7 +979,7 @@ export default function PurchaseReportPage() {
                   adds up to this figure. */}
               <Card icon={<TrendingUp className="w-4 h-4" />} label="Total Purchases (Grand Total)" value={fmtSignedINR(s.total_amount)}
                 sub={<>incl. GST and every charge · <span className="inline-block">{`booked into stock ${fmtINR(s.total_spend)}`}</span></>} tone="accent" className="col-span-2" />
-              <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases" value={fmtNum(s.purchase_count)} sub={`${fmtNum(s.day_count)} days`} />
+              <Card icon={<ShoppingCart className="w-4 h-4" />} label="Purchases" value={fmtNum(s.purchase_count)} sub={`${fmtNum(s.day_count)} day${s.day_count === 1 ? '' : 's'}`} />
               <Card icon={<Building2 className="w-4 h-4" />} label="Vendors" value={fmtNum(s.vendor_count)} />
               <Card icon={<Package className="w-4 h-4" />} label="Items" value={fmtNum(s.item_count)} />
               <Card icon={<AlertTriangle className="w-4 h-4" />} label="Emergency Spend" value={fmtINR(s.emergency_spend)} sub={`${fmtNum(s.emergency_count)} purchases`} tone={s.emergency_spend > 0 ? 'warn' : undefined} />
@@ -1430,7 +1431,8 @@ function ItemwisePurchases({ from, to, setFrom, setTo, vendors, categories, pres
   const billText = bc
     ? (bc.compared
       ? (bc.differences.length === 0
-        ? billMatchSentence(bc, false, fmtNum)
+        // With no bills the sentence above already says there is nothing to add up.
+        ? (bc.bills === 0 ? '' : billMatchSentence(bc, false, fmtNum))
         : `${billsDoNot(bc.differences.length, fmtNum)} match the Purchase Bill Summary for the same dates — report it.`)
       // Round 3: with no lines there are no bills, and why bills were not
       // compared says nothing — the sentence above already says so plainly.
