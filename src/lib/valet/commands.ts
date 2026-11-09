@@ -8,7 +8,7 @@
  * Adding a command without a row here is impossible — there is no other route.
  */
 import type { SessionUser } from '@/lib/auth';
-import type { ValetNeed } from './caps';
+import { hasValetCap, type ValetNeed } from './caps';
 import type { DB, Actor, OutletValet } from './core';
 import { fail, getPickup, notify, staffActor, requireStaff } from './core';
 import { rateLimit } from './credentials';
@@ -25,6 +25,7 @@ import {
   setOutletEnabled, saveConfig, rotateEntryToken, zoneSave, tagsAdd, tagSetStatus, tagReplace, staffAssign,
   handoverNoteCreate, handoverNoteAck,
 } from './ops-admin';
+import { addTicketBook, retireTicketBook, confirmPaperClaim } from './ops-paper';
 import { enqueue, cancelForSession } from './notify';
 
 // Untyped JSON from the client: every handler validates the fields it reads.
@@ -34,7 +35,8 @@ interface Ctx { db: DB; ov: OutletValet; actor: Actor; now: Date; body: Body }
 type Result = Record<string, unknown> & { session_id?: string | null; pickup_id?: string | null };
 
 interface CommandDef {
-  need: ValetNeed | 'admin';
+  /** One capability, or any one of several (e.g. attendant OR desk). */
+  need: ValetNeed | 'admin' | ValetNeed[];
   /** Settings commands work while the outlet is switched off (that is how it is switched on). */
   allowDisabled?: boolean;
   /** Per-user fixed-window limit: [max, seconds]. */
@@ -62,7 +64,7 @@ export const COMMANDS: Record<string, CommandDef> = {
     const r = checkinCreate(c.db, c.ov, c.actor, c.body, c.now);
     return { ...r, session_id: r.session_id };
   } },
-  'checkin.find':   { need: 'attendant', limit: [30, 60], run: c => { expirePending(c.db, c.now); return { request: findPendingByCode(c.db, c.ov, s(c.body.code), c.now) }; } },
+  'checkin.find':   { need: ['attendant', 'host'], limit: [30, 60], run: c => { expirePending(c.db, c.now); return { request: findPendingByCode(c.db, c.ov, s(c.body.code), c.now) }; } },
   'park.start':     { need: 'attendant', run: c => ({ ...parkStart(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, c.now) }) },
   'park.confirm':   { need: 'attendant', run: c => ({ ...parkConfirm(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, c.body, c.now) }) },
   'key.transfer':   { need: 'attendant', run: c => ({ ...keyTransfer(c.db, c.ov, c.actor, s(c.body.session_id), c.body.version, c.body, c.now), session_id: s(c.body.session_id) }) },
@@ -165,6 +167,11 @@ export const COMMANDS: Record<string, CommandDef> = {
   'handover_note.create': { need: 'head', run: c => handoverNoteCreate(c.db, c.ov, c.actor, s(c.body.note), c.now) },
   'handover_note.ack':    { need: 'head', run: c => handoverNoteAck(c.db, c.ov, c.actor, s(c.body.note_id), c.now) },
 
+  // ── paper tickets
+  'ticket_book.add':    { need: 'head', allowDisabled: true, run: c => addTicketBook(c.db, c.ov, c.actor, c.body, c.now) },
+  'ticket_book.retire': { need: 'head', allowDisabled: true, run: c => retireTicketBook(c.db, c.ov, c.actor, s(c.body.book_id), c.now) },
+  'paper.claim_confirm': { need: ['attendant', 'host'], limit: [30, 60], run: c => confirmPaperClaim(c.db, c.ov, c.actor, s(c.body.request_id), c.body.stub_checked === true, c.now) },
+
   // ── settings
   'settings.enable':       { need: 'admin', allowDisabled: true, run: c => setOutletEnabled(c.db, c.ov.outlet_id, c.actor, !!c.body.enabled, c.now) },
   'settings.config':       { need: 'admin', allowDisabled: true, run: c => saveConfig(c.db, c.ov.outlet_id, c.actor, c.body.config, c.now) },
@@ -181,7 +188,8 @@ export function runCommand(db: DB, user: SessionUser | null, body: Body, now: Da
   const name = s(body.cmd);
   const def = Object.prototype.hasOwnProperty.call(COMMANDS, name) ? COMMANDS[name] : undefined;
   if (!def) fail(400, 'unknown_command', 'Unknown valet action.');
-  const { actor, ov } = requireStaff(db, user, s(body.outlet_id), def!.need, { allowDisabled: def!.allowDisabled });
+  const need = Array.isArray(def!.need) ? (def!.need.find(n => hasValetCap(user ?? undefined, n)) ?? def!.need[0]) : def!.need;
+  const { actor, ov } = requireStaff(db, user, s(body.outlet_id), need, { allowDisabled: def!.allowDisabled });
   if (def!.limit && !rateLimit(db, `cmd:${name}:${actor.id}`, def!.limit[0], def!.limit[1], now)) {
     fail(429, 'slow_down', 'Too many attempts. Wait a minute and try again.');
   }

@@ -73,7 +73,7 @@ a{color:var(--acc)}
 var B=${boot};
 var L=localStorage.getItem('fnb_vp_lang')||B.lang||'en';
 var S={data:null,sel:null,code:null,codeExp:null,lastOk:null,busy:false,err:'',info:'',entryInfo:null,lastStates:{},done:false};
-var q=new URLSearchParams(location.search);var ENTRY=q.get('e')||B.entry||'';var ACT=q.get('a')||'';
+var q=new URLSearchParams(location.search);var ENTRY=q.get('e')||B.entry||'';var ACT=q.get('a')||'';var PAPER=q.get('paper')==='1';
 function T(k,v){var s=(B.strings[L]&&B.strings[L][k])||B.strings.en[k]||k;if(v)for(var n in v)s=s.replace('{'+n+'}',v[n]);return s}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
 function fmtTime(iso){try{return new Date(iso).toLocaleTimeString(L==='hi'?'hi-IN':'en-IN',{hour:'numeric',minute:'2-digit',timeZone:'Asia/Kolkata'})}catch(_){return ''}}
@@ -111,10 +111,10 @@ function render(){
 }
 function renderNoPass(app){
   var pd=S.data&&S.data.pending;
-  if(pd&&pd.status==='pending'&&pd.pairing_code){var c=el('div','card');c.appendChild(el('h1',null,T('pair_title')));c.appendChild(el('div','big',pd.pairing_code));c.appendChild(el('p',null,T('pair_body')));
+  if(pd&&pd.status==='pending'&&pd.pairing_code){var c=el('div','card');c.appendChild(el('h1',null,T('pair_title')));c.appendChild(el('div','big',pd.pairing_code));c.appendChild(el('p',null,T(pd.kind==='paper'||pd.kind==='paper_claim'?'pair_body_paper':'pair_body')));
     var t=el('p','mute');t.id='pairExp';c.appendChild(t);app.appendChild(c);tick();return}
   if(pd&&pd.status==='expired')app.appendChild(el('div','note',T('pair_expired')));
-  if(ENTRY&&S.entryInfo&&S.entryInfo.ok){if(!S.entryInfo.enabled){app.appendChild(el('div','note',T('venue_off')));return}renderCheckin(app);return}
+  if(ENTRY&&S.entryInfo&&S.entryInfo.ok){if(!S.entryInfo.enabled){app.appendChild(el('div','note',T('venue_off')));return}if(PAPER&&S.entryInfo.paper){renderPaper(app);return}renderCheckin(app);return}
   var c2=el('div','card');c2.appendChild(el('h2',null,T('no_pass')));c2.appendChild(el('p','mute',T('no_pass_body')));app.appendChild(c2);
 }
 function field(f,key,name,req,type,auto){var w=document.createDocumentFragment();var lb=el('label',null,T(key)+(req?' *':''));lb.htmlFor='f_'+name;w.appendChild(lb);var i=el('input');i.id='f_'+name;i.name=name;i.type=type||'text';i.autocomplete=auto||'off';if(req)i.required=true;if(name==='plate'){i.autocapitalize='characters';i.maxLength=16}else i.maxLength=60;
@@ -125,6 +125,9 @@ function renderCheckin(app){var r=(S.entryInfo&&S.entryInfo.required)||{};var c=
   var b=el('button','btn',T('checkin_go'));b.type='submit';b.disabled=S.busy;f.appendChild(b);
   f.onsubmit=function(ev){ev.preventDefault();var fd=new FormData(f);var o={e:ENTRY};fd.forEach(function(v,k){o[k]=String(v)});act('checkin',o)};
   c.appendChild(f);app.appendChild(c)}
+function renderPaper(app){var c=el('div','card');c.appendChild(el('h1',null,T('paper_title')));var f=el('form');field(f,'ticket_no','ticket_no',true);field(f,'plate','plate',false);
+  var b=el('button','btn',T('paper_go'));b.type='submit';b.disabled=S.busy;f.appendChild(b);
+  f.onsubmit=function(ev){ev.preventDefault();var fd=new FormData(f);var o={e:ENTRY};fd.forEach(function(v,k){o[k]=String(v)});act('paper',o)};c.appendChild(f);app.appendChild(c)}
 function renderPass(app,p,multi){
   if(multi){var back=el('button','btn2','← '+T('choose_car'));back.type='button';back.onclick=function(){S.sel=null;S.code=null;render()};app.appendChild(back)}
   var c=el('div','card');var top=el('div','row');var l=el('div');l.appendChild(el('div','tag',T('tag')));l.appendChild(el('div','tagno',p.tag_code||'—'));top.appendChild(l);

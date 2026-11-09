@@ -41,6 +41,8 @@ export const STRINGS = {
     venue_off: 'Valet check-in is not available right now. Please see the valet desk.',
     done_title: 'Handed over', done_body: 'Thank you — drive safely.',
     err_generic: 'Something went wrong. Please try again or ask the valet desk.',
+    paper_title: 'Paper valet ticket', ticket_no: 'Ticket number (on your stub)', paper_go: 'Continue',
+    pair_body_paper: 'Show your paper ticket stub and this code at the valet desk. Your pass appears here once they check the stub.',
     wa_get: 'Get updates on WhatsApp', wa_on: 'WhatsApp updates are on', wa_how: 'Tap below to open WhatsApp, then press Send. This links your number to this pass. Reply STOP any time.', wa_open: 'Open WhatsApp',
   },
   hi: {
@@ -73,6 +75,8 @@ export const STRINGS = {
     venue_off: 'वैले चेक-इन अभी उपलब्ध नहीं है। कृपया वैले डेस्क पर आएँ।',
     done_title: 'गाड़ी सौंप दी गई', done_body: 'धन्यवाद — सुरक्षित चलाएँ।',
     err_generic: 'कुछ गड़बड़ हुई। फिर से कोशिश करें या वैले डेस्क से पूछें।',
+    paper_title: 'पेपर वैले टिकट', ticket_no: 'टिकट नंबर (आपकी पर्ची पर)', paper_go: 'आगे बढ़ें',
+    pair_body_paper: 'अपनी टिकट की पर्ची और यह कोड वैले डेस्क पर दिखाएँ। पर्ची जाँचने के बाद आपका पास यहाँ दिखेगा।',
     wa_get: 'WhatsApp पर अपडेट पाएँ', wa_on: 'WhatsApp अपडेट चालू हैं', wa_how: 'नीचे दबाकर WhatsApp खोलें, फिर Send दबाएँ। इससे आपका नंबर इस पास से जुड़ जाएगा। कभी भी STOP लिखकर बंद करें।', wa_open: 'WhatsApp खोलें',
   },
 } as const;

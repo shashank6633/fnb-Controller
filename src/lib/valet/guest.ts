@@ -21,6 +21,7 @@ import { nowIso, addMinutes, maskPlate, nextClose, cleanText } from './config';
 import { isHeld } from './states';
 import { etaFor, promoteDue } from './queue';
 import { createPendingCheckin, expirePending } from './ops-arrival';
+import { guestPaperEntry } from './ops-paper';
 import {
   requestPickup, cancelPickup, reschedulePickup, guestOutside, issueHandoverCode, raiseAlert,
 } from './ops-pickup';
@@ -135,13 +136,13 @@ export function guestState(db: DB, device: GuestDevice | null, now: Date = new D
     if (!seenOutlets.has(ov.outlet_id)) { promoteDue(db, ov.outlet_id, now); seenOutlets.add(ov.outlet_id); }
     passes.push({ ...passView(db, ov, s, now), help_phone: ov.cfg.help_phone });
   }
-  const pend = db.prepare(`SELECT r.id, r.pairing_code, r.expires_at, r.status, r.outlet_id FROM valet_checkin_requests r
+  const pend = db.prepare(`SELECT r.id, r.pairing_code, r.expires_at, r.status, r.outlet_id, r.source FROM valet_checkin_requests r
                            WHERE r.device_id = ? AND r.status IN ('pending','expired') ORDER BY r.created_at DESC LIMIT 1`).get(device.id) as
-    { id: string; pairing_code: string; expires_at: string; status: string; outlet_id: string } | undefined;
+    { id: string; pairing_code: string; expires_at: string; status: string; outlet_id: string; source: string } | undefined;
   let pending = null;
   if (pend && (pend.status === 'pending' || pend.expires_at > addMinutes(now, -10))) {
     const ov = loadOutletValet(db, pend.outlet_id);
-    pending = { pairing_code: pend.status === 'pending' ? pend.pairing_code : '', expires_at: pend.expires_at, status: pend.status,
+    pending = { pairing_code: pend.status === 'pending' ? pend.pairing_code : '', expires_at: pend.expires_at, status: pend.status, kind: pend.source,
       venue_name: ov ? (ov.cfg.venue_name || ov.outlet_name) : '' };
   }
   return { passes, pending, lang: device.lang };
@@ -151,7 +152,7 @@ export function guestState(db: DB, device: GuestDevice | null, now: Date = new D
 export function guestEntry(db: DB, entryToken: string) {
   const ov = outletByEntry(db, entryToken);
   if (!ov) return { ok: false as const };
-  return { ok: true as const, venue_name: ov.cfg.venue_name || ov.outlet_name, enabled: ov.enabled, required: ov.cfg.required, language: ov.cfg.language };
+  return { ok: true as const, venue_name: ov.cfg.venue_name || ov.outlet_name, enabled: ov.enabled, required: ov.cfg.required, language: ov.cfg.language, paper: ov.cfg.paper.enabled };
 }
 
 function outletByEntry(db: DB, token: string): OutletValet | null {
@@ -171,7 +172,7 @@ export function guestAct(
   const cmd = String(body.cmd || '');
   if (!rateLimit(db, `guest-ip:${ip}`, 120, 600, now)) fail(429, 'slow_down', 'Too many requests. Please wait a few minutes.');
 
-  if (cmd === 'checkin' || cmd === 'activate') {
+  if (cmd === 'checkin' || cmd === 'activate' || cmd === 'paper') {
     if (!rateLimit(db, `guest-${cmd}-ip:${ip}`, cmd === 'checkin' ? 10 : 20, 600, now)) fail(429, 'slow_down', 'Too many attempts. Please ask the valet desk.');
     let setCookie: string | undefined;
     let dev = device;
@@ -183,6 +184,13 @@ export function guestAct(
       }
       return dev!;
     };
+    if (cmd === 'paper') {
+      const ov = outletByEntry(db, body.e);
+      if (!ov || !ov.enabled) fail(404, 'not_available', 'Valet is not available right now. Please see the valet desk.');
+      const d = ensure();
+      const r = guestPaperEntry(db, ov!, d.id, body, now);
+      return { body: { ok: true, pairing_code: r.pairing_code, expires_at: r.expires_at, kind: r.kind }, setCookie };
+    }
     if (cmd === 'checkin') {
       const ov = outletByEntry(db, body.e);
       if (!ov || !ov.enabled) fail(404, 'not_available', 'Valet check-in is not available right now. Please see the valet desk.');

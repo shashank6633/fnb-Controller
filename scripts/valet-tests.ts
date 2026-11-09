@@ -1010,6 +1010,45 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     (globalThis as any).__TOKEN = undefined;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  S('W paper tickets');
+  {
+    const pp = require(path.join(WT, 'src/lib/valet/ops-paper.ts'));
+    const { entry_token } = adm.rotateEntryToken(db, OA, A('admin'), at(1200));
+    const g1 = guest.guestAct(db, null, { cmd: 'checkin', e: entry_token, plate: 'KA01PP0001' }, '5.5.5.1', false, at(1200));
+    const dev1 = guest.deviceFromCookie(db, String(g1.setCookie).split(';')[0].split('=')[1]);
+    eq(caught(() => guest.guestAct(db, dev1, { cmd: 'paper', e: entry_token, ticket_no: 'P120' }, '5.5.5.1', false, at(1200)))?.code, 'paper_off', 'paper entry refused while paper mode is off');
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, paper: { enabled: true } } }, at(1200));
+    eq((run('head', { cmd: 'ticket_book.add', outlet_id: OA, prefix: 'P', first_no: 100, last_no: 150 }, at(1200)) as any).ok, true, 'ticket book registered');
+    eq((run('head', { cmd: 'ticket_book.add', outlet_id: OA, prefix: 'P', first_no: 140, last_no: 160 }, at(1200)) as any).code, 'overlap', 'overlapping book refused');
+    eq(caught(() => arr.checkinCreate(db, ov(), A('a1'), { plate: 'KA01PP0002', ticket_no: 'P999' }, at(1201)))?.code, 'ticket_unknown', 'ticket outside every book refused');
+    const held = arr.checkinCreate(db, ov(), A('a1'), { plate: 'KA01PP0003', ticket_no: 'p-0120' }, at(1201)).session_id;
+    eq(sess(held).ticket_no, 'P120', 'ticket canonicalised (p-0120 → P120)');
+    eq(caught(() => arr.checkinCreate(db, ov(), A('a2'), { plate: 'KA01PP0004', ticket_no: 'P120' }, at(1202)))?.code, 'ticket_in_use', 'one active car per ticket');
+    // Curbside done → guest's typed ticket is only a CLAIM; the pass needs the stub checked.
+    const c1 = guest.guestAct(db, dev1, { cmd: 'paper', e: entry_token, ticket_no: 'P120', plate: 'KA01PP0003' }, '5.5.5.1', false, at(1203));
+    eq(c1.body.kind, 'paper_claim', 'held ticket → a pending claim');
+    eq(guest.guestState(db, dev1, at(1203)).passes.length, 0, 'a ticket number alone grants NOTHING');
+    const g2 = guest.guestAct(db, null, { cmd: 'checkin', e: entry_token, plate: 'KA01PP0009' }, '5.5.5.2', false, at(1203));
+    const dev2 = guest.deviceFromCookie(db, String(g2.setCookie).split(';')[0].split('=')[1]);
+    eq(caught(() => guest.guestAct(db, dev2, { cmd: 'paper', e: entry_token, ticket_no: 'P120' }, '5.5.5.2', false, at(1203.5)))?.code, 'ticket_pending', 'a second phone cannot pile onto the same ticket');
+    const found = arr.findPendingByCode(db, ov(), c1.body.pairing_code, at(1204));
+    ok(found.source === 'paper_claim' && found.claim_tag !== undefined, 'staff see it is a paper claim');
+    eq(caught(() => arr.checkinCreate(db, ov(), A('a1'), { request_id: found.id, tag_code: 'W9' }, at(1204)))?.code, 'use_claim', 'a claim cannot become a second check-in');
+    eq((run('host', { cmd: 'paper.claim_confirm', outlet_id: OA, request_id: found.id }, at(1204)) as any).code, 'stub_required', 'stub must be ticked as checked');
+    eq((run('host', { cmd: 'paper.claim_confirm', outlet_id: OA, request_id: found.id, stub_checked: true }, at(1205)) as any).session_id, held, 'desk confirms the stub');
+    eq(guest.guestState(db, dev1, at(1206)).passes.map((p: any) => p.session_id), [held], 'only now the guest has the pass');
+    // Curbside skipped → pending VERIFICATION; staff check in from it with the stub's ticket.
+    const v1 = guest.guestAct(db, dev2, { cmd: 'paper', e: entry_token, ticket_no: 'P130', plate: 'KA01PP0010' }, '5.5.5.2', false, at(1207));
+    eq(v1.body.kind, 'paper', 'unregistered ticket → verification request only');
+    const f2 = arr.findPendingByCode(db, ov(), v1.body.pairing_code, at(1207));
+    eq((run('host', { cmd: 'paper.claim_confirm', outlet_id: OA, request_id: f2.id, stub_checked: true }, at(1207)) as any).code, 'not_claim', 'verification is a check-in, not a claim');
+    const newS = arr.checkinCreate(db, ov(), A('a2'), { request_id: f2.id, tag_code: 'W10' }, at(1208)).session_id;
+    eq([sess(newS).ticket_no, sess(newS).checkin_source], ['P130', 'paper'], 'checked in under the stub\'s ticket');
+    eq(guest.guestState(db, dev2, at(1209)).passes.length, 1, 'guest gets the pass after staff confirmed the car + stub');
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, paper: { enabled: false } } }, at(1210));
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

@@ -13,6 +13,7 @@ import {
   nowIso, addMinutes, businessDate, normPlate, normTagCode, cleanMobile, cleanText,
 } from './config';
 import { sha256, randomToken, crockfordCode, digits } from './credentials';
+import { validateTicket } from './ops-paper';
 
 export interface CheckinInput {
   plate?: string; make?: string; model?: string; colour?: string;
@@ -83,6 +84,7 @@ export function checkinCreate(db: DB, ov: OutletValet, actor: Actor, input: Chec
       if (!pending) fail(404, 'request_not_found', 'That guest check-in was not found at this outlet.');
       if (pending!.status !== 'pending') fail(409, 'request_closed', `That guest check-in is already ${pending!.status}.`);
       if (pending!.expires_at <= at) fail(409, 'request_expired', 'That guest check-in has expired. Ask the guest to scan again, or check the car in here.');
+      if (pending!.source === 'paper_claim') fail(409, 'use_claim', `This guest's car is already parked under ticket ${pending!.ticket_no}. Check their paper stub and use "Stub matches — give pass".`);
     }
     // Staff-typed values win; the guest's own entries fill the gaps.
     const pick = (k: keyof CheckinInput, max = 40) => cleanText((input[k] as string) || (pending?.[k as string] ?? ''), max);
@@ -92,8 +94,13 @@ export function checkinCreate(db: DB, ov: OutletValet, actor: Actor, input: Chec
     };
     requireFields(ov, v);
     const plateNorm = normPlate(v.plate);
-    const ticket = cleanText(input.ticket_no || pending?.ticket_no || '', 20).toUpperCase();
+    let ticket = cleanText(input.ticket_no || pending?.ticket_no || '', 20).toUpperCase();
+    // Paper mode: only tickets from a book issued at this outlet are accepted.
+    if (ticket && ov.cfg.paper.enabled) ticket = validateTicket(db, ov.outlet_id, ticket);
     if (!input.tag_code && !ticket) fail(400, 'tag_required', 'Enter or scan the key tag number (or the paper ticket number).');
+    if (ticket && db.prepare(`SELECT 1 FROM valet_vehicle_sessions WHERE outlet_id = ? AND ticket_no = ? AND state NOT IN ('HANDED_OVER','VOIDED')`).get(ov.outlet_id, ticket)) {
+      fail(409, 'ticket_in_use', `Paper ticket ${ticket} is already on another car.`);
+    }
     const tag = input.tag_code ? resolveTag(db, ov.outlet_id, input.tag_code, actor, at, true) : null;
 
     if (plateNorm) {
@@ -142,8 +149,10 @@ export function checkinCreate(db: DB, ov: OutletValet, actor: Actor, input: Chec
 export function findPendingByCode(db: DB, ov: OutletValet, code: string, now: Date = new Date()) {
   const c = String(code || '').replace(/\D/g, '');
   if (c.length !== 6) fail(400, 'bad_code', 'Pairing codes are 6 digits.');
-  const row = db.prepare(`SELECT id, plate, make, model, colour, guest_name, guest_mobile, ticket_no, created_at, expires_at, source
-                          FROM valet_checkin_requests WHERE outlet_id = ? AND pairing_code = ? AND status = 'pending'`).get(ov.outlet_id, c) as
+  const row = db.prepare(`SELECT r.id, r.plate, r.make, r.model, r.colour, r.guest_name, r.guest_mobile, r.ticket_no, r.created_at, r.expires_at, r.source,
+                            s.tag_code AS claim_tag, s.state AS claim_state
+                          FROM valet_checkin_requests r LEFT JOIN valet_vehicle_sessions s ON s.id = r.session_id
+                          WHERE r.outlet_id = ? AND r.pairing_code = ? AND r.status = 'pending'`).get(ov.outlet_id, c) as
     Record<string, string> | undefined;
   if (!row || row.expires_at <= nowIso(now)) fail(404, 'code_not_found', 'No waiting check-in with that code. It may have expired — ask the guest to scan again.');
   // An attendant needs the car details to confirm — the mobile goes no further than "provided".

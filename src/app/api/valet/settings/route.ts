@@ -31,8 +31,9 @@ export async function GET(req: Request) {
                OR EXISTS (SELECT 1 FROM valet_staff_outlets s WHERE s.user_id = u.id AND s.outlet_id = ?))
         ORDER BY u.name`).all(ov.outlet_id, ov.outlet_id);
     }
+    const books = db.prepare(`SELECT id, prefix, first_no, last_no, status, issued_at, note FROM valet_ticket_books WHERE outlet_id = ? ORDER BY status, issued_at DESC`).all(ov.outlet_id);
     return {
-      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg,
+      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg, books,
       entry_token: ov.entry_token, entry_path: ov.entry_token ? `/valet-pass?e=${ov.entry_token}` : '',
       zones, tags, staff, can_admin: actor.isAdmin,
     };

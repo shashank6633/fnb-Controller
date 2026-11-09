@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { KeyRound, Car, ScanLine, AlertTriangle, LogIn, LogOut, Coffee, Printer, QrCode, Timer, Hand } from 'lucide-react';
 import BatchTagScanner from '@/components/BatchTagScanner';
-import { HandoverModal, IssuedModal, PhotoModal } from '../modals';
+import { HandoverModal, IssuedModal, PhotoModal, PaperClaimConfirm } from '../modals';
 import { ATT, STAFF_STATE_LABEL, type Lang } from '@/lib/valet/i18n';
 import { normTagCode } from '@/lib/valet/config';
 import {
@@ -308,6 +308,8 @@ function CheckinModal({ v, outletId, userId, onClose, onDone }: { v: View; outle
           <Field label="Guest's 6-digit pairing code"><input className={`${inputCls} text-2xl tracking-[.3em] font-bold`} inputMode="numeric" maxLength={6} value={pairing} onChange={e => setPairing(e.target.value.replace(/\D/g, ''))} autoFocus /></Field>
           <Btn big className="w-full" onClick={() => void findCode()} disabled={pairing.length !== 6 || cmd.busy}>Find guest</Btn>
         </div>
+      ) : pending?.source === 'paper_claim' ? (
+        <PaperClaimConfirm outletId={outletId} request={pending} onDone={ok => { if (ok) onClose(); }} />
       ) : (
         <div className="space-y-2">
           {pending ? <InfoNote>Guest check-in found ({pending.source === 'paper' ? 'paper ticket' : 'phone'}). Check the car matches, then put a key tag on the keys.{pending.has_mobile ? ' Guest left a mobile number.' : ''}</InfoNote> : null}

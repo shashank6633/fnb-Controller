@@ -21,6 +21,7 @@ interface SettingsData {
   outlet: { id: string; name: string }; enabled: boolean; config: Cfg; entry_token: string; entry_path: string;
   zones: { id: string; name: string; kind: string; capacity: number | null; retrieval_minutes: number | null; sort_order: number; is_active: number }[];
   tags: { id: string; code: string; kind: string; status: string; notes: string; on_car: string | null }[];
+  books: { id: string; prefix: string; first_no: number; last_no: number; status: string; issued_at: string; note: string }[];
   staff: null | { id: string; name: string; email: string; role_name: string | null; valet_head: number; valet_attendant: number; valet_host: number; assigned: number }[];
   can_admin: boolean;
 }
@@ -59,6 +60,7 @@ export default function ValetSettingsPage() {
               <EntryQr data={data} run={run} ask={ask} />
               <Zones data={data} run={run} />
               <Tags data={data} run={run} ask={ask} />
+              <TicketBooks data={data} run={run} />
               {data.can_admin ? <Rules data={data} run={run} /> : <InfoNote>Valet rules (hours, timers, required fields) are set by the owner/admin.</InfoNote>}
               {data.can_admin && data.staff ? <Staff data={data} run={run} /> : null}
               <Messages outletId={outletId} canAdmin={data.can_admin} />
@@ -228,6 +230,8 @@ function Rules({ data, run }: { data: SettingsData; run: Run }) {
             {box('required.model', 'Model', c.required?.model)}{box('required.colour', 'Colour', c.required?.colour)}
             {box('required.guest_name', 'Guest name', c.required?.guest_name)}{box('required.guest_mobile', 'Guest mobile', c.required?.guest_mobile)}
           </div>
+          <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">Paper tickets</h3>
+          {box('paper.enabled', 'This outlet also uses paper valet tickets (bill-folder / table QR entry)', c.paper?.enabled)}
           <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">Condition photos</h3>
           <div className="grid grid-cols-2 gap-2">
             <Field label="Minimum photos (0–6)"><input className={inputCls} inputMode="numeric" value={c.photos?.min} onChange={e => num('photos.min', e.target.value)} /></Field>
@@ -372,6 +376,34 @@ function Messages({ outletId, canAdmin }: { outletId: string; canAdmin: boolean 
             {!d.rows.length ? <tr><td colSpan={5} className="py-2 text-[#8B7355]">No guest messages yet. Messages are only queued for guests who linked WhatsApp on their pass.</td></tr> : null}
           </tbody>
         </table>
+      </div>
+    </Panel>
+  );
+}
+
+function TicketBooks({ data, run }: { data: SettingsData; run: Run }) {
+  const [prefix, setPrefix] = useState('');
+  const [a, setA] = useState('');
+  const [b, setB] = useState('');
+  const [origin, setOrigin] = useState('');
+  useEffect(() => { setOrigin(window.location.origin); }, []);
+  if (!data.config.paper?.enabled) return null;
+  return (
+    <Panel title="Paper ticket books">
+      <p className="text-xs text-[#8B7355] mb-2">Register each ticket book before it is used. A ticket outside these books is refused. A ticket number alone never releases a car — staff always check the guest&apos;s paper stub.</p>
+      {data.entry_path ? <p className="text-xs mb-2">Table / bill-folder QR for paper-ticket guests: <span className="font-mono break-all">{origin}{data.entry_path}&amp;paper=1</span></p> : null}
+      <table className="w-full text-sm mb-2"><tbody>
+        {data.books.map(bk => (
+          <tr key={bk.id} className="border-t border-[#F0E4D6]"><td className="py-1 pr-2 font-mono">{bk.prefix}{bk.first_no} – {bk.prefix}{bk.last_no}</td><td className="pr-2">{bk.status}</td>
+            <td className="text-right">{bk.status === 'active' ? <button type="button" className="text-xs font-semibold text-[#af4408]" onClick={() => void run('ticket_book.retire', { book_id: bk.id }, 'Book retired.')}>Retire</button> : null}</td></tr>
+        ))}
+        {!data.books.length ? <tr><td className="py-1 text-[#8B7355]">No books registered yet.</td></tr> : null}
+      </tbody></table>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
+        <Field label="Prefix (letters, optional)"><input className={inputCls} value={prefix} onChange={e => setPrefix(e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3))} /></Field>
+        <Field label="First number"><input className={inputCls} inputMode="numeric" value={a} onChange={e => setA(e.target.value.replace(/\D/g, ''))} /></Field>
+        <Field label="Last number"><input className={inputCls} inputMode="numeric" value={b} onChange={e => setB(e.target.value.replace(/\D/g, ''))} /></Field>
+        <Btn onClick={() => void run('ticket_book.add', { prefix, first_no: Number(a), last_no: Number(b) }, 'Ticket book added.')} disabled={!a || !b}>Add book</Btn>
       </div>
     </Panel>
   );

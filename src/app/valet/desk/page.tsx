@@ -13,6 +13,7 @@ import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, StateChip,
   useValetContext, useCmd, hhmm,
 } from '../ui';
+import { PaperClaimConfirm } from '../modals';
 
 interface Hit {
   id: string; state: string; tag_code: string; ticket_no: string; plate: string; make: string; model: string; colour: string;
@@ -50,6 +51,7 @@ export default function DeskPage() {
               <Btn type="submit" big disabled={!q.trim()}><Search size={18} aria-hidden /><span className="sr-only">Search</span></Btn>
             </form>
           </Panel>
+          <PaperDesk outletId={outletId} />
           <ErrorNote message={err || cmd.err} />
           {done ? <InfoNote>{done}</InfoNote> : null}
           {hits && !hits.length ? <InfoNote>No car found. Check the number on the guest&apos;s receipt, or ask the valet desk.</InfoNote> : null}
@@ -91,5 +93,30 @@ export default function DeskPage() {
         </div>
       </Gate>
     </div>
+  );
+}
+
+/** Paper ticket at the desk: the guest shows a 6-digit code from their phone
+ *  plus their paper stub; the host checks the stub and gives the pass. */
+function PaperDesk({ outletId }: { outletId: string }) {
+  const [code, setCode] = useState('');
+  const [req, setReq] = useState<Record<string, string> | null>(null);
+  const [msg, setMsg] = useState('');
+  const cmd = useCmd(outletId);
+  return (
+    <Panel title="Paper ticket guest at the desk">
+      {req ? (
+        req.source === 'paper_claim'
+          ? <PaperClaimConfirm outletId={outletId} request={req} onDone={ok => { if (ok) { setMsg(`Pass given for ticket ${req.ticket_no}.`); setReq(null); setCode(''); } }} />
+          : <div className="space-y-2"><InfoNote>Ticket {req.ticket_no || '—'}: this car has not been checked in yet. Ask a valet attendant to check it in with the guest&apos;s code.</InfoNote><Btn kind="ghost" onClick={() => setReq(null)}>Back</Btn></div>
+      ) : (
+        <form className="flex gap-2 items-end" onSubmit={async e => { e.preventDefault(); setMsg(''); const r = await cmd.run<{ request: Record<string, string> }>('checkin.find', { code }); if (r?.request) setReq(r.request); }}>
+          <div className="flex-1"><Field label="Code on the guest's phone (6 digits)"><input className={`${inputCls} text-xl tracking-[.3em] font-bold`} inputMode="numeric" maxLength={6} value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ''))} /></Field></div>
+          <Btn type="submit" disabled={code.length !== 6 || cmd.busy}>Find</Btn>
+        </form>
+      )}
+      <ErrorNote message={cmd.err} />
+      {msg ? <InfoNote>{msg}</InfoNote> : null}
+    </Panel>
   );
 }

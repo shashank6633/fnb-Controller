@@ -240,3 +240,27 @@ export function PhotoModal({ outletId, sessionId, tag, onClose }: { outletId: st
     </Modal>
   );
 }
+
+// ── Paper ticket claim: staff look at the guest's physical stub ─────────────
+
+export function PaperClaimConfirm({ outletId, request, onDone }: {
+  outletId: string; request: Record<string, string>; onDone: (ok: boolean) => void;
+}) {
+  const [checked, setChecked] = useState(false);
+  const cmd = useCmd(outletId);
+  return (
+    <div className="space-y-2">
+      <InfoNote>
+        Paper ticket <b>{request.ticket_no}</b> — this car is already parked{request.claim_tag ? <> (tag <b>{request.claim_tag}</b>)</> : null}.
+        A ticket number can be guessed: <b>look at the guest&apos;s paper stub</b> before giving them the pass.
+      </InfoNote>
+      <ErrorNote message={cmd.err} />
+      <label className="flex items-start gap-2 text-sm"><input type="checkbox" className="mt-1" checked={checked} onChange={e => setChecked(e.target.checked)} />
+        I have checked the guest&apos;s paper stub and it shows ticket {request.ticket_no}.</label>
+      <Btn big kind="ok" className="w-full" disabled={!checked || cmd.busy} onClick={async () => {
+        const r = await cmd.run('paper.claim_confirm', { request_id: request.id, stub_checked: true });
+        onDone(!!r);
+      }}>Stub matches — give the guest their pass</Btn>
+    </div>
+  );
+}
