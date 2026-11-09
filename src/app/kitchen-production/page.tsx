@@ -430,6 +430,7 @@ export default function KitchenProductionPage() {
   // same canAccessPage the sidebar and proxy use).
   const [meUser, setMeUser] = useState<Parameters<typeof canAccessPage>[1]>(null);
   const canOpen = (href: string) => (!isBrewery ? true : !!meUser && canAccessPage(href, meUser));
+  const dashboardHref = isBrewery ? '/brewery-production/dashboard' : '/kitchen-production/dashboard';
 
   // Toast
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
@@ -568,10 +569,10 @@ export default function KitchenProductionPage() {
     return batches.filter(b => inExpiryBucket(b, expiryFilter, now, today, tomorrow));
   }, [batches, expiryFilter]);
 
-  // The Production Dashboard's expiry tiles count Kitchen AND Brewery batches
-  // and link here. So that the number on the tile and the list here never
-  // silently disagree, count the other screen's batches in the same bucket and
-  // say where they are (shown only when there are some).
+  // A dashboard expiry tile links here with ?expiry=. Since ruling 122 each
+  // dashboard counts its own side only, so the tile and this list agree; this
+  // note still says how many batches in the same bucket sit on the other
+  // screen (shown only when there are some).
   const otherVariant: Variant = isBrewery ? 'kitchen' : 'brewery';
   const [otherInBucket, setOtherInBucket] = useState(0);
   useEffect(() => {
@@ -759,8 +760,9 @@ export default function KitchenProductionPage() {
           )}
         </div>
         <div className={`flex items-center gap-2${isBrewery ? ' flex-wrap' : ''}`}>
-          {canOpen('/kitchen-production/dashboard') && (
-            <Link href="/kitchen-production/dashboard"
+          {/* Each screen opens its own dashboard (ruling 122). */}
+          {canOpen(dashboardHref) && (
+            <Link href={dashboardHref}
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
               <LayoutGrid className="w-4 h-4" /> <span className="hidden sm:inline">Dashboard</span>
             </Link>

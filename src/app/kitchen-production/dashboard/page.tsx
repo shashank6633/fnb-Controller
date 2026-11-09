@@ -8,17 +8,25 @@
  * tiles deep-link into the batch list pre-filtered to that bucket, and an
  * "expiring soon" table of the next ~10 batches to lapse.
  *
- * Data: GET /api/kitchen-production/dashboard → { widgets, expiring_soon }.
+ * Kitchen and Brewery are separate dashboards (owner ruling 122, 2026-11-09).
+ * /brewery-production/dashboard renders this same component; the URL picks
+ * the side, every figure counts that side only, and each tile opens the batch
+ * list of the same side — so the number on a tile and the list behind it
+ * agree. The Brewery one is admin / manager / HOD only (page-catalog mgmtOnly;
+ * the API refuses everyone else itself).
+ *
+ * Data: GET /api/kitchen-production/dashboard?kind=… → { kind, widgets, expiring_soon }.
  * See that route for exact widget semantics (IST calendar buckets, rolling
  * windows, waste %, FIFO heuristic, low-stock).
  */
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import {
   ChefHat, Loader2, RefreshCw, LayoutGrid, BarChart3, Package, Printer,
   Boxes, Layers, Utensils, Trash2, GitCompare, AlertTriangle, Clock,
-  CheckCircle2, ScanLine, ArrowRight,
+  CheckCircle2, ScanLine, ArrowRight, Beer,
 } from 'lucide-react';
 import { fmtIST } from '@/lib/format-date';
 
@@ -79,6 +87,14 @@ const wasteSub = (w: Widgets) => {
 
 // ─── Page ───────────────────────────────────────────────────────────────
 export default function KitchenProductionDashboardPage() {
+  // /brewery-production/dashboard renders this same component (ruling 122).
+  const pathname = usePathname();
+  const isBrewery = (pathname || '').startsWith('/brewery-production');
+  const kind = isBrewery ? 'brewery' : 'kitchen';
+  const listHref = isBrewery ? '/brewery-production' : '/kitchen-production';
+  const BatchesIcon = isBrewery ? Beer : ChefHat;
+  const batchesLabel = isBrewery ? 'Brewery batches' : 'Kitchen batches';
+
   const [widgets, setWidgets] = useState<Widgets | null>(null);
   const [soon, setSoon] = useState<ExpiringSoon[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,7 +104,7 @@ export default function KitchenProductionDashboardPage() {
   useEffect(() => {
     let cancelled = false;
     setLoading(true); setError(null);
-    fetch('/api/kitchen-production/dashboard', { credentials: 'same-origin' })
+    fetch(`/api/kitchen-production/dashboard?kind=${kind}`, { credentials: 'same-origin' })
       .then(async r => {
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -102,7 +118,7 @@ export default function KitchenProductionDashboardPage() {
       .catch(e => { if (!cancelled) setError(e.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [refreshKey]);
+  }, [refreshKey, kind]);
 
   return (
     <div className="p-4 sm:p-6 max-w-7xl mx-auto space-y-4">
@@ -110,17 +126,24 @@ export default function KitchenProductionDashboardPage() {
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-bold text-[#2D1B0E] flex items-center gap-2">
-            <LayoutGrid className="w-6 h-6 text-[#af4408]" /> Production Dashboard
+            {isBrewery
+              ? <><Beer className="w-6 h-6 text-[#af4408]" /> Brewery Dashboard</>
+              : <><LayoutGrid className="w-6 h-6 text-[#af4408]" /> Kitchen Dashboard</>}
           </h1>
           <p className="text-xs text-[#6B5744] mt-0.5 max-w-2xl">
-            Live snapshot of the kitchen-production floor — today's output, consumption,
-            waste, FIFO discipline and, above all, what's about to <b>expire</b>.
+            {isBrewery ? (
+              <>Live snapshot of the brewery — today's brews, beer used, waste, FIFO
+              discipline and, above all, what's about to <b>expire</b>. Brewery batches only.</>
+            ) : (
+              <>Live snapshot of the kitchen-production floor — today's output, consumption,
+              waste, FIFO discipline and, above all, what's about to <b>expire</b>. Kitchen batches only.</>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Link href="/kitchen-production"
+          <Link href={listHref}
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-            <ChefHat className="w-4 h-4" /> <span className="hidden sm:inline">Kitchen batches</span>
+            <BatchesIcon className="w-4 h-4" /> <span className="hidden sm:inline">{batchesLabel}</span>
           </Link>
           <Link href="/kitchen-production/reports"
                 className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
@@ -149,11 +172,11 @@ export default function KitchenProductionDashboardPage() {
               <span className="text-[11px] text-[#8B7355]">— tap a tile to see those batches</span>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-              <ExpiryTile bucket="expired"  label="Expired"        value={widgets.expired}           tone="red" />
-              <ExpiryTile bucket="today"    label="Expiring Today" value={widgets.expiring_today}     tone="orange" />
-              <ExpiryTile bucket="tomorrow" label="Tomorrow"       value={widgets.expiring_tomorrow}  tone="amber" />
-              <ExpiryTile bucket="3d"       label="Within 3 Days"  value={widgets.expiring_3d}        tone="yellow" />
-              <ExpiryTile bucket="7d"       label="Within 7 Days"  value={widgets.expiring_7d}        tone="emerald" />
+              <ExpiryTile listHref={listHref} bucket="expired"  label="Expired"        value={widgets.expired}           tone="red" />
+              <ExpiryTile listHref={listHref} bucket="today"    label="Expiring Today" value={widgets.expiring_today}     tone="orange" />
+              <ExpiryTile listHref={listHref} bucket="tomorrow" label="Tomorrow"       value={widgets.expiring_tomorrow}  tone="amber" />
+              <ExpiryTile listHref={listHref} bucket="3d"       label="Within 3 Days"  value={widgets.expiring_3d}        tone="yellow" />
+              <ExpiryTile listHref={listHref} bucket="7d"       label="Within 7 Days"  value={widgets.expiring_7d}        tone="emerald" />
             </div>
           </div>
 
@@ -178,7 +201,7 @@ export default function KitchenProductionDashboardPage() {
               <div className="text-sm font-semibold text-[#2D1B0E] flex items-center gap-2">
                 <Clock className="w-4 h-4 text-[#af4408]" /> Expiring soon
               </div>
-              <Link href="/kitchen-production?expiry=7d"
+              <Link href={`${listHref}?expiry=7d`}
                     className="text-xs text-[#af4408] hover:underline flex items-center gap-1">
                 View all <ArrowRight className="w-3.5 h-3.5" />
               </Link>
@@ -220,11 +243,9 @@ export default function KitchenProductionDashboardPage() {
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
               <ScanLine className="w-4 h-4 text-[#af4408]" /> Scan a batch
             </Link>
-            <Link href="/kitchen-production"
+            <Link href={listHref}
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
-              {/* Kitchen Production lists Kitchen items' batches only since
-                  Brewery Production (ruling 114) — this dashboard counts both. */}
-              <Package className="w-4 h-4 text-[#af4408]" /> Kitchen batches
+              <Package className="w-4 h-4 text-[#af4408]" /> {batchesLabel}
             </Link>
           </div>
         </>
@@ -242,12 +263,12 @@ const EXPIRY_TONE: Record<string, { card: string; num: string; label: string }> 
   emerald: { card: 'border-emerald-300 bg-emerald-50 hover:bg-emerald-100', num: 'text-emerald-700', label: 'text-emerald-800' },
 };
 
-function ExpiryTile({ bucket, label, value, tone }: {
-  bucket: string; label: string; value: number; tone: keyof typeof EXPIRY_TONE;
+function ExpiryTile({ listHref, bucket, label, value, tone }: {
+  listHref: string; bucket: string; label: string; value: number; tone: keyof typeof EXPIRY_TONE;
 }) {
   const t = EXPIRY_TONE[tone];
   return (
-    <Link href={`/kitchen-production?expiry=${bucket}`}
+    <Link href={`${listHref}?expiry=${bucket}`}
           className={`block border-2 rounded-xl p-3 text-center transition-colors ${t.card}`}>
       <div className={`text-3xl font-bold leading-none ${t.num}`}>{value}</div>
       <div className={`text-[11px] font-semibold mt-1.5 ${t.label}`}>{label}</div>

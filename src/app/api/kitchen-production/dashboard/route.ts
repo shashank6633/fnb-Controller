@@ -3,14 +3,22 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { parseDateTime, expiryStatus, ProductionBatch } from '@/lib/production-batch';
 import { todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { packFactor } from '@/lib/pack-units';
+import { batchKindSql, canSeeBeerQuantities } from '@/lib/brewery-beer';
 
 /**
- * GET /api/kitchen-production/dashboard
- *   → { widgets: { …see keys below }, expiring_soon: [ …next ~10 to expire ] }
+ * GET /api/kitchen-production/dashboard?kind=kitchen|brewery
+ *   → { kind, widgets: { …see keys below }, expiring_soon: [ …next ~10 to expire ] }
  *
  * All figures are computed server-side against a single `now`, scoped to the
  * caller's current outlet (NULL-outlet rows are treated as shared, matching the
  * list/consume routes).
+ *
+ * Kitchen and Brewery are SEPARATE dashboards (owner ruling 122, 2026-11-09).
+ * Every figure below counts one side only — the same split as the batch list's
+ * `kind` filter. kind defaults to kitchen, so no caller ever gets beer mixed
+ * into the Kitchen totals. kind=brewery is admin / manager / HOD only — the
+ * people who may see how much beer was used (ruling 121, canSeeBeerQuantities);
+ * anyone else gets 403, whatever page they came from.
  *
  * Widget keys:
  *   expiring_today / expiring_tomorrow   — ACTIVE batches whose expiry falls on
@@ -44,12 +52,21 @@ import { packFactor } from '@/lib/pack-units';
  * "today" for tx rows is the IST calendar day: created_at is stored UTC
  * (datetime('now')), so we shift it +5:30 before comparing dates.
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
     // READ — logged-in only. The owner opened /kitchen-production/dashboard to
     // all signed-in users (hodOnly removed, 89ecb14); this feed matches the page.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+
+    const kind = new URL(request.url).searchParams.get('kind') || 'kitchen';
+    if (kind !== 'kitchen' && kind !== 'brewery') {
+      return Response.json({ error: 'kind must be kitchen or brewery' }, { status: 400 });
+    }
+    if (kind === 'brewery' && !canSeeBeerQuantities(me)) {
+      return Response.json(
+        { error: 'The Brewery Dashboard is for admins, managers and HODs only.' }, { status: 403 });
+    }
 
     const db = getDb();
     const outletId = await getCurrentOutletId();
@@ -61,12 +78,22 @@ export async function GET() {
     const outletSql = outletId ? 'AND (outlet_id = ? OR outlet_id IS NULL)' : '';
     const outletParams: any[] = outletId ? [outletId] : [];
 
+    // Kitchen / Brewery side, for production_batches rows (kindSql), a joined
+    // batch `pb` (pbKindSql), and batch_transactions rows (txKindSql — a tx
+    // carries no item, so it follows its batch).
+    const kindSql = batchKindSql(kind);
+    const pbKindSql = batchKindSql(kind, 'pb.production_item_id');
+    const txKindSql = `batch_id IN (SELECT id FROM production_batches WHERE ${kindSql})`;
+
     // ---- expiry buckets over ACTIVE batches (computed in JS with `now`) ----
+    // production_date / _time feed the FIFO check below. Without them every
+    // chain's "oldest active" was +Infinity and FIFO Compliance read 100% no
+    // matter what (owner ruling 122, fixed 2026-11-09).
     const activeBatches = db.prepare(
       `SELECT id, item_name, production_item_id, batch_number, material_id, unit, quantity_produced,
-              quantity_consumed, expiry_date, expiry_time
+              quantity_consumed, expiry_date, expiry_time, production_date, production_time
          FROM production_batches
-        WHERE status = 'active' ${outletSql}`
+        WHERE status = 'active' AND ${kindSql} ${outletSql}`
     ).all(...outletParams) as ProductionBatch[];
 
     // FIFO chains group by production_item_id (rename/typo safe), else NOCASE name.
@@ -138,22 +165,22 @@ export async function GET() {
 
     const active_batches = activeBatches.length;
     const total_batches = countRow(
-      `SELECT COUNT(*) AS c FROM production_batches WHERE 1=1 ${outletSql}`, ...outletParams);
+      `SELECT COUNT(*) AS c FROM production_batches WHERE ${kindSql} ${outletSql}`, ...outletParams);
 
     const today_production = countRow(
       `SELECT COUNT(*) AS c FROM production_batches
-        WHERE production_date = ? ${outletSql}`, today, ...outletParams);
+        WHERE production_date = ? AND ${kindSql} ${outletSql}`, today, ...outletParams);
 
     // tx-based "today" (created_at is UTC → shift to IST before comparing date)
     const istDay = `date(created_at, '+5 hours', '+30 minutes')`;
     const labels_printed_today = countRow(
       `SELECT COUNT(*) AS c FROM batch_transactions
-        WHERE type IN ('printed','reprinted') AND ${istDay} = ? ${outletSql}`,
+        WHERE type IN ('printed','reprinted') AND ${istDay} = ? AND ${txKindSql} ${outletSql}`,
       today, ...outletParams);
 
     const today_consumption_qty = Number((db.prepare(
       `SELECT COALESCE(SUM(quantity),0) AS s FROM batch_transactions
-        WHERE type = 'consumed' AND ${istDay} = ? ${outletSql}`
+        WHERE type = 'consumed' AND ${istDay} = ? AND ${txKindSql} ${outletSql}`
     ).get(today, ...outletParams) as any)?.s || 0);
 
     // Same figure split per batch unit — kg + pcs + L must never be added
@@ -166,7 +193,7 @@ export async function GET() {
       `SELECT LOWER(TRIM(COALESCE(pb.unit, ''))) AS unit, COALESCE(SUM(t.quantity),0) AS qty
          FROM batch_transactions t
          JOIN production_batches pb ON pb.id = t.batch_id
-        WHERE t.type = 'consumed' AND ${txIstDay} = ? ${txOutletSql}
+        WHERE t.type = 'consumed' AND ${txIstDay} = ? AND ${pbKindSql} ${txOutletSql}
         GROUP BY LOWER(TRIM(COALESCE(pb.unit, '')))
         ORDER BY qty DESC`
     ).all(today, ...outletParams) as { unit: string; qty: number }[])
@@ -183,7 +210,7 @@ export async function GET() {
          FROM batch_transactions t
          JOIN production_batches pb ON pb.id = t.batch_id
         WHERE t.type IN ('wasted','disposed','created')
-          AND ${txIstDay} >= date(?, '-30 days') ${txOutletSql}
+          AND ${txIstDay} >= date(?, '-30 days') AND ${pbKindSql} ${txOutletSql}
         GROUP BY LOWER(TRIM(COALESCE(pb.unit, '')))`
     ).all(today, ...outletParams) as { unit: string; wasted: number; created: number }[];
     const wasteRows = wasteAgg
@@ -214,7 +241,7 @@ export async function GET() {
     const drawn = db.prepare(
       `SELECT id, item_name, production_item_id, production_date, production_time
          FROM production_batches
-        WHERE quantity_consumed > 0 ${outletSql}`
+        WHERE quantity_consumed > 0 AND ${kindSql} ${outletSql}`
     ).all(...outletParams) as ProductionBatch[];
     let fifo_compliance_pct = 100;
     if (drawn.length) {
@@ -245,7 +272,7 @@ export async function GET() {
     const soonRows = db.prepare(
       `SELECT batch_number, item_name, expiry_date, expiry_time
          FROM production_batches
-        WHERE status = 'active' AND expiry_date IS NOT NULL AND expiry_date != '' ${outletSql}
+        WHERE status = 'active' AND expiry_date IS NOT NULL AND expiry_date != '' AND ${kindSql} ${outletSql}
         ORDER BY expiry_date ASC, expiry_time ASC
         LIMIT 10`
     ).all(...outletParams) as ProductionBatch[];
@@ -275,7 +302,7 @@ export async function GET() {
       low_stock_alerts,
     };
 
-    return Response.json({ widgets, expiring_soon });
+    return Response.json({ kind, widgets, expiring_soon });
   } catch (e: any) {
     console.error('GET /api/kitchen-production/dashboard failed:', e);
     return Response.json({ error: e?.message || 'Failed to load dashboard' }, { status: 500 });

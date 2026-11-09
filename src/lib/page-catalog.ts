@@ -764,6 +764,16 @@ export const PAGE_CATALOG: PageSection[] = [
       // and expected litres stay admin / manager / HOD server-side whoever opens
       // it. Twin of the Sidebar.tsx row with the same href — change both.
       { path: '/brewery-closing',      label: 'Brewery Closing Stock' },
+      // Owner ruling 122 (2026-11-09): the Production Dashboard for Brewery
+      // batches only. mgmtOnly = admin, manager and HOD, the same people the
+      // server lets see beer quantities (canSeeBeerQuantities in
+      // src/lib/brewery-beer.ts). The flag is REQUIRED, not decoration: a grant
+      // of /brewery-production above also matches this child path, so without
+      // it every brewer ticked for Brewery Production would open it. The API
+      // refuses everyone else itself (403); this line is not the security
+      // boundary. Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/brewery-production/dashboard', label: 'Brewery Production — Dashboard', mgmtOnly: true },
+      // Kitchen batches only since ruling 122 (sidebar: "Kitchen Dashboard").
       { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/butchering',          label: 'Butchering' },
