@@ -96,18 +96,25 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
   attendant/head only, progress + retry upload, head drawer strip; counts toward the photo policy.
 - Reports (reports.ts, /api/valet/reports, /valet/reports page + catalog/sidebar rows): definitions,
   denominators, immediate vs booked kept apart, shift-hours filter, outlet scoping, formula-safe CSV.
+- Paper tickets (17bb4d2, ops-paper.ts): ticket books, validation, guest entry = pending claim/verification
+  only, stub-checked confirmation. A ticket number alone grants nothing.
+- Dining links (894e3ee, ops-dining.ts, tests 361/0): link is to the ORDER (table transfer keeps it; table
+  read live); by-table resolves the ONE open bill — 2+ open bills on a table (real data has one with 4) →
+  refused 'ambiguous_table'; bill with no outlet → refused; merged bill shows "merged — re-link".
+  /cashier gets <ValetOrderChip> (one insertion above the actions row): route /api/valet/dining answers
+  {show:false} (200) to anyone without a valet cap / not assigned / valet off — checked BEFORE the order
+  lookup; request button only for host cap (mirrors pickup.request) and only after "Guest asked" tick.
+  Head drawer: Dining line + Link to table / Re-link / Unlink; board MiniCard shows "Table X · bill #N".
+- Test fix: section K "quiet device" leaked the REAL clock from section H's process race (a5's shift
+  last_seen_at = wall time) → passed only before ~midnight IST or when a5 lost the race. K now sets a5's
+  heartbeat explicitly. Product logic unchanged.
 
 ## 4. Exact next steps
 
-1. Paper tickets: ticket books (head), ticket validation at check-in when paper mode is on, guest
-   bill-folder/table entry (`/valet-pass?e=…&paper=1`) → pending verification ('paper') or a claim on an
-   existing session ('paper_claim') that staff confirm by inspecting the physical stub. Tests.
-2. FNB links: link a car to a table's CURRENT open order (order_id survives table transfer), desk lookup by
-   table, a self-contained Valet chip on /cashier (renders nothing unless valet enabled + host capability;
-   request only after guest confirmation; never automatic). Impact-check /cashier first. Tests.
-3. Browser pass for part 2 (photos upload, simulator link + NOW reply, reports, settings) on the harness
-   (blank the WA creds in that copy first). Gate vs origin/main (fetch first). Owner note.
-4. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
+1. Browser pass for part 2 (photos upload, simulator link + NOW reply, reports, settings, paper desk,
+   desk table lookup, cashier chip — incl. a NON-valet cashier sees no chip + no console error) on a fresh
+   harness copy (blank the WA creds in that copy first). Gate vs origin/main (fetch first). Owner note.
+2. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
    adapter/simulator (devices, authenticated ingestion, dedupe, health). Docs (setup, templates, hardware,
    shift guide, deploy/rollback, env example). Final checklist.
 
