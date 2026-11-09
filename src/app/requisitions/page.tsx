@@ -653,8 +653,8 @@ export default function RequisitionsPage() {
   // "Merge into one PO" (ruling #65: store manager + admin — viewer.can_store is
   // the server's canProcessAsStore, the same gate the merge route enforces).
   const [merging, setMerging] = useState(false);
-  const [viewer, setViewer] = useState<{ email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean }>({
-    email: '', role: '', can_chef: false, can_mgmt: false, can_store: false, can_issue: false,
+  const [viewer, setViewer] = useState<{ email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean; can_cancel: boolean; is_dept_head: boolean }>({
+    email: '', role: '', can_chef: false, can_mgmt: false, can_store: false, can_issue: false, can_cancel: false, is_dept_head: false,
   });
 
   const reload = async () => {
@@ -671,6 +671,7 @@ export default function RequisitionsPage() {
       email: r.viewer_email || '', role: r.viewer_role || '',
       can_chef: !!r.viewer_can_approve_chef, can_mgmt: !!r.viewer_can_approve_mgmt, can_store: !!r.viewer_can_process_store,
       can_issue: !!r.viewer_can_issue_store,
+      can_cancel: !!r.viewer_can_cancel, is_dept_head: !!r.viewer_is_dept_head,
     });
     setLoading(false);
   };
@@ -1193,7 +1194,7 @@ function RoutedLineNote({ it }: { it: ReqItem }) {
 function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; expanded: boolean; onToggle: () => void;
   materials: Material[];
-  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
+  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean; can_cancel: boolean; is_dept_head: boolean };
   requireMgmt: boolean;
   reload: () => void;
   onEdit: (draft: Requisition) => void;
@@ -1275,7 +1276,7 @@ function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt,
 
 function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; materials: Material[];
-  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean };
+  viewer: { email: string; role: string; can_chef: boolean; can_mgmt: boolean; can_store: boolean; can_issue: boolean; can_cancel: boolean; is_dept_head: boolean };
   requireMgmt: boolean;
   reload: () => void;
   onEdit: (draft: Requisition) => void;
@@ -1299,9 +1300,11 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   const isAdmin  = viewer.role === 'admin';
   const canEdit  = (isAuthor || isAdmin) && detail.status === 'draft';
   const canSubmit = (isAuthor || isAdmin) && detail.status === 'draft' && (detail.items?.length || 0) > 0;
-  // Per-requisition: only the head of THIS req's main department (or admin) sees
-  // Approve/Reject. detail.can_approve_chef comes from the API (isMainDeptHead);
-  // fall back to the global hint only if the field is absent (older payload).
+  // Approve/Reject show EXACTLY when chef-approve / chef-reject would accept:
+  // detail.can_approve_chef is the API's canApproveAsChef (admin, Is HOD, or Can
+  // approve requisitions) — being this department's head is NOT part of it (a
+  // head sees the request; approving needs one of those ticks). Falls back to
+  // the list's viewer flag, the same gate, only if the field is absent.
   const canChefAct = ((detail as any).can_approve_chef ?? viewer.can_chef) && detail.status === 'submitted';
   // Only show Mgmt Approve when the global gate is ON. When OFF, chef approval
   // is the final gate — the requisition is already in the store inbox and
@@ -1312,7 +1315,10 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   // Cancel: HOD/admin may cancel any live requisition. The department drafter may
   // cancel ONLY while it is still a DRAFT — once it is submitted (Chef Inbox) or
   // being issued (Partially Issued), only HOD/admin can cancel it.
-  const isHodOrAdmin = isAdmin || viewer.can_chef;
+  // viewer.can_cancel is cancel/route.ts's own isHodOrAdmin (admin or Is HOD) —
+  // NOT can_chef, which also covers "Can approve requisitions" holders, whom the
+  // cancel route refuses.
+  const isHodOrAdmin = isAdmin || viewer.can_cancel;
   const canCancel = !['fulfilled', 'cancelled', 'chef_rejected'].includes(detail.status)
     && (isHodOrAdmin || (isAuthor && detail.status === 'draft'));
   // Phase 1 §2: dept staff confirms goods physically arrived. One-shot — only on fulfilled, not yet acked.
@@ -1321,8 +1327,11 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
   // Plain department staff (NOT admin / manager / HOD / store) get a stripped-down,
   // mobile-friendly item view: Item / Qty / Unit per line + one overall total.
   // HOD, admin, store and manager keep the full table (the else branch below).
+  // So does a department head (Departments → Department head): they had it
+  // while the head rode on can_chef, and taking can_chef back must not take it.
   const isPlainDept = viewer.role !== 'admin' && viewer.role !== 'manager'
-    && !viewer.can_chef && !viewer.can_mgmt && !viewer.can_store && !viewer.can_issue;
+    && !viewer.can_chef && !viewer.can_mgmt && !viewer.can_store && !viewer.can_issue
+    && !viewer.is_dept_head;
   // Has the store actually handed anything over? This MUST stay the same
   // predicate the full item table uses to reveal its Issued / To Purchase
   // columns (both call sites below read this const) — the department view and
@@ -1689,6 +1698,13 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
         {canStoreAct && <button onClick={() => setShowProcess(true)} className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded inline-flex items-center gap-1"><Package className="w-3 h-3" /> Issue to Department</button>}
         {canAck     && <button disabled={busy} onClick={ack} className="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Confirm Received at Dept</button>}
         {canCancel  && <button disabled={busy} onClick={cancel}     className="px-3 py-1.5 text-xs text-red-600 hover:underline">Cancel</button>}
+        {/* A department head without an approve tick sees the request but no
+            buttons — say who can approve instead of leaving them guessing. */}
+        {detail.status === 'submitted' && !canChefAct && viewer.is_dept_head && (
+          <span className="self-center text-[11px] text-[#6B5744] inline-flex items-center gap-1">
+            <Eye className="w-3 h-3" /> You can see this request. Approving needs “Is HOD” or “Can approve requisitions”.
+          </span>
+        )}
       </div>
       </div>
 

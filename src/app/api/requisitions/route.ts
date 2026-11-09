@@ -362,11 +362,12 @@ export async function GET(request: Request) {
         it.routed_department_name = rs ? rs.department.name : null;
         if (rs && !rs.complete && !rs.closed) routedLinesOwing++;
       }
-      // Approve permission for the detail view: any HOD (is_head_chef) or admin —
-      // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
-      // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw
-      // view-only even though the API would let them act.)
-      const can_approve_chef = visMe ? (canApproveAsChef(visMe) || isMainDeptHead(db, visMe, r.department_id)) : false;
+      // Approve permission for the detail view: EXACTLY the chef-approve /
+      // chef-reject gate (canApproveAsChef — admin, Is HOD, or Can approve
+      // requisitions). NOT this req's main-dept head: departments.head_user_id
+      // gives visibility only (owner's July ruling, b8ba6b7), and OR-ing it in
+      // here showed a head without Is HOD the buttons the API then refused (403).
+      const can_approve_chef = visMe ? canApproveAsChef(visMe) : false;
       // routed_lines_owing: ROUTED lines (above) still owed by THE RULE — the
       // sending department's work on this requisition, not the store's.
       return Response.json({ requisition: { ...r, items, can_approve_chef, routed_lines_owing: routedLinesOwing } });
@@ -513,12 +514,13 @@ export async function GET(request: Request) {
     }
 
     const me = await getCurrentUser();
-    // Per-requisition approve permission: only the head of THAT requisition's
-    // main department (or admin) may approve it. The global flag is just a hint
-    // for the UI (is this user a head anywhere?) — the per-row flag is authoritative.
+    // Per-requisition approve permission — the same gate as chef-approve /
+    // chef-reject (canApproveAsChef). Being the main-dept head of the row's
+    // department is deliberately NOT added: it decides who SEES the row, never
+    // who may approve it (owner's July ruling, b8ba6b7).
     const rowsWithPerm = (rows as any[]).map((r) => ({
       ...r,
-      can_approve_chef: me ? (canApproveAsChef(me) || isMainDeptHead(db, me, r.department_id)) : false,
+      can_approve_chef: me ? canApproveAsChef(me) : false,
     }));
 
     /* ── Event-wise roll-up — Admin + HOD only, refused HERE ────────────────
@@ -605,7 +607,17 @@ export async function GET(request: Request) {
       requisitions: rowsWithPerm,
       viewer_role: me?.role || 'guest',
       viewer_email: me?.email || '',
-      viewer_can_approve_chef: me ? (canApproveAsChef(me) || isAnyMainDeptHead(db, me)) : false,
+      // = chef-approve / chef-reject's gate. Drives the HOD Approve / Reject
+      // buttons and the "… waiting for your chef approval." banner on the page.
+      viewer_can_approve_chef: me ? canApproveAsChef(me) : false,
+      // = cancel/route.ts's isHodOrAdmin: may cancel ANY live requisition. (The
+      // drafter's own-draft cancel is per requisition — the page checks it.)
+      // Not canApproveAsChef: "Can approve requisitions" alone does not cancel.
+      viewer_can_cancel: me ? (me.role === 'admin' || !!me.is_head_chef) : false,
+      // Heads a main department (departments.head_user_id) — VISIBILITY only.
+      // The page keeps a head's full item table and tells a head who cannot
+      // approve who can; it grants no button.
+      viewer_is_dept_head: me ? isAnyMainDeptHead(db, me) : false,
       viewer_can_approve_mgmt: me ? canApproveAsMgmt(me) : false,
       viewer_can_process_store: me ? canProcessAsStore(me) : false,
       // STRICT issue permission — store person only, no admin bypass. Drives the

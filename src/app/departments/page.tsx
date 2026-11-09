@@ -592,23 +592,29 @@ export default function DepartmentsPage() {
               {/* Department head — MAIN depts only. Subs show read-only inheritance. */}
               {!editing.parent_id ? (
                 <label className="text-xs text-[#6B5744] flex flex-col gap-1">
-                  Department head (approves all requisitions under this department)
+                  Department head (sees every request in this department and its sections)
                   <select value={editing.head_user_id || ''}
                           onChange={e => setEditing(p => p ? { ...p, head_user_id: e.target.value || null } : p)}
                           className="px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm">
                     <option value="">(no head set)</option>
                     {users.map(u => <option key={u.id} value={u.id}>{u.name || u.email}</option>)}
                   </select>
+                  {/* TRUE to the server (owner's July ruling, b8ba6b7): head_user_id
+                      is visibility (requisitionVisibility) + the head's own item
+                      list (effectiveCategoriesForUser → userMainDept), never the
+                      approve gate — that is canApproveAsChef. */}
                   <span className="text-[10px] text-[#8B7355]">
-                    The sole approver for requisitions in this department and all its sub-departments.
+                    Approving needs “Is HOD” or “Can approve requisitions” on their role or user.
+                    When raising requisitions, the head’s own item list follows this department’s Material Categories (unless they are an admin or store manager).
                   </span>
                 </label>
               ) : (
                 <div className="text-xs text-[#6B5744] flex flex-col gap-1">
                   Department head
                   <div className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-[11px] text-[#6B5744]">
-                    Approvals handled by <span className="font-medium text-[#2D1B0E]">{editingParent?.name || 'the main department'}</span>&rsquo;s head
-                    {' '}(<span className="font-medium">{editingParent?.head_user_name || 'not set'}</span>).
+                    Uses <span className="font-medium text-[#2D1B0E]">{editingParent?.name || 'the main department'}</span>&rsquo;s head
+                    {' '}(<span className="font-medium">{editingParent?.head_user_name || 'not set'}</span>): they see every request here.
+                    {' '}Approving needs “Is HOD” or “Can approve requisitions”.
                   </div>
                 </div>
               )}
@@ -621,7 +627,35 @@ export default function DepartmentsPage() {
                   <option value="">(none)</option>
                   {users.map(u => <option key={u.id} value={u.id}>{u.name || u.email}</option>)}
                 </select>
-                <span className="text-[10px] text-[#8B7355]">Mark approvers via Users page (`is_head_chef` flag).</span>
+                {/* head_chef_user_id is read by: wa-report-recipients.ts
+                    (hodsOfDepartment: this row's OWN head_user_id + this field;
+                    only when BOTH are empty does it fall back to the active
+                    manager/admin-tier or users.is_head_chef members whose
+                    department_id is exactly this row); po-deviation-alert.ts
+                    (headsOf, main departments only); and, via /api/departments
+                    head_chef_email, tasks/checklists + tasks/hygiene, which
+                    pre-fill a failed item's task assignee with the row's OWN
+                    head_user_email, else this field. A sub-department's own
+                    head_user_id is always null (save() sends null for subs), so
+                    on a sub this field is used and the main's head never is.
+                    No approve gate and no requisitionVisibility reads it. */}
+                <span className="text-[10px] text-[#8B7355]">
+                  Gives no approval and no view of requests.
+                  {!editing.parent_id ? (
+                    <>
+                      {' '}WhatsApp reports sent to “HOD — {editing.name || 'this department'}” go to this person and the Department head above. If both are blank, they go to the managers, admins and HODs whose own department is {editing.name || 'this one'}.
+                      {' '}This person also gets the alert when a delivery of this department’s items does not match its PO.
+                      {' '}When an item for this department fails on Daily Checklists or Hygiene Audits, the follow-up task is filled in for the Department head above, or for this person if no head is set (it can be changed).
+                    </>
+                  ) : (
+                    <>
+                      {' '}WhatsApp reports sent to “HOD — {editing.name || 'this department'}” go to this person. If it is blank, they go to the managers, admins and HODs whose own department is {editing.name || 'this one'}.
+                      {' '}When an item for this department fails on Daily Checklists or Hygiene Audits, this person is filled in to get the follow-up task (it can be changed).
+                      {' '}{editingParent?.name || 'The main department'}’s head is not used for either.
+                    </>
+                  )}
+                  {' '}To let someone approve, tick “Is HOD” or “Can approve requisitions” in Settings → Roles or on the user in Settings → Users.
+                </span>
               </label>
               <label className="text-xs text-[#6B5744] flex flex-col gap-1">
                 Submission Windows
@@ -667,7 +701,7 @@ export default function DepartmentsPage() {
                   <span className="text-[10px] text-[#8B7355]">
                     {editingCats.size === 0
                       ? 'No filter set — this department (and its sub-departments) sees all materials.'
-                      : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this department and its sub-departments only see these in inventory pickers. Admins / HOD / store manager always see all.`}
+                      : `${editingCats.size} categor${editingCats.size === 1 ? 'y' : 'ies'} selected. Staff in this department and its sub-departments, HODs included, see only these when raising requisitions and in item lists such as Raw Materials, Recipes and Wastage. Store screens (Purchases, GRN, Purchase Orders, Transfers), Butchering and Closing Stock can still list every item. Only admins and store managers are never filtered.`}
                   </span>
                 </div>
               ) : (
