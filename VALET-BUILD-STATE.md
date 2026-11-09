@@ -108,16 +108,28 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
 - Test fix: section K "quiet device" leaked the REAL clock from section H's process race (a5's shift
   last_seen_at = wall time) → passed only before ~midnight IST or when a5 lost the race. K now sets a5's
   heartbeat explicitly. Product logic unchanged.
+- PART 2 BROWSER PASS DONE (2026-11-10 03:25–04:55, harness copy, WA creds blanked, simulator only):
+  ordinary cashier sees NO chip + quiet 200; desk links by tag → request only after "Guest asked" tick →
+  head board shows "Table 3 · bill #…" live; re-link to a 4-open-bill table refused in plain words; unlink;
+  desk search by table; photo upload (2400px → 33 KB stored, note + who), fake JPEG → 415, signed-out → 401;
+  guest QR check-in → pairing → WhatsApp code → simulator "VALET <code>" linked → "NOW" → pickup queued
+  (source guest/WhatsApp) → ready → "ready" message SIMULATED, guest pass flips to ready + handover code;
+  reports + CSV; settings (templates, paper, books); paper: ticket-only check-in, unknown ticket refused,
+  table claim needs stub tick, verification path; head "Needs attention" escalations with Seen.
+  Fixes from the pass (all committed, tests 365/0): desk card shows the linked table; chip spacing; guest
+  later-times only bookable ones (none after closing, not the closing minute — 2 tests); pairing code
+  submits on Enter/Go; attendant check-in PAPER TICKET field (was missing!); verification shows the ticket;
+  pass says TICKET; ticket-book form clears; demo seed adds a no-valet cashier.
+- Browser-harness lessons: cookies are per HOST not port — other sessions' servers on localhost:38xx share
+  `fnb_session` → use own hosts (valet-att/valet-admin/valet-desk/guest/guest2 .localhost). Turbopack in
+  the harness MISSES rsync'd server-lib changes → restart the server after syncing src/lib. Demo admin
+  user added to the harness copy only (token in session scratchpad, never in chat).
 
 ## 4. Exact next steps
 
-1. Browser pass for part 2 (photos upload, simulator link + NOW reply, reports, settings, paper desk,
-   desk table lookup, cashier chip — incl. a NON-valet cashier sees no chip + no console error) on a fresh
-   harness copy (blank the WA creds in that copy first). Gate vs origin/main (fetch first). Owner note.
-   HARNESS READY (2026-11-10 ~03:30): browser-214625/app re-synced (rsync -rlpD src/scripts/docs), old DB
-   moved to harness/valet/old-browser-db-<time>/, fresh snapshot copied, WA token/Interakt key/verify token
-   BLANKED + wa_notifications_enabled=0 in that copy, demo seed run (5 staff incl. `cashier` = no valet cap,
-   not assigned). Server not started yet: launch entry "valet-browser" (:3900). Owner approved this step.
+1. Gate vs origin/main (git fetch first; merge origin/main into this branch if it moved; harness/valet/gate.sh;
+   one `next build` at a time — check no other build running; load was ~14–27 from other sessions).
+   Then the owner's part-2 progress note (plain words).
 2. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
    adapter/simulator (devices, authenticated ingestion, dedupe, health). Docs (setup, templates, hardware,
    shift guide, deploy/rollback, env example). Final checklist.
@@ -127,6 +139,9 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
 - App-wide sidebar highlights parent + child links at once (isActive = startsWith), e.g. /feedback vs
   /feedback/take, /boh vs /boh/dashboard, /valet vs /valet/settings.
 - The floating captain-alerts bell shows for every signed-in user (existing behaviour, already noted in memory).
+- /cashier lists a table once PER open order: the measured data has table "1" with 4 open (empty, test-
+  looking) orders → React "two children with the same key" console error + 4 tiles for one table. Existing
+  cashier behaviour + data; valet only refuses to guess on such a table.
 
 ## 5. Decisions and assumptions
 
