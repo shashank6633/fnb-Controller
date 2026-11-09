@@ -38,20 +38,32 @@ plain-language checklists, never "Done".
 
 ## 2. Done and verified
 
-- (nothing verified yet)
+- **Engine + access + APIs (increment 1 backend)** — commits dcbb6ca, 0b2687c, + test commit.
+  Proof: `npx tsc --noEmit` clean; `npx tsx scripts/valet-tests.ts <harness copy>` → **229 passed, 0 failed**
+  (sections A–P: schema/constraints, access incl. proxy + catalog + command table, check-in, parking,
+  pickups/idempotency/scheduling, FIFO fairness, take-next, **5-process simultaneous claim race → exactly
+  2 of 5 got cars, no double claim**, gate/dwell/holding/no-show, change requests, reassignment handoff,
+  verified handover + replay + lockout + recovery, guest layer/CSRF/enumeration/tag reuse, midnight
+  business date, shift custody, void/desk masking/ETA honesty/cross-outlet).
+- Files: `src/lib/valet/*` (schema, states, config, caps, credentials, core, bus, queue, ops-arrival,
+  ops-pickup, ops-admin, commands, board, guest, guest-page, i18n, http), routes `src/app/valet-pass`,
+  `src/app/api/valet/{command,board,attendant,desk,session,context,settings,stream}`,
+  `src/app/api/valet-guest/{state,entry,act}`. Shared files touched: db.ts (1 import + 1 call), auth.ts,
+  page-catalog.ts, proxy.ts, Sidebar.tsx, api/auth/roles/route.ts, settings/roles/page.tsx.
 
 ## 3. In progress
 
-- Increment 1: inspection done; spec + design saved. Next: schema module.
+- Increment 1 SCREENS: `/valet` (Head Dashboard), `/valet/attendant`, `/valet/desk`, `/valet/settings`.
 
 ## 4. Exact next steps
 
-1. `src/lib/valet/schema.ts` (per-statement DDL, FSSAI style) + one call from `initializeSchema` in `src/lib/db.ts`.
-2. Roles columns `valet_head/valet_attendant/valet_host` (ALTER in the valet schema) → `getCurrentUser` (separate fail-closed query) → `page-catalog.ts` `valetCap` flag in canAccessPage + canAccessPageStrict + firstAllowedPath → proxy (public exact guest paths, `/api/valet/` CSRF prefix, fail-closed cap query) → Sidebar → roles API + roles page toggles.
-3. Core libs: `src/lib/valet/{states,config,access,queue,credentials,ops,bus,i18n}.ts`.
-4. APIs `/api/valet/*` (staff) + `/api/valet-guest/*` (guest, exact static paths).
-5. Pages `/valet`, `/valet/attendant`, `/valet/desk`, `/valet/settings`; guest `/valet-pass`, `/valet-checkin` (route handlers serving HTML).
-6. `scripts/valet-tests.ts` (harness-copy pattern of brewery-dept-tests.ts).
+1. Shared client kit `src/app/valet/ui.tsx` (outlet picker, live hook = SSE + polling + stale banner, status chip).
+2. `/valet/settings` (enable outlet, zones, tags, staff, entry QR) — needed to set up a test outlet.
+3. `/valet/attendant` (mobile-first: shift, new check-in incl. pairing code, my task, take next, park, ready, gate/holding, handover, claim receipt print, pass QR).
+4. `/valet/desk` (lookup + request pickup with guest confirmation).
+5. `/valet` Head Dashboard (counts, metrics, lanes board/list, exceptions, team, card drawer actions).
+6. Regression gate (copy of brewery gate.sh → harness/valet/gate.sh) vs origin/main baseline; next build.
+7. Browser scenarios on port 39xx with seeded fictional data; two simultaneous staff clients.
 
 ## 5. Decisions and assumptions
 
