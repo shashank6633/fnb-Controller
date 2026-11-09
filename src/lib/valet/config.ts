@@ -30,11 +30,23 @@ export interface ValetConfig {
   retention_months: number;
   closing_rush: { enabled: boolean; lead_minutes: number; batch_size: number };
   paper: { enabled: boolean };
-  notifications: { whatsapp: boolean };
+  notifications: {
+    /** Send real WhatsApp messages (only when the app's WhatsApp is configured). OFF = simulator. */
+    whatsapp: boolean;
+    /** The venue's WhatsApp number guests message to link their pass (E.164, no secrets). */
+    whatsapp_number: string;
+    /** Approved template NAME + language per message kind ('' = not set up → simulator). */
+    templates: Record<NotifyKind, { name: string; lang: string }>;
+  };
   hardware: { nfc: boolean; rfid: boolean };
 }
 
 export const DWELL_CHOICES = [2, 3, 5, 10] as const;
+
+/** Guest message kinds. Each maps to an approved template the owner names in
+ *  Valet Settings; positional parameters are documented in docs/valet/NOTIFICATIONS.md. */
+export const NOTIFY_KINDS = ['linked', 'ready', 'holding', 'eta_changed', 'closing_prompt'] as const;
+export type NotifyKind = typeof NOTIFY_KINDS[number];
 
 export const DEFAULT_CONFIG: ValetConfig = {
   venue_name: '',
@@ -55,7 +67,7 @@ export const DEFAULT_CONFIG: ValetConfig = {
   retention_months: 12,
   closing_rush: { enabled: false, lead_minutes: 40, batch_size: 5 },
   paper: { enabled: false },
-  notifications: { whatsapp: false },
+  notifications: { whatsapp: false, whatsapp_number: '', templates: { linked: { name: '', lang: 'en' }, ready: { name: '', lang: 'en' }, holding: { name: '', lang: 'en' }, eta_changed: { name: '', lang: 'en' }, closing_prompt: { name: '', lang: 'en' } } },
   hardware: { nfc: false, rfid: false },
 };
 
@@ -119,7 +131,14 @@ export function parseConfig(raw: unknown): ValetConfig {
       batch_size: int(c.batch_size, D.closing_rush.batch_size, 1, 50),
     },
     paper: { enabled: bool(o.paper?.enabled, D.paper.enabled) },
-    notifications: { whatsapp: bool(o.notifications?.whatsapp, D.notifications.whatsapp) },
+    notifications: {
+      whatsapp: bool(o.notifications?.whatsapp, D.notifications.whatsapp),
+      whatsapp_number: str(o.notifications?.whatsapp_number, '', 20).replace(/[^\d+]/g, ''),
+      templates: Object.fromEntries(NOTIFY_KINDS.map(k => {
+        const t = o.notifications?.templates?.[k] || {};
+        return [k, { name: str(t.name, '', 120).replace(/[^a-z0-9_]/gi, '').toLowerCase(), lang: str(t.lang, 'en', 10).replace(/[^a-zA-Z_]/g, '') || 'en' }];
+      })) as Record<NotifyKind, { name: string; lang: string }>,
+    },
     hardware: { nfc: bool(o.hardware?.nfc, D.hardware.nfc), rfid: bool(o.hardware?.rfid, D.hardware.rfid) },
   };
 }

@@ -362,9 +362,114 @@ const TABLES: string[] = [
     acknowledged_name TEXT NOT NULL DEFAULT '',
     acknowledged_at TEXT
   )`,
+  // ── increment 2 ──────────────────────────────────────────────────────────
+  // Notification OUTBOX: one row per message we intend to send. status is a
+  // ladder that only a provider can climb past 'sent': queued → sending → sent
+  // → delivered → read, or failed / cancelled / simulated. Holds NO phone
+  // number — identity_id points at the verified identity.
+  `CREATE TABLE IF NOT EXISTS valet_notifications (
+    id                  TEXT PRIMARY KEY,
+    outlet_id           TEXT NOT NULL,
+    session_id          TEXT,
+    pickup_id           TEXT,
+    identity_id         TEXT,
+    channel             TEXT NOT NULL DEFAULT 'whatsapp',
+    kind                TEXT NOT NULL,
+    dedupe_key          TEXT NOT NULL,
+    params_json         TEXT NOT NULL DEFAULT '[]',
+    template_name       TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'queued',
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TEXT,
+    lease_until         TEXT,
+    last_error          TEXT NOT NULL DEFAULT '',
+    provider_message_id TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    sent_at             TEXT,
+    delivered_at        TEXT,
+    read_at             TEXT,
+    failed_at           TEXT
+  )`,
+  // A VERIFIED messaging identity linked to a pass. "Verified" means the
+  // provider told us a message came FROM this number carrying the pass's link
+  // code — a number typed into a form is never verified (spec §8).
+  `CREATE TABLE IF NOT EXISTS valet_msg_identities (
+    id              TEXT PRIMARY KEY,
+    outlet_id       TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    channel         TEXT NOT NULL DEFAULT 'whatsapp',
+    link_code       TEXT NOT NULL,
+    link_expires_at TEXT NOT NULL,
+    phone           TEXT NOT NULL DEFAULT '',
+    verified_at     TEXT,
+    verified_how    TEXT NOT NULL DEFAULT '',
+    consent_at      TEXT,
+    opted_out_at    TEXT,
+    last_inbound_at TEXT,
+    simulated       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+  )`,
+  // Provider events already applied (delivery statuses, inbound message ids):
+  // the dedupe + replay guard. A repeated or replayed event is a no-op.
+  `CREATE TABLE IF NOT EXISTS valet_provider_events (
+    event_key   TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL
+  )`,
+  // Condition photos — PRIVATE BLOBs, served only through an authorised route.
+  `CREATE TABLE IF NOT EXISTS valet_media (
+    id            TEXT PRIMARY KEY,
+    outlet_id     TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    position      TEXT NOT NULL DEFAULT 'other',
+    annotation    TEXT NOT NULL DEFAULT '',
+    mime          TEXT NOT NULL,
+    size_bytes    INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,
+    data          BLOB,
+    captured_by   TEXT NOT NULL DEFAULT '',
+    captured_by_name TEXT NOT NULL DEFAULT '',
+    captured_at   TEXT NOT NULL,
+    deleted_at    TEXT,
+    deleted_reason TEXT NOT NULL DEFAULT ''
+  )`,
+  // Paper mode: ticket books issued to the desk, and each ticket's use.
+  `CREATE TABLE IF NOT EXISTS valet_ticket_books (
+    id          TEXT PRIMARY KEY,
+    outlet_id   TEXT NOT NULL,
+    prefix      TEXT NOT NULL DEFAULT '',
+    first_no    INTEGER NOT NULL,
+    last_no     INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active',
+    issued_at   TEXT NOT NULL,
+    issued_by   TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT ''
+  )`,
+  // Retention sweeps — one row per run, so "did the cleanup run, and what did it
+  // touch" is answerable without reading logs.
+  `CREATE TABLE IF NOT EXISTS valet_retention_runs (
+    id            TEXT PRIMARY KEY,
+    outlet_id     TEXT NOT NULL,
+    run_date      TEXT NOT NULL,
+    cutoff        TEXT NOT NULL,
+    sessions_redacted INTEGER NOT NULL DEFAULT 0,
+    photos_removed    INTEGER NOT NULL DEFAULT 0,
+    held_skipped      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL
+  )`,
 ];
 
 const INDEXES: string[] = [
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_notif_dedupe ON valet_notifications(dedupe_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_notif_due ON valet_notifications(status, next_attempt_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_notif_session ON valet_notifications(session_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_notif_provider ON valet_notifications(provider_message_id) WHERE provider_message_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_link_code ON valet_msg_identities(outlet_id, link_code) WHERE verified_at IS NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_ident_session ON valet_msg_identities(session_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_ident_phone ON valet_msg_identities(phone) WHERE phone <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_media_session ON valet_media(session_id, deleted_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_ticket_books ON valet_ticket_books(outlet_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_retention_day ON valet_retention_runs(outlet_id, run_date)`,
   `CREATE INDEX IF NOT EXISTS idx_valet_zones_outlet ON valet_zones(outlet_id, kind, is_active)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_tags_code ON valet_tags(outlet_id, code_norm)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_tags_nfc ON valet_tags(nfc_ref) WHERE nfc_ref IS NOT NULL`,

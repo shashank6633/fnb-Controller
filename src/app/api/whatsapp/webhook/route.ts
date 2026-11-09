@@ -92,6 +92,7 @@ export async function GET(request: Request) {
 
 /** Warn once per process, not once per event — Meta sends a lot of them. */
 let unsignedWarned = false;
+let valetUnsignedWarned = false;
 
 export async function POST(request: Request) {
   let eventId = 0;
@@ -214,6 +215,27 @@ export async function POST(request: Request) {
       }
     } catch (e: any) {
       console.error('[/api/whatsapp/webhook POST] template status update failed (raw payload archived):', e);
+    }
+  }
+
+  // VALET PARKING — delivery statuses of valet messages and guest replies
+  // ("VALET <code>" to link a pass, NOW, STOP). Its OWN try, after everything
+  // above, so it can never disturb the inbox ingest or the archive. It acts
+  // ONLY when the signature was checked AND enforced: a guest's car must never
+  // be requested, and no delivery may be recorded, on a POST this app cannot
+  // prove came from Meta (spec §8). With no app secret configured it does
+  // nothing and says so once. Dedupes every event id inside (replay-safe).
+  if (payload) {
+    try {
+      if (auth.enforced) {
+        const { ingestWhatsApp } = await import('@/lib/valet/notify');
+        ingestWhatsApp(getDb(), payload);
+      } else if (!valetUnsignedWarned) {
+        valetUnsignedWarned = true;
+        console.warn('[/api/whatsapp/webhook POST] valet: WhatsApp events IGNORED — no app secret is configured, so they cannot be proven to be Meta\'s. Add it at Settings → Integrations → WhatsApp.');
+      }
+    } catch (e: any) {
+      console.error('[/api/whatsapp/webhook POST] valet ingest failed (raw payload archived):', e);
     }
   }
   return Response.json({ received: true });

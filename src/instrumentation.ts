@@ -58,6 +58,16 @@ export async function register(): Promise<void> {
   } catch {
     // Instrumentation must never throw — swallow.
   }
+  // VALET PARKING worker — its own 20 s tick (escalations, guest messages,
+  // closing rush, retention). Same production / ENABLE_SCHEDULER switch, its own
+  // try so neither can stop the other. src/lib/valet/worker.ts.
+  try {
+    if (process.env.NEXT_RUNTIME !== 'nodejs') return;
+    const { startValetWorkerOnce } = await import('./lib/valet/worker');
+    startValetWorkerOnce();
+  } catch {
+    // Instrumentation must never throw — swallow.
+  }
 }
 
 export async function onRequestError(
