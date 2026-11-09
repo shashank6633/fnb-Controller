@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { KeyRound, Car, ScanLine, AlertTriangle, LogIn, LogOut, Coffee, Printer, QrCode, Timer, Hand } from 'lucide-react';
 import BatchTagScanner from '@/components/BatchTagScanner';
-import { HandoverModal, IssuedModal } from '../modals';
+import { HandoverModal, IssuedModal, PhotoModal } from '../modals';
 import { ATT, STAFF_STATE_LABEL, type Lang } from '@/lib/valet/i18n';
 import { normTagCode } from '@/lib/valet/config';
 import {
@@ -173,6 +173,7 @@ export default function AttendantPage() {
                         <Btn kind="ghost" onClick={() => void cmd.run('park.start', { session_id: c.id, version: c.version })} disabled={c.state !== 'CHECKED_IN'}>{L('start_parking')}</Btn>
                         <Btn kind="ghost" onClick={() => setModal({ kind: 'pass', card: c })}><QrCode size={15} className="inline mr-1" aria-hidden />{L('show_pass')}</Btn>
                         <Btn kind="ghost" onClick={() => setModal({ kind: 'claim', card: c })}><Printer size={15} className="inline mr-1" aria-hidden />{L('print_claim')}</Btn>
+                        <Btn kind="ghost" className="col-span-2" onClick={() => setModal({ kind: 'photos', card: c })}>{L('photos')}</Btn>
                       </div>
                     </TaskCard>
                   ))}
@@ -208,6 +209,7 @@ export default function AttendantPage() {
       {modal?.kind === 'hold' && modal.card && v ? <ParkModal v={v} card={modal.card} outletId={outletId} mode="hold" onClose={close} onDone={() => { close(); live.reload(); }} /> : null}
       {modal?.kind === 'ready' && modal.card && v ? <ReadyModal v={v} card={modal.card} outletId={outletId} onClose={close} onDone={() => { close(); live.reload(); }} /> : null}
       {modal?.kind === 'handover' && modal.card ? <HandoverModal card={modal.card} outletId={outletId} isHead={!!ctx?.user.head} onClose={close} onDone={() => { close(); live.reload(); }} /> : null}
+      {modal?.kind === 'photos' && modal.card ? <PhotoModal outletId={outletId} sessionId={modal.card.id} tag={modal.card.tag_code} onClose={close} /> : null}
       {modal?.kind === 'problem' && v ? <ProblemModal v={v} outletId={outletId} onClose={close} /> : null}
       {modal?.kind === 'scan' ? (
         // The scanner calls onClose after a successful read too — close only the
@@ -226,6 +228,7 @@ export default function AttendantPage() {
           <div className="grid grid-cols-2 gap-2 mt-2">
             <Btn kind="ghost" onClick={() => setModal({ kind: 'pass', card: modal.card })}>{L('show_pass')}</Btn>
             <Btn kind="ghost" onClick={() => setModal({ kind: 'claim', card: modal.card })}>{L('print_claim')}</Btn>
+            <Btn kind="ghost" className="col-span-2" onClick={() => setModal({ kind: 'photos', card: modal.card })}>{L('photos')}</Btn>
           </div>
         </Modal>
       ) : null}

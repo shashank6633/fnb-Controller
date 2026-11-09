@@ -907,6 +907,47 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     eq(ids.map(id => core.activePickup(db, id)).filter(Boolean).length, 0, 'a prompt never creates a pickup by itself');
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  S('U photos');
+  {
+    const md = require(path.join(WT, 'src/lib/valet/media.ts'));
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200, 7)]);
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(50, 1)]);
+    const html = Buffer.from('<html><script>alert(1)</script></html>');
+    const sid = checkin('a1', 'U1', at(1100));
+    eq(md.sniffImage(jpeg), 'image/jpeg', 'JPEG recognised by its bytes');
+    eq(md.sniffImage(png), 'image/png', 'PNG recognised');
+    eq(caught(() => md.storePhoto(db, ov(), A('a1'), { session_id: sid, data: html }, at(1100)))?.code, 'not_image', 'HTML disguised as a photo refused');
+    eq(caught(() => md.storePhoto(db, ov(), A('a1'), { session_id: sid, data: Buffer.alloc(md.PHOTO_MAX_BYTES + 1, 0xff) }, at(1100)))?.code, 'too_large', 'over 2 MB refused');
+    // Photo policy: with min 1 photo, one photo satisfies it (no exception needed).
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, photos: { min: 1, max: 6, allow_exception: true } } }, at(1100));
+    eq(caught(() => park('a1', sid, at(1100)))?.code, 'photo_exception_required', 'no photo yet → exception required');
+    const r1 = md.storePhoto(db, ov(), A('a1'), { session_id: sid, position: 'damage', annotation: 'dent rear left', data: jpeg }, at(1101));
+    eq(r1.count, 1, 'first photo stored');
+    park('a1', sid, at(1102));
+    eq(sess(sid).state, 'PARKED', 'policy met by the photo — parked without an exception');
+    run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, photos: { min: 0, max: 6, allow_exception: true } } }, at(1102));
+    for (let i = 0; i < 5; i++) md.storePhoto(db, ov(), A('a1'), { session_id: sid, data: png }, at(1103));
+    eq(caught(() => md.storePhoto(db, ov(), A('a1'), { session_id: sid, data: jpeg }, at(1104)))?.code, 'limit', 'a 7th photo refused');
+    const row = db.prepare(`SELECT captured_by, position, annotation FROM valet_media WHERE id = ?`).get(r1.media_id) as any;
+    eq([row.captured_by, row.position, row.annotation], [users.a1.id, 'damage', 'dent rear left'], 'who + position + note recorded');
+    eq(md.readPhoto(db, OB, r1.media_id), null, 'another outlet cannot read it');
+    // The route: attendant gets the bytes with no-store; the desk (host) cannot.
+    const mr = require(path.join(WT, 'src/app/api/valet/media/route.ts'));
+    (globalThis as any).__TOKEN = users.a1.token;
+    const ok1 = await mr.GET(new Request(`http://localhost/api/valet/media?outlet=${OA}&id=${r1.media_id}`));
+    ok(ok1.status === 200 && ok1.headers.get('content-type') === 'image/jpeg' && /no-store/.test(ok1.headers.get('cache-control') || ''), 'attendant reads the photo privately (no-store)');
+    (globalThis as any).__TOKEN = users.host.token;
+    const no = await mr.GET(new Request(`http://localhost/api/valet/media?outlet=${OA}&id=${r1.media_id}`));
+    eq(no.status, 403, 'desk/host cannot open photos');
+    (globalThis as any).__TOKEN = undefined;
+    const anon = await mr.GET(new Request(`http://localhost/api/valet/media?outlet=${OA}&id=${r1.media_id}`));
+    eq(anon.status, 401, 'signed-out request refused');
+    const sid2 = checkin('a1', 'U2', at(1105));
+    pk.voidSession(db, ov(), A('head'), sid2, sess(sid2).version, 'test record for photos', true, at(1105));
+    eq(caught(() => md.storePhoto(db, ov(), A('a1'), { session_id: sid2, data: jpeg }, at(1106)))?.code, 'closed', 'no photos on a closed car');
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

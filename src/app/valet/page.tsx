@@ -14,7 +14,7 @@ import {
   PageHead, OutletPicker, Gate, Panel, Btn, inputCls, ErrorNote, InfoNote, Modal, LiveBadge, StateChip,
   useValetContext, useLive, useCmd, useNow, useAsk, countdown, ago, hhmm,
 } from './ui';
-import { HandoverModal, IssuedModal } from './modals';
+import { HandoverModal, IssuedModal, PhotoStrip } from './modals';
 
 interface Eta { low_min: number | null; high_min: number | null; basis: string; position: number | null; ahead: number | null; note: string }
 interface Card {
@@ -461,6 +461,7 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
               <Btn kind="danger" onClick={async () => { const why = await ask('Void this record — why? (test entry / duplicate). History is kept.'); if (why === null) return; void cmd.run('session.void', { session_id: c.id, version: c.version, reason: why, is_test: /test/i.test(why) }).then(() => onClose()); }}>Void record</Btn>
             </> : null}
           </div>
+          <div><div className="text-xs font-bold text-[#6B5744] mb-1">Condition photos</div><PhotoStrip outletId={outletId} sessionId={c.id} /></div>
           {d ? (
             <details className="rounded-lg border border-[#E8D5C4] p-2" open>
               <summary className="cursor-pointer text-sm font-bold">Timeline ({d.events.length}) · custody ({d.custody.length}) · attempts ({d.pickups.length})</summary>

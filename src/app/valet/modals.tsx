@@ -133,3 +133,110 @@ export function HandoverModal({ card, outletId, isHead, onClose, onDone }: { car
   );
 }
 
+
+// ── Condition photos ───────────────────────────────────────────────────────
+
+const POSITIONS: [string, string][] = [['front', 'Front'], ['rear', 'Rear'], ['left', 'Left side'], ['right', 'Right side'], ['interior', 'Inside'], ['damage', 'Damage close-up'], ['other', 'Other']];
+
+/** Shrink on the phone before upload (max 1600 px, JPEG): faster on weak
+ *  networks and well under the server's 2 MB cap. */
+async function shrink(file: File): Promise<Blob> {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext('2d')!.drawImage(bmp, 0, 0, c.width, c.height);
+    return await new Promise<Blob>((res, rej) => c.toBlob(b => (b ? res(b) : rej(new Error('encode'))), 'image/jpeg', 0.82));
+  } catch { return file; }   // older browsers: send as-is (the server still checks size + type)
+}
+
+function csrf(): string {
+  const m = document.cookie.split('; ').find(c => c.startsWith('fnb_csrf='));
+  return m ? decodeURIComponent(m.split('=')[1]) : '';
+}
+
+interface Photo { id: string; position: string; annotation: string; captured_by_name: string; captured_at: string; deleted: number }
+
+export function PhotoStrip({ outletId, sessionId, reloadKey = 0 }: { outletId: string; sessionId: string; reloadKey?: number }) {
+  const [list, setList] = useState<Photo[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/valet/media?outlet=${encodeURIComponent(outletId)}&session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' })
+      .then(r => r.json()).then(j => { if (alive) setList(j.photos || []); }).catch(() => { if (alive) setList([]); });
+    return () => { alive = false; };
+  }, [outletId, sessionId, reloadKey]);
+  if (!list) return <p className="text-xs text-[#8B7355]">Loading photos…</p>;
+  if (!list.length) return <p className="text-xs text-[#8B7355]">No condition photos.</p>;
+  return (
+    <div className="flex gap-2 overflow-x-auto pb-1">
+      {list.map(p => (
+        <figure key={p.id} className="shrink-0 w-28">
+          {p.deleted ? <div className="h-20 w-28 rounded bg-stone-200 text-[10px] flex items-center justify-center">removed (retention)</div> : (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={`/api/valet/media?outlet=${encodeURIComponent(outletId)}&id=${encodeURIComponent(p.id)}`} alt={`${p.position} photo`} className="h-20 w-28 rounded object-cover border border-[#E8D5C4]" />
+          )}
+          <figcaption className="text-[10px] leading-tight mt-0.5"><b>{p.position}</b>{p.annotation ? ` — ${p.annotation}` : ''}<br />{p.captured_by_name}, {hhmm(p.captured_at)}</figcaption>
+        </figure>
+      ))}
+    </div>
+  );
+}
+
+export function PhotoModal({ outletId, sessionId, tag, onClose }: { outletId: string; sessionId: string; tag: string; onClose: () => void }) {
+  const [position, setPosition] = useState('front');
+  const [note, setNote] = useState('');
+  const [pending, setPending] = useState<Blob | null>(null);
+  const [progress, setProgress] = useState<number | null>(null);
+  const [err, setErr] = useState('');
+  const [reloadKey, setReloadKey] = useState(0);
+  const upload = useCallback((blob: Blob) => {
+    setErr(''); setProgress(0); setPending(blob);
+    const fd = new FormData();
+    fd.append('outlet_id', outletId); fd.append('session_id', sessionId); fd.append('position', position); fd.append('annotation', note);
+    fd.append('file', blob, 'photo.jpg');
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/valet/media');
+    xhr.setRequestHeader('X-CSRF-Token', csrf());
+    xhr.upload.onprogress = e => { if (e.lengthComputable) setProgress(Math.round((e.loaded / e.total) * 100)); };
+    xhr.onload = () => {
+      setProgress(null);
+      let j: { error?: string } = {};
+      try { j = JSON.parse(xhr.responseText); } catch { /* ignore */ }
+      if (xhr.status >= 200 && xhr.status < 300) { setPending(null); setNote(''); setReloadKey(k => k + 1); }
+      else setErr(j.error || `Upload failed (${xhr.status}).`);
+    };
+    xhr.onerror = () => { setProgress(null); setErr('No connection — the photo is kept here. Tap Retry.'); };
+    xhr.send(fd);
+  }, [outletId, sessionId, position, note]);
+  return (
+    <Modal title={`Condition photos — tag ${tag}`} onClose={onClose} wide>
+      <div className="space-y-3">
+        <PhotoStrip outletId={outletId} sessionId={sessionId} reloadKey={reloadKey} />
+        <div className="flex flex-wrap gap-2">
+          {POSITIONS.map(([k, l]) => (
+            <button key={k} type="button" onClick={() => setPosition(k)} aria-pressed={position === k}
+              className={`min-h-[44px] rounded-xl border px-3 text-sm font-bold ${position === k ? 'bg-[#2D1B0E] text-white' : 'bg-white border-[#E8D5C4]'}`}>{l}</button>
+          ))}
+        </div>
+        <Field label="Existing damage / note (optional)"><input className={inputCls} value={note} onChange={e => setNote(e.target.value)} maxLength={300} placeholder="e.g. dent on rear bumper" /></Field>
+        <ErrorNote message={err} />
+        {progress !== null ? (
+          <div className="h-3 w-full rounded bg-[#F0E4D6]" role="progressbar" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}>
+            <div className="h-3 rounded bg-[#af4408]" style={{ width: `${progress}%` }} />
+          </div>
+        ) : null}
+        <div className="flex gap-2 flex-wrap">
+          <label className="inline-flex min-h-[52px] cursor-pointer items-center rounded-xl bg-[#af4408] px-4 font-bold text-white">
+            Take / choose photo
+            <input type="file" accept="image/*" capture="environment" className="sr-only"
+              onChange={async e => { const f = e.target.files?.[0]; e.target.value = ''; if (f) upload(await shrink(f)); }} />
+          </label>
+          {pending && err ? <Btn big kind="ghost" onClick={() => upload(pending)}>Retry</Btn> : null}
+          <Btn big kind="ghost" onClick={onClose}>Done</Btn>
+        </div>
+        <p className="text-[11px] text-[#8B7355]">Up to 6 photos per car. Photos are private to the valet team and removed after the outlet&apos;s retention period.</p>
+      </div>
+    </Modal>
+  );
+}

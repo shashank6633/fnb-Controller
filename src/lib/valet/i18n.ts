@@ -112,7 +112,7 @@ export const ATT: Record<Lang, Record<string, string>> = {
     unparked: 'Not parked yet', at_gate: 'At the gate', holding: 'In holding', keys_with_me: 'Keys with me',
     show_pass: 'Show pass QR', print_claim: 'Print claim receipt', nothing: 'Nothing waiting right now.',
     on_shift: 'On shift', on_break: 'On break', off_shift: 'Off shift', change_req: 'Guest asked to change this pickup',
-    accept_change: 'Accept change', keep_going: 'Keep going', lang: 'हिंदी',
+    accept_change: 'Accept change', keep_going: 'Keep going', lang: 'हिंदी', photos: 'Condition photos',
   },
   hi: {
     start_shift: 'शिफ़्ट शुरू करें', end_shift: 'शिफ़्ट खत्म करें', take_break: 'ब्रेक लें', end_break: 'ब्रेक खत्म',
@@ -124,6 +124,6 @@ export const ATT: Record<Lang, Record<string, string>> = {
     unparked: 'अभी पार्क नहीं हुई', at_gate: 'गेट पर', holding: 'होल्डिंग में', keys_with_me: 'मेरे पास चाबियाँ',
     show_pass: 'पास QR दिखाएँ', print_claim: 'क्लेम रसीद छापें', nothing: 'अभी कुछ इंतज़ार में नहीं है।',
     on_shift: 'शिफ़्ट पर', on_break: 'ब्रेक पर', off_shift: 'शिफ़्ट पर नहीं', change_req: 'मेहमान ने इस पिकअप में बदलाव माँगा',
-    accept_change: 'बदलाव मानें', keep_going: 'जारी रखें', lang: 'English',
+    accept_change: 'बदलाव मानें', keep_going: 'जारी रखें', lang: 'English', photos: 'गाड़ी की फ़ोटो',
   },
 };
