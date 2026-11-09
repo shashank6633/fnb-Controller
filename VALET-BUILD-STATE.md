@@ -53,17 +53,28 @@ plain-language checklists, never "Done".
 
 ## 3. In progress
 
-- Increment 1 SCREENS: `/valet` (Head Dashboard), `/valet/attendant`, `/valet/desk`, `/valet/settings`.
+- Increment 1 SCREENS written + committed (f1ac194): `/valet` Head Dashboard, `/valet/attendant`,
+  `/valet/desk`, `/valet/settings`, shared kit `src/app/valet/ui.tsx`, dialogs `src/app/valet/modals.tsx`.
+  tsc clean (use `--incremental false`: a stale tsconfig.tsbuildinfo once reported a phantom TS6200; the stale
+  file was MOVED to scratchpad/stale-tsbuildinfo-*). Lint: 9 remaining = setState-in-effect pattern the app
+  uses everywhere (33 such in feedback/captain/cashier) — accepted, not a gate.
+- Regression gate running: `harness/valet/gate.sh base origin/main` then `gate.sh valet valet-parking-1109 build`
+  (same snapshot.db for both). Outputs: harness/valet/gate-base.out, gate-valet.out.
+- Demo seed: `npx tsx scripts/valet-demo-seed.ts <harness dir>` (fictional cars/staff, harness-only guard).
 
 ## 4. Exact next steps
 
-1. Shared client kit `src/app/valet/ui.tsx` (outlet picker, live hook = SSE + polling + stale banner, status chip).
-2. `/valet/settings` (enable outlet, zones, tags, staff, entry QR) — needed to set up a test outlet.
-3. `/valet/attendant` (mobile-first: shift, new check-in incl. pairing code, my task, take next, park, ready, gate/holding, handover, claim receipt print, pass QR).
-4. `/valet/desk` (lookup + request pickup with guest confirmation).
-5. `/valet` Head Dashboard (counts, metrics, lanes board/list, exceptions, team, card drawer actions).
-6. Regression gate (copy of brewery gate.sh → harness/valet/gate.sh) vs origin/main baseline; next build.
-7. Browser scenarios on port 39xx with seeded fictional data; two simultaneous staff clients.
+1. Read gate-base.out vs gate-valet.out → must be equal except valet-tests; next build exit 0.
+2. Browser tree = `git archive HEAD` into harness/valet/browser-run-*, + node_modules clone + seeded DB
+   (browser-* dir from the seed) + harness-only `allowedDevOrigins: ['127.0.0.1','*.localhost']` in its
+   next.config.ts. `next dev` ONLY (NEVER next start on a prod-DB copy: the scheduler would run and could
+   send real WhatsApp). Port 3900. Head on localhost, attendant on 127.0.0.1, guest on guest.localhost
+   (separate cookie jars); sign in by setting fnb_session from demo-sessions.json via the browser.
+3. Scenarios: guest QR check-in → pairing → attendant confirm → pass → request → take next → fetch → ready →
+   handover with rotating code; scheduled pickup; phone-less (claim receipt); no-show → holding → returned;
+   head intervention (reassign, priority, ETA, void); two staff clients updating live. 375px + desktop.
+4. Fix what the browser finds; re-run valet-tests; commit; owner progress note.
+5. Then increment 2 (see §1).
 
 ## 5. Decisions and assumptions
 
