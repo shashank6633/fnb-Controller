@@ -27,6 +27,7 @@ export async function valetJson(fn: () => unknown | Promise<unknown>, headers: R
   }
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped JSON body; callers validate
 export async function readJson(req: Request, maxBytes = 32_000): Promise<Record<string, any>> {
   const len = Number(req.headers.get('content-length') || 0);
   if (len > maxBytes) throw new ValetError(413, 'too_large', 'Request too large.');

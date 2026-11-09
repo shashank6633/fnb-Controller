@@ -22,6 +22,7 @@
  *   P void + desk lookup masking + ETA honesty
  */
 /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any */
+export {};   // a module, not a global script: its top-level names must not collide with sibling test scripts
 const Module = require('module');
 const fs = require('fs');
 const path = require('path');
@@ -271,7 +272,7 @@ const S = (name: string) => { section = name; console.log(`== ${name}`); };
 
   // ═══════════════════════════════════════════════════════════════════════
   S('E pickups');
-  let P1: any, P2: any, P3: any;
+  let P1: any, P2: any;
   {
     const r = pk.requestPickup(db, ov(), core.SYSTEM, { session_id: S1, when: 'now', idempotency_key: 'k1' }, 'guest', at(5));
     P1 = r.pickup;
@@ -482,7 +483,6 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
   {
     const id = checkin('a3', 'K1', at(200)); park('a3', id, at(200), { key_location: 'attendant' });
     const p = pk.requestPickup(db, ov(), core.SYSTEM, { session_id: id, when: 'now' }, 'guest', at(201)).pickup;
-    adm.keyTransfer ? null : null;
     pk.takeNext(db, ov(), A('a3'), at(202));
     eq(caught(() => pk.assignPickup(db, ov(), A('head'), p.id, pick(p.id).version, users.a5.id, '', at(203)))?.code, 'reason_required', 'reassignment needs a reason');
     const a5busy = core.activeTaskCount(db, users.a5.id);

@@ -97,3 +97,31 @@ export const STAFF_STATE_LABEL: Record<Lang, Record<string, string>> = {
     COMPLETED: 'पूरा', CANCELLED: 'रद्द', NO_SHOW: 'नहीं आए',
   },
 };
+
+/** Attendant-screen action labels, both languages. */
+export const ATT: Record<Lang, Record<string, string>> = {
+  en: {
+    start_shift: 'Start shift', end_shift: 'End shift', take_break: 'Take a break', end_break: 'End break',
+    new_checkin: 'New check-in', take_next: 'Take next car', scan_tag: 'Scan / enter tag', report: 'Report problem',
+    my_task: 'My task', waiting: 'waiting', start_fetch: 'Start fetching', give_back: 'Give back to queue',
+    mark_ready: 'Mark ready at gate', set_spot: 'Set parking spot', start_parking: 'Start parking',
+    confirm_handoff: 'Confirm handoff', verify_handover: 'Verify handover', went_inside: 'Guest went back inside',
+    move_holding: 'Move to holding', confirm_holding: 'Confirm holding spot', guest_returned: 'Guest has returned',
+    unparked: 'Not parked yet', at_gate: 'At the gate', holding: 'In holding', keys_with_me: 'Keys with me',
+    show_pass: 'Show pass QR', print_claim: 'Print claim receipt', nothing: 'Nothing waiting right now.',
+    on_shift: 'On shift', on_break: 'On break', off_shift: 'Off shift', change_req: 'Guest asked to change this pickup',
+    accept_change: 'Accept change', keep_going: 'Keep going', lang: 'हिंदी',
+  },
+  hi: {
+    start_shift: 'शिफ़्ट शुरू करें', end_shift: 'शिफ़्ट खत्म करें', take_break: 'ब्रेक लें', end_break: 'ब्रेक खत्म',
+    new_checkin: 'नई गाड़ी चेक-इन', take_next: 'अगली गाड़ी लें', scan_tag: 'टैग स्कैन / लिखें', report: 'समस्या बताएँ',
+    my_task: 'मेरा काम', waiting: 'इंतज़ार में', start_fetch: 'गाड़ी लाना शुरू', give_back: 'वापस कतार में दें',
+    mark_ready: 'गेट पर तैयार', set_spot: 'पार्किंग जगह दर्ज करें', start_parking: 'पार्क करना शुरू',
+    confirm_handoff: 'हैंडऑफ़ की पुष्टि', verify_handover: 'जाँच कर गाड़ी सौंपें', went_inside: 'मेहमान अंदर चले गए',
+    move_holding: 'होल्डिंग में ले जाएँ', confirm_holding: 'होल्डिंग जगह दर्ज करें', guest_returned: 'मेहमान वापस आ गए',
+    unparked: 'अभी पार्क नहीं हुई', at_gate: 'गेट पर', holding: 'होल्डिंग में', keys_with_me: 'मेरे पास चाबियाँ',
+    show_pass: 'पास QR दिखाएँ', print_claim: 'क्लेम रसीद छापें', nothing: 'अभी कुछ इंतज़ार में नहीं है।',
+    on_shift: 'शिफ़्ट पर', on_break: 'ब्रेक पर', off_shift: 'शिफ़्ट पर नहीं', change_req: 'मेहमान ने इस पिकअप में बदलाव माँगा',
+    accept_change: 'बदलाव मानें', keep_going: 'जारी रखें', lang: 'English',
+  },
+};

@@ -26,6 +26,8 @@ import {
   handoverNoteCreate, handoverNoteAck,
 } from './ops-admin';
 
+// Untyped JSON from the client: every handler validates the fields it reads.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Body = Record<string, any>;
 interface Ctx { db: DB; ov: OutletValet; actor: Actor; now: Date; body: Body }
 type Result = Record<string, unknown> & { session_id?: string | null; pickup_id?: string | null };

@@ -162,7 +162,6 @@ export function requestToReady(db: DB, ov: OutletValet, date: string) {
 }
 
 export function teamPanel(db: DB, ov: OutletValet, now: Date) {
-  const at = nowIso(now);
   const date = businessDate(now, ov.cfg);
   const assigned = db.prepare(`SELECT u.id, u.name FROM valet_staff_outlets s JOIN users u ON u.id = s.user_id AND u.is_active = 1 WHERE s.outlet_id = ?`).all(ov.outlet_id) as
     { id: string; name: string }[];
@@ -280,6 +279,8 @@ export function attendantView(db: DB, ov: OutletValet, actor: Actor, now: Date =
     unparked: cards.filter(c => c.state === 'CHECKED_IN' || (c.state === 'PARKING' && !mine.includes(c))),
     at_gate: cards.filter(c => c.state === 'READY_AT_GATE' || c.state === 'RELOCATING'),
     holding: cards.filter(c => c.state === 'HOLDING_NEAR_GATE'),
+    // For tag lookup (scan a tag → its car). Car details only — no guest contact.
+    parked: cards.filter(c => c.state === 'PARKED'),
     queue: { waiting: cards.filter(c => c.pickup?.state === 'QUEUED').length, scheduled: cards.filter(c => c.pickup?.state === 'SCHEDULED').length },
     keys_with_me: keysWithMe,
     zones: db.prepare(`SELECT id, name, kind, capacity FROM valet_zones WHERE outlet_id = ? AND is_active = 1 ORDER BY kind, sort_order, name`).all(ov.outlet_id),

@@ -71,9 +71,11 @@ const hhmm = (v: unknown, d: string) => (typeof v === 'string' && HHMM.test(v.tr
 
 /** Parse stored config (string or object) into a fully-defaulted, clamped config. */
 export function parseConfig(raw: unknown): ValetConfig {
+  // Parsing untrusted JSON: every field below is type-checked and clamped.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let o: Record<string, any> = {};
   if (typeof raw === 'string') { try { o = JSON.parse(raw) || {}; } catch { o = {}; } }
-  else if (raw && typeof raw === 'object' && !Array.isArray(raw)) o = raw as Record<string, any>;
+  else if (raw && typeof raw === 'object' && !Array.isArray(raw)) o = raw as typeof o;
   const D = DEFAULT_CONFIG;
   const r = o.required || {}, p = o.photos || {}, k = o.pickup || {}, h = o.hours || {};
   const e = o.escalation || {}, c = o.closing_rush || {};

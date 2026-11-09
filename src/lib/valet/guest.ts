@@ -160,6 +160,7 @@ export interface ActResult { body: Record<string, unknown>; setCookie?: string }
 
 /** POST /api/valet-guest/act — every guest write. */
 export function guestAct(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped JSON; each command validates what it reads
   db: DB, device: GuestDevice | null, body: Record<string, any>, ip: string, secure: boolean, now: Date = new Date(),
 ): ActResult {
   const cmd = String(body.cmd || '');
