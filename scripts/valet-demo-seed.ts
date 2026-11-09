@@ -60,20 +60,24 @@ process.chdir(dir);
   const rHead = mkRole('Valet Head (demo)', ['/valet', '/valet/attendant', '/valet/desk', '/valet/settings'], [1, 0, 0]);
   const rAtt = mkRole('Valet Attendant (demo)', ['/valet/attendant'], [0, 1, 0]);
   const rDesk = mkRole('Valet Desk (demo)', ['/valet/desk', '/cashier'], [0, 0, 1]);
+  // An ordinary cashier with NO valet capability: their bill screen must look
+  // exactly as it does today (no valet chip, nothing in the console).
+  const rCash = mkRole('Cashier, no valet (demo)', ['/cashier'], [0, 0, 0]);
   const sessions: Record<string, { user_id: string; token: string; name: string }> = {};
-  const mkUser = (key: string, name: string, role: string) => {
+  const mkUser = (key: string, name: string, role: string, valetOutlet = true) => {
     const uid = id();
     db.prepare(`INSERT INTO users (id, email, password_hash, name, role, role_id, is_active) VALUES (?,?, '!', ?, 'staff', ?, 1)`)
       .run(uid, `${key}.${uid.slice(0, 6)}@valet-demo.invalid`, name, role);
     const token = crypto.randomBytes(32).toString('hex');
     db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)').run(token, uid, new Date(Date.now() + 3 * 86_400_000).toISOString());
-    db.prepare('INSERT OR IGNORE INTO valet_staff_outlets (user_id, outlet_id, created_at, created_by) VALUES (?,?,?,?)').run(uid, outlet, new Date().toISOString(), 'demo-seed');
+    if (valetOutlet) db.prepare('INSERT OR IGNORE INTO valet_staff_outlets (user_id, outlet_id, created_at, created_by) VALUES (?,?,?,?)').run(uid, outlet, new Date().toISOString(), 'demo-seed');
     sessions[key] = { user_id: uid, token, name };
   };
   mkUser('head', 'Meera Rao (demo head)', rHead);
   mkUser('ravi', 'Ravi Kumar (demo attendant)', rAtt);
   mkUser('imran', 'Imran Shaikh (demo attendant)', rAtt);
   mkUser('desk', 'Lata Menon (demo desk)', rDesk);
+  mkUser('cashier', 'Vikram Das (demo cashier, no valet)', rCash, false);
   const actor = (k: string, head = false) => ({ kind: 'staff', id: sessions[k].user_id, name: sessions[k].name, isAdmin: false, head, attendant: true, host: head });
   ov = core.loadOutletValet(db, outlet);
   for (const k of ['head', 'ravi', 'imran']) adm.shiftStart(db, ov, actor(k, k === 'head'));
@@ -100,6 +104,6 @@ process.chdir(dir);
   pk.requestPickup(db, ov, core.SYSTEM, { session_id: ids[1], when: 'now' }, 'guest');
   pk.requestPickup(db, ov, core.SYSTEM, { session_id: ids[2], when: 'in10' }, 'guest');
   fs.writeFileSync(path.join(dir, 'demo-sessions.json'), JSON.stringify({ outlet_id: outlet, entry_token: core.loadOutletValet(db, outlet).entry_token, sessions }, null, 2));
-  console.log(`seeded demo valet data at outlet ${outlet}: ${cars.length} fictional cars, 4 demo staff (tokens in demo-sessions.json)`);
+  console.log(`seeded demo valet data at outlet ${outlet}: ${cars.length} fictional cars, ${Object.keys(sessions).length} demo staff (tokens in demo-sessions.json)`);
   process.exit(0);
 })().catch(e => { console.error('CRASHED:', e); process.exit(3); });

@@ -114,6 +114,10 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
 1. Browser pass for part 2 (photos upload, simulator link + NOW reply, reports, settings, paper desk,
    desk table lookup, cashier chip — incl. a NON-valet cashier sees no chip + no console error) on a fresh
    harness copy (blank the WA creds in that copy first). Gate vs origin/main (fetch first). Owner note.
+   HARNESS READY (2026-11-10 ~03:30): browser-214625/app re-synced (rsync -rlpD src/scripts/docs), old DB
+   moved to harness/valet/old-browser-db-<time>/, fresh snapshot copied, WA token/Interakt key/verify token
+   BLANKED + wa_notifications_enabled=0 in that copy, demo seed run (5 staff incl. `cashier` = no valet cap,
+   not assigned). Server not started yet: launch entry "valet-browser" (:3900). Owner approved this step.
 2. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
    adapter/simulator (devices, authenticated ingestion, dedupe, health). Docs (setup, templates, hardware,
    shift guide, deploy/rollback, env example). Final checklist.
