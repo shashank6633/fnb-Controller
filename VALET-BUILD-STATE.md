@@ -32,8 +32,8 @@ plain-language checklists, never "Done".
 
 | # | Scope | Status |
 |---|---|---|
-| 1 | Core: schema, access, outlet enable, zones, staff↔outlet, tags, staff + guest-led check-in, parking + custody, guest pass, queue + Take next car, ready/dwell/holding, verified handover + claim receipt + recovery, Head Dashboard, team/shifts, SSE + polling, tests | **IN PROGRESS** |
-| 2 | Scheduling across midnight/hours/capacity, photos, reports+CSV, paper ticket books, FNB links, notification outbox + WhatsApp adapter/simulator, consent, escalations, closing rush, retention | not started |
+| 1 | Core: schema, access, outlet enable, zones, staff↔outlet, tags, staff + guest-led check-in, parking + custody, guest pass, queue + Take next car, ready/dwell/holding, verified handover + claim receipt + recovery, Head Dashboard, team/shifts, SSE + polling, tests | **VERIFIED (local)** |
+| 2 | Scheduling across midnight/hours/capacity, photos, reports+CSV, paper ticket books, FNB links, notification outbox + WhatsApp adapter/simulator, consent, escalations, closing rush, retention | **NEXT** |
 | 3 | NFC provisioning, RFID adapter + simulator | not started |
 
 ## 2. Done and verified
@@ -51,30 +51,56 @@ plain-language checklists, never "Done".
   `src/app/api/valet-guest/{state,entry,act}`. Shared files touched: db.ts (1 import + 1 call), auth.ts,
   page-catalog.ts, proxy.ts, Sidebar.tsx, api/auth/roles/route.ts, settings/roles/page.tsx.
 
+- **Increment 1 browser-verified (2026-11-09 evening)** on a harness copy (`harness/valet/browser-214625/app`,
+  `next dev` port 3900 bound to 127.0.0.1, scheduler OFF), identities separated by origin (head=localhost,
+  attendant=127.0.0.1, guest=guest.localhost, desk=desk.localhost). Scenarios run and checked in the DB:
+  1. Guest QR check-in → pairing code → attendant confirms with tag → guest phone becomes the pass → park
+     (zone/spot/rack, 3 custody rows) → guest "Now" (ETA range + "1 car ahead") → head assigns → fetch →
+     ready (3-min gate timer + rotating 6-digit code on the guest phone) → verified handover by guest code →
+     "Handed over" on the guest phone; DB: code consumed once, grants revoked, tag freed, pickup COMPLETED.
+  2. Phone-less guest: claim receipt (code shown once) → wrong tag refused + logged → handover by claim code.
+  3. Scheduled pickup: booked request released by the queue rule and dispatched FIFO.
+  4. No-show: ready → guest went inside → move to holding (reason) → confirm holding spot → pickup NO_SHOW →
+     guest returned → new pickup queued (both attempts + 15-event timeline kept).
+  5. Head intervention: assign from the drawer, priority with an on-screen-enforced reason (shown on card).
+  6. Two simultaneous staff clients: head board updated via SSE ("Live") when the attendant claimed a car.
+  7. Desk (host): lookup "4" → tag 04 (masked plate) → request only after ticking guest confirmation.
+  8. Hindi on the guest page. 375px attendant + guest; desktop head board.
+- Bugs found in the browser and FIXED: guest page redraw wiped a half-typed form; false "booked pickup late"
+  on request-now cars; "keys with someone quiet" noise for locked phones (now off-shift only); 12 cramped
+  tiles; scanner showed kitchen "batch" wording (optional props added, kitchen unchanged); scanner close
+  wiped the car dialog; tag "2" ≠ "02" (numeric tags now ignore leading zeros); desk needed 2 chars; native
+  prompt()/confirm() replaced by an in-app reason dialog; at-gate duplicate; phone title squeeze.
+- Commits: … f8c207e, 2bbc122. tsc clean (`--incremental false`). valet-tests 232/0. Gate earlier: suites
+  identical to origin/main baseline; next build OK. origin/main merged in at ee4d521 (59d764e, clean).
+
 ## 3. In progress
 
-- Increment 1 SCREENS written + committed (f1ac194): `/valet` Head Dashboard, `/valet/attendant`,
-  `/valet/desk`, `/valet/settings`, shared kit `src/app/valet/ui.tsx`, dialogs `src/app/valet/modals.tsx`.
-  tsc clean (use `--incremental false`: a stale tsconfig.tsbuildinfo once reported a phantom TS6200; the stale
-  file was MOVED to scratchpad/stale-tsbuildinfo-*). Lint: 9 remaining = setState-in-effect pattern the app
-  uses everywhere (33 such in feedback/captain/cashier) — accepted, not a gate.
-- Regression gate running: `harness/valet/gate.sh base origin/main` then `gate.sh valet valet-parking-1109 build`
-  (same snapshot.db for both). Outputs: harness/valet/gate-base.out, gate-valet.out.
-- Demo seed: `npx tsx scripts/valet-demo-seed.ts <harness dir>` (fictional cars/staff, harness-only guard).
+- Nothing half-done. Next = increment 2.
 
-## 4. Exact next steps
+## 4. Exact next steps (increment 2)
 
-1. Read gate-base.out vs gate-valet.out → must be equal except valet-tests; next build exit 0.
-2. Browser tree = `git archive HEAD` into harness/valet/browser-run-*, + node_modules clone + seeded DB
-   (browser-* dir from the seed) + harness-only `allowedDevOrigins: ['127.0.0.1','*.localhost']` in its
-   next.config.ts. `next dev` ONLY (NEVER next start on a prod-DB copy: the scheduler would run and could
-   send real WhatsApp). Port 3900. Head on localhost, attendant on 127.0.0.1, guest on guest.localhost
-   (separate cookie jars); sign in by setting fnb_session from demo-sessions.json via the browser.
-3. Scenarios: guest QR check-in → pairing → attendant confirm → pass → request → take next → fetch → ready →
-   handover with rotating code; scheduled pickup; phone-less (claim receipt); no-show → holding → returned;
-   head intervention (reassign, priority, ETA, void); two staff clients updating live. 375px + desktop.
-4. Fix what the browser finds; re-run valet-tests; commit; owner progress note.
-5. Then increment 2 (see §1).
+1. Valet worker (`src/lib/valet/worker.ts`, 20 s tick, armed in instrumentation.ts next to the scheduler,
+   same prod-only/ENABLE_SCHEDULER rule): promote due pickups, expire pending, escalations (unclaimed 5 min,
+   long fetch, outside waiting, dwell overrun, no staff) as deduped valet_alerts that auto-resolve.
+2. Notification outbox `valet_notifications` + adapters: in-app (always), WhatsApp via src/lib/whatsapp.ts
+   template sends ONLY when configured + consent + verified identity; otherwise a clearly labelled SIMULATOR.
+   Webhook ingest: delivery statuses + button replies (dedupe provider event ids, reject replay, verify
+   signature with the existing app-secret logic). Failed-delivery view on the board.
+3. Photos: `valet_media` BLOB store (≤6, ≤1.5 MB after client resize, magic-byte check), upload with
+   progress/retry from the attendant, authorised short-lived view route, damage annotation.
+4. Reports `/valet/reports` + CSV (safe CSV: formula-injection guard), definitions + denominators.
+5. Paper ticket books + bill-folder/table QR entry (pending verification; stub confirmation before dispatch).
+6. FNB links: table/order/booking/customer on a session; cashier/host buttons (guest-confirmed request);
+   bill print/settle offers a prompt only. Must not change existing POS flows (impact-check first).
+7. Closing-rush mode; retention job (redact valet-only PII + photos after N months, incident holds).
+8. Re-run gate vs origin/main; browser scenarios for each; owner note.
+
+## 4b. Follow-ups noticed (not valet scope — for the owner)
+
+- App-wide sidebar highlights parent + child links at once (isActive = startsWith), e.g. /feedback vs
+  /feedback/take, /boh vs /boh/dashboard, /valet vs /valet/settings.
+- The floating captain-alerts bell shows for every signed-in user (existing behaviour, already noted in memory).
 
 ## 5. Decisions and assumptions
 
