@@ -27,6 +27,13 @@ interface Card {
     priority: number; priority_reason: string; assigned_user_id: string | null; assigned_name: string; handoff_open: boolean; handoff_from_name: string;
     guest_outside_at: string | null; change_request: string; change_open: boolean; started_at: string | null; eta: Eta; scheduled: boolean };
   flags: string[];
+  dining: null | { order_id: string; order_number: number | null; table_number: string; status: string; merged: boolean };
+}
+/** "Table 12 · bill #345", read live — after a table transfer it shows the new table. */
+function diningText(dn: Card['dining']) {
+  if (!dn) return '';
+  if (dn.merged) return `Bill #${dn.order_number ?? '?'} merged — re-link`;
+  return `${dn.table_number ? `Table ${dn.table_number}` : 'Parcel'} · bill #${dn.order_number ?? '?'}${dn.status === 'open' ? '' : ` (${dn.status})`}`;
 }
 interface Team { user_id: string; name: string; status: string; hours: number; active_tasks: { id: string; tag_code: string; state: string }[]; moving: number; keys_held: number; parks_today: number; fetches_today: number; device_quiet: boolean; started_at: string | null }
 interface Stat { n: number; avg: number | null; p90: number | null; max: number | null }
@@ -240,6 +247,7 @@ function MiniCard({ c, now, onOpen }: { c: Card; now: number; onOpen: (id: strin
       <div className="text-[11px] text-[#6B5744]">{[c.colour, c.make, c.model].filter(Boolean).join(' ')}</div>
       {c.zone_name ? <div className="text-[11px] text-[#6B5744]">Car: {c.zone_name}{c.spot ? ` · ${c.spot}` : ''}</div> : null}
       <div className="text-[11px] text-[#6B5744]">Keys: {c.key_desc}</div>
+      {c.dining ? <div className={`text-[11px] ${c.dining.merged ? 'text-amber-800' : 'text-[#6B5744]'}`}>{diningText(c.dining)}</div> : null}
       {p ? (
         <div className="mt-1 text-[11px] space-y-0.5">
           {p.state === 'SCHEDULED' ? <div>Booked {hhmm(p.target_at)}</div> : <div>Asked {ago(p.requested_at, now)} ago{p.priority > 0 ? ` · priority ${p.priority}` : ''}</div>}
@@ -394,6 +402,17 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
               }}>Show number</button> : null}
               {reveal ? <a className="ml-2 font-mono font-bold text-[#af4408]" href={`tel:${reveal.guest_mobile}`}>{reveal.guest_mobile}</a> : null}
             </div>
+            {!['HANDED_OVER', 'VOIDED'].includes(c.state) || c.dining ? (
+              <div className="sm:col-span-2">Dining: <b className={c.dining?.merged ? 'text-amber-800' : ''}>{c.dining ? diningText(c.dining) : 'not linked'}</b>
+                {!['HANDED_OVER', 'VOIDED'].includes(c.state) ? <>
+                  <button type="button" className="ml-2 text-xs font-semibold text-[#af4408]" onClick={async () => {
+                    const t = await askRaw({ title: 'Link to a table\'s open bill', label: 'Table number (the CURRENT open bill on that table is used)', min: 1, confirmText: 'Link' }); if (t === null) return;
+                    void cmd.run('dining.link', { session_id: c.id, table: t });
+                  }}>{c.dining ? 'Re-link' : 'Link to table'}</button>
+                  {c.dining ? <button type="button" className="ml-2 text-xs font-semibold text-[#6B5744]" onClick={() => void cmd.run('dining.unlink', { session_id: c.id })}>Unlink</button> : null}
+                </> : null}
+              </div>
+            ) : null}
             {c.duplicate_plate_note ? <div className="sm:col-span-2 text-amber-800">Duplicate plate note: {c.duplicate_plate_note}</div> : null}
             {c.has_photo_exception ? <div className="sm:col-span-2 text-amber-800">Photos skipped (reason recorded)</div> : null}
           </div>

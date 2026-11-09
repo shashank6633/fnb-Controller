@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 import { getPrintCounter, setPrintCounter } from '@/lib/offline-print/bridge-client';
 import CashierFloorPresence from '@/components/CashierFloorPresence';
+import ValetOrderChip from '@/components/ValetOrderChip';
 import {
   Wallet, Printer, Download, Percent, BadgePercent, PanelRightClose, PanelRightOpen,
   Loader2, CheckCircle2, XCircle, Clock, RefreshCw, Users, Receipt, X, ArrowLeft, AlertTriangle, MapPin,
@@ -515,6 +516,11 @@ export default function CashierPage() {
                 <span>No <b>BILL printer</b> is set up, so <b>Print Bill</b> won&apos;t produce a printout. Add one on the <a href="/dine-in/offline-print" className="underline font-medium">Printers page</a> (role = Bill). You can still <b>Download Bill</b> as a PDF.</span>
               </div>
             )}
+
+            {/* Valet cars for this visit. Renders nothing unless the cashier
+                holds a valet capability at an outlet with valet switched on;
+                never requests a car by itself. */}
+            <ValetOrderChip orderId={order.id} />
 
             {/* actions — status-aware */}
             <div className="px-4 py-3 border-t border-[#E8D5C4] flex flex-wrap items-center gap-2">

@@ -26,6 +26,7 @@ import {
   handoverNoteCreate, handoverNoteAck,
 } from './ops-admin';
 import { addTicketBook, retireTicketBook, confirmPaperClaim } from './ops-paper';
+import { linkDining, unlinkDining } from './ops-dining';
 import { enqueue, cancelForSession } from './notify';
 
 // Untyped JSON from the client: every handler validates the fields it reads.
@@ -166,6 +167,10 @@ export const COMMANDS: Record<string, CommandDef> = {
   'tag.replace':     { need: 'head', run: c => ({ ...tagReplace(c.db, c.ov, c.actor, c.body, c.now), session_id: s(c.body.session_id) }) },
   'handover_note.create': { need: 'head', run: c => handoverNoteCreate(c.db, c.ov, c.actor, s(c.body.note), c.now) },
   'handover_note.ack':    { need: 'head', run: c => handoverNoteAck(c.db, c.ov, c.actor, s(c.body.note_id), c.now) },
+
+  // ── dining links (optional; never moves a car)
+  'dining.link':   { need: ['attendant', 'host'], limit: [30, 60], run: c => { const r = linkDining(c.db, c.ov, c.actor, c.body, c.now); return { ...r }; } },
+  'dining.unlink': { need: ['attendant', 'host'], run: c => unlinkDining(c.db, c.ov, c.actor, s(c.body.session_id), c.now) },
 
   // ── paper tickets
   'ticket_book.add':    { need: 'head', allowDisabled: true, run: c => addTicketBook(c.db, c.ov, c.actor, c.body, c.now) },

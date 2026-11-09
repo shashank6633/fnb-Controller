@@ -511,6 +511,10 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     pk.startFetch(db, ov(), A('a5'), p.id, pick(p.id).version, at(205));
     eq(pick(p.id).state, 'IN_PROGRESS', 'new attendant fetching');
     // Board: an attendant whose device went quiet is flagged uncertain, nothing re-dispatched.
+    // Set a5's last heartbeat explicitly: section H races on the REAL clock and
+    // may stamp a5's shift with today's wall time, which made this check pass
+    // or fail depending on the hour the suite ran.
+    db.prepare('UPDATE valet_shifts SET last_seen_at = ? WHERE user_id = ? AND ended_at IS NULL').run(cfgm.nowIso(at(205)), users.a5.id);
     const b = board.headBoard(db, ov(), at(240));
     const card = b.cards.find((x: any) => x.id === id);
     ok(card.flags.includes('uncertain'), 'quiet device holding a moving car → uncertain');
@@ -1047,6 +1051,76 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     eq([sess(newS).ticket_no, sess(newS).checkin_source], ['P130', 'paper'], 'checked in under the stub\'s ticket');
     eq(guest.guestState(db, dev2, at(1209)).passes.length, 1, 'guest gets the pass after staff confirmed the car + stub');
     run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, paper: { enabled: false } } }, at(1210));
+  }
+
+  S('X dining links');
+  {
+    const dn = require(path.join(WT, 'src/lib/valet/ops-dining.ts'));
+    const mkTable = (outlet: string, no: string) => { const id = uid('zztbl'); db.prepare(`INSERT INTO restaurant_tables (id, outlet_id, table_number) VALUES (?,?,?)`).run(id, outlet, no); return id; };
+    const mkOrder = (outlet: string | null, tableId: string | null, status = 'open', n = Math.floor(Math.random() * 900000) + 100000) => {
+      const id = uid('zzord');
+      db.prepare(`INSERT INTO orders (id, outlet_id, order_number, table_id, status, created_at) VALUES (?,?,?,?,?, datetime('now'))`).run(id, outlet, n, tableId, status);
+      return id;
+    };
+    const T7 = mkTable(OA, 'X7'), T9 = mkTable(OA, 'X9'), T10 = mkTable(OA, 'X 10'), TAMB = mkTable(OA, 'X11');
+    const TB7 = mkTable(OB, 'X7');
+    const oldBill = mkOrder(OA, T7, 'settled');           // the previous guests on table X7
+    const bill7 = mkOrder(OA, T7);                        // the current guests on X7
+    const billB = mkOrder(OB, TB7);                       // same table number, other outlet
+    const bill10 = mkOrder(OA, T10);
+    mkOrder(OA, TAMB); mkOrder(OA, TAMB);                 // two open bills on one table (seen in the real data)
+    const orphan = mkOrder(null, null);                   // a bill with no outlet recorded
+    const car = arr.checkinCreate(db, ov(), A('a1'), { plate: 'KA01DN0001', tag_code: 'X71' }, at(1300)).session_id;
+    const card = () => board.sessionDetail(db, ov(), car, 'head', at(1300)).card;
+
+    eq((run('plain', { cmd: 'dining.link', outlet_id: OA, session_id: car, table: 'X7' }, at(1301)) as any).ok, false, 'a user with no valet capability cannot link');
+    const l1 = run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, table: 'x7' }, at(1301)) as any;
+    eq([l1.ok, (sess(car) as any).order_id], [true, bill7], 'by table → the CURRENT open bill, never the settled one before it, never outlet B\'s X7');
+    eq(card().dining.table_number, 'X7', 'board card shows the table');
+    // Table transfer: the POS keeps the order id and moves orders.table_id.
+    db.prepare('UPDATE orders SET table_id = ? WHERE id = ?').run(T9, bill7);
+    eq([card().dining.order_id, card().dining.table_number], [bill7, 'X9'], 'after a table transfer the link follows the guests (live table)');
+    eq(board.deskLookup(db, ov(), 'X9', at(1302)).map((c: any) => c.id), [car], 'desk finds the car by its NEW table');
+    eq(board.deskLookup(db, ov(), 'X7', at(1302)).length, 0, 'the old table no longer finds it');
+    eq((run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, table: 'X7' }, at(1303)) as any).code, 'no_open_order', 'X7 now has only the settled bill → nothing to link (outlet B\'s X7 is never used)');
+    eq((run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, order_id: oldBill }, at(1303)) as any).code, 'order_closed', 'a settled bill cannot be linked');
+    eq((run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, order_id: billB }, at(1303)) as any).code, 'no_order', 'another outlet\'s bill is refused');
+    eq((run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, order_id: orphan }, at(1303)) as any).code, 'no_order', 'a bill with no outlet is refused (fail closed)');
+    eq((run('host', { cmd: 'dining.link', outlet_id: OA, session_id: car, table: 'X11' }, at(1303)) as any).code, 'ambiguous_table', 'two open bills on one table → refused, never a guess');
+    const l2 = run('a2', { cmd: 'dining.link', outlet_id: OA, tag_code: 'x71', table: 'x10' }, at(1304)) as any;
+    eq([l2.ok, (sess(car) as any).order_id], [true, bill10], 'attendant re-links by TAG; table match ignores case and spaces ("x10" = "X 10")');
+    eq(dn.carsForOrder(db, OA, bill10).map((c: any) => c.id), [car], 'the bill lists its car');
+    eq(dn.carsForOrder(db, OA, bill7).length, 0, 're-linking moved it off the old bill');
+    db.prepare(`UPDATE orders SET status = 'merged' WHERE id = ?`).run(bill10);
+    eq(card().dining.merged, true, 'a merged bill is flagged "merged — re-link" (documented limitation)');
+    db.prepare(`UPDATE orders SET status = 'open' WHERE id = ?`).run(bill10);
+    eq((sess(car) as any).state !== 'RETRIEVING' && !db.prepare(`SELECT 1 FROM valet_pickups WHERE session_id = ?`).get(car), true, 'linking never requests the car');
+
+    // The cashier chip's route: silent for everyone who does not use valet here.
+    const dr = require(path.join(WT, 'src/app/api/valet/dining/route.ts'));
+    const get = async (key: string | null, order: string) => {
+      (globalThis as any).__TOKEN = key ? users[key].token : undefined;
+      const r = await dr.GET(new Request(`http://localhost/api/valet/dining?order=${encodeURIComponent(order)}`));
+      return { status: r.status, body: await r.json() };
+    };
+    const asPlain = await get('plain', bill10);
+    eq([asPlain.status, asPlain.body], [200, { show: false }], 'plain cashier → {show:false}, no error, nothing about the bill');
+    const asHost = await get('host', bill10);
+    eq([asHost.status, asHost.body.show, asHost.body.can_request, asHost.body.cars.map((c: any) => c.id)], [200, true, true, [car]], 'desk/host sees the car and may request');
+    ok(!/guest_mobile|guest_name|mobile/.test(JSON.stringify(asHost.body.cars)), 'no guest contact in the chip payload');
+    const asAtt = await get('a1', bill10);
+    eq([asAtt.body.show, asAtt.body.can_request], [true, false], 'attendant sees it but gets no request button (pickup.request is a host action)');
+    eq((await get('host', billB)).body, { show: false }, 'host not assigned to outlet B → {show:false}');
+    eq((await get('host', 'no-such-order')).body, { show: false }, 'unknown bill → {show:false}');
+    eq((await get(null, bill10)).status, 401, 'signed out → 401');
+    (globalThis as any).__TOKEN = undefined;
+    // The request itself still needs the guest's confirmation.
+    eq((run('host', { cmd: 'pickup.request', outlet_id: OA, session_id: car, when: 'now' }, at(1305)) as any).code, 'confirm_required', 'cashier request needs the guest-asked tick');
+    const rq = run('host', { cmd: 'pickup.request', outlet_id: OA, session_id: car, when: 'now', guest_confirmed: true, idempotency_key: `cashier:${car}:1` }, at(1305)) as any;
+    eq(rq.ok, true, 'with the tick, the cashier can request the car');
+    eq(dn.carsForOrder(db, OA, bill10)[0].pickup_state, rq.state, 'chip then shows it as requested');
+    run('host', { cmd: 'dining.unlink', outlet_id: OA, session_id: car }, at(1306));
+    eq([(sess(car) as any).order_id, (sess(car) as any).table_id], [null, null], 'unlink clears the link');
   }
 
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);

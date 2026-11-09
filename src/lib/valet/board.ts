@@ -12,6 +12,7 @@ import { laneFor, BOARD_LANES } from './states';
 import { nowIso, addMinutes, minutesBetween, businessDate, maskMobile, maskPlate, normTagCode } from './config';
 import { promoteDue, eligibleQueue, etaFor, capacityOf, availableAttendants, durationStats, type Eta } from './queue';
 import { expirePending, keyDesc } from './ops-arrival';
+import { diningRef, type DiningRef } from './ops-dining';
 
 export interface Card {
   id: string; version: number; state: string; lane: string;
@@ -23,6 +24,8 @@ export interface Card {
   parking_by: string | null; parking_by_name: string; relocating_by: string | null;
   has_guest_name: boolean; guest_name?: string; mobile_masked?: string;
   has_photo_exception: boolean; duplicate_plate_note: string; checkin_source: string; is_test: boolean;
+  /** Linked dining visit, read LIVE (current table after a transfer). */
+  dining: (DiningRef & { merged: boolean }) | null;
   pickup: null | {
     id: string; version: number; state: string; source: string; requested_at: string; target_at: string;
     queued_at: string | null; priority: number; priority_reason: string; assigned_user_id: string | null; assigned_name: string;
@@ -80,6 +83,7 @@ function toCard(
     has_guest_name: !!s.guest_name,
     has_photo_exception: !!s.photo_exception, duplicate_plate_note: audience === 'desk' ? '' : s.duplicate_plate_note,
     checkin_source: s.checkin_source, is_test: s.is_test === 1,
+    dining: (() => { const d = diningRef(db, s.order_id); return d ? { ...d, merged: d.status === 'merged' } : null; })(),
     pickup: p ? {
       id: p.id, version: p.version, state: p.state, source: p.source, requested_at: p.requested_at, target_at: p.target_at,
       queued_at: p.queued_at, priority: p.priority, priority_reason: audience === 'head' ? p.priority_reason : '',
@@ -329,8 +333,11 @@ export function deskLookup(db: DB, ov: OutletValet, q: string, now: Date = new D
   // its last 4+ characters. Never a listing without a query.
   return loadCards(db, ov, now, 'desk',
     `state NOT IN ('HANDED_OVER','VOIDED') AND (tag_id IN (SELECT id FROM valet_tags WHERE outlet_id = valet_vehicle_sessions.outlet_id AND code_norm = ?)
-       OR upper(ticket_no) = ? OR (length(?) >= 4 AND plate_norm LIKE '%' || ?)) LIMIT 10`,
-    [normTagCode(t), t, t, t]);
+       OR upper(ticket_no) = ? OR (length(?) >= 4 AND plate_norm LIKE '%' || ?)
+       -- a TABLE number finds cars linked to that table's CURRENT open bill only
+       OR order_id IN (SELECT o.id FROM orders o JOIN restaurant_tables rt ON rt.id = o.table_id
+                       WHERE o.status = 'open' AND rt.outlet_id = valet_vehicle_sessions.outlet_id AND upper(replace(rt.table_number, ' ', '')) = ?)) LIMIT 10`,
+    [normTagCode(t), t, t, t, t]);
 }
 
 /** One car in full for staff: card + timeline + custody trail. */
