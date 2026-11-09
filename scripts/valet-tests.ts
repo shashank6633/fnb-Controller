@@ -948,6 +948,68 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     eq(caught(() => md.storePhoto(db, ov(), A('a1'), { session_id: sid2, data: jpeg }, at(1106)))?.code, 'closed', 'no photos on a closed car');
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  S('V reports');
+  {
+    const rp = require(path.join(WT, 'src/lib/valet/reports.ts'));
+    // A fresh outlet so every figure can be worked out by hand.
+    const OC = uid('zzoutc');
+    db.prepare(`INSERT INTO outlets (id, name, is_default) VALUES (?, ?, 0)`).run(OC, `ZZ Report Outlet ${OC.slice(-4)}`);
+    run('admin', { cmd: 'settings.enable', outlet_id: OC, enabled: true }, at(0));
+    const ovC = () => core.loadOutletValet(db, OC);
+    const zc = (run('admin', { cmd: 'zone.save', outlet_id: OC, name: 'C lot', kind: 'parking', capacity: 20, retrieval_minutes: 6 }, at(0)) as any).zone_id;
+    mkUser('rc1', R_ATT); U.rc1 = await me('rc1');
+    run('admin', { cmd: 'staff.assign', outlet_id: OC, user_id: users.rc1.id, assigned: true }, at(0));
+    const D = (hm: string) => new Date(`2026-12-01T${hm}:00.000Z`);   // 2026-12-01 evening IST
+    adm.shiftStart(db, ovC(), A('rc1'), D('13:00'));
+    const car = (tag: string, test = false) => {
+      const id = arr.checkinCreate(db, ovC(), A('rc1'), { plate: `TS09RP${tag}`, tag_code: tag, is_test: test }, D('14:00')).session_id;
+      arr.parkConfirm(db, ovC(), A('rc1'), id, sess(id).version, { zone_id: zc, key_location: 'desk' }, D('14:01'));
+      return id;
+    };
+    const cycle = (id: string, req: string, claim: string, start: string, ready: string, out: string, when = 'now', atIso?: string) => {
+      const p = pk.requestPickup(db, ovC(), core.SYSTEM, { session_id: id, when, at: atIso }, 'guest', D(req)).pickup;
+      queue.promoteDue(db, OC, D(claim));
+      pk.assignPickup(db, ovC(), A('admin'), p.id, pick(p.id).version, users.rc1.id, '', D(claim));
+      pk.startFetch(db, ovC(), A('rc1'), p.id, pick(p.id).version, D(start));
+      pk.markReady(db, ovC(), A('rc1'), p.id, pick(p.id).version, {}, D(ready));
+      const c = pk.issueHandoverCode(db, id, D(out));
+      pk.handover(db, ovC(), A('rc1'), id, { tag_code: sess(id).tag_code, method: 'guest_code', code: c.code }, D(out));
+    };
+    cycle(car('C1'), '14:10', '14:11', '14:12', '14:20', '14:22');          // immediate: request→ready 10
+    cycle(car('C2'), '14:30', '14:32', '14:33', '14:36', '14:40');          // immediate: 6
+    cycle(car('C3'), '14:05', '15:24', '15:25', '15:28', '15:31', 'at', D('15:30').toISOString());   // booked 15:30, ready 15:28 → -2
+    cycle(car('C4', true), '14:10', '14:11', '14:12', '14:59', '15:00');    // TEST car: must not count
+    const r = rp.valetReport(db, { outletIds: [OC], from: '2026-12-01', to: '2026-12-01' });
+    eq(r.totals.arrivals, 3, 'arrivals exclude the test car');
+    eq([r.totals.immediate_requests, r.totals.scheduled_requests], [2, 1], 'immediate and booked counted apart');
+    eq(r.times.request_to_ready, { n: 2, avg: 8, p90: 10, max: 10 }, 'request→ready (immediate only) = avg 8, p90 10, max 10 — worked by hand');
+    eq(r.times.scheduled_lateness, { n: 1, avg: -2, p90: -2, max: -2 }, 'booked car ready 2 min early = -2');
+    eq(r.times.retrieval_time, { n: 3, avg: 4.7, p90: 8, max: 8 }, 'fetch times 8, 3, 3 → avg 4.7 (14/3), p90 8, max 8 — worked by hand');
+    eq(r.totals.handed_over, 3, 'handovers');
+    eq(r.totals.peak_hour?.hour, 19, 'peak hour 19:00 IST (14:00 UTC check-ins)');
+    ok(r.attendants.some((a: any) => a.name === users.rc1.name && a.parks === 3 && a.fetches === 3), 'per-attendant parks/fetches');
+    // Shift-hours filter: 20:00–23:00 IST excludes 19:30 check-ins.
+    eq(rp.valetReport(db, { outletIds: [OC], from: '2026-12-01', to: '2026-12-01', shiftFrom: '20:00', shiftTo: '23:00' }).totals.arrivals, 0, 'shift-hours filter applied');
+    // CSV safety.
+    eq(rp.csvCell('=HYPERLINK("http://x")'), `"'=HYPERLINK(""http://x"")"`, 'formula neutralised in CSV');
+    eq(rp.csvCell('-2'), `"'-2"`, 'a leading minus is neutralised too (documented)');
+    ok(rp.reportCsv(r).includes('request_to_ready'), 'CSV carries the measures');
+    // Route scoping: a head of outlet A cannot pull outlet C; 'all' = only own outlets.
+    const rr = require(path.join(WT, 'src/app/api/valet/reports/route.ts'));
+    (globalThis as any).__TOKEN = users.head.token;
+    const denied = await rr.GET(new Request(`http://localhost/api/valet/reports?outlet=${OC}&from=2026-12-01&to=2026-12-01`));
+    eq(denied.status, 403, 'head not assigned to outlet C → refused');
+    const allRes = await (await rr.GET(new Request(`http://localhost/api/valet/reports?outlet=all&from=2026-12-01&to=2026-12-01`))).json();
+    eq(allRes.totals.arrivals, 0, '"all" for this head covers only their outlets (none of C\'s cars)');
+    (globalThis as any).__TOKEN = users.a1.token;
+    eq((await rr.GET(new Request(`http://localhost/api/valet/reports?outlet=${OA}&from=2026-12-01&to=2026-12-01`))).status, 403, 'an attendant cannot open reports');
+    (globalThis as any).__TOKEN = users.admin.token;
+    const csvRes = await rr.GET(new Request(`http://localhost/api/valet/reports?outlet=${OC}&from=2026-12-01&to=2026-12-01&format=csv`));
+    ok(csvRes.status === 200 && /text\/csv/.test(csvRes.headers.get('content-type') || ''), 'admin downloads CSV');
+    (globalThis as any).__TOKEN = undefined;
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

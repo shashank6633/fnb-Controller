@@ -420,6 +420,7 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/valet',               label: 'Valet Head Dashboard', valetCap: 'head' },
       { path: '/valet/attendant',     label: 'Valet Attendant',      valetCap: 'attendant' },
       { path: '/valet/desk',          label: 'Valet Desk (Host / Cashier)', valetCap: 'host' },
+      { path: '/valet/reports',       label: 'Valet Reports',        valetCap: 'head' },
       { path: '/valet/settings',      label: 'Valet Settings',       valetCap: 'head' },
     ],
   },

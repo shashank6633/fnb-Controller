@@ -149,6 +149,7 @@ const TABS: { href: string; label: string; need: 'head' | 'attendant' | 'host' }
   { href: '/valet', label: 'Head Dashboard', need: 'head' },
   { href: '/valet/attendant', label: 'Attendant', need: 'attendant' },
   { href: '/valet/desk', label: 'Desk', need: 'host' },
+  { href: '/valet/reports', label: 'Reports', need: 'head' },
   { href: '/valet/settings', label: 'Settings', need: 'head' },
 ];
 

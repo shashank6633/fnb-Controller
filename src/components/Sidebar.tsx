@@ -212,6 +212,7 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Valet Head Dashboard", href: "/valet",           icon: CarFront },
       { kind: "link", label: "Valet Attendant",      href: "/valet/attendant", icon: KeyRound },
       { kind: "link", label: "Valet Desk",           href: "/valet/desk",      icon: ConciergeBell },
+      { kind: "link", label: "Valet Reports",        href: "/valet/reports",   icon: BarChart3 },
       { kind: "link", label: "Valet Settings",       href: "/valet/settings",  icon: Settings2 },
     ],
   },
