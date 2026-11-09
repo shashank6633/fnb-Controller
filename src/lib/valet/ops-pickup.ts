@@ -490,14 +490,16 @@ export function guestOutside(db: DB, ov: OutletValet, actor: Actor, sessionId: s
 
 export const MAX_VERIFY_FAILURES = 5;
 
-/** Issue a rotating, short-lived, single-use handover code for the guest pass. */
+/** A superseded code still verifies for this long, so a code that rotated while
+ *  the attendant was typing it is not a failed handover. */
+export const CODE_ROTATION_GRACE_SEC = 20;
+
+/** Issue a rotating, short-lived, single-use handover code for the guest pass.
+ *  Always a NEW code (only hashes are stored, so an old one cannot be shown
+ *  again); the guest endpoint rate-limits how often this may be asked. */
 export function issueHandoverCode(db: DB, sessionId: string, now: Date = new Date()) {
   const at = nowIso(now);
   return withTx(db, () => {
-    const live = db.prepare(`SELECT id, expires_at FROM valet_handover_codes WHERE session_id = ? AND consumed_at IS NULL
-                             AND superseded_at IS NULL AND expires_at > ? ORDER BY issued_at DESC LIMIT 1`).get(sessionId, addMinutes(now, 0.5)) as
-      { id: string; expires_at: string } | undefined;
-    if (live) return null;   // the current code still has >30 s; the caller shows it
     db.prepare(`UPDATE valet_handover_codes SET superseded_at = ? WHERE session_id = ? AND consumed_at IS NULL AND superseded_at IS NULL`).run(at, sessionId);
     const code = digits(6);
     const expires = addMinutes(now, 1.5);
@@ -547,7 +549,8 @@ export function handover(db: DB, ov: OutletValet, actor: Actor, sessionId: strin
       const code = normCode(input.code);
       if (method === 'guest_code') {
         if (!/^\d{6}$/.test(code)) return failOnce('bad_code', 'Enter the 6-digit code shown on the guest’s pass.');
-        const rows = db.prepare(`SELECT id, code_hash FROM valet_handover_codes WHERE session_id = ? AND consumed_at IS NULL AND expires_at > ?`).all(s.id, at) as
+        const rows = db.prepare(`SELECT id, code_hash FROM valet_handover_codes WHERE session_id = ? AND consumed_at IS NULL AND expires_at > ?
+                                 AND (superseded_at IS NULL OR superseded_at > ?)`).all(s.id, at, addMinutes(now, -CODE_ROTATION_GRACE_SEC / 60)) as
           { id: string; code_hash: string }[];
         const hit = rows.find(r => sameHash(r.code_hash, sha256(code)));
         if (!hit) return failOnce('code_wrong', 'That code is wrong or has expired. Ask the guest to show the current code.');
