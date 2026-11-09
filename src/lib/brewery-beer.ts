@@ -42,6 +42,18 @@ export function canSeeBeerQuantities(me: SessionUser | null | undefined): boolea
   return !!me && canManageKitchenProduction(me);
 }
 
+/**
+ * SQL test that a production_batches row is on the Kitchen or the Brewery side
+ * — the same split as the batch list's `kind` filter (api/kitchen-production/
+ * route.ts): Brewery = its item is ticked "Brewery item"; Kitchen = everything
+ * else, including a batch with no item. `col` is the batch's production_item_id
+ * column, qualified when the query joins. Owner ruling 122 (2026-11-09).
+ */
+export function batchKindSql(kind: 'kitchen' | 'brewery', col = 'production_item_id'): string {
+  const ids = `SELECT id FROM production_items WHERE is_brewery = 1 AND id IS NOT NULL`;
+  return kind === 'brewery' ? `${col} IN (${ids})` : `(${col} IS NULL OR ${col} NOT IN (${ids}))`;
+}
+
 /** Ids of every production item ticked "Brewery item". */
 export function breweryItemIds(db: Database.Database): Set<string> {
   const rows = db.prepare(
