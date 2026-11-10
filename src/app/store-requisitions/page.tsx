@@ -64,7 +64,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Package, Loader2, RefreshCw, Search, Clock, CheckCircle2, AlertCircle,
   Send, RotateCcw, ChevronRight, ChevronDown, History, User as UserIcon, XCircle,
-  Hourglass, Split, Merge,
+  Hourglass, Split, Merge, Printer,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 // MERGED PO (owner rulings #63-#70): the shared "Merge into one PO" modal and
@@ -78,6 +78,7 @@ import MergePoModal, {
 import { fmtIST, fmtISTDate, fmtISTIsoDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import { packFactor, shownPurchaseQty, type PackMeta } from '@/lib/pack-units';
+import { MAX_PRINT_IDS } from '@/lib/requisition-print';
 // THE RULE and the shelf take, as both desks run them — ONE transcription of the
 // server's (central-debit-clamp.ts / issue-stock.ts), proved against it by
 // scripts/desk-rule-tests.ts. Never re-type any of it on this page.
@@ -2764,6 +2765,22 @@ export default function StoreRequisitionsPage() {
     for (const r of list) for (const n of r.routed_depts || []) if (!names.includes(n)) names.push(n);
     return withDeptLabel(names);
   }, [list]);
+  /** PRINT ALL (owner ruling #126): every requisition on the tab in view — the
+   *  same `filtered` rows the body renders, in the same order, department
+   *  filter and search included — one A4 slip per page. The context line is
+   *  printed on each slip so a stack of paper says which list it came from. */
+  const printAllHref = useMemo(() => {
+    if (filter === 'issued_log' || filtered.length === 0) return '';
+    const tabName = ({
+      open: 'Pending Issue', deferred: 'Deferred', balance_pending: 'Balance Pending',
+      routed: routedTabLabel, issued_today: 'Issued Today',
+    } as Record<string, string>)[filter] || '';
+    const deptName = departments.find(d => d.id === deptId)?.name || 'All departments';
+    const ctx = [tabName, deptName, search.trim() ? `search "${search.trim()}"` : ''].filter(Boolean).join(' · ');
+    // The ids ride in the URL; MAX_PRINT_IDS keeps it inside nginx's 8 KB.
+    const ids = filtered.slice(0, MAX_PRINT_IDS).map(r => r.id).join(',');
+    return `/store-requisitions/print?ids=${encodeURIComponent(ids)}&ctx=${encodeURIComponent(ctx.slice(0, 80))}`;
+  }, [filter, filtered, routedTabLabel, departments, deptId, search]);
 
   const toggleRow = (id: string) => {
     setExpanded(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -3515,6 +3532,14 @@ export default function StoreRequisitionsPage() {
           <option value="">All departments</option>
           {departments.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
         </select>
+        {printAllHref && !loading && (
+          <a href={printAllHref} target="_blank" rel="noopener"
+             title="Print every requisition on this tab — one A4 issue slip per page, or Save as PDF"
+             className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded text-sm inline-flex items-center gap-1.5">
+            <Printer className="w-4 h-4" />
+            {filtered.length > MAX_PRINT_IDS ? `Print first ${MAX_PRINT_IDS} of ${filtered.length}` : `Print all (${filtered.length})`}
+          </a>
+        )}
       </div>
 
       {error && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">{error}</div>}
@@ -4925,6 +4950,21 @@ function ReqCard(props: {
           </span>
         </div>
       </button>
+      {/* PRINT THIS REQUISITION (owner ruling #126) — its own slim row UNDER
+          the header, never beside it. The chips already squeeze the
+          requisition number on a phone; a Print column in that row took
+          ~70 px more and wrapped REQ-2026-0007 onto three lines at 1280 px
+          (measured against production's layout). Outside the button: a link
+          nested in a button is invalid and would also toggle the card. */}
+      {/* pointer-events: the row tucks 6 px under the header, so only the link
+          itself takes clicks — the rest of that strip still toggles the card. */}
+      <div className="flex justify-end px-4 pb-2 -mt-1.5 pointer-events-none">
+        <a href={`/store-requisitions/print?ids=${encodeURIComponent(req.id)}`} target="_blank" rel="noopener"
+           title={`Print ${req.req_number} — A4 issue slip or Save as PDF`}
+           className="pointer-events-auto inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-[#6B5744] hover:text-[#af4408] hover:bg-[#FFF1E3]">
+          <Printer className="w-3.5 h-3.5" /> Print slip
+        </a>
+      </div>
 
       {/* Issue All Items — one-click bulk issue of every open (non-rejected,
           non-deferred, remaining>0) line. Only on the Pending Issue tab, and

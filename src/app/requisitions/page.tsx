@@ -15,6 +15,7 @@ import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Send, CheckCircle2, XCircle, Package,
   AlertTriangle, AlertCircle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye, Pencil,
+  Printer,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { packFactor, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
@@ -1697,6 +1698,11 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
         {canMgmtAct && <button onClick={() => setShowMgmtApprove(true)} className="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Mgmt Approve</button>}
         {canStoreAct && <button onClick={() => setShowProcess(true)} className="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded inline-flex items-center gap-1"><Package className="w-3 h-3" /> Issue to Department</button>}
         {canAck     && <button disabled={busy} onClick={ack} className="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded inline-flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Confirm Received at Dept</button>}
+        {/* Print (owner ruling #126) — the A4 / PDF issue slip, for anyone who
+            can open this requisition; the print page re-reads it through the
+            same visibility-filtered API. */}
+        <a href={`/requisitions/print?ids=${encodeURIComponent(detail.id)}`} target="_blank" rel="noopener"
+           className="px-3 py-1.5 text-xs bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded inline-flex items-center gap-1"><Printer className="w-3 h-3" /> Print</a>
         {canCancel  && <button disabled={busy} onClick={cancel}     className="px-3 py-1.5 text-xs text-red-600 hover:underline">Cancel</button>}
         {/* A department head without an approve tick sees the request but no
             buttons — say who can approve instead of leaving them guessing. */}
