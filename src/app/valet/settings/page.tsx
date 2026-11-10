@@ -13,6 +13,7 @@ import {
   PageHead, OutletPicker, Gate, Panel, Btn, Field, inputCls, ErrorNote, InfoNote, QrImage,
   useValetContext, valetCmd, useAsk, type AskOptions,
 } from '../ui';
+import { NfcPanel, RfidPanel, type NfcRfidData } from './nfc-rfid';
 
 // The config is edited as loose JSON and normalised by the server (parseConfig).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,7 +21,8 @@ type Cfg = Record<string, any>;
 interface SettingsData {
   outlet: { id: string; name: string }; enabled: boolean; config: Cfg; entry_token: string; entry_path: string;
   zones: { id: string; name: string; kind: string; capacity: number | null; retrieval_minutes: number | null; sort_order: number; is_active: number }[];
-  tags: { id: string; code: string; kind: string; status: string; notes: string; on_car: string | null }[];
+  tags: { id: string; code: string; kind: string; status: string; notes: string; on_car: string | null; nfc_ref: string | null; nfc_issued_at: string | null; rfid_epc: string | null }[];
+  rfid: NfcRfidData['rfid'];
   books: { id: string; prefix: string; first_no: number; last_no: number; status: string; issued_at: string; note: string }[];
   staff: null | { id: string; name: string; email: string; role_name: string | null; valet_head: number; valet_attendant: number; valet_host: number; assigned: number }[];
   can_admin: boolean;
@@ -61,9 +63,11 @@ export default function ValetSettingsPage() {
               <Zones data={data} run={run} />
               <Tags data={data} run={run} ask={ask} />
               <TicketBooks data={data} run={run} />
+              <NfcPanel data={data} run={run} ask={ask} />
               {data.can_admin ? <Rules data={data} run={run} /> : <InfoNote>Valet rules (hours, timers, required fields) are set by the owner/admin.</InfoNote>}
               {data.can_admin && data.staff ? <Staff data={data} run={run} /> : null}
               <Messages outletId={outletId} canAdmin={data.can_admin} />
+              <RfidPanel data={data} run={run} onChanged={() => void load()} />
             </>
           )}
         </div>
@@ -232,6 +236,12 @@ function Rules({ data, run }: { data: SettingsData; run: Run }) {
           </div>
           <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">Paper tickets</h3>
           {box('paper.enabled', 'This outlet also uses paper valet tickets (bill-folder / table QR entry)', c.paper?.enabled)}
+          <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">RFID (optional hardware)</h3>
+          <Field label="RFID mode" hint="Keep OFF until a reader model is chosen, installed and tested on site. Simulator = practise with pretend reads only. Live = only registered readers.">
+            <select className={inputCls} value={c.rfid?.mode || 'off'} onChange={e => set('rfid.mode', e.target.value)}>
+              <option value="off">Off</option><option value="simulator">Simulator (pretend reads)</option><option value="live">Live readers</option>
+            </select>
+          </Field>
           <h3 className="text-xs font-bold uppercase tracking-wide text-[#8B7355] pt-2">Condition photos</h3>
           <div className="grid grid-cols-2 gap-2">
             <Field label="Minimum photos (0–6)"><input className={inputCls} inputMode="numeric" value={c.photos?.min} onChange={e => num('photos.min', e.target.value)} /></Field>

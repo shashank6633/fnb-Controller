@@ -1130,6 +1130,126 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     eq([(sess(car) as any).order_id, (sess(car) as any).table_id], [null, null], 'unlink clears the link');
   }
 
+  S('Y NFC key-tag links');
+  {
+    const nfc = require(path.join(WT, 'src/lib/valet/ops-nfc.ts'));
+    const cols = (db.prepare('PRAGMA table_info(valet_tags)').all() as { name: string }[]).map(c => c.name);
+    ok(['nfc_ref', 'nfc_issued_at', 'nfc_chip_serial', 'rfid_epc'].every(c => cols.includes(c)), 'tag NFC/RFID columns exist (added to an existing table)');
+    adm.tagsAdd(db, ov(), A('head'), { code: 'Y1' }, at(1400));
+    const tagY = (db.prepare('SELECT id FROM valet_tags WHERE outlet_id = ? AND code_norm = ?').get(OA, cfgm.normTagCode('Y1')) as any).id;
+    eq((run('a1', { cmd: 'tag.nfc_issue', outlet_id: OA, tag_id: tagY }, at(1400)) as any).ok, false, 'an attendant cannot give out NFC links');
+    const i1 = run('head', { cmd: 'tag.nfc_issue', outlet_id: OA, tag_id: tagY }, at(1400)) as any;
+    ok(i1.ok && /^[0-9A-Z]{12}$/.test(i1.nfc_ref) && i1.path === `/valet/attendant?nfc=${i1.nfc_ref}`, 'head gives tag Y1 an opaque 12-character link');
+    ok(!i1.nfc_ref.includes('Y1'), 'the link is not the tag number');
+    const r0 = nfc.resolveNfc(db, U.a1, i1.nfc_ref, '', at(1401));
+    eq([r0.tag_code, r0.session_id, r0.outlet_id], ['Y1', null, OA], 'staff opening the sticker see the tag (no car yet)');
+    const car = arr.checkinCreate(db, ov(), A('a1'), { plate: 'KA01NF0001', tag_code: 'y1' }, at(1402)).session_id;
+    eq(nfc.resolveNfc(db, U.a2, i1.nfc_ref.toLowerCase(), '', at(1403)).session_id, car, 'once the keys carry the tag, the sticker opens that car (case-insensitive)');
+    eq(caught(() => nfc.resolveNfc(db, U.plain, i1.nfc_ref, '', at(1403)))?.code, 'nfc_unknown', 'a non-valet user learns nothing');
+    eq(caught(() => nfc.resolveNfc(db, null, i1.nfc_ref, '', at(1403)))?.code, 'unauthenticated', 'signed out → sign in first');
+    eq(caught(() => nfc.resolveNfc(db, U.a1, 'ZZZZZZZZZZZZ', '', at(1403)))?.code, 'nfc_unknown', 'an unknown link → same answer');
+    const refB = 'B0B0B0B0B0B0';
+    db.prepare(`INSERT INTO valet_tags (id, outlet_id, code, code_norm, kind, status, nfc_ref, created_at, updated_at) VALUES (?,?,?,?, 'key_tag', 'available', ?, ?, ?)`)
+      .run(uid('zztag'), OB, 'Y1', cfgm.normTagCode('Y1'), refB, cfgm.nowIso(at(1403)), cfgm.nowIso(at(1403)));
+    eq(caught(() => nfc.resolveNfc(db, U.a1, refB, '', at(1403)))?.code, 'nfc_unknown', 'another outlet\'s live link looks exactly like a dead one');
+    // Copy check: the first chip serial is remembered; a different chip with the same link raises an alert.
+    eq(nfc.resolveNfc(db, U.a1, i1.nfc_ref, '04:aa:bb:cc', at(1404)).copy_warning, false, 'first chip serial remembered');
+    eq(nfc.resolveNfc(db, U.a1, i1.nfc_ref, '04:AA:BB:CC', at(1405)).copy_warning, false, 'same chip again → fine');
+    eq(nfc.resolveNfc(db, U.a1, i1.nfc_ref, '04:11:22:33', at(1406)).copy_warning, true, 'a DIFFERENT chip with the same link → possible copy');
+    ok(db.prepare(`SELECT 1 FROM valet_alerts WHERE dedupe_key = ? AND resolved_at IS NULL`).get(`nfc_copy:${tagY}`), 'the head gets a "possible copied sticker" alert');
+    eq(sess(car).state, 'CHECKED_IN', 'opening a sticker changes nothing about the car');
+    const i2 = run('head', { cmd: 'tag.nfc_issue', outlet_id: OA, tag_id: tagY }, at(1407)) as any;
+    ok(i2.ok && i2.reissued && i2.nfc_ref !== i1.nfc_ref, 're-issue gives a new link');
+    eq(caught(() => nfc.resolveNfc(db, U.a1, i1.nfc_ref, '', at(1408)))?.code, 'nfc_unknown', 'the old sticker stops working');
+    eq(nfc.resolveNfc(db, U.a1, i2.nfc_ref, '04:11:22:33', at(1408)).copy_warning, false, 're-issue forgets the old chip (new sticker starts clean)');
+    eq(nfc.nfcLinks(db, OA).filter((x: any) => x.code === 'Y1').length, 1, 'the link list shows the tag once');
+    eq((run('head', { cmd: 'tag.nfc_clear', outlet_id: OA, tag_id: tagY }, at(1409)) as any).cleared, true, 'link removed');
+    eq(caught(() => nfc.resolveNfc(db, U.a1, i2.nfc_ref, '', at(1409)))?.code, 'nfc_unknown', 'a removed link stops working');
+    adm.tagsAdd(db, ov(), A('head'), { code: 'Y2' }, at(1409));
+    const tagY2 = (db.prepare('SELECT id FROM valet_tags WHERE outlet_id = ? AND code_norm = ?').get(OA, cfgm.normTagCode('Y2')) as any).id;
+    run('head', { cmd: 'tag.status', outlet_id: OA, tag_id: tagY2, status: 'lost', reason: 'test' }, at(1409));
+    eq((run('head', { cmd: 'tag.nfc_issue', outlet_id: OA, tag_id: tagY2 }, at(1409)) as any).code, 'tag_inactive', 'a lost tag gets no link');
+  }
+
+  S('Z RFID adapter + simulator');
+  {
+    const rf = require(path.join(WT, 'src/lib/valet/ops-rfid.ts'));
+    const setMode = (mode: string) => run('admin', { cmd: 'settings.config', outlet_id: OA, config: { ...ov().cfg, rfid: { mode } } }, at(1500));
+    eq(ov().cfg.rfid.mode, 'off', 'RFID is OFF by default');
+    const zoneK = (db.prepare(`SELECT id FROM valet_zones WHERE outlet_id = ? AND kind = 'parking' LIMIT 1`).get(OA) as any).id;
+    eq((run('head', { cmd: 'rfid.reader_register', outlet_id: OA, name: 'Key cabinet' }, at(1500)) as any).code, 'admin_only', 'only the owner/admin registers readers');
+    const reg = run('admin', { cmd: 'rfid.reader_register', outlet_id: OA, name: 'Key cabinet', zone_id: zoneK }, at(1500)) as any;
+    ok(reg.ok && typeof reg.token === 'string' && reg.token.length >= 40, 'reader registered; token returned once');
+    const row = db.prepare('SELECT * FROM valet_rfid_readers WHERE id = ?').get(reg.reader_id) as any;
+    ok(row.token_hash === creds.sha256(reg.token) && !JSON.stringify(row).includes(reg.token), 'only the token\'s SHA-256 is stored');
+    eq(rf.readerHealth(row, at(1500)), 'never', 'health: never heard from');
+    // Map tag Y1 to an EPC.
+    const tagY = (db.prepare('SELECT id FROM valet_tags WHERE outlet_id = ? AND code_norm = ?').get(OA, cfgm.normTagCode('Y1')) as any).id;
+    eq((run('head', { cmd: 'tag.rfid_epc', outlet_id: OA, tag_id: tagY, epc: 'not-hex!' }, at(1500)) as any).code, 'bad_epc', 'a malformed EPC is refused');
+    const EPC = 'E2801160600002A1B2C3D4E5';
+    eq((run('head', { cmd: 'tag.rfid_epc', outlet_id: OA, tag_id: tagY, epc: 'e280 1160 6000 02a1 b2c3 d4e5' }, at(1500)) as any).epc, EPC, 'EPC normalised (spaces, case)');
+    const tagOther = (db.prepare(`SELECT id FROM valet_tags WHERE outlet_id = ? AND id <> ? AND status = 'available' LIMIT 1`).get(OA, tagY) as any).id;
+    eq((run('head', { cmd: 'tag.rfid_epc', outlet_id: OA, tag_id: tagOther, epc: EPC }, at(1500)) as any).code, 'epc_in_use', 'one EPC, one tag');
+    const AUTH = `Bearer ${reg.token}`;
+    const T = (sec: number) => new Date(at(1500).getTime() + sec * 1000);
+    eq(caught(() => rf.ingestHttp(db, AUTH, { events: [] }, T(0)))?.code, 'rfid_not_live', 'mode OFF → a real reader is refused');
+    eq((run('admin', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'Y1' }, at(1500)) as any).code, 'not_simulator', 'mode OFF → the simulator is refused too');
+    setMode('live');
+    eq(caught(() => rf.ingestHttp(db, 'Bearer wrong-token-wrong-token-xx', { events: [] }, T(0)))?.code, 'reader_unauthorised', 'unknown token → 401');
+    eq(caught(() => rf.ingestHttp(db, '', { events: [] }, T(0)))?.code, 'reader_unauthorised', 'no token → 401');
+    const car = (db.prepare(`SELECT id, state, version FROM valet_vehicle_sessions WHERE tag_id = ? AND state NOT IN ('HANDED_OVER','VOIDED')`).get(tagY) as any);
+    const iso = (sec: number) => T(sec).toISOString();
+    const r1 = rf.ingestHttp(db, AUTH, { events: [
+      { event_id: 'e1', epc: EPC, antenna: '2', observed_at: iso(0) },
+      { event_id: 'e1', epc: EPC, observed_at: iso(1) },                 // same event id again
+      { event_id: 'e2', epc: EPC, observed_at: iso(10) },                // same tag within 30 s
+      { event_id: 'e3', epc: EPC, observed_at: iso(-300) },              // 5 min old
+      { event_id: 'e4', epc: EPC, observed_at: iso(300) },               // reader clock 5 min ahead
+      { event_id: 'e5', epc: 'ABCDEF0123456789', observed_at: iso(0) },  // not on any tag
+      { event_id: 'e6', observed_at: iso(0) },                           // no EPC
+    ] }, T(0));
+    eq(r1.results.map((x: any) => x.status), ['accepted', 'replay', 'duplicate', 'stale', 'future', 'unknown_tag', 'invalid'], 'each read judged: accepted / replay / duplicate / stale / future / unknown / invalid');
+    eq(rf.ingestHttp(db, AUTH, { events: [{ event_id: 'e1', epc: EPC, observed_at: iso(60) }] }, T(60)).results[0].status, 'replay', 'a replayed event id is refused even later');
+    eq(rf.ingestHttp(db, AUTH, { events: [{ event_id: 'e7', epc: EPC, observed_at: iso(60) }] }, T(60)).results[0].status, 'accepted', 'outside the de-dupe window → a new observation');
+    const ev = db.prepare(`SELECT * FROM valet_rfid_events WHERE reader_id = ? AND event_id = 'e1'`).get(reg.reader_id) as any;
+    ok(ev.epc === EPC && ev.antenna === '2' && ev.zone_id === zoneK && ev.observed_at === iso(0) && ev.received_at === iso(0) && ev.session_id === car.id,
+      'normalised: event id, reader, EPC, antenna, zone, observed + received time, car');
+    const after = sess(car.id) as any;
+    eq([after.state, after.version], [car.state, car.version], 'an RFID read never changes the car');
+    ok(!db.prepare(`SELECT 1 FROM valet_pickups WHERE session_id = ?`).get(car.id), '…and never requests it');
+    const seen = rf.tagSighting(db, tagY, T(61));
+    ok(seen && seen.reads_10min === 2 && seen.reader_name === 'Key cabinet' && !seen.simulated, 'the drawer can show "keys seen near Key cabinet, 2 reads" (observation)');
+    ok(board.sessionDetail(db, ov(), car.id, 'head', T(61)).rfid, 'car drawer carries the sighting while RFID is on');
+    const rowAfter = db.prepare('SELECT * FROM valet_rfid_readers WHERE id = ?').get(reg.reader_id) as any;
+    eq([rowAfter.events_accepted, rowAfter.events_rejected, rf.readerHealth(rowAfter, T(61))], [2, 7, 'ok'], 'reader counters + health ok');
+    eq(rf.readerHealth(rowAfter, T(61 + 6 * 60)), 'quiet', 'quiet after 5 min without a heartbeat');
+    eq(caught(() => rf.ingestHttp(db, AUTH, { events: Array.from({ length: 201 }, (_, i) => ({ event_id: `b${i}`, epc: EPC, observed_at: iso(70) })) }, T(70)))?.code, 'batch_too_large', 'batches over 200 refused');
+    eq((run('admin', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'Y1' }, at(1502)) as any).code, 'not_simulator', 'LIVE → the simulator is refused (no mixing)');
+    // Rotate + disable.
+    const rot = run('admin', { cmd: 'rfid.reader_rotate', outlet_id: OA, reader_id: reg.reader_id }, at(1502)) as any;
+    eq(caught(() => rf.ingestHttp(db, AUTH, { events: [] }, T(120)))?.code, 'reader_unauthorised', 'old token dead after rotation');
+    ok(rf.ingestHttp(db, `Bearer ${rot.token}`, { events: [] }, T(120)).accepted === 0, 'new token works (heartbeat)');
+    run('admin', { cmd: 'rfid.reader_enable', outlet_id: OA, reader_id: reg.reader_id, enabled: false }, at(1502));
+    eq(caught(() => rf.ingestHttp(db, `Bearer ${rot.token}`, { events: [] }, T(121)))?.code, 'reader_unauthorised', 'disabled reader → same 401');
+    run('admin', { cmd: 'rfid.reader_enable', outlet_id: OA, reader_id: reg.reader_id, enabled: true }, at(1502));
+    // Simulator mode: the simulator works, real readers do not.
+    setMode('simulator');
+    eq(caught(() => rf.ingestHttp(db, `Bearer ${rot.token}`, { events: [] }, T(130)))?.code, 'rfid_not_live', 'SIMULATOR → real readers refused');
+    const s1 = run('admin', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'y1', event_id: 'sim-a' }, T(400)) as any;
+    eq(s1.results[0].status, 'accepted', 'simulated read accepted through the same checks');
+    eq((run('admin', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'Y1', event_id: 'sim-a' }, T(500)) as any).results[0].status, 'replay', 'simulator shows a replay refusal');
+    eq((run('admin', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'Y1', age_seconds: 600 }, T(500)) as any).results[0].status, 'stale', 'simulator shows a stale refusal');
+    eq((run('head', { cmd: 'rfid.simulate', outlet_id: OA, reader_id: reg.reader_id, tag_code: 'Y1' }, T(500)) as any).code, 'admin_only', 'only the owner runs the simulator');
+    ok(rf.tagSighting(db, tagY, T(401)).simulated, 'a simulated sighting is labelled SIMULATED');
+    // The HTTP route itself.
+    const ir = require(path.join(WT, 'src/app/api/valet-rfid/ingest/route.ts'));
+    const post = (auth: string) => ir.POST(new Request('http://localhost/api/valet-rfid/ingest', { method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' }, body: JSON.stringify({ events: [] }) }));
+    eq((await post(`Bearer ${rot.token}`)).status, 409, 'route: not live → 409');
+    eq((await post('Bearer nope-nope-nope-nope-nope')).status, 401, 'route: bad token → 401');
+    setMode('off');
+    eq(board.sessionDetail(db, ov(), car.id, 'head', T(600)).rfid, null, 'RFID OFF → the drawer shows no RFID line');
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

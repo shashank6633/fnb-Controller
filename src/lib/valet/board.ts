@@ -13,6 +13,7 @@ import { nowIso, addMinutes, minutesBetween, businessDate, maskMobile, maskPlate
 import { promoteDue, eligibleQueue, etaFor, capacityOf, availableAttendants, durationStats, type Eta } from './queue';
 import { expirePending, keyDesc } from './ops-arrival';
 import { diningRef, type DiningRef } from './ops-dining';
+import { tagSighting } from './ops-rfid';
 
 export interface Card {
   id: string; version: number; state: string; lane: string;
@@ -351,5 +352,8 @@ export function sessionDetail(db: DB, ov: OutletValet, sessionId: string, audien
   const pickups = db.prepare(`SELECT id, state, source, requested_at, target_at, assigned_name, started_at, ready_at, completed_at, cancelled_at, cancel_reason, no_show_at
                               FROM valet_pickups WHERE session_id = ? AND outlet_id = ? ORDER BY seq`).all(sessionId, ov.outlet_id);
   const incidents = db.prepare(`SELECT id, kind, description, status, created_at, resolution FROM valet_incidents WHERE session_id = ? AND outlet_id = ?`).all(sessionId, ov.outlet_id);
-  return { card: cards[0], events, custody, pickups, incidents };
+  // RFID: an OBSERVATION of the keys' tag, never a state. Only while RFID is on.
+  const tagId = (db.prepare('SELECT tag_id FROM valet_vehicle_sessions WHERE id = ?').get(sessionId) as { tag_id: string | null } | undefined)?.tag_id ?? null;
+  const rfid = ov.cfg.rfid.mode === 'off' ? null : tagSighting(db, tagId, now);
+  return { card: cards[0], events, custody, pickups, incidents, rfid };
 }

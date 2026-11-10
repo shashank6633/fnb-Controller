@@ -10,7 +10,8 @@
  * only (no guest name or mobile), for 30 minutes, removed on success.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { KeyRound, Car, ScanLine, AlertTriangle, LogIn, LogOut, Coffee, Printer, QrCode, Timer, Hand } from 'lucide-react';
+import { KeyRound, Car, ScanLine, AlertTriangle, LogIn, LogOut, Coffee, Printer, QrCode, Timer, Hand, Nfc } from 'lucide-react';
+import { useWebNfc, readOnce, refFromUrl } from '../nfc';
 import BatchTagScanner from '@/components/BatchTagScanner';
 import { HandoverModal, IssuedModal, PhotoModal, PaperClaimConfirm } from '../modals';
 import { ATT, STAFF_STATE_LABEL, type Lang } from '@/lib/valet/i18n';
@@ -39,6 +40,14 @@ interface View {
 
 const DRAFT_TTL = 30 * 60_000;
 
+/** A car in a view by its key tag (or paper ticket) number. */
+function findInView(v: View | null | undefined, raw: string): Card | null {
+  if (!v) return null;
+  const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const all = [...v.my_tasks, ...v.unparked, ...v.at_gate, ...v.holding, ...v.parked];
+  return all.find(c => normTagCode(c.tag_code) === normTagCode(t) || (c.ticket_no && c.ticket_no.toUpperCase() === t)) || null;
+}
+
 export default function AttendantPage() {
   const { ctx, error: ctxError, outletId, setOutletId } = useValetContext();
   const [lang, setLang] = useState<Lang>('en');
@@ -54,12 +63,47 @@ export default function AttendantPage() {
   const close = useCallback(() => setModal(null), []);
   const me = ctx?.user.id;
 
-  const findByTag = (raw: string): Card | null => {
-    if (!v) return null;
-    const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const all = [...v.my_tasks, ...v.unparked, ...v.at_gate, ...v.holding, ...v.parked];
-    return all.find(c => normTagCode(c.tag_code) === normTagCode(t) || (c.ticket_no && c.ticket_no.toUpperCase() === t)) || null;
+  const findByTag = (raw: string): Card | null => findInView(v, raw);
+
+  // ── Key-tag NFC sticker (DESIGN.md §6b). Opened by the phone's own NFC tap as
+  // /valet/attendant?nfc=<ref>, or read here with Web NFC (Android Chrome). The
+  // server resolves the reference for staff of that tag's outlet only.
+  const [nfcNote, setNfcNote] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
+  const [nfcBusy, setNfcBusy] = useState(false);
+  const resolveNfcRef = useCallback(async (ref: string, serial = '') => {
+    const r = await fetch(`/api/valet/nfc?ref=${encodeURIComponent(ref)}&serial=${encodeURIComponent(serial)}`, { cache: 'no-store' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { setNfcNote({ kind: 'error', text: j.error || 'Could not read that key tag link.' }); return; }
+    // The sticker may belong to another of this person's outlets: read that
+    // outlet's cars directly rather than waiting for the live view to switch.
+    const view: View | null = j.outlet_id === outletId && v ? v
+      : await fetch(`/api/valet/attendant?outlet=${encodeURIComponent(j.outlet_id)}`, { cache: 'no-store' }).then(x => (x.ok ? x.json() : null)).catch(() => null);
+    if (j.outlet_id !== outletId) setOutletId(j.outlet_id);
+    const c = findInView(view, j.tag_code);
+    setNfcNote(j.copy_warning ? { kind: 'error', text: `Tag ${j.tag_code}: this sticker is a different chip from the one first used — possible copy. The Valet Head has been told.` }
+      : c ? null : { kind: 'info', text: `Tag ${j.tag_code}: no car on it right now.` });
+    if (c) setModal({ kind: 'car', card: c });
+  }, [outletId, setOutletId, v]);
+  useEffect(() => {
+    // Arrival from a sticker. The reference is dropped from the address bar at
+    // once, so this runs a single time even though resolveNfcRef can change.
+    const ref = new URLSearchParams(window.location.search).get('nfc');
+    if (!ref) return;
+    window.history.replaceState(null, '', window.location.pathname);
+    // Started from a promise callback: nothing is set synchronously in the effect.
+    void Promise.resolve().then(() => resolveNfcRef(ref));
+  }, [resolveNfcRef]);
+  const tapNfc = async () => {
+    setNfcBusy(true); setNfcNote({ kind: 'info', text: 'Hold the key tag against the back of the phone…' });
+    // No `finally`: the React Compiler skips any component that has one.
+    let read: { url: string; serial: string } | null = null;
+    try { read = await readOnce(); } catch (e) { setNfcNote({ kind: 'error', text: (e as Error).message }); }
+    const ref = read ? refFromUrl(read.url) : '';
+    if (read && !ref) setNfcNote({ kind: 'error', text: 'That NFC tag is not a valet key tag.' });
+    if (read && ref) await resolveNfcRef(ref, read.serial);
+    setNfcBusy(false);
   };
+  const canNfc = useWebNfc();
 
   const onShift = !!v?.shift && v.shift.outlet_id === outletId;
   const onBreak = onShift && v?.shift?.status === 'break';
@@ -78,6 +122,7 @@ export default function AttendantPage() {
         <div className="mt-3 space-y-3">
           {live.error ? <ErrorNote message={live.error.message} /> : null}
           <ErrorNote message={cmd.err} />
+          {nfcNote?.kind === 'error' ? <ErrorNote message={nfcNote.text} /> : nfcNote ? <InfoNote>{nfcNote.text}</InfoNote> : null}
           {v && !v.outlet.enabled ? <InfoNote>Valet is switched off for this outlet.</InfoNote> : null}
           {!v ? <p className="text-sm text-[#8B7355]">Loading…</p> : (
             <>
@@ -107,6 +152,7 @@ export default function AttendantPage() {
                 </Btn>
                 <Btn big kind="ghost" onClick={() => setModal({ kind: 'scan' })}><ScanLine size={18} className="inline mr-1.5" aria-hidden />{L('scan_tag')}</Btn>
                 <Btn big kind="ghost" onClick={() => setModal({ kind: 'problem' })}><AlertTriangle size={18} className="inline mr-1.5" aria-hidden />{L('report')}</Btn>
+                {canNfc ? <Btn big kind="ghost" className="col-span-2" onClick={() => void tapNfc()} disabled={nfcBusy}><Nfc size={18} className="inline mr-1.5" aria-hidden />{L('tap_nfc')}</Btn> : null}
               </div>
 
               {/* My task */}

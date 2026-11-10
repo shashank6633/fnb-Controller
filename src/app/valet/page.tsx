@@ -359,7 +359,8 @@ function TeamPanel({ b, cmd, now }: { b: Board; cmd: ReturnType<typeof useCmd>; 
 
 interface Detail { card: Card; events: { event_type: string; from_state: string; to_state: string; actor_name: string; reason: string; created_at: string }[];
   custody: { kind: string; from_desc: string; to_desc: string; actor_name: string; note: string; created_at: string }[];
-  pickups: { id: string; state: string; source: string; requested_at: string; target_at: string; assigned_name: string; ready_at: string | null; cancel_reason: string }[] }
+  pickups: { id: string; state: string; source: string; requested_at: string; target_at: string; assigned_name: string; ready_at: string | null; cancel_reason: string }[];
+  rfid: null | { observed_at: string; reader_name: string; zone_name: string | null; reads_10min: number; simulated: boolean } }
 
 function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; b: Board; outletId: string; onClose: () => void; reload: () => void; isAdmin: boolean }) {
   const [d, setD] = useState<Detail | null>(null);
@@ -377,6 +378,7 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
   const p = c?.pickup;
   const onShift = b.team.filter(t => t.status === 'available' || t.status === 'busy');
   const { ask: askRaw, askEl } = useAsk();
+  const nowMs = useNow(30_000);
   /** A recorded reason: at least 5 characters, enforced on screen. */
   const ask = (title: string) => askRaw({ title, label: 'Reason (recorded)', min: 5, confirmText: 'Continue' });
   void isAdmin;
@@ -480,6 +482,8 @@ function CarDrawer({ id, b, outletId, onClose, reload, isAdmin }: { id: string; 
               <Btn kind="danger" onClick={async () => { const why = await ask('Void this record — why? (test entry / duplicate). History is kept.'); if (why === null) return; void cmd.run('session.void', { session_id: c.id, version: c.version, reason: why, is_test: /test/i.test(why) }).then(() => onClose()); }}>Void record</Btn>
             </> : null}
           </div>
+          {/* An observation, never a location fix or a state change (spec §10). */}
+          {d?.rfid ? <p className="text-xs text-[#6B5744]">RFID{d.rfid.simulated ? ' (SIMULATED)' : ''}: keys seen near <b>{d.rfid.zone_name || d.rfid.reader_name}</b> {ago(d.rfid.observed_at, nowMs)} ago · {d.rfid.reads_10min} read{d.rfid.reads_10min === 1 ? '' : 's'} in 10 min — unconfirmed, check before acting.</p> : null}
           <div><div className="text-xs font-bold text-[#6B5744] mb-1">Condition photos</div><PhotoStrip outletId={outletId} sessionId={c.id} /></div>
           {d ? (
             <details className="rounded-lg border border-[#E8D5C4] p-2" open>

@@ -110,7 +110,7 @@ export const STAFF_STATE_LABEL: Record<Lang, Record<string, string>> = {
 export const ATT: Record<Lang, Record<string, string>> = {
   en: {
     start_shift: 'Start shift', end_shift: 'End shift', take_break: 'Take a break', end_break: 'End break',
-    new_checkin: 'New check-in', take_next: 'Take next car', scan_tag: 'Scan / enter tag', report: 'Report problem',
+    new_checkin: 'New check-in', take_next: 'Take next car', scan_tag: 'Scan / enter tag', report: 'Report problem', tap_nfc: 'Tap key tag (NFC)',
     my_task: 'My task', waiting: 'waiting', start_fetch: 'Start fetching', give_back: 'Give back to queue',
     mark_ready: 'Mark ready at gate', set_spot: 'Set parking spot', start_parking: 'Start parking',
     confirm_handoff: 'Confirm handoff', verify_handover: 'Verify handover', went_inside: 'Guest went back inside',
@@ -122,7 +122,7 @@ export const ATT: Record<Lang, Record<string, string>> = {
   },
   hi: {
     start_shift: 'शिफ़्ट शुरू करें', end_shift: 'शिफ़्ट खत्म करें', take_break: 'ब्रेक लें', end_break: 'ब्रेक खत्म',
-    new_checkin: 'नई गाड़ी चेक-इन', take_next: 'अगली गाड़ी लें', scan_tag: 'टैग स्कैन / लिखें', report: 'समस्या बताएँ',
+    new_checkin: 'नई गाड़ी चेक-इन', take_next: 'अगली गाड़ी लें', scan_tag: 'टैग स्कैन / लिखें', report: 'समस्या बताएँ', tap_nfc: 'की-टैग टैप करें (NFC)',
     my_task: 'मेरा काम', waiting: 'इंतज़ार में', start_fetch: 'गाड़ी लाना शुरू', give_back: 'वापस कतार में दें',
     mark_ready: 'गेट पर तैयार', set_spot: 'पार्किंग जगह दर्ज करें', start_parking: 'पार्क करना शुरू',
     confirm_handoff: 'हैंडऑफ़ की पुष्टि', verify_handover: 'जाँच कर गाड़ी सौंपें', went_inside: 'मेहमान अंदर चले गए',
