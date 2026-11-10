@@ -26,7 +26,8 @@
 
 * App starts; logs show no `[valet] schema statement failed`.
 * `/valet` opens for the owner; a normal staff login does not see Valet in the sidebar.
-* Cashier screen: open a bill as a normal cashier — no valet box, no console errors.
+* Cashier screen: open a bill as a normal cashier — no valet box, and no valet request errors in the
+  browser console (the valet check answers 200 "nothing to show").
 * `/valet-pass?e=nonsense` opens and says "No valet pass on this phone yet" (public page works, reveals nothing).
 
 ## Rollback
