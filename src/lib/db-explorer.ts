@@ -645,15 +645,16 @@ export const SAVED_QUERIES: readonly SavedQuery[] = [
   },
   {
     id: 'purchase_total_mismatch',
-    title: 'Purchase rows where total does not equal qty x rate',
+    title: 'Purchase rows where total is off from qty x rate by Rs 1 or more (rate rounding left out)',
     explains:
-      'Rows whose stored total_price disagrees with quantity x unit_price. 219 rows, overstated by Rs 156,621.22. Widening the tolerance to 50 paise still leaves Rs 156,616.84 across 105 rows — so this is a handful of large wrong rows from the inward import, not rounding dust.',
+      'Rows whose stored line total (total_price) differs from quantity x rate (unit_price) by Rs 1 or more; difference = total − quantity x rate, in rupees rounded to the paisa. Rate rounding is left out: the rate is stored to 2 decimals while the total keeps the exact bill amount, so a row whose rate is within half a paisa of total ÷ quantity is not listed, however large the quantity (Rs 25,272.70 for 200 units is a rate of Rs 126.3635, stored as Rs 126.36: Rs 0.70; a bill discount on 11,500 cups at Rs 0.56 can show −Rs 25.00 the same way). A row here is a real disagreement, for example a line total entered with tax included but no CGST/SGST split out, a missing quantity or rate, or a typing error. No rows = nothing to fix.',
     sql:
       'SELECT\n' +
       '  id, date, vendor, quantity, unit_price, total_price,\n' +
-      '  ROUND(total_price - (quantity * unit_price), 2) AS overstated_by\n' +
+      '  ROUND(COALESCE(total_price, 0) - (COALESCE(quantity, 0) * COALESCE(unit_price, 0)), 2) AS difference\n' +
       'FROM purchases\n' +
-      'WHERE ABS(COALESCE(total_price, 0) - (COALESCE(quantity, 0) * COALESCE(unit_price, 0))) > 0.005\n' +
+      'WHERE ROUND(ABS(COALESCE(total_price, 0) - (COALESCE(quantity, 0) * COALESCE(unit_price, 0))), 2) >= 1\n' +
+      '  AND NOT COALESCE(quantity > 0 AND ABS(unit_price - total_price / quantity) <= 0.0050001, 0)\n' +
       'ORDER BY ABS(total_price - (quantity * unit_price)) DESC',
   },
   {
