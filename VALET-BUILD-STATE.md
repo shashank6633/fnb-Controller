@@ -151,10 +151,24 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
   page list (= every page) unless admin tier; Roles screen "Valet pages only (n)" button + warning.
   No live role has a valet tick (guard is a no-op for all existing roles). Test section AA → 438/0.
 
+## 3c. DEPLOYED — 2026-11-10 12:06 IST (owner said "Deploy" in this session)
+
+- Pushed af05b8f to origin/main (fast-forward from a18108c) → GitHub Action run 42769296777 success →
+  https://fnb.akanhyd.com/api/build-info = af05b8f.
+- Before push: full gate on 3bbb338 == live main on every suite (valet 438/0, build ok); main then moved
+  to a18108c (db-explorer.ts only, no overlap) → merged (af05b8f) → tsc, check-rate-basis, check-db-explorer
+  identical to live main, next build ok. Bundle proof: 0 liquor / party-manager / fssai / feedback paths,
+  0 lq_/fssai_ lines, preview.html untracked; only boot write = ALTER roles ADD 3 valet columns DEFAULT 0.
+- Post-deploy (public): /login 200; /valet-pass bad link 200 + noindex; guest entry {ok:false}; valet board,
+  dining, RFID intake → 401 signed out; /valet → 307 login.
+- Rollback: Valet Settings Switch OFF / untick roles (soft); code: on box `sudo mv .next .next.broken &&
+  sudo mv .next.bak .next && sudo pm2 restart fnb-controller` (previous build a18108c kept as .next.bak).
+- The local main checkout (~/Desktop/Claude/fnb-controller) is STALE as always — not touched.
+
 ## 4. Exact next steps
 
-1. Nothing left to build in the spec. Waiting for the owner's review / "Deploy" (then: fetch + merge
-   origin/main, re-run the gate, deploy the normal way — docs/valet/DEPLOY.md).
+1. Deployed. Owner setup next (docs/valet/SETUP.md): role ticks + "Valet pages only", outlet ON, zones,
+   tags, staff, QR standee; WhatsApp templates + Meta app secret later.
 2. If the owner asks for changes: they go on this branch as new WIP commits, gate again.
 
 ## 4b. Follow-ups noticed (not valet scope — for the owner)
