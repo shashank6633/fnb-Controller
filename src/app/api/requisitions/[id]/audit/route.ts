@@ -1,11 +1,15 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { requisitionVisibility } from '@/lib/dept-hierarchy';
 
 /**
  * Audit timeline for a requisition. Aggregates events on the requisition
  * itself + all its items.
  *
  * GET /api/requisitions/[id]/audit
+ *
+ * Scoped by the SAME rule as GET /api/requisitions?id= (requisitionVisibility):
+ * anyone who can open the requisition can read its history, nobody else.
  */
 export const dynamic = 'force-dynamic';
 
@@ -15,6 +19,20 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const { id } = await params;
     const db = getDb();
+
+    // The timeline carries actor emails, before/after quantities and notes, so a
+    // requisition the viewer cannot open must not be readable here either. A 404
+    // rather than a 403, and the same JOIN as the ?id= read, so the two routes
+    // never disagree about whether a requisition exists (mirrors
+    // /api/returns/[id]/audit). null visibility = see all (admin / store team /
+    // global approver).
+    const vis = requisitionVisibility(db, me);
+    const visible = db.prepare(`
+      SELECT 1 FROM requisitions r
+      JOIN departments d ON d.id = r.department_id
+      WHERE r.id = ? AND (${vis ? vis.sql : '1=1'})
+    `).get(id, ...(vis ? vis.params : []));
+    if (!visible) return Response.json({ error: 'Not found' }, { status: 404 });
 
     // Pull events on the req itself + every item belonging to it
     const events = db.prepare(`
