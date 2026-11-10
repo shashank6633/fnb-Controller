@@ -22,6 +22,9 @@ Plain steps for a normal night. Screens: **Valet Head Dashboard** (`/valet`), **
 * **Guest has no phone / no time**: **New check-in → Staff check-in**, fill plate + tag, **Check in**,
   then **No phone — print a claim receipt** (the receipt's code is what gets the car back).
 * **Paper-ticket outlet**: type the paper ticket number (and a key tag if you use both).
+* **Tap card** (if you carry one): after **Check in**, hold your card out. The guest taps it with their
+  phone and their screen shows a number. The same number appears at the top of your screen — check it
+  matches, pick the car, tap **Give pass to NN**. Wrong number or a stranger? **Not them**.
 * Photos: **Condition photos** — front, rear, sides, any damage. Skip only with a reason.
 * Park it: **Set parking spot** → zone + bay + where the keys go (rack/hook, or with you).
 

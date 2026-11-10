@@ -30,6 +30,10 @@ software paths were tested in a desktop browser and with the built-in simulators
 * **Reading**: a phone's ordinary NFC tap opens the link — iPhone (XS and later, screen on, unlocked)
   and Android (NFC on). No app, no Web NFC. Attendants on Chrome/Android also get a **Tap key tag
   (NFC)** button that reads the sticker in the page and checks the chip serial (copy detection).
+* **Attendant tap cards**: one NTAG213 card per attendant (badge or lanyard). Copy the attendant's
+  link from Valet Settings → NFC panel → Attendant tap cards, write it once, lock it. Guests tap it
+  with their phone; the attendant confirms the number shown on both phones. A phone cannot be read
+  as a card, and a website cannot make a phone act as one — that is why the card is needed.
 * Not supported: Web NFC on iPhone/Safari, desktop browsers, Firefox. The QR and typed-number paths
   always remain.
 * Security: an NFC link is an address, not a key. Stickers can be copied; a key-tag sticker opens only

@@ -176,6 +176,24 @@ guest credential or personal data:
   unconfirmed". It never changes a car or pickup state, never authorises a handover, never identifies
   an owner, never claims an exact spot from one read. Gate/barrier control is out of scope.
 
+## 6c. Tap-to-pair attendant cards (owner, 2026-11-10)
+
+The owner asked for "the valet has NFC, the guest taps their mobile and the details reach them".
+A phone cannot be scanned as a tag, and a web page cannot make a phone act as one (iPhone forbids
+it; Android needs a native app), so the attendant carries a CARD instead:
+
+* Card content: ONE public URL, `/valet-pass?h=<12-char opaque ref>` — an address, not a pass
+  (spec §10 rule kept: no private credential on any NFC card). Issued per staff member per outlet by
+  the Valet Head; "New link" kills the old card.
+* Guest taps (ordinary OS tap, iPhone + Android) → the pass page asks the server for a waiting
+  request and shows a 2-digit number. The attendant must be ON SHIFT (else: "use the QR").
+* The attendant's screen shows the same number and the cars THEY checked in during the last 2 hours
+  (newest first). Only "Give pass to NN" grants the pass (`granted_how = 'card_tap_confirmed'`);
+  "Not them" rejects. The number is how the attendant tells two simultaneous taps apart.
+* Limits: a request lives 3 minutes; at most 3 waiting per attendant (numbers unique among them);
+  6 taps per phone per 10 minutes; same phone tapping again keeps its number; only that attendant
+  (or a head) can answer.
+
 ## 7. Assumptions (A#) — change any by telling the build
 
 * A1 — no app localisation system exists; en/hi strings live in `src/lib/valet/i18n.ts`.

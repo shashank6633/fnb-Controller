@@ -28,6 +28,9 @@ that copy). 🧪 = proven by the automated valet tests only.
 - ✅ Cashier bill screen: valet staff see the guest's car and can request it after ticking "Guest
   asked"; **ordinary cashiers see no change**.
 - ✅ Reports with definitions + CSV; Settings (zones, tags, rules, staff, paper books, messages).
+- ✅ Tap-to-pair (added 10 Nov evening): guest taps the attendant's NFC card link → both phones show
+  the same number → attendant presses "Give pass" → the pass appears on the guest's phone. A tap alone
+  gives nothing; off-duty, busy, time-out and old-card refusals 🧪.
 - ✅ NFC: venue / table / key-tag links; a key-tag sticker opens that car for valet staff only;
   strangers get the sign-in page; copied-sticker alert 🧪; re-issue kills an old sticker 🧪.
 - ✅ RFID (simulator): register a reader (token shown once), map key-tag EPCs, pretend reads judged
