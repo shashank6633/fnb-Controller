@@ -23,6 +23,7 @@ interface SettingsData {
   zones: { id: string; name: string; kind: string; capacity: number | null; retrieval_minutes: number | null; sort_order: number; is_active: number }[];
   tags: { id: string; code: string; kind: string; status: string; notes: string; on_car: string | null; nfc_ref: string | null; nfc_issued_at: string | null; rfid_epc: string | null }[];
   rfid: NfcRfidData['rfid'];
+  handoff_cards: NfcRfidData['handoff_cards'];
   books: { id: string; prefix: string; first_no: number; last_no: number; status: string; issued_at: string; note: string }[];
   staff: null | { id: string; name: string; email: string; role_name: string | null; valet_head: number; valet_attendant: number; valet_host: number; assigned: number }[];
   can_admin: boolean;

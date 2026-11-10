@@ -3,6 +3,7 @@ import { getDb } from '@/lib/db';
 import { requireStaff } from '@/lib/valet/core';
 import { valetJson } from '@/lib/valet/http';
 import { listReaders, recentReads } from '@/lib/valet/ops-rfid';
+import { handoffCards } from '@/lib/valet/ops-handoff';
 
 /**
  * GET ?outlet= — Valet Settings data. Valet Head (zones, tags) or admin. The
@@ -35,8 +36,10 @@ export async function GET(req: Request) {
     const books = db.prepare(`SELECT id, prefix, first_no, last_no, status, issued_at, note FROM valet_ticket_books WHERE outlet_id = ? ORDER BY status, issued_at DESC`).all(ov.outlet_id);
     // RFID readers + recent reads: visible to the head (health), managed by the admin.
     const rfid = { readers: listReaders(db, ov.outlet_id), reads: recentReads(db, ov.outlet_id, 30) };
+    // Tap-to-pair cards per valet staff member of this outlet (§6c).
+    const handoff_cards = handoffCards(db, ov.outlet_id);
     return {
-      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg, books, rfid,
+      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg, books, rfid, handoff_cards,
       entry_token: ov.entry_token, entry_path: ov.entry_token ? `/valet-pass?e=${ov.entry_token}` : '',
       zones, tags, staff, can_admin: actor.isAdmin,
     };

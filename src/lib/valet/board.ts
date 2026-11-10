@@ -14,6 +14,7 @@ import { promoteDue, eligibleQueue, etaFor, capacityOf, availableAttendants, dur
 import { expirePending, keyDesc } from './ops-arrival';
 import { diningRef, type DiningRef } from './ops-dining';
 import { tagSighting } from './ops-rfid';
+import { attendantTaps } from './ops-handoff';
 
 export interface Card {
   id: string; version: number; state: string; lane: string;
@@ -321,6 +322,8 @@ export function attendantView(db: DB, ov: OutletValet, actor: Actor, now: Date =
     config: { dwell_minutes: ov.cfg.dwell_minutes, max_tasks: ov.cfg.max_tasks_per_attendant, photos_min: ov.cfg.photos.min,
       photo_exception: ov.cfg.photos.allow_exception, required: ov.cfg.required, gate_label: ov.cfg.pickup_gate_label, paper: ov.cfg.paper.enabled },
     capacity: { gate: capacityOf(db, ov.outlet_id, 'gate'), holding: capacityOf(db, ov.outlet_id, 'holding') },
+    // Guests who tapped this attendant's card, waiting for them to confirm (§6c).
+    handoff: attendantTaps(db, ov.outlet_id, actor.id, now),
   };
 }
 

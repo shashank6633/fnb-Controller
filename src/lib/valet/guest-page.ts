@@ -73,7 +73,7 @@ a{color:var(--acc)}
 var B=${boot};
 var L=localStorage.getItem('fnb_vp_lang')||B.lang||'en';
 var S={data:null,sel:null,code:null,codeExp:null,lastOk:null,busy:false,err:'',info:'',entryInfo:null,lastStates:{},done:false};
-var q=new URLSearchParams(location.search);var ENTRY=q.get('e')||B.entry||'';var ACT=q.get('a')||'';var PAPER=q.get('paper')==='1';
+var q=new URLSearchParams(location.search);var ENTRY=q.get('e')||B.entry||'';var ACT=q.get('a')||'';var PAPER=q.get('paper')==='1';var TAP=q.get('h')||'';
 function T(k,v){var s=(B.strings[L]&&B.strings[L][k])||B.strings.en[k]||k;if(v)for(var n in v)s=s.replace('{'+n+'}',v[n]);return s}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=String(text);return e}
 function fmtTime(iso){try{return new Date(iso).toLocaleTimeString(L==='hi'?'hi-IN':'en-IN',{hour:'numeric',minute:'2-digit',timeZone:'Asia/Kolkata'})}catch(_){return ''}}
@@ -102,6 +102,11 @@ function render(){
   document.getElementById('venue').textContent=(p&&p.venue_name)||(S.entryInfo&&S.entryInfo.venue_name)||B.venue||B.business||'';
   document.getElementById('sub').textContent=T('title');
   if(S.err){app.appendChild(el('div','err',S.err))}
+  // Tapped an attendant's card: show the number until they confirm (DESIGN.md §6c).
+  var tp=S.data&&S.data.tap;
+  if(tp&&tp.status==='pending'){var tc=el('div','card');tc.appendChild(el('h1',null,T('tap_title')));tc.appendChild(el('div','big',tp.number));
+    tc.appendChild(el('p',null,tp.valet_name?T('tap_body',{name:tp.valet_name}):T('tap_body_noname')));var te=el('p','mute');te.id='tapExp';tc.appendChild(te);app.appendChild(tc);tick();return}
+  if(tp&&!ps.length&&(tp.status==='rejected'||tp.status==='expired'))app.appendChild(el('div','note',T(tp.status==='rejected'?'tap_rejected':'tap_expired')));
   if(S.done&&!ps.length){var d=el('div','card');d.appendChild(el('h1',null,T('done_title')));d.appendChild(el('p',null,T('done_body')));app.appendChild(d);return}
   if(!S.data&&!S.offline){app.appendChild(el('p','mute','…'));return}
   if(!ps.length){renderNoPass(app);return}
@@ -175,11 +180,13 @@ function renderCode(box,p){var w=el('div');w.style.marginTop='12px';w.appendChil
 var codeBusy=false;function fetchCode(p){if(codeBusy)return;codeBusy=true;api('/api/valet-guest/act',{cmd:'code',session_id:p.session_id}).then(function(j){codeBusy=false;S.code=j.code;S.codeExp=j.expires_at;S.codeFor=p.session_id;var h=document.getElementById('hcode');if(h)h.textContent=j.code}).catch(function(){codeBusy=false})}
 function tick(){var e=document.getElementById('hexp');if(e&&S.codeExp){var s=secsLeft(S.codeExp);e.textContent=T('code_refresh')+' '+mmss(s);if(s<15){var p=pass();if(p&&p.can_show_code)fetchCode(p)}}
   var d=document.getElementById('dwell');if(d){d.textContent='⏱ '+mmss(secsLeft(d.dataset.at))}
-  var pe=document.getElementById('pairExp');var pd=S.data&&S.data.pending;if(pe&&pd){var s2=secsLeft(pd.expires_at);pe.textContent=T('pair_expires')+' '+mmss(s2)}}
+  var pe=document.getElementById('pairExp');var pd=S.data&&S.data.pending;if(pe&&pd){var s2=secsLeft(pd.expires_at);pe.textContent=T('pair_expires')+' '+mmss(s2)}
+  var tx=document.getElementById('tapExp');var tq=S.data&&S.data.tap;if(tx&&tq){tx.textContent=T('tap_expires')+' '+mmss(secsLeft(tq.expires_at))}}
 document.getElementById('langbtn').onclick=function(){L=L==='hi'?'en':'hi';try{localStorage.setItem('fnb_vp_lang',L)}catch(_){};if(S.data&&S.data.passes&&S.data.passes.length)api('/api/valet-guest/act',{cmd:'lang',lang:L}).catch(function(){});render()};
 function start(){var p0=ENTRY?api('/api/valet-guest/entry?e='+encodeURIComponent(ENTRY)).then(function(j){S.entryInfo=j}).catch(function(){S.entryInfo={ok:false}}):Promise.resolve();
   var p1=ACT?api('/api/valet-guest/act',{cmd:'activate',a:ACT}).catch(function(e){S.err=e.message}).then(function(){history.replaceState(null,'','/valet-pass')}):Promise.resolve();
-  Promise.all([p0,p1]).then(poll)}
+  var p2=TAP?api('/api/valet-guest/act',{cmd:'tap',h:TAP}).catch(function(e){S.err=e.message}).then(function(){history.replaceState(null,'','/valet-pass')}):Promise.resolve();
+  Promise.all([p0,p1,p2]).then(poll)}
 start();setInterval(tick,1000);
 var iv=setInterval(poll,5000);document.addEventListener('visibilitychange',function(){clearInterval(iv);iv=setInterval(poll,document.hidden?20000:5000);if(!document.hidden)poll()});
 window.addEventListener('online',poll);

@@ -36,6 +36,8 @@ interface View {
   queue: { waiting: number; scheduled: number }; keys_with_me: { id: string; tag_code: string; state: string }[];
   zones: { id: string; name: string; kind: string; capacity: number | null }[];
   config: { dwell_minutes: number; max_tasks: number; photos_min: number; photo_exception: boolean; required: Record<string, boolean>; gate_label: string; paper?: boolean };
+  handoff: { taps: { id: string; number: number; created_at: string; expires_at: string }[];
+    cars: { id: string; tag_code: string; ticket_no: string; plate: string; make: string; model: string; colour: string; checked_in_at: string; passes: number }[] };
 }
 
 const DRAFT_TTL = 30 * 60_000;
@@ -123,6 +125,7 @@ export default function AttendantPage() {
           {live.error ? <ErrorNote message={live.error.message} /> : null}
           <ErrorNote message={cmd.err} />
           {nfcNote?.kind === 'error' ? <ErrorNote message={nfcNote.text} /> : nfcNote ? <InfoNote>{nfcNote.text}</InfoNote> : null}
+          {v?.handoff?.taps.length ? <TapPanel v={v} cmd={cmd} L={L} /> : null}
           {v && !v.outlet.enabled ? <InfoNote>Valet is switched off for this outlet.</InfoNote> : null}
           {!v ? <p className="text-sm text-[#8B7355]">Loading…</p> : (
             <>
@@ -278,6 +281,48 @@ export default function AttendantPage() {
           </div>
         </Modal>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * A guest tapped this attendant's card (DESIGN.md §6c). Their phone shows a
+ * number; the attendant checks it matches, picks the car (newest check-in
+ * first) and gives the pass. Nothing is granted without this tap.
+ */
+function TapPanel({ v, cmd, L }: { v: View; cmd: ReturnType<typeof useCmd>; L: (k: string) => string }) {
+  const cars = v.handoff.cars;
+  const [pick, setPick] = useState<Record<string, string>>({});
+  return (
+    <div className="space-y-2">
+      {v.handoff.taps.map(t => {
+        const chosen = pick[t.id] || cars[0]?.id || '';
+        return (
+          <Panel key={t.id} className="border-[#af4408] ring-2 ring-[#f5b48a]">
+            <div className="flex items-center justify-between gap-3">
+              <div><div className="font-bold">{L('tap_title')}</div><div className="text-xs text-[#8B7355]">{L('tap_check')}</div></div>
+              <div className="text-5xl font-extrabold tabular-nums" aria-label={`${L('tap_check')} ${t.number}`}>{t.number}</div>
+            </div>
+            {cars.length ? (
+              <div className="mt-2 space-y-1">
+                <div className="text-xs font-semibold text-[#6B5744]">{L('which_car')}</div>
+                {cars.map(c => (
+                  <label key={c.id} className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${chosen === c.id ? 'border-[#af4408] bg-[#FFF1E3]' : 'border-[#E8D5C4] bg-white'}`}>
+                    <input type="radio" name={`tap-${t.id}`} checked={chosen === c.id} onChange={() => setPick(p => ({ ...p, [t.id]: c.id }))} />
+                    <span className="font-extrabold">{c.tag_code || c.ticket_no}</span>
+                    <span className="min-w-0 truncate">{c.plate} · {[c.colour, c.make, c.model].filter(Boolean).join(' ')}</span>
+                    {c.passes ? <span className="ml-auto shrink-0 text-[11px] text-[#8B7355]">{L('has_pass')}</span> : null}
+                  </label>
+                ))}
+              </div>
+            ) : <InfoNote>{L('tap_no_car')}</InfoNote>}
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <Btn big kind="ok" disabled={!chosen || cmd.busy} onClick={() => void cmd.run('handoff.confirm', { tap_id: t.id, session_id: chosen })}>{L('give_pass')} {t.number}</Btn>
+              <Btn big kind="ghost" disabled={cmd.busy} onClick={() => void cmd.run('handoff.reject', { tap_id: t.id })}>{L('not_them')}</Btn>
+            </div>
+          </Panel>
+        );
+      })}
     </div>
   );
 }

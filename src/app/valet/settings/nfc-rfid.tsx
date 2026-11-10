@@ -16,6 +16,7 @@ export interface NfcRfidData {
   entry_path: string; can_admin: boolean;
   zones: { id: string; name: string; kind: string; is_active: number }[];
   tags: { id: string; code: string; status: string; on_car: string | null; nfc_ref: string | null; nfc_issued_at: string | null; rfid_epc: string | null }[];
+  handoff_cards: { user_id: string; name: string; ref: string | null; created_at: string | null; path: string | null }[];
   rfid: {
     readers: { id: string; name: string; zone_name: string | null; enabled: number; health: string; last_seen_at: string | null; events_accepted: number; events_rejected: number }[];
     reads: { received_at: string; observed_at: string; source: string; event_id: string; epc: string; antenna: string; status: string; reader_name: string; tag_code: string | null }[];
@@ -101,6 +102,32 @@ export function NfcPanel({ data, run, ask }: { data: NfcRfidData; run: Run; ask:
         <span className="text-xs text-[#8B7355]">{linked.length} key tag{linked.length === 1 ? '' : 's'} with an NFC link</span>
         {linked.length ? <Btn kind="ghost" onClick={csv}><Download size={14} className="inline mr-1" aria-hidden />All links (CSV)</Btn> : null}
       </div>
+      {/* Tap-to-pair cards (DESIGN.md §6c): one card per attendant. A guest taps
+          it, both phones show the same number, the attendant confirms. */}
+      <h3 className="mt-5 text-sm font-bold">Attendant tap cards</h3>
+      <p className="text-xs text-[#8B7355] mb-2">
+        Give each attendant one NFC card. After checking a car in, they hold the card out; the guest taps it with their phone, both phones show the
+        same number, and the attendant presses <b>Give pass</b>. The card holds only a public link — a tap alone never gives a pass. Write it once,
+        then lock it. Staff appear here once ticked under Staff for this outlet.
+      </p>
+      {data.handoff_cards.length ? (
+        <div className="overflow-x-auto"><table className="w-full text-sm"><tbody>
+          {data.handoff_cards.map(h => (
+            <tr key={h.user_id} className="border-t border-[#F0E4D6]">
+              <td className="py-1.5 pr-2 font-semibold">{h.name}</td>
+              <td className="pr-2 text-xs text-[#8B7355]">{h.ref ? `Card link given ${when(h.created_at)}` : 'No card yet'}</td>
+              <td className="text-right whitespace-nowrap space-x-2">
+                {h.path ? <>
+                  <CopyBtn text={`${origin}${h.path}`} />
+                  <WriteBtn url={`${origin}${h.path}`} can={can} onMsg={setMsg} />
+                  <button type="button" className="text-xs font-semibold text-[#af4408]" onClick={async () => { if (await ask({ title: `Give ${h.name} a new card link? Their old card stops working — write the new link to a card.`, confirmText: 'New link' }) !== null) void run('handoff.card_issue', { user_id: h.user_id }, `${h.name} has a new card link.`); }}>New link</button>
+                  <button type="button" className="text-xs font-semibold text-[#6B5744]" onClick={async () => { if (await ask({ title: `Remove ${h.name}'s card link? Their card stops working.`, confirmText: 'Remove', danger: true }) !== null) void run('handoff.card_clear', { user_id: h.user_id }, 'Card link removed.'); }}>Remove</button>
+                </> : <button type="button" className="text-xs font-semibold text-[#af4408]" onClick={() => void run('handoff.card_issue', { user_id: h.user_id }, `${h.name} now has a card link — copy or write it.`)}>Give card link</button>}
+              </td>
+            </tr>
+          ))}
+        </tbody></table></div>
+      ) : <p className="text-xs text-[#8B7355]">No valet attendants are ticked for this outlet yet.</p>}
     </Panel>
   );
 }

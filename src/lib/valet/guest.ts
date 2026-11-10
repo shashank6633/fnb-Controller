@@ -22,6 +22,7 @@ import { isHeld } from './states';
 import { etaFor, promoteDue } from './queue';
 import { createPendingCheckin, expirePending } from './ops-arrival';
 import { guestPaperEntry } from './ops-paper';
+import { guestTap, deviceTap } from './ops-handoff';
 import {
   requestPickup, cancelPickup, reschedulePickup, guestOutside, issueHandoverCode, raiseAlert,
 } from './ops-pickup';
@@ -131,7 +132,7 @@ function passView(db: DB, ov: OutletValet, s: SessionRow, now: Date) {
 
 /** GET /api/valet-guest/state — this browser's own passes and pending check-in. */
 export function guestState(db: DB, device: GuestDevice | null, now: Date = new Date()) {
-  if (!device) return { passes: [], pending: null, lang: '' };
+  if (!device) return { passes: [], pending: null, tap: null, lang: '' };
   db.prepare('UPDATE valet_guest_devices SET last_seen_at = ? WHERE id = ?').run(nowIso(now), device.id);
   expirePending(db, now);
   const passes = [];
@@ -151,7 +152,7 @@ export function guestState(db: DB, device: GuestDevice | null, now: Date = new D
     pending = { pairing_code: pend.status === 'pending' ? pend.pairing_code : '', expires_at: pend.expires_at, status: pend.status, kind: pend.source,
       venue_name: ov ? (ov.cfg.venue_name || ov.outlet_name) : '' };
   }
-  return { passes, pending, lang: device.lang };
+  return { passes, pending, tap: deviceTap(db, device.id, now), lang: device.lang };
 }
 
 /** GET /api/valet-guest/entry?e= — what the check-in page needs to render. */
@@ -178,7 +179,7 @@ export function guestAct(
   const cmd = String(body.cmd || '');
   if (!rateLimit(db, `guest-ip:${ip}`, 120, 600, now)) fail(429, 'slow_down', 'Too many requests. Please wait a few minutes.');
 
-  if (cmd === 'checkin' || cmd === 'activate' || cmd === 'paper') {
+  if (cmd === 'checkin' || cmd === 'activate' || cmd === 'paper' || cmd === 'tap') {
     if (!rateLimit(db, `guest-${cmd}-ip:${ip}`, cmd === 'checkin' ? 10 : 20, 600, now)) fail(429, 'slow_down', 'Too many attempts. Please ask the valet desk.');
     let setCookie: string | undefined;
     let dev = device;
@@ -190,6 +191,12 @@ export function guestAct(
       }
       return dev!;
     };
+    if (cmd === 'tap') {
+      // Tapped an attendant's card (DESIGN.md §6c): only a waiting request —
+      // the pass comes when the attendant confirms the number shown here.
+      const r = guestTap(db, ensure().id, String(body.h || ''), now);
+      return { body: { ok: true, number: r.number, expires_at: r.expires_at, valet_name: r.valet_name }, setCookie };
+    }
     if (cmd === 'paper') {
       const ov = outletByEntry(db, body.e);
       if (!ov || !ov.enabled) fail(404, 'not_available', 'Valet is not available right now. Please see the valet desk.');

@@ -1289,6 +1289,61 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     (globalThis as any).__TOKEN = undefined;
   }
 
+  S('AB tap-to-pair attendant cards');
+  {
+    // Owner, 2026-11-10: the guest taps the attendant's NFC card with their phone to get the pass.
+    const ho = require(path.join(WT, 'src/lib/valet/ops-handoff.ts'));
+    const t0 = at(1700);
+    const shiftOn = (k: string) => { if (!db.prepare('SELECT 1 FROM valet_shifts WHERE user_id = ? AND ended_at IS NULL').get(users[k].id)) onShift(k, t0); };
+    shiftOn('a1'); shiftOn('a2');
+    eq((run('a1', { cmd: 'handoff.card_issue', outlet_id: OA, user_id: users.a1.id }, t0) as any).ok, false, 'an attendant cannot hand out card links');
+    eq((run('head', { cmd: 'handoff.card_issue', outlet_id: OA, user_id: users.plain.id }, t0) as any).code, 'not_staff', 'only valet staff of this outlet get a card');
+    const c1 = run('head', { cmd: 'handoff.card_issue', outlet_id: OA, user_id: users.a1.id }, t0) as any;
+    ok(c1.ok && /^[0-9A-Z]{12}$/.test(c1.ref) && c1.path === `/valet-pass?h=${c1.ref}`, 'head gives a1 a card: a public link with an opaque reference');
+    const car = arr.checkinCreate(db, ov(), A('a1'), { plate: 'KA01TP0001', make: 'Tata', model: 'Nexon', colour: 'Red', tag_code: 'AB1' }, t0).session_id;
+    // Guest phone taps the card (an OS tap opens /valet-pass?h=…).
+    const g1 = guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.6.1', false, t0);
+    const dev1 = guest.deviceFromCookie(db, String(g1.setCookie).split(';')[0].split('=')[1]);
+    ok(g1.body.number >= 10 && g1.body.number <= 99 && g1.body.valet_name === 'ZZ', 'the guest gets a 2-digit number and the valet\'s first name');
+    eq(guest.guestState(db, dev1, t0).passes.length, 0, 'a tap ALONE gives no pass');
+    eq(guest.guestState(db, dev1, t0).tap.status, 'pending', 'the guest page shows "waiting for the valet"');
+    eq(guest.guestAct(db, dev1, { cmd: 'tap', h: c1.ref.toLowerCase() }, '6.6.6.1', false, at(1700.5)).body.number, g1.body.number, 'the same phone tapping again keeps its number');
+    const view = board.attendantView(db, ov(), A('a1'), at(1701));
+    ok(view.handoff.taps.length === 1 && view.handoff.taps[0].number === g1.body.number, 'a1\'s screen shows the same number');
+    eq(view.handoff.cars[0].id, car, '…with the car a1 just checked in offered first');
+    eq(board.attendantView(db, ov(), A('a2'), at(1701)).handoff.taps.length, 0, 'other attendants do not see it');
+    const tapId = view.handoff.taps[0].id;
+    eq((run('a2', { cmd: 'handoff.confirm', outlet_id: OA, tap_id: tapId, session_id: car }, at(1701)) as any).code, 'not_yours', 'another attendant cannot confirm a tap on a1\'s card');
+    eq((run('a1', { cmd: 'handoff.confirm', outlet_id: OA, tap_id: tapId, session_id: car }, at(1701)) as any).session_id, car, 'a1 confirms → done');
+    eq(guest.guestState(db, dev1, at(1702)).passes.map((p: any) => p.session_id), [car], 'the guest\'s phone now shows the pass');
+    eq((db.prepare('SELECT granted_how FROM valet_pass_grants WHERE device_id = ? AND session_id = ?').get(dev1.id, car) as any).granted_how, 'card_tap_confirmed', 'recorded as a confirmed card tap');
+    eq((run('a1', { cmd: 'handoff.confirm', outlet_id: OA, tap_id: tapId, session_id: car }, at(1702)) as any).code, 'tap_closed', 'a tap is answered once');
+    // A stranger taps the same card: the attendant sees an unexpected number and says "Not them".
+    const g2 = guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.6.2', false, at(1703));
+    const dev2 = guest.deviceFromCookie(db, String(g2.setCookie).split(';')[0].split('=')[1]);
+    const t2 = board.attendantView(db, ov(), A('a1'), at(1703)).handoff.taps[0];
+    eq((run('a1', { cmd: 'handoff.reject', outlet_id: OA, tap_id: t2.id }, at(1703)) as any).ok, true, 'a1 rejects a tap that is not their guest');
+    eq([guest.guestState(db, dev2, at(1704)).passes.length, guest.guestState(db, dev2, at(1704)).tap.status], [0, 'rejected'], 'that phone gets nothing and is told to ask again');
+    // Timing out.
+    const g3 = guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.6.3', false, at(1710));
+    const dev3 = guest.deviceFromCookie(db, String(g3.setCookie).split(';')[0].split('=')[1]);
+    const t3 = board.attendantView(db, ov(), A('a1'), at(1710)).handoff.taps[0];
+    eq((run('a1', { cmd: 'handoff.confirm', outlet_id: OA, tap_id: t3.id, session_id: car }, at(1714)) as any).code, 'tap_closed', 'a tap older than 3 minutes cannot be confirmed');
+    eq(guest.guestState(db, dev3, at(1714)).tap.status, 'expired', 'the guest is told it timed out');
+    // At most three waiting per attendant; numbers never clash.
+    const nums = [1, 2, 3].map(i => guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, `6.6.7.${i}`, false, at(1720)).body.number);
+    eq(new Set(nums).size, 3, 'three waiting taps get three different numbers');
+    eq(caught(() => guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.7.9', false, at(1720)))?.code, 'valet_busy', 'a fourth is asked to wait');
+    // Off duty, and a re-issued card.
+    db.prepare('UPDATE valet_shifts SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL').run(cfgm.nowIso(at(1730)), users.a1.id);
+    eq(caught(() => guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.8.1', false, at(1731)))?.code, 'off_duty', 'an attendant off shift → guest is told to use the QR');
+    onShift('a1', at(1732));
+    const c2 = run('head', { cmd: 'handoff.card_issue', outlet_id: OA, user_id: users.a1.id }, at(1732)) as any;
+    ok(c2.reissued && c2.ref !== c1.ref, 'head can give a new card link');
+    eq(caught(() => guest.guestAct(db, null, { cmd: 'tap', h: c1.ref }, '6.6.8.2', false, at(1733)))?.code, 'card_unknown', 'the old card stops working');
+    eq(ho.handoffCards(db, OA).filter((h: any) => h.user_id === users.a1.id && h.ref === c2.ref).length, 1, 'Settings lists a1 with the new card');
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

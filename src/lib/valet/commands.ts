@@ -28,6 +28,7 @@ import {
 import { addTicketBook, retireTicketBook, confirmPaperClaim } from './ops-paper';
 import { linkDining, unlinkDining } from './ops-dining';
 import { issueNfcRef, clearNfcRef } from './ops-nfc';
+import { issueHandoffCard, clearHandoffCard, confirmTap, rejectTap } from './ops-handoff';
 import { registerReader, rotateReaderToken, setReaderEnabled, setTagEpc, simulateRead } from './ops-rfid';
 import { enqueue, cancelForSession } from './notify';
 
@@ -196,6 +197,13 @@ export const COMMANDS: Record<string, CommandDef> = {
   'rfid.reader_rotate':    { need: 'admin', allowDisabled: true, run: c => rotateReaderToken(c.db, c.ov, c.actor, s(c.body.reader_id), c.now) },
   'rfid.reader_enable':    { need: 'admin', allowDisabled: true, run: c => setReaderEnabled(c.db, c.ov, c.actor, s(c.body.reader_id), c.body.enabled === true, c.now) },
   'rfid.simulate':         { need: 'admin', limit: [120, 60], run: c => ({ ...simulateRead(c.db, c.ov, c.actor, c.body, c.now) }) },
+
+  // ── Tap-to-pair cards (DESIGN.md §6c): the head gives out card links; the
+  //    attendant confirms the number the guest's phone shows.
+  'handoff.card_issue':    { need: 'head', allowDisabled: true, run: c => issueHandoffCard(c.db, c.ov, c.actor, s(c.body.user_id), c.now) },
+  'handoff.card_clear':    { need: 'head', allowDisabled: true, run: c => clearHandoffCard(c.db, c.ov, c.actor, s(c.body.user_id), c.now) },
+  'handoff.confirm':       { need: 'attendant', limit: [60, 60], run: c => confirmTap(c.db, c.ov, c.actor, s(c.body.tap_id), s(c.body.session_id), c.now) },
+  'handoff.reject':        { need: 'attendant', run: c => rejectTap(c.db, c.ov, c.actor, s(c.body.tap_id), c.now) },
 };
 
 /** Run one staff command end to end: look up, authorise, rate-limit, execute,

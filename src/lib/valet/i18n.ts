@@ -37,6 +37,8 @@ export const STRINGS = {
     name_opt: 'Your name (optional)', mobile_opt: 'Mobile (optional)', checkin_go: 'Get my pairing code',
     pair_title: 'Your pairing code', pair_body: 'Show this code to the valet and hand over your keys. Your pass appears here once they confirm.',
     pair_expires: 'Code expires in', pair_expired: 'This code has expired. Please start again.',
+    tap_title: 'Show the valet this number', tap_body: 'Waiting for {name} to confirm your car. Your pass appears here by itself.', tap_body_noname: 'Waiting for the valet to confirm your car. Your pass appears here by itself.',
+    tap_expires: 'Number valid for', tap_rejected: 'The valet did not confirm. Please ask them and tap their card again.', tap_expired: 'That tap timed out. Please tap the valet\'s card again.',
     choose_car: 'Choose a car', select_car_note: 'You have more than one car with us — choose one.',
     offline: 'No connection — showing the last update.', updated: 'Updated', lang: 'हिंदी',
     venue_off: 'Valet check-in is not available right now. Please see the valet desk.',
@@ -72,6 +74,8 @@ export const STRINGS = {
     name_opt: 'आपका नाम (वैकल्पिक)', mobile_opt: 'मोबाइल (वैकल्पिक)', checkin_go: 'मेरा पेयरिंग कोड दें',
     pair_title: 'आपका पेयरिंग कोड', pair_body: 'यह कोड वैले को दिखाएँ और चाबी दें। उनकी पुष्टि के बाद आपका पास यहाँ दिखेगा।',
     pair_expires: 'कोड की समय-सीमा', pair_expired: 'यह कोड समाप्त हो गया। कृपया फिर से शुरू करें।',
+    tap_title: 'वैले को यह नंबर दिखाएँ', tap_body: '{name} आपकी गाड़ी की पुष्टि कर रहे हैं। आपका पास अपने-आप यहाँ दिखेगा।', tap_body_noname: 'वैले आपकी गाड़ी की पुष्टि कर रहे हैं। आपका पास अपने-आप यहाँ दिखेगा।',
+    tap_expires: 'नंबर की समय-सीमा', tap_rejected: 'वैले ने पुष्टि नहीं की। कृपया उनसे पूछें और उनका कार्ड फिर से टैप करें।', tap_expired: 'टैप का समय समाप्त हो गया। कृपया वैले का कार्ड फिर से टैप करें।',
     choose_car: 'गाड़ी चुनें', select_car_note: 'आपकी एक से ज़्यादा गाड़ियाँ हमारे पास हैं — एक चुनें।',
     offline: 'कनेक्शन नहीं है — आख़िरी जानकारी दिख रही है।', updated: 'अपडेट', lang: 'English',
     venue_off: 'वैले चेक-इन अभी उपलब्ध नहीं है। कृपया वैले डेस्क पर आएँ।',
@@ -110,7 +114,7 @@ export const STAFF_STATE_LABEL: Record<Lang, Record<string, string>> = {
 export const ATT: Record<Lang, Record<string, string>> = {
   en: {
     start_shift: 'Start shift', end_shift: 'End shift', take_break: 'Take a break', end_break: 'End break',
-    new_checkin: 'New check-in', take_next: 'Take next car', scan_tag: 'Scan / enter tag', report: 'Report problem', tap_nfc: 'Tap key tag (NFC)',
+    new_checkin: 'New check-in', take_next: 'Take next car', scan_tag: 'Scan / enter tag', report: 'Report problem', tap_nfc: 'Tap key tag (NFC)', tap_title: 'A guest tapped your card', tap_check: 'Their phone shows', which_car: 'Which car is theirs?', give_pass: 'Give pass to', not_them: 'Not them', tap_no_car: 'You have not checked a car in during the last 2 hours. Check their car in first, then ask them to tap your card again.', has_pass: 'already has a pass',
     my_task: 'My task', waiting: 'waiting', start_fetch: 'Start fetching', give_back: 'Give back to queue',
     mark_ready: 'Mark ready at gate', set_spot: 'Set parking spot', start_parking: 'Start parking',
     confirm_handoff: 'Confirm handoff', verify_handover: 'Verify handover', went_inside: 'Guest went back inside',
@@ -122,7 +126,7 @@ export const ATT: Record<Lang, Record<string, string>> = {
   },
   hi: {
     start_shift: 'शिफ़्ट शुरू करें', end_shift: 'शिफ़्ट खत्म करें', take_break: 'ब्रेक लें', end_break: 'ब्रेक खत्म',
-    new_checkin: 'नई गाड़ी चेक-इन', take_next: 'अगली गाड़ी लें', scan_tag: 'टैग स्कैन / लिखें', report: 'समस्या बताएँ', tap_nfc: 'की-टैग टैप करें (NFC)',
+    new_checkin: 'नई गाड़ी चेक-इन', take_next: 'अगली गाड़ी लें', scan_tag: 'टैग स्कैन / लिखें', report: 'समस्या बताएँ', tap_nfc: 'की-टैग टैप करें (NFC)', tap_title: 'एक मेहमान ने आपका कार्ड टैप किया', tap_check: 'उनके फ़ोन पर नंबर', which_car: 'उनकी गाड़ी कौन-सी है?', give_pass: 'पास दें —', not_them: 'ये नहीं', tap_no_car: 'पिछले 2 घंटे में आपने कोई गाड़ी चेक-इन नहीं की। पहले उनकी गाड़ी चेक-इन करें, फिर उनसे आपका कार्ड दोबारा टैप करने को कहें।', has_pass: 'पास पहले से है',
     my_task: 'मेरा काम', waiting: 'इंतज़ार में', start_fetch: 'गाड़ी लाना शुरू', give_back: 'वापस कतार में दें',
     mark_ready: 'गेट पर तैयार', set_spot: 'पार्किंग जगह दर्ज करें', start_parking: 'पार्क करना शुरू',
     confirm_handoff: 'हैंडऑफ़ की पुष्टि', verify_handover: 'जाँच कर गाड़ी सौंपें', went_inside: 'मेहमान अंदर चले गए',

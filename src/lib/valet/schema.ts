@@ -492,7 +492,34 @@ const TABLES: string[] = [
     tag_id        TEXT,
     session_id    TEXT
   )`,
+  // Attendant "tap-to-pair" cards (owner, 2026-11-10; DESIGN.md §6c). The card holds
+  // a PUBLIC link with an opaque reference — never a pass. A guest's tap only
+  // creates a waiting request; the attendant must confirm the matching number.
+  `CREATE TABLE IF NOT EXISTS valet_handoff_cards (
+    id          TEXT PRIMARY KEY,
+    outlet_id   TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL DEFAULT '',
+    revoked_at  TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS valet_handoff_taps (
+    id          TEXT PRIMARY KEY,
+    outlet_id   TEXT NOT NULL,
+    card_id     TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    device_id   TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_by TEXT NOT NULL DEFAULT '',
+    session_id  TEXT
+  )`,
 ];
+
 
 /** Columns added to valet tables after their first version. Added before the
  *  indexes run, so an index on a new column never meets an old table. */
@@ -558,6 +585,10 @@ const INDEXES: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_rfid_event ON valet_rfid_events(reader_id, event_id)`,
   `CREATE INDEX IF NOT EXISTS idx_valet_rfid_dedupe ON valet_rfid_events(reader_id, epc, observed_at)`,
   `CREATE INDEX IF NOT EXISTS idx_valet_rfid_tag ON valet_rfid_events(tag_id, observed_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_handoff_ref ON valet_handoff_cards(ref)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_handoff_card_active ON valet_handoff_cards(outlet_id, user_id) WHERE revoked_at IS NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_handoff_taps_user ON valet_handoff_taps(user_id, status, expires_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_handoff_taps_device ON valet_handoff_taps(device_id, created_at)`,
 ];
 
 /** Role-only capability columns, DEFAULT 0 with NO backfill: roles are the
