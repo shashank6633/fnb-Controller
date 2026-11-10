@@ -33,8 +33,8 @@ plain-language checklists, never "Done".
 | # | Scope | Status |
 |---|---|---|
 | 1 | Core: schema, access, outlet enable, zones, staff↔outlet, tags, staff + guest-led check-in, parking + custody, guest pass, queue + Take next car, ready/dwell/holding, verified handover + claim receipt + recovery, Head Dashboard, team/shifts, SSE + polling, tests | **VERIFIED (local)** |
-| 2 | Scheduling across midnight/hours/capacity, photos, reports+CSV, paper ticket books, FNB links, notification outbox + WhatsApp adapter/simulator, consent, escalations, closing rush, retention | **NEXT** |
-| 3 | NFC provisioning, RFID adapter + simulator | not started |
+| 2 | Scheduling across midnight/hours/capacity, photos, reports+CSV, paper ticket books, FNB links, notification outbox + WhatsApp adapter/simulator, consent, escalations, closing rush, retention | **VERIFIED (local, browser 10 Nov)** |
+| 3 | NFC provisioning, RFID adapter + simulator, docs, final checklist | **VERIFIED (local, browser 10 Nov; no physical device)** |
 
 ## 2. Done and verified
 
@@ -74,7 +74,7 @@ plain-language checklists, never "Done".
 - Commits: … f8c207e, 2bbc122. tsc clean (`--incremental false`). valet-tests 232/0. Gate earlier: suites
   identical to origin/main baseline; next build OK. origin/main merged in at ee4d521 (59d764e, clean).
 
-## 3. In progress — increment 2
+## 3. Increment 2 (done)
 
 DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
 - worker.ts (20 s tick, armed in instrumentation.ts; prod or ENABLE_SCHEDULER=1 only) → promote due, expire,
@@ -125,14 +125,32 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
   the harness MISSES rsync'd server-lib changes → restart the server after syncing src/lib. Demo admin
   user added to the harness copy only (token in session scratchpad, never in chat).
 
+## 3b. Increment 3 (2026-11-10, commits d97e2c4 … 456c1c6+)
+
+- NFC (ops-nfc.ts, /api/valet/nfc): key-tag link = /valet/attendant?nfc=<12-char opaque ref>; staff of
+  that outlet only (others/dead links get the SAME 404 'nfc_unknown'; signed out → 401 → login);
+  re-issue kills old sticker; chip-serial copy check → 'nfc_copy' alert; lost/retired tags refused.
+  Attendant: ?nfc= arrival opens the car (fetches the other outlet's view if needed) + Web NFC "Tap key
+  tag" (useWebNfc capability hook). Settings NFC panel: venue/table/key links, copy, write (Web NFC
+  only), New link / Remove, CSV, EPC per tag.
+- RFID (ops-rfid.ts, POST /api/valet-rfid/ingest = public EXACT path, Bearer token, SHA-256 stored):
+  config rfid.mode off|simulator|live (default off, admin-only via Rules); verdicts accepted / replay /
+  duplicate / stale / future / unknown_tag / invalid; batch ≤ 200; rate limit; health never/ok/quiet/
+  disabled; simulator (admin, simulator mode only); drawer shows "keys seen near …, unconfirmed".
+  Observations never change car/pickup/custody. Schema: valet_rfid_readers, valet_rfid_events, tag
+  columns nfc_issued_at / nfc_chip_serial / rfid_epc via ADDED_COLUMNS (runs before indexes).
+- Tests Y (NFC) + Z (RFID) → suite 423/0. Lint: no new findings; learned that the React Compiler lint
+  reports ONE finding per component and SKIPS a component containing try…finally or a render-time
+  setState — removing eslint-disable lines and `finally` restored analysis.
+- Docs: SETUP, NOTIFICATIONS, OPERATIONS, HARDWARE, DEPLOY, env.example, CHECKLIST (final owner list).
+- Gate: part-2 gate PASSED (efc8198 == origin/main 1b8b290 on every suite; valet 365/0; build ok).
+  FINAL GATE PASSED on af7b7f1 (== origin/main 1b8b290 on every suite; valet 423/0; build ok) — CHECKLIST §6.
+
 ## 4. Exact next steps
 
-1. Gate vs origin/main (git fetch first; merge origin/main into this branch if it moved; harness/valet/gate.sh;
-   one `next build` at a time — check no other build running; load was ~14–27 from other sessions).
-   Then the owner's part-2 progress note (plain words).
-2. Part 3: NFC provisioning (tag inventory NDEF URLs, Web NFC capability detection, instructions) + RFID
-   adapter/simulator (devices, authenticated ingestion, dedupe, health). Docs (setup, templates, hardware,
-   shift guide, deploy/rollback, env example). Final checklist.
+1. Nothing left to build in the spec. Waiting for the owner's review / "Deploy" (then: fetch + merge
+   origin/main, re-run the gate, deploy the normal way — docs/valet/DEPLOY.md).
+2. If the owner asks for changes: they go on this branch as new WIP commits, gate again.
 
 ## 4b. Follow-ups noticed (not valet scope — for the owner)
 

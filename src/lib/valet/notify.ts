@@ -181,6 +181,7 @@ export async function deliverDue(db: DB, now: Date = new Date(), send: SendFn = 
  *  no-op. Returns what it did, for logs. */
 export function ingestWhatsApp(db: DB, payloadJson: string, now: Date = new Date(), opts: { simulated?: boolean } = {}): string[] {
   const did: string[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- untyped provider JSON; every field below is read with ?. and String()/Number()
   let body: any;
   try { body = JSON.parse(payloadJson); } catch { return did; }
   const at = nowIso(now);
