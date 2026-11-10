@@ -33,7 +33,8 @@ Plain steps for a normal night. Screens: **Valet Head Dashboard** (`/valet`), **
 * **Start fetching** → bring it to the gate → **Mark ready at gate**. The guest's pass shows "ready" and a
   6-digit code that changes every 90 seconds.
 * **Handover**: the guest shows the code on their phone (or the claim receipt). Type it, give the keys.
-  Press **Verify handover**. Never hand over on a tag number, plate or name alone.
+  Press **Verify handover**, type the tag on the keys in your hand and the code, then **Hand over the car**.
+  Never hand over on a tag number, plate or name alone.
 
 ## Guest not there yet
 
@@ -44,7 +45,9 @@ Plain steps for a normal night. Screens: **Valet Head Dashboard** (`/valet`), **
 ## If something goes wrong
 
 * **Guest lost their phone and receipt**: the Valet Head uses **Verify handover / recovery** in the
-  car's drawer — records how the person was checked (ID shown, booking name, etc.) and why. Logged.
+  car's drawer — records how the guest was verified (vehicle papers shown, bill or reservation
+  matched, a manager knows the guest, ownership questions answered) and what happened. Logged. Do not
+  photograph ID cards.
 * **Wrong car / damage / complaint**: **Record incident** in the drawer. An incident can keep the
   car's record and photos past normal deletion ("incident hold").
 * **Board shows "Needs attention"**: unclaimed requests, long fetches, cars waiting at the gate,
