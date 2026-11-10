@@ -119,6 +119,8 @@ labelled as an estimate. Head override (with reason) wins.
 | Rotating handover code | 6 digits | SHA-256 | 90 s; single use; consumed with the handover |
 | Printed claim code (phone-less) | 8 chars Crockford | SHA-256 | until handover/revoke; single use |
 | Venue entry token (QR/NFC card) | 16 random chars, rotatable | plain (public by design) | until rotated |
+| Key-tag NFC reference (`nfc_ref`) | 12 chars Crockford, unique | plain (an address, NOT a credential) | until re-issued |
+| RFID reader token | 32 random bytes, shown once | SHA-256 | until rotated / reader disabled |
 
 Tag numbers and plates are identifiers, never credentials. Failed verifications are counted;
 5 failures on a session lock code verification until the head runs recovery.
@@ -133,6 +135,46 @@ Tag numbers and plates are identifiers, never credentials. Failed verifications 
    books, FNB links + host/cashier actions, notification outbox + WhatsApp adapter/simulator +
    consent + webhook dedupe, escalations, closing rush, retention.
 3. NFC provisioning (NDEF URLs, Web NFC capability detection), RFID adapter + simulator.
+
+## 6b. Increment 3 decisions — NFC and RFID (spec §10)
+
+**What an NFC sticker/card holds** — one NDEF URL record, always a public HTTPS address, never a
+guest credential or personal data:
+
+| Card | URL | Who it works for |
+|---|---|---|
+| Venue check-in card / standee | `/valet-pass?e=<entry token>` | any guest — opens check-in only |
+| Table / bill-folder card (paper outlets) | `/valet-pass?e=<entry token>&paper=1` | any guest — ticket entry only |
+| Key-tag sticker | `/valet/attendant?nfc=<nfc_ref>` | signed-in valet staff of THAT outlet; anyone else gets the sign-in page and learns nothing |
+
+* **OS tap vs Web NFC.** A tap is the phone's own NFC opening the URL — works on iPhone and Android,
+  needs no Web NFC, so guests never depend on it. Web NFC (`NDEFReader`, Chrome on Android over
+  HTTPS) is used ONLY for two optional staff conveniences: writing URLs to stickers from Settings,
+  and "Tap key tag" in the attendant screen. Detected with `'NDEFReader' in window`; when absent the
+  buttons are not shown and QR / typed tag numbers remain. Not yet tried on a physical device.
+* `nfc_ref` is an opaque random reference, not the tag number (tag numbers repeat across outlets and
+  are guessable). Re-issuing it kills the old sticker (lost / copied). A reference is an ADDRESS: the
+  page still needs a staff sign-in and an outlet assignment, and the car is still released only by the
+  guest's code / claim code / head recovery.
+* Copy check: when Web NFC reads a sticker it reports the chip serial. The first serial is remembered
+  per tag; a different chip carrying the same reference raises a head alert ("possible copied sticker").
+
+**RFID (UHF, optional, later hardware)** — an adapter, a simulator, and nothing that moves a car.
+
+* Outlet setting `rfid.mode`: `off` (default) → nothing accepted; `simulator` → only the admin's
+  simulator; `live` → only registered readers over HTTPS. Never both, so simulated reads cannot mix
+  with real ones. Owner switches to `live` only after reader model, protocol, placement and field
+  tests are confirmed.
+* Reader registration (admin): name, outlet, the zone it watches; a token shown ONCE (stored as
+  SHA-256), rotatable; disable. Health: never seen / ok (heard within 5 min) / quiet / disabled.
+* Ingestion `POST /api/valet-rfid/ingest` (public exact path, self-authenticating, Bearer token):
+  normalised event = event id, reader id, EPC, antenna, zone, observed time, received time. Per event:
+  `replay` (same reader + event id seen before), `stale` (observed more than the allowed skew ago),
+  `future` (clock ahead), `duplicate` (same reader + EPC within the de-dupe window), `unknown_tag`,
+  else `accepted`. Batches ≤ 200, rate-limited.
+* An accepted read is an OBSERVATION: "keys for tag 07 seen near Key cabinet 2 min ago (3 reads),
+  unconfirmed". It never changes a car or pickup state, never authorises a handover, never identifies
+  an owner, never claims an exact spot from one read. Gate/barrier control is out of scope.
 
 ## 7. Assumptions (A#) — change any by telling the build
 

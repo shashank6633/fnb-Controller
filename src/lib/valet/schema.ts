@@ -457,6 +457,49 @@ const TABLES: string[] = [
     held_skipped      INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL
   )`,
+  // RFID readers (optional UHF hardware, docs/valet/DESIGN.md §6b). The token is
+  // shown once and stored as SHA-256; a reader is bound to ONE outlet.
+  `CREATE TABLE IF NOT EXISTS valet_rfid_readers (
+    id            TEXT PRIMARY KEY,
+    outlet_id     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    zone_id       TEXT,
+    token_hash    TEXT NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT NOT NULL DEFAULT '',
+    token_rotated_at TEXT,
+    disabled_at   TEXT,
+    last_seen_at  TEXT,
+    last_event_at TEXT,
+    events_accepted INTEGER NOT NULL DEFAULT 0,
+    events_rejected INTEGER NOT NULL DEFAULT 0
+  )`,
+  // Every RFID read as received, with its verdict. Observations only: nothing
+  // here changes a car, a pickup or custody.
+  `CREATE TABLE IF NOT EXISTS valet_rfid_events (
+    id            TEXT PRIMARY KEY,
+    outlet_id     TEXT NOT NULL,
+    reader_id     TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'reader',
+    event_id      TEXT NOT NULL,
+    epc           TEXT NOT NULL DEFAULT '',
+    antenna       TEXT NOT NULL DEFAULT '',
+    zone_id       TEXT,
+    observed_at   TEXT NOT NULL,
+    received_at   TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    tag_id        TEXT,
+    session_id    TEXT
+  )`,
+];
+
+/** Columns added to valet tables after their first version. Added before the
+ *  indexes run, so an index on a new column never meets an old table. */
+const ADDED_COLUMNS: [table: string, column: string, type: string][] = [
+  ['valet_tags', 'nfc_issued_at', 'TEXT'],
+  ['valet_tags', 'nfc_chip_serial', 'TEXT'],
+  ['valet_tags', 'rfid_epc', 'TEXT'],
 ];
 
 const INDEXES: string[] = [
@@ -508,6 +551,13 @@ const INDEXES: string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_alert_open ON valet_alerts(dedupe_key) WHERE resolved_at IS NULL`,
   `CREATE INDEX IF NOT EXISTS idx_valet_alerts_outlet ON valet_alerts(outlet_id, resolved_at)`,
   `CREATE INDEX IF NOT EXISTS idx_valet_handover_notes ON valet_handover_notes(outlet_id, created_at)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_tags_epc ON valet_tags(outlet_id, rfid_epc) WHERE rfid_epc IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_rfid_token ON valet_rfid_readers(token_hash)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_rfid_readers ON valet_rfid_readers(outlet_id)`,
+  // REPLAY GUARD: a reader's event id is accepted once, ever.
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_valet_rfid_event ON valet_rfid_events(reader_id, event_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_rfid_dedupe ON valet_rfid_events(reader_id, epc, observed_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_valet_rfid_tag ON valet_rfid_events(tag_id, observed_at)`,
 ];
 
 /** Role-only capability columns, DEFAULT 0 with NO backfill: roles are the
@@ -517,13 +567,21 @@ export const VALET_ROLE_COLUMNS = ['valet_head', 'valet_attendant', 'valet_host'
 /** Apply every valet statement; each failure is logged by name and never stops
  *  the rest. Safe to call on every boot (IF NOT EXISTS / column probe). */
 export function applyValetSchema(db: Database.Database): void {
-  for (const sql of [...TABLES, ...INDEXES]) {
+  const run = (sql: string) => {
     try { db.exec(sql); }
     catch (e) {
       const name = /(?:TABLE|INDEX) IF NOT EXISTS (\w+)/.exec(sql)?.[1] || sql.slice(0, 60);
       console.error(`[valet] schema statement failed (${name}):`, e);
     }
+  };
+  TABLES.forEach(run);
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    try {
+      const cols = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(c => c.name));
+      if (cols.size > 0 && !cols.has(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    } catch (e) { console.error(`[valet] add column ${table}.${column} failed:`, e); }
   }
+  INDEXES.forEach(run);
   try {
     const cols = new Set((db.prepare('PRAGMA table_info(roles)').all() as { name: string }[]).map(c => c.name));
     if (cols.size > 0) {

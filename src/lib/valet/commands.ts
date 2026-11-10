@@ -27,6 +27,8 @@ import {
 } from './ops-admin';
 import { addTicketBook, retireTicketBook, confirmPaperClaim } from './ops-paper';
 import { linkDining, unlinkDining } from './ops-dining';
+import { issueNfcRef, clearNfcRef } from './ops-nfc';
+import { registerReader, rotateReaderToken, setReaderEnabled, setTagEpc, simulateRead } from './ops-rfid';
 import { enqueue, cancelForSession } from './notify';
 
 // Untyped JSON from the client: every handler validates the fields it reads.
@@ -185,6 +187,15 @@ export const COMMANDS: Record<string, CommandDef> = {
   'zone.save':             { need: 'head', allowDisabled: true, run: c => zoneSave(c.db, c.ov, c.actor, c.body, c.now) },
   'tags.add':              { need: 'head', allowDisabled: true, run: c => tagsAdd(c.db, c.ov, c.actor, c.body, c.now) },
   'tag.status':            { need: 'head', allowDisabled: true, run: c => tagSetStatus(c.db, c.ov, c.actor, c.body, c.now) },
+
+  // ── NFC key-tag links + RFID (DESIGN.md §6b). Reader tokens and the simulator are the owner's.
+  'tag.nfc_issue':         { need: 'head', allowDisabled: true, limit: [120, 60], run: c => issueNfcRef(c.db, c.ov, c.actor, s(c.body.tag_id), c.now) },
+  'tag.nfc_clear':         { need: 'head', allowDisabled: true, run: c => clearNfcRef(c.db, c.ov, c.actor, s(c.body.tag_id), c.now) },
+  'tag.rfid_epc':          { need: 'head', allowDisabled: true, run: c => setTagEpc(c.db, c.ov, c.actor, c.body, c.now) },
+  'rfid.reader_register':  { need: 'admin', allowDisabled: true, run: c => registerReader(c.db, c.ov, c.actor, c.body, c.now) },
+  'rfid.reader_rotate':    { need: 'admin', allowDisabled: true, run: c => rotateReaderToken(c.db, c.ov, c.actor, s(c.body.reader_id), c.now) },
+  'rfid.reader_enable':    { need: 'admin', allowDisabled: true, run: c => setReaderEnabled(c.db, c.ov, c.actor, s(c.body.reader_id), c.body.enabled === true, c.now) },
+  'rfid.simulate':         { need: 'admin', limit: [120, 60], run: c => ({ ...simulateRead(c.db, c.ov, c.actor, c.body, c.now) }) },
 };
 
 /** Run one staff command end to end: look up, authorise, rate-limit, execute,

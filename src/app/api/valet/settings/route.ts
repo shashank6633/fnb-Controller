@@ -2,6 +2,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { requireStaff } from '@/lib/valet/core';
 import { valetJson } from '@/lib/valet/http';
+import { listReaders, recentReads } from '@/lib/valet/ops-rfid';
 
 /**
  * GET ?outlet= — Valet Settings data. Valet Head (zones, tags) or admin. The
@@ -17,7 +18,7 @@ export async function GET(req: Request) {
     const { actor, ov } = requireStaff(db, user, new URL(req.url).searchParams.get('outlet') || '', 'head', { allowDisabled: true });
     const zones = db.prepare(`SELECT id, name, kind, capacity, retrieval_minutes, sort_order, is_active FROM valet_zones
                               WHERE outlet_id = ? ORDER BY is_active DESC, kind, sort_order, name`).all(ov.outlet_id);
-    const tags = db.prepare(`SELECT t.id, t.code, t.kind, t.status, t.notes, t.updated_at,
+    const tags = db.prepare(`SELECT t.id, t.code, t.kind, t.status, t.notes, t.updated_at, t.nfc_ref, t.nfc_issued_at, t.rfid_epc,
                                (SELECT s.state FROM valet_vehicle_sessions s WHERE s.tag_id = t.id AND s.state NOT IN ('HANDED_OVER','VOIDED')) AS on_car
                              FROM valet_tags t WHERE t.outlet_id = ? ORDER BY length(t.code_norm), t.code_norm`).all(ov.outlet_id);
     let staff = null;
@@ -32,8 +33,10 @@ export async function GET(req: Request) {
         ORDER BY u.name`).all(ov.outlet_id, ov.outlet_id);
     }
     const books = db.prepare(`SELECT id, prefix, first_no, last_no, status, issued_at, note FROM valet_ticket_books WHERE outlet_id = ? ORDER BY status, issued_at DESC`).all(ov.outlet_id);
+    // RFID readers + recent reads: visible to the head (health), managed by the admin.
+    const rfid = { readers: listReaders(db, ov.outlet_id), reads: recentReads(db, ov.outlet_id, 30) };
     return {
-      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg, books,
+      outlet: { id: ov.outlet_id, name: ov.outlet_name }, enabled: ov.enabled, config: ov.cfg, books, rfid,
       entry_token: ov.entry_token, entry_path: ov.entry_token ? `/valet-pass?e=${ov.entry_token}` : '',
       zones, tags, staff, can_admin: actor.isAdmin,
     };

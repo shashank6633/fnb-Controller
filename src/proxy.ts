@@ -195,6 +195,10 @@ const VALET_GUEST_PATHS = new Set([
   '/api/valet-guest/state',      // GET: this browser's own passes
   '/api/valet-guest/entry',      // GET: venue name for a public check-in token
   '/api/valet-guest/act',        // POST: check-in, activate, pickup, outside, help, code
+  // Machine-to-machine: an RFID reader posting reads. No cookie — a per-reader
+  // Bearer token (SHA-256 stored), refused unless the outlet's RFID mode is
+  // 'live' (off by default); replay/stale/duplicate checks (valet/ops-rfid.ts).
+  '/api/valet-rfid/ingest',
 ]);
 
 // Print PAGES that must render without bouncing through /login — the four paths
@@ -248,7 +252,8 @@ function isPublic(pathname: string): boolean {
   // available — so POST is public + CSRF-exempt. It's rate-limited, size-capped
   // and write-only; the GET/PATCH admin console self-checks role==='admin'.
   if (pathname === '/api/error-report') return true;
-  // Valet guest pass: guests have no account. Exact paths only (see the set).
+  // Valet guest pass (guests have no account) + the RFID reader intake (a
+  // machine with a Bearer token). Exact paths only (see the set).
   if (VALET_GUEST_PATHS.has(pathname)) return true;
 
   // ───────────────────────── HARD FLOOR — /api/ stops here ─────────────────────────

@@ -38,8 +38,13 @@ export interface ValetConfig {
     /** Approved template NAME + language per message kind ('' = not set up → simulator). */
     templates: Record<NotifyKind, { name: string; lang: string }>;
   };
-  hardware: { nfc: boolean; rfid: boolean };
+  /** Optional UHF RFID (DESIGN.md §6b). 'off' accepts nothing; 'simulator' only the
+   *  admin's simulator; 'live' only registered readers — never both. */
+  rfid: { mode: RfidMode; dedupe_seconds: number; max_skew_seconds: number };
 }
+
+export const RFID_MODES = ['off', 'simulator', 'live'] as const;
+export type RfidMode = typeof RFID_MODES[number];
 
 export const DWELL_CHOICES = [2, 3, 5, 10] as const;
 
@@ -68,7 +73,7 @@ export const DEFAULT_CONFIG: ValetConfig = {
   closing_rush: { enabled: false, lead_minutes: 40, batch_size: 5 },
   paper: { enabled: false },
   notifications: { whatsapp: false, whatsapp_number: '', templates: { linked: { name: '', lang: 'en' }, ready: { name: '', lang: 'en' }, holding: { name: '', lang: 'en' }, eta_changed: { name: '', lang: 'en' }, closing_prompt: { name: '', lang: 'en' } } },
-  hardware: { nfc: false, rfid: false },
+  rfid: { mode: 'off', dedupe_seconds: 30, max_skew_seconds: 120 },
 };
 
 const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -139,7 +144,11 @@ export function parseConfig(raw: unknown): ValetConfig {
         return [k, { name: str(t.name, '', 120).replace(/[^a-z0-9_]/gi, '').toLowerCase(), lang: str(t.lang, 'en', 10).replace(/[^a-zA-Z_]/g, '') || 'en' }];
       })) as Record<NotifyKind, { name: string; lang: string }>,
     },
-    hardware: { nfc: bool(o.hardware?.nfc, D.hardware.nfc), rfid: bool(o.hardware?.rfid, D.hardware.rfid) },
+    rfid: {
+      mode: (RFID_MODES as readonly string[]).includes(o.rfid?.mode) ? o.rfid.mode as RfidMode : D.rfid.mode,
+      dedupe_seconds: int(o.rfid?.dedupe_seconds, D.rfid.dedupe_seconds, 5, 600),
+      max_skew_seconds: int(o.rfid?.max_skew_seconds, D.rfid.max_skew_seconds, 10, 900),
+    },
   };
 }
 
