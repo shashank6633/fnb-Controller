@@ -146,6 +146,11 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
 - Gate: part-2 gate PASSED (efc8198 == origin/main 1b8b290 on every suite; valet 365/0; build ok).
   FINAL GATE PASSED on af7b7f1 (== origin/main 1b8b290 on every suite; valet 423/0; build ok) — CHECKLIST §6.
 
+- OWNER 2026-11-10 "For Valet Role Only Valet Related Pages should be Seen": verified (page list =
+  valet pages → only valet pages, lands on them). Trap closed: roles API refuses a valet tick with NO
+  page list (= every page) unless admin tier; Roles screen "Valet pages only (n)" button + warning.
+  No live role has a valet tick (guard is a no-op for all existing roles). Test section AA → 438/0.
+
 ## 4. Exact next steps
 
 1. Nothing left to build in the spec. Waiting for the owner's review / "Deploy" (then: fetch + merge

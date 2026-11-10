@@ -66,6 +66,20 @@ function cleanPages(input: unknown): CleanedPages {
   };
 }
 
+/**
+ * VALET roles must list their pages (owner, 2026-11-10: "for a valet role only
+ * valet-related pages should be seen"). A role with NO page list opens every
+ * ordinary page (`if (!user.page_access) return true`), so a valet tick on a
+ * list-less role would show a car jockey the whole app. Refused instead. The
+ * admin tier is exempt (it sees everything by design). Measured 2026-11-10: no
+ * existing role carries a valet tick, and the only list-less role is
+ * Administrator — so this changes nothing for any role that exists today.
+ */
+const VALET_NEEDS_PAGES = 'A role with a Valet tick must have its pages ticked. Press "Valet pages only" for a valet-only role — with no pages ticked, this role could open every page in the app.';
+function listsPages(v: string | null | undefined): boolean {
+  try { const a = JSON.parse(String(v ?? '')); return Array.isArray(a) && a.length > 0; } catch { return false; }
+}
+
 /** Coerce a max-discount-% input to a sane number in [0, 100]. Non-numeric → 0. */
 function clampPct(input: unknown): number {
   const n = Number(input);
@@ -104,6 +118,9 @@ export async function POST(req: Request) {
   // refused rather than silently stored as NULL (= every page). See cleanPages.
   const pages = cleanPages(page_access);
   if (!pages.ok) return Response.json({ error: pages.error }, { status: 400 });
+  if ((valet_head || valet_attendant || valet_host) && base_role !== 'admin' && !listsPages(pages.value)) {
+    return Response.json({ error: VALET_NEEDS_PAGES }, { status: 400 });
+  }
   const db = getDb();
   if (db.prepare('SELECT id FROM roles WHERE lower(name) = lower(?)').get(nm)) {
     return Response.json({ error: 'A role with that name already exists' }, { status: 409 });
@@ -155,6 +172,16 @@ export async function PUT(req: Request) {
   // to be stored as NULL, which means EVERY page.
   const pages = page_access === undefined ? null : cleanPages(page_access);
   if (pages && !pages.ok) return Response.json({ error: pages.error }, { status: 400 });
+  // Judge the role as it will be AFTER this edit (sent value, else stored value).
+  {
+    const after = (sent: unknown, stored: unknown) => (sent !== undefined ? !!sent : stored === 1);
+    const valetAfter = after(valet_head, role.valet_head) || after(valet_attendant, role.valet_attendant) || after(valet_host, role.valet_host);
+    const tierAfter = base_role != null && !role.is_system ? base_role : role.base_role;
+    const pagesAfter = pages && pages.ok ? pages.value : role.page_access;
+    if (valetAfter && tierAfter !== 'admin' && !listsPages(pagesAfter)) {
+      return Response.json({ error: VALET_NEEDS_PAGES }, { status: 400 });
+    }
+  }
 
   const sets: string[] = [];
   const params: any[] = [];

@@ -6,9 +6,13 @@ the owner switches it on.
 ## 1. Owner / admin — one-time
 
 1. **Settings → Roles**: on the roles that should use valet, tick **Valet Head**, **Valet
-   Attendant** or **Valet Desk/host** (all start unticked — no existing role changes). Add the valet
-   pages to those roles' page lists as usual. A Valet Desk tick also shows the valet box on the
-   Cashier bill screen.
+   Attendant** or **Valet Desk/host** (all start unticked — no existing role changes).
+   * **Valet-only staff** (car jockeys, the valet head): make a new role, tick the valet box, then
+     press **"Valet pages only"** — the role then sees ONLY its valet screens and lands on them after
+     sign-in. A role with a valet tick cannot be saved with no pages ticked (no pages = every page).
+   * **A host/cashier who also helps with valet**: add the Valet Desk tick to their existing role and
+     tick the Valet Desk page; they keep their other pages. The tick also shows the valet box on the
+     Cashier bill screen.
 2. **Valet Settings** (`/valet/settings`), per outlet:
    * **Switch ON**.
    * **Zones**: parking zones (with capacity and "minutes to fetch" if known), the pickup gate, a

@@ -1250,6 +1250,45 @@ catch (e) { console.log(JSON.stringify({ ok: false, code: e.code || String(e.mes
     eq(board.sessionDetail(db, ov(), car.id, 'head', T(600)).rfid, null, 'RFID OFF → the drawer shows no RFID line');
   }
 
+  S('AA valet-only roles see only valet pages');
+  {
+    // Owner, 2026-11-10: "For a valet role only valet-related pages should be seen."
+    const sideKeys = ['/', '/inventory', '/purchases', '/cashier', '/dine-in/orders', '/recipes', '/hr/employees', '/settings/roles'];
+    const att = U.a1, head = U.head;   // demo roles carry valet pages only
+    eq(sideKeys.filter(p => catalog.canAccessPage(p, att)), [], 'a valet attendant opens NO ordinary page (incl. the home dashboard)');
+    ok(catalog.canAccessPage('/valet/attendant', att) && !catalog.canAccessPage('/valet', att) && !catalog.canAccessPage('/valet/settings', att), 'the attendant opens only the Attendant screen');
+    eq(catalog.firstAllowedPath(att), '/valet/attendant', 'after sign-in an attendant lands on the Attendant screen');
+    eq(sideKeys.filter(p => catalog.canAccessPage(p, head)), [], 'a valet head opens no ordinary page either');
+    eq(catalog.firstAllowedPath(head), '/valet', 'a valet head lands on the Head Dashboard');
+    // The safeguard on the Roles API: a valet tick with NO page list (= every page) is refused.
+    const rr = require(path.join(WT, 'src/app/api/auth/roles/route.ts'));
+    (globalThis as any).__TOKEN = users.admin.token;
+    const call = async (method: 'POST' | 'PUT', body: Record<string, unknown>) => {
+      const r = await rr[method](new Request('http://localhost/api/auth/roles', { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+      return { status: r.status, body: await r.json() };
+    };
+    const nm = `ZZ Jockey ${uid().slice(-4)}`;
+    const noPages = await call('POST', { name: nm, base_role: 'staff', page_access: [], valet_attendant: true });
+    ok(noPages.status === 400 && /Valet pages only/.test(noPages.body.error), 'a new valet role with no pages ticked is refused (would have opened every page)');
+    ok(!db.prepare('SELECT 1 FROM roles WHERE name = ?').get(nm), '…and nothing was saved');
+    eq((await call('POST', { name: nm, base_role: 'staff', page_access: ['/valet/attendant'], valet_attendant: true })).status, 201, 'with only the valet page ticked it saves');
+    const jr = db.prepare('SELECT id, page_access, valet_attendant FROM roles WHERE name = ?').get(nm) as any;
+    eq([JSON.parse(jr.page_access), jr.valet_attendant], [['/valet/attendant'], 1], 'stored: one page, the attendant tick');
+    eq((await call('PUT', { id: jr.id, page_access: [] })).status, 400, 'emptying a valet role\'s page list later is refused too');
+    eq((await call('PUT', { id: jr.id, valet_attendant: false, page_access: [] })).status, 200, 'untick valet AND empty the list → allowed (ordinary role rules)');
+    eq((await call('PUT', { id: jr.id, valet_attendant: true })).status, 400, 'ticking valet on a list-less role is refused');
+    const plainNm = `ZZ Plain ${uid().slice(-4)}`;
+    eq((await call('POST', { name: plainNm, base_role: 'staff', page_access: [] })).status, 201, 'a NON-valet role with no pages still saves exactly as before (unchanged rule)');
+    const adminRole = db.prepare(`SELECT id FROM roles WHERE base_role = 'admin' AND page_access IS NULL LIMIT 1`).get() as any;
+    if (adminRole) {
+      eq((await call('PUT', { id: adminRole.id, valet_head: true })).status, 200, 'the admin tier is exempt (it sees everything by design)');
+      db.prepare('UPDATE roles SET valet_head = 0 WHERE id = ?').run(adminRole.id);   // copy only: put it back
+    }
+    // Every role that exists today: none carries a valet tick, so the guard cannot block any of them.
+    eq((db.prepare(`SELECT COUNT(*) AS n FROM roles WHERE name NOT LIKE 'ZZ %' AND (valet_head + valet_attendant + valet_host) > 0`).get() as any).n, 0, 'no existing (live) role carries a valet tick');
+    (globalThis as any).__TOKEN = undefined;
+  }
+
   console.log(`\nVALET TESTS: ${pass} passed, ${fails.length} failed`);
   if (fails.length) { console.log(fails.map(f => ' - ' + f).join('\n')); process.exit(1); }
   process.exit(0);

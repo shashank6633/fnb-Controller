@@ -50,6 +50,7 @@ that copy). 🧪 = proven by the automated valet tests only.
 ## 3. What you need to set up before using it
 
 1. Settings → Roles: tick Valet Head / Valet Attendant / Valet Desk on the right roles (all start off).
+   For valet-only staff press **"Valet pages only"** — they then see only valet screens (✅ checked).
 2. Valet Settings per outlet: switch ON, zones, key tags, rules, staff, print the QR standee.
 3. WhatsApp (optional): create the 5 Utility templates (docs/valet/NOTIFICATIONS.md), name them in
    Valet Settings, paste the **Meta app secret** in Settings → Integrations → WhatsApp (needed for

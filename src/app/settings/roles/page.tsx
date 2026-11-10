@@ -338,6 +338,26 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.valet_host} onChange={(e) => setDraft({ ...draft, valet_host: e.target.checked })} /> Valet Desk (host / cashier can request a guest&apos;s car)
                 </label>
+                {/* Owner, 2026-11-10: a valet role sees ONLY valet pages. One click
+                    replaces the page list with exactly the valet screens these ticks
+                    open (from the catalog, so it can never drift). The server also
+                    refuses a valet tick with no page list (= every page). */}
+                {(draft.valet_head || draft.valet_attendant || draft.valet_host) && draft.base_role !== 'admin' ? (() => {
+                  const valetPages = PAGE_CATALOG.flatMap(s => s.pages)
+                    .filter(p => p.valetCap && (draft.valet_head || (p.valetCap === 'attendant' && draft.valet_attendant) || (p.valetCap === 'host' && draft.valet_host)))
+                    .map(p => p.path);
+                  const onlyValet = draft.pages.size > 0 && Array.from(draft.pages).every(p => valetPages.includes(p));
+                  return (
+                    <div className="basis-full rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2 text-[12px] text-[#6B5744]">
+                      {draft.pages.size === 0
+                        ? <p className="font-semibold text-red-700">No pages are ticked — this role could open every page in the app. Press the button for a valet-only role.</p>
+                        : onlyValet ? <p>This is a valet-only role: it sees only {valetPages.length === 1 ? 'its valet screen' : 'its valet screens'}.</p>
+                        : <p>This role also has non-valet pages ticked. For a valet-only person (car jockey, valet head), press the button.</p>}
+                      <button type="button" className="mt-1 rounded border border-[#af4408]/40 bg-white px-2 py-1 text-xs font-semibold text-[#af4408]"
+                        onClick={() => setDraft({ ...draft, pages: new Set(valetPages) })}>Valet pages only ({valetPages.length})</button>
+                    </div>
+                  );
+                })() : null}
               </div>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 The three <strong>Valet</strong> ticks open the matching Valet Parking screens — Head Dashboard and
