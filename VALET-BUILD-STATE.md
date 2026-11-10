@@ -165,9 +165,21 @@ DONE in increment 2 (tests 316/0, tsc clean; commits ba1cab6 … a26dfe5):
   sudo mv .next.bak .next && sudo pm2 restart fnb-controller` (previous build a18108c kept as .next.bak).
 - The local main checkout (~/Desktop/Claude/fnb-controller) is STALE as always — not touched.
 
+## 3d. After deploy — tap-to-pair attendant cards (2026-11-10 evening, NOT deployed yet)
+
+- Owner asked: "valet person has the RFID or NFC to scan their mobile so the details are updated to
+  them". Explained phones can't be scanned/act as tags from a web app; owner chose (AskUserQuestion)
+  "Tap-to-pair NFC card". Built: ops-handoff.ts, tables valet_handoff_cards / valet_handoff_taps,
+  guest cmd 'tap' (/valet-pass?h=<ref>), attendant pop-up + page panel "A guest tapped your card — NN",
+  commands handoff.card_issue/card_clear (head) + handoff.confirm/reject (attendant), Settings → NFC
+  panel → Attendant tap cards. Tests AB → 463/0. Browser: both flows (page panel; pop-up over the
+  "give the pass" dialog right after check-in) → guest pass appears by itself.
+- Staff guide artifact https://claude.ai/artifact/Pmdd2wH31SxkCtVQZEB5Mm has the tap step.
+- NEEDS the owner's word "Deploy" (per-action) → fetch/merge origin/main, gate, push, Action.
+
 ## 4. Exact next steps
 
-1. Deployed. Owner setup next (docs/valet/SETUP.md): role ticks + "Valet pages only", outlet ON, zones,
+1. Tap-to-pair awaiting "Deploy". Deployed base: owner setup next (docs/valet/SETUP.md): role ticks + "Valet pages only", outlet ON, zones,
    tags, staff, QR standee; WhatsApp templates + Meta app secret later.
 2. If the owner asks for changes: they go on this branch as new WIP commits, gate again.
 

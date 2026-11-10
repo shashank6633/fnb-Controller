@@ -71,6 +71,9 @@ export default function AttendantPage() {
   // /valet/attendant?nfc=<ref>, or read here with Web NFC (Android Chrome). The
   // server resolves the reference for staff of that tag's outlet only.
   const [nfcNote, setNfcNote] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
+  // Card taps waiting for this attendant (DESIGN.md §6c); ones closed in the pop-up stay on the page.
+  const [tapHidden, setTapHidden] = useState<string[]>([]);
+  const popTaps = (v?.handoff?.taps ?? []).filter(t => !tapHidden.includes(t.id));
   const [nfcBusy, setNfcBusy] = useState(false);
   const resolveNfcRef = useCallback(async (ref: string, serial = '') => {
     const r = await fetch(`/api/valet/nfc?ref=${encodeURIComponent(ref)}&serial=${encodeURIComponent(serial)}`, { cache: 'no-store' });
@@ -125,7 +128,7 @@ export default function AttendantPage() {
           {live.error ? <ErrorNote message={live.error.message} /> : null}
           <ErrorNote message={cmd.err} />
           {nfcNote?.kind === 'error' ? <ErrorNote message={nfcNote.text} /> : nfcNote ? <InfoNote>{nfcNote.text}</InfoNote> : null}
-          {v?.handoff?.taps.length ? <TapPanel v={v} cmd={cmd} L={L} /> : null}
+          {v?.handoff?.taps.length ? <TapPanel where="page" v={v} cmd={cmd} L={L} /> : null}
           {v && !v.outlet.enabled ? <InfoNote>Valet is switched off for this outlet.</InfoNote> : null}
           {!v ? <p className="text-sm text-[#8B7355]">Loading…</p> : (
             <>
@@ -281,6 +284,14 @@ export default function AttendantPage() {
           </div>
         </Modal>
       ) : null}
+      {/* A tap pops up over whatever is open (the "give the pass" dialog right
+          after check-in, usually). Closing it only hides it here: the same
+          panel stays at the top of the page until answered or timed out. */}
+      {v && popTaps.length ? (
+        <Modal title={L('tap_title')} onClose={() => setTapHidden(h => [...h, ...popTaps.map(t => t.id)])}>
+          <TapPanel where="pop" v={{ ...v, handoff: { ...v.handoff, taps: popTaps } }} cmd={cmd} L={L} />
+        </Modal>
+      ) : null}
     </div>
   );
 }
@@ -290,7 +301,7 @@ export default function AttendantPage() {
  * number; the attendant checks it matches, picks the car (newest check-in
  * first) and gives the pass. Nothing is granted without this tap.
  */
-function TapPanel({ v, cmd, L }: { v: View; cmd: ReturnType<typeof useCmd>; L: (k: string) => string }) {
+function TapPanel({ where, v, cmd, L }: { where: string; v: View; cmd: ReturnType<typeof useCmd>; L: (k: string) => string }) {
   const cars = v.handoff.cars;
   const [pick, setPick] = useState<Record<string, string>>({});
   return (
@@ -300,7 +311,7 @@ function TapPanel({ v, cmd, L }: { v: View; cmd: ReturnType<typeof useCmd>; L: (
         return (
           <Panel key={t.id} className="border-[#af4408] ring-2 ring-[#f5b48a]">
             <div className="flex items-center justify-between gap-3">
-              <div><div className="font-bold">{L('tap_title')}</div><div className="text-xs text-[#8B7355]">{L('tap_check')}</div></div>
+              <div>{where === 'page' ? <div className="font-bold">{L('tap_title')}</div> : null}<div className="text-xs text-[#8B7355]">{L('tap_check')}</div></div>
               <div className="text-5xl font-extrabold tabular-nums" aria-label={`${L('tap_check')} ${t.number}`}>{t.number}</div>
             </div>
             {cars.length ? (
@@ -308,7 +319,7 @@ function TapPanel({ v, cmd, L }: { v: View; cmd: ReturnType<typeof useCmd>; L: (
                 <div className="text-xs font-semibold text-[#6B5744]">{L('which_car')}</div>
                 {cars.map(c => (
                   <label key={c.id} className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${chosen === c.id ? 'border-[#af4408] bg-[#FFF1E3]' : 'border-[#E8D5C4] bg-white'}`}>
-                    <input type="radio" name={`tap-${t.id}`} checked={chosen === c.id} onChange={() => setPick(p => ({ ...p, [t.id]: c.id }))} />
+                    <input type="radio" name={`tap-${where}-${t.id}`} checked={chosen === c.id} onChange={() => setPick(p => ({ ...p, [t.id]: c.id }))} />
                     <span className="font-extrabold">{c.tag_code || c.ticket_no}</span>
                     <span className="min-w-0 truncate">{c.plate} · {[c.colour, c.make, c.model].filter(Boolean).join(' ')}</span>
                     {c.passes ? <span className="ml-auto shrink-0 text-[11px] text-[#8B7355]">{L('has_pass')}</span> : null}
