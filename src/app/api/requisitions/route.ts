@@ -871,7 +871,7 @@ export async function PUT(request: Request) {
     if (!allowed) {
       return Response.json({
         error: r.status === 'submitted'
-          ? 'Only the head chef or admin can edit a submitted requisition.'
+          ? 'A submitted requisition can be edited only by an admin, someone with “Is HOD” or “Can approve requisitions”, or the Department head of the main department it belongs to.'
           : r.status === 'chef_approved'
             ? 'Only admin can edit an already-chef-approved requisition.'
             : 'Only the drafter or admin can edit this requisition.',

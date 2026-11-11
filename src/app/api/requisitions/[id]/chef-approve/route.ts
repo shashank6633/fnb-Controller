@@ -22,7 +22,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // Any Head Chef (is_head_chef role) or an admin may approve — matches the
     // Party Approvals page visibility + the per-item edit gate (canApproveAsChef).
     if (!canApproveAsChef(me)) {
-      return Response.json({ error: 'Only a head chef or an admin can approve this requisition.' }, { status: 403 });
+      return Response.json({ error: 'Only an admin or someone with “Is HOD” or “Can approve requisitions” can approve this requisition.' }, { status: 403 });
     }
     if (r.status !== 'submitted') {
       return Response.json({ error: `Only submitted requisitions can be approved (current: ${r.status})` }, { status: 400 });

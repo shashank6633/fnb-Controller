@@ -332,11 +332,11 @@ export default function ReturnsSettingsPage() {
                   <PackageCheck className="w-4 h-4 text-[#af4408]" /> Stock moves only when the Store accepts
                 </p>
                 <p className="text-sm text-[#8B7355] mt-0.5">
-                  A return ticket is raised by a department, approved by the Department Head or Manager, and
-                  only then reaches the Store. <b>No stock moves at any of those steps.</b> Stock moves at
+                  A return ticket is raised by a department, approved by an admin or someone with “Is HOD” or
+                  “Can approve requisitions”, and only then reaches the Store. <b>No stock moves at any of those steps.</b> Stock moves at
                   exactly one moment — when the <b>Store verifies and accepts</b> the line — and it moves
                   once. A line the Store rejects (with a mandatory reason) leaves stock exactly where it was,
-                  and so does a ticket the Head rejects or the department cancels.
+                  and so does a ticket the approver rejects or the department cancels.
                 </p>
                 <p className="text-sm text-[#8B7355] mt-1.5">
                   Setting a window here does not change any of that. It only stops a <b>new</b> vendor return

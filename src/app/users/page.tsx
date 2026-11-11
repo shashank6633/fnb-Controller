@@ -78,7 +78,7 @@ const POSITION_TEMPLATES: Array<{
   { value: '',                    label: '— None / Custom —',
     defaults: { role: 'staff', is_head_chef: 0, is_store_manager: 0 }, hint: 'Manually configure role + permissions below.' },
   { value: 'Department User',     label: 'Department User (own requisitions only)',
-    defaults: { role: 'staff', is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises & views ONLY their own department’s requisitions. Remember to set the Department below.' },
+    defaults: { role: 'staff', is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises requisitions only for their own department. On Internal Requisitions, Party Requisitions and Party Approvals they see only the ones they raised — or, if set as a Department head (Departments → Department head), that department and its sub-departments; if they head none and departments are ticked in Department Visibility, those departments instead. Party Events shows them their own department’s part of every party, whoever raised it. Remember to set the Department below.' },
   { value: 'Head Chef',           label: 'HOD (Head of Department)',
     defaults: { role: 'manager', is_head_chef: 1, is_store_manager: 0 }, hint: 'Approves requisitions — ⚠ sees the requisitions of the department they head and its sub-departments (Departments → Department head); if they head none, those of the departments ticked in Department Visibility; otherwise only the ones they raised. Party Requisitions → By event and Party Events show every department’s party requisitions.' },
   { value: 'Sous Chef',           label: 'Sous Chef',
@@ -92,11 +92,11 @@ const POSITION_TEMPLATES: Array<{
   { value: 'Storekeeper',         label: 'Storekeeper',
     defaults: { role: 'manager', is_head_chef: 0, is_store_manager: 1 }, hint: 'Handles physical stock — ⚠ sees ALL requisitions.' },
   { value: 'Bartender',           label: 'Bartender',
-    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises requisitions for the Bar — own department only.' },
+    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises Bar requisitions — only for their own department. On Internal Requisitions, Party Requisitions and Party Approvals they see only the ones they raised — or, if set as a Department head (Departments → Department head), that department and its sub-departments; if they head none and departments are ticked in Department Visibility, those departments instead. Party Events shows them their own department’s part of every party, whoever raised it.' },
   { value: 'Cook',                label: 'Cook',
-    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises requisitions for their kitchen — own department only.' },
+    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises kitchen requisitions — only for their own department. On Internal Requisitions, Party Requisitions and Party Approvals they see only the ones they raised — or, if set as a Department head (Departments → Department head), that department and its sub-departments; if they head none and departments are ticked in Department Visibility, those departments instead. Party Events shows them their own department’s part of every party, whoever raised it.' },
   { value: 'Server',              label: 'Server / Service Staff',
-    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises service-side requisitions — own department only.' },
+    defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Raises service-side requisitions — only for their own department. On Internal Requisitions, Party Requisitions and Party Approvals they see only the ones they raised — or, if set as a Department head (Departments → Department head), that department and its sub-departments; if they head none and departments are ticked in Department Visibility, those departments instead. Party Events shows them their own department’s part of every party, whoever raised it.' },
   { value: 'Other',               label: 'Other (specify in notes)',
     defaults: { role: 'staff',   is_head_chef: 0, is_store_manager: 0 }, hint: 'Custom title — set permissions below.' },
 ];
@@ -468,7 +468,9 @@ export default function UsersPage() {
                   </select>
                   <span className="block text-[10px] text-[#8B7355] mt-0.5">
                     Department staff (e.g. Bartender, Pizza Cook) raise requisitions for their own department.
-                    Leave blank for HOD / Store Manager who span all kitchens.
+                    An HOD or Store Manager can raise for any department. Items they can request: a Store Manager, every item; a Department head (Departments → Department head), those in the Material Categories of the department they head; any other HOD, those in this department’s Material Categories (a sub-department uses its main department’s), or every item if this is left blank. A department with no Material Categories allows every item.
+                    On Internal Requisitions, Party Requisitions and Party Approvals this field does not change which requisitions they see: a Store Manager sees all; an HOD sees those of the department they head and its sub-departments; if they head none, those of the departments ticked in Department Visibility; otherwise only the ones they raised.
+                    Party Requisitions → By event and Party Events show an HOD every department’s party requisitions. On Party Events a Store Manager who is not an HOD sees only this department’s part of each party — nothing if this is blank.
                   </span>
                 </label>
 
@@ -778,7 +780,7 @@ function PageAccessSection({ editing, setEditing, departments, roles, rolesReady
             <div className="text-[11px] font-semibold text-[#2D1B0E] mb-1">
               🏷 Department Visibility
               <span className="ml-2 text-[10px] font-normal text-[#8B7355]">
-                {currentDepts.size === 0 ? 'Default: own dept only' : `Sees ${currentDepts.size} dept${currentDepts.size === 1 ? '' : 's'}`}
+                {currentDepts.size === 0 ? 'Nothing ticked: Internal Requisitions, Party Requisitions and Party Approvals show them only the requisitions they raised, and stock and transfer screens only their own department — unless they are allowed more anyway (e.g. admins and store managers see all of these; “Can approve requisitions” every requisition; a Department head their department’s requisitions; managers and HODs every department’s stock and transfers). Party Events and Party Requisitions → By event ignore these ticks.' :`Sees ${currentDepts.size} dept${currentDepts.size === 1 ? '' : 's'}`}
               </span>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-1 text-xs">

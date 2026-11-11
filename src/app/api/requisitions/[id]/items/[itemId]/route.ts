@@ -31,7 +31,7 @@ export async function PUT(
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     if (!canApproveAsChef(me)) {
-      return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+      return Response.json({ error: 'Only an admin or someone with “Is HOD” or “Can approve requisitions” can change a line’s approved quantity or chef note, or reject a line before approval.' }, { status: 403 });
     }
 
     const { id: reqId, itemId } = await params;

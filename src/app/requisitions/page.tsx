@@ -844,9 +844,18 @@ export default function RequisitionsPage() {
         (statusFilter === 'inbox-mgmt' && !viewer.can_mgmt)) && (
         <div className="mb-3 px-3 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-[11px] text-[#6B5744] flex items-center gap-2">
           <Eye className="w-3.5 h-3.5" />
+          {/* TRUE for every viewer it reaches. HOD Inbox: !viewer.can_chef =
+              chef-approve / chef-reject's canApproveAsChef refuses them, and
+              cancel's admin-or-Is-HOD does too, so nothing on a submitted row
+              acts. Mgmt Inbox: mgmt-approve is canApproveAsMgmt (admin only);
+              no "View only" there — a store person can still issue an
+              internal chef-approved row and an Is HOD can still cancel one. */}
           <span>
-            <b>View only.</b> This is the {statusFilter === 'inbox-chef' ? 'HOD\'s' : 'Management\'s'} approval queue —
-            you can see what's pending but the action buttons (Approve / Reject) are gated to that role.
+            {statusFilter === 'inbox-chef' ? (
+              <><b>View only.</b> This is the HOD approval queue. Approving or rejecting needs “Is HOD” or “Can approve requisitions”.</>
+            ) : (
+              <>This is the Management approval queue. Only an admin can give Management approval.</>
+            )}
           </span>
         </div>
       )}

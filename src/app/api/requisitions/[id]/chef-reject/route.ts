@@ -17,7 +17,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // Any Head Chef (is_head_chef role) or an admin may reject — same gate as
     // chef-approve so a chef who can approve can also send a req back.
     if (!canApproveAsChef(me)) {
-      return Response.json({ error: 'Only a head chef or an admin can reject this requisition.' }, { status: 403 });
+      return Response.json({ error: 'Only an admin or someone with “Is HOD” or “Can approve requisitions” can reject this requisition.' }, { status: 403 });
     }
     if (r.status !== 'submitted') {
       return Response.json({ error: `Only submitted requisitions can be rejected (current: ${r.status})` }, { status: 400 });

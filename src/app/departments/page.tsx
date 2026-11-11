@@ -282,7 +282,7 @@ export default function DepartmentsPage() {
           <Building className="w-7 h-7 text-[#af4408]" />
           <div>
             <h1 className="text-2xl font-bold text-[#2D1B0E]">Departments</h1>
-            <p className="text-xs text-[#6B5744]">Define operating departments and assign their HOD (Head of Department) approvers.</p>
+            <p className="text-xs text-[#6B5744] max-w-md">Define operating departments, their heads and their item categories. Who can approve is set in Settings → Roles or Settings → Users (“Is HOD” or “Can approve requisitions”).</p>
           </div>
         </div>
         {isAdmin && (
@@ -584,7 +584,7 @@ export default function DepartmentsPage() {
                 </select>
                 <span className="text-[10px] text-[#8B7355]">
                   {editing.parent_id
-                    ? `Sub-department: inherits its head + item categories from ${editingParent?.name || 'its main department'}.`
+                    ? `Sub-department: uses ${editingParent?.name || 'its main department'}’s item categories, and ${editingParent?.name || 'the main department'}’s head sees its requests (approving is separate).`
                     : 'Main department: has its own head and item categories, shared by all its sub-departments.'}
                 </span>
               </label>

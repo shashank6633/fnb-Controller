@@ -17,7 +17,7 @@
 import { Fragment, useEffect, useState } from 'react';
 import {
   PartyPopper, ChefHat, Loader2, CheckCircle2, X, AlertTriangle, RefreshCw,
-  ChevronDown, ChevronRight, Pencil, Plus, Trash2, Save, ExternalLink,
+  ChevronDown, ChevronRight, Pencil, Plus, Trash2, Save, ExternalLink, Eye,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
@@ -199,6 +199,14 @@ export default function PartyApprovalsPage() {
     fetch('/api/admin/party-rules').then(r => r.json()).then(d => setRequireMgmt(d?.require_mgmt_approval === true)).catch(() => {});
   }, []);
   const canMgmtApprove = me?.role === 'admin' && requireMgmt;
+  // HOD Approve / Reject / Approve all and the per-line edits show EXACTLY when
+  // the server accepts them: viewer_can_approve_chef is the list API's
+  // canApproveAsChef (admin, Is HOD, or Can approve requisitions) — the very
+  // gate chef-approve, chef-reject and items/[itemId] check. Opening this page
+  // is not enough (a Manager role can have it with no approve tick), and being
+  // a Department head is not part of it (owner's July ruling, b8ba6b7).
+  // null until the list has loaded, so neither the buttons nor the note flash.
+  const [canChef, setCanChef] = useState<boolean | null>(null);
 
   // PUT a single item change (qty / reject / note). Updates local detail in
   // place so the UI reflects the change instantly. Server logs the audit event.
@@ -257,6 +265,7 @@ export default function PartyApprovalsPage() {
       const j = await r.json();
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
       setReqs(j.requisitions || []);
+      setCanChef(!!j.viewer_can_approve_chef);
     } catch (e: any) {
       setError(e?.message || 'Failed to load');
     } finally {
@@ -452,8 +461,15 @@ export default function PartyApprovalsPage() {
         <div className="flex-1">
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Party Approvals</h1>
           <p className="text-xs text-[#8B7355]">
-            All dept requisitions for each upcoming party, in one place. Approve individually or per-event.
+            All dept requisitions for each upcoming party, in one place.{canChef === true && ' Approve individually or per-event.'}
           </p>
+          {/* A viewer the server would refuse sees no approve buttons — say who
+              can approve instead (same note as Internal Requisitions). */}
+          {canChef === false && (
+            <p className="text-[11px] text-[#6B5744] flex items-start gap-1 mt-0.5">
+              <Eye size={11} className="shrink-0 mt-[3px]" /> You can see these requests. Approving or rejecting needs “Is HOD” or “Can approve requisitions”.
+            </p>
+          )}
         </div>
         <select value={filter} onChange={e => setFilter(e.target.value as any)}
                 className="text-xs px-2 py-1 border border-[#D4B896] rounded bg-white">
@@ -519,7 +535,7 @@ export default function PartyApprovalsPage() {
                     {allApproved && <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">✓ all cleared</span>}
                   </div>
                   <div className="text-sm font-mono font-semibold text-[#2D1B0E]">{fmt(g.total_cost)}</div>
-                  {g.submitted_count > 0 && (
+                  {g.submitted_count > 0 && canChef === true && (
                     <button onClick={(e) => { e.stopPropagation(); approveAllForEvent(g); }}
                             className="inline-flex items-center gap-1 text-xs px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded">
                       <CheckCircle2 size={12} /> Approve all
@@ -611,7 +627,7 @@ export default function PartyApprovalsPage() {
                               })()}
                             </td>
                             <td className="py-1.5 px-3 text-right">
-                              {r.status === 'submitted' ? (
+                              {r.status === 'submitted' && canChef === true ? (
                                 // Per-item edits + line-level rejects are now
                                 // available in the expanded dropdown ("view items"),
                                 // so the bulky row-level Edit modal button is
@@ -668,9 +684,10 @@ export default function PartyApprovalsPage() {
                                         📜 audit history
                                       </button>
                                     </div>
-                                    {/* Edit / reject is allowed when the req is still submitted (chef approval phase). */}
+                                    {/* Edit / reject is allowed when the req is still submitted (chef approval phase)
+                                        and the viewer passes items/[itemId]'s gate (canChef, above). */}
                                     {(() => {
-                                      const editable = r.status === 'submitted';
+                                      const editable = r.status === 'submitted' && canChef === true;
                                       const guests = detail.guest_count ?? r.guest_count ?? null;
                                       // Count implausible lines against the SAVED qtys (drafts are per-row below).
                                       const flaggedCount = detail.items.filter((x: any) => {
@@ -679,9 +696,11 @@ export default function PartyApprovalsPage() {
                                       }).length;
                                       return (
                                     <>
+                                    {/* Everyone is told which lines are flagged; the fix-before-approving
+                                        instruction shows only when this viewer can edit the lines (editable). */}
                                     {flaggedCount > 0 && (
                                       <div className="mb-1.5 px-2 py-1 rounded bg-amber-100 border border-amber-300 text-amber-900 text-[11px]">
-                                        ⚠ {flaggedCount} line{flaggedCount === 1 ? ' looks' : 's look'} implausible (likely a unit mistake — e.g. ml instead of bottles). Hover the ⚠ on each line, and fix the qty before approving.
+                                        ⚠ {flaggedCount} line{flaggedCount === 1 ? ' looks' : 's look'} implausible (likely a unit mistake — e.g. ml instead of bottles). {editable ? 'Hover the ⚠ on each line, and fix the qty before approving.' : 'Hover the ⚠ on each line to see why.'}
                                       </div>
                                     )}
                                     <div className="overflow-x-auto">
