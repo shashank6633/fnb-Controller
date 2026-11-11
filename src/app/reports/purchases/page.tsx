@@ -1330,6 +1330,7 @@ function ItemwisePurchases({ from, to, setFrom, setTo, vendors, categories, pres
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [downloading, setDownloading] = useState(false);
+  const [downloadingInward, setDownloadingInward] = useState(false);
   const [paintAll, setPaintAll] = useState(false);
   /** Only the latest request may paint — a slow answer for old filters must not overwrite a newer one. */
   const seq = useRef(0);
@@ -1398,6 +1399,26 @@ function ItemwisePurchases({ from, to, setFrom, setTo, vendors, categories, pres
     finally { setDownloading(false); }
   };
 
+  // Owner ruling 127: the Recaho-style 38-column inward list for the selected
+  // dates (all vendors, all items), built server-side by /api/reports/purchase-inward.
+  const downloadInward = async () => {
+    setDownloadingInward(true); setError('');
+    try {
+      const res = await fetch(`/api/reports/purchase-inward?${new URLSearchParams({ from, to }).toString()}`, { cache: 'no-store' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as { error?: string }));
+        setError(j?.error || (res.status === 403 ? 'Management only — download refused.' : `Download failed (HTTP ${res.status}).`));
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `purchase-inward_${from}_${to}.xlsx`; a.click();
+      URL.revokeObjectURL(url);
+    } catch { setError('Network error — download failed.'); }
+    finally { setDownloadingInward(false); }
+  };
+
   const rows = data?.rows || [];
   const shown = paintAll ? rows : rows.slice(0, ITEMWISE_PAINT_CAP);
   const t = data?.totals;
@@ -1463,6 +1484,14 @@ function ItemwisePurchases({ from, to, setFrom, setTo, vendors, categories, pres
             className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white">
             {downloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileSpreadsheet className="w-3.5 h-3.5" />} Download Excel
           </button>
+          <div className="flex flex-col items-start">
+            <span className="text-[10px] text-[#8B7355] mb-1 max-w-[320px]">Recaho's 38 columns + our PINV · these dates, no filters · total = Grand Total · Liquor Store bills on their own sheet</span>
+            <button onClick={downloadInward} disabled={downloadingInward || !from || !to}
+              title="Purchase Inward data in the Recaho layout for the From–To dates (all vendors, all items). Its TOTAL INWARD AMOUNT column adds up to the Purchase Report Grand Total for those dates. Liquor (TGBCL) bills recorded in the Liquor Store go on a separate “Liquor Inward” sheet whose total is their Net Indent — never added to that Grand Total. Liquor booked as an ordinary purchase is a purchase line, so it stays in the Grand Total, as on this report."
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold border border-[#af4408] text-[#af4408] bg-white hover:bg-[#FFF1E3] disabled:opacity-60">
+              {downloadingInward ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileSpreadsheet className="w-3.5 h-3.5" />} Purchase Inward (Excel)
+            </button>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           {presets.map(p => (
