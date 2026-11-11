@@ -26,6 +26,14 @@ import {
   deskLineComplete, planDeskDebit, forecastDeskTake, type DeskTakeForecast,
   deskGrid, deskLineBasis,
 } from '@/lib/desk-rule';
+// STALE LINE UNIT (owner ruling 128, "Block it + stop new ones"): a line saved
+// in a unit the item no longer uses. isStaleLineUnit is desk-rule.ts
+// deskLineBasis === null — the server's lineFactor().needsReview — never a
+// second rule; the words are the owner's, one copy for every screen.
+import {
+  isStaleLineUnit, fmtStoredLineQty, staleUnitFacts, staleUnitNames,
+  STALE_UNIT_WORDS, STALE_UNIT_TITLE, STALE_UNIT_TITLE_SHORT,
+} from '@/lib/stale-line-unit';
 // Party stock issued elsewhere (ruling #86a): the store's own words, ONE copy
 // shared with party-pending.ts and the store desk.
 import {
@@ -1201,6 +1209,35 @@ function RoutedLineNote({ it }: { it: ReqItem }) {
   );
 }
 
+/**
+ * A LINE WHOSE UNIT DOESN'T MATCH ITS ITEM (owner ruling 128), on the detail's
+ * own tables. The owner's words, then the facts ("The line says PKT; this item
+ * is bought in kg and used in g."). The remedy is said only where it is the
+ * next step: on a draft its author edits the draft (the submit route says the
+ * same); on a live requisition that still owes the line, "reject and raise
+ * again" — the HOD rejects it on approval, the store on Issue Requisitions.
+ * A line that is rejected, store-rejected, complete, or on a closed
+ * requisition gets the words alone, as on the Store desk and the A4 slip.
+ * Renders nothing on any other line.
+ */
+function StaleLineNote({ it, status }: { it: ReqItem; status: string }) {
+  if (!isStaleLineUnit(it)) return null;
+  const meta = { unit: it.material_unit, purchase_unit: it.material_purchase_unit };
+  const owed = !it.is_rejected
+    && !Number((it as { store_rejected?: number | null }).store_rejected || 0)
+    && !TERMINAL_STATUSES.includes(status)
+    && !lineIssueComplete(it);
+  const buy = staleUnitNames(it.unit, meta).buy;
+  const words = status === 'draft'
+    ? `${STALE_UNIT_TITLE_SHORT} — edit the draft, remove this line and add it again${buy ? ` in ${buy}` : ''}.`
+    : owed ? `${STALE_UNIT_TITLE}.` : `${STALE_UNIT_TITLE_SHORT}.`;
+  return (
+    <div className="mt-0.5 text-[9px] leading-snug text-red-700 no-underline">
+      <b>{words}</b> {staleUnitFacts(it.unit, meta)}
+    </div>
+  );
+}
+
 function RequisitionRow({ r, expanded, onToggle, materials, viewer, requireMgmt, reload, onEdit }: {
   r: Requisition; expanded: boolean; onToggle: () => void;
   materials: Material[];
@@ -1434,6 +1471,14 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     const rejected = !!it.is_rejected;
                     // Owner rule: purchase basis leads, recipe figure as the hint.
                     const U = lineUnits(it);
+                    // A line whose unit doesn't match its item (ruling 128)
+                    // prints every figure AS STORED in its own unit ("2 PKT")
+                    // — the purchase-unit reading above would turn 2 PKT into
+                    // "0.002 kg = 2 g". fq = figure + unit, fn = figure alone;
+                    // on every other line they are exactly what was printed.
+                    const stale = isStaleLineUnit(it);
+                    const fn = (q: Q) => stale ? fmtStoredLineQty(Number(q) || 0, '') : fmtNum(U.toPU(q));
+                    const fq = (q: Q) => stale ? fmtStoredLineQty(Number(q) || 0, it.unit) : `${fmtNum(U.toPU(q))} ${U.pu}`;
                     // ONE headline figure per line — the truth about goods (see
                     // deptLeadQty). Everything below is the exception report.
                     const lead = deptLeadQty(it, storeHasIssued);
@@ -1461,25 +1506,26 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                       ? 'Rejected by HOD — not issued'
                       : (!storeHasIssued && it.chef_approved_qty != null
                           && Number(it.chef_approved_qty) !== Number(it.quantity_requested))
-                        ? `HOD approved · requested ${fmtNum(U.toPU(it.quantity_requested))} ${U.pu}`
+                        ? `HOD approved · requested ${fq(it.quantity_requested)}`
                       : (storeHasIssued && approved > 0 && open > 1e-9)
-                        ? `of ${fmtNum(U.toPU(approved))} ${U.pu} ${basis} · ${fmtNum(U.toPU(open))} ${reqIsClosed ? 'short' : 'still to come'}`
+                        ? `of ${fq(approved)} ${basis} · ${fn(open)} ${reqIsClosed ? 'short' : 'still to come'}`
                       : (storeHasIssued && approved > 0 && over > 1e-9)
-                        ? `${fmtNum(U.toPU(over))} ${U.pu} over the ${fmtNum(U.toPU(approved))} ${U.pu} ${basis}`
+                        ? `${fq(over)} over the ${fq(approved)} ${basis}`
                       : null;
                     return (
                       <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`}>
                         <td className="py-1 px-2">
                           {it.material_name}
                           {!rejected && <RoutedLineNote it={it} />}
+                          <StaleLineNote it={it} status={detail.status} />
                         </td>
                         <td className="py-1 px-2 text-right font-mono">
                           {/* Rejected prints an em-dash, same as the full table.
                               It used to print the placeholder 1 that
                               chef-approve/route.ts writes on a rejected line —
                               a quantity nobody ever asked for or issued. */}
-                          {rejected ? <span className="text-red-700 no-underline">—</span> : fmtNum(U.toPU(lead))}
-                          {!rejected && U.pf > 1 && (
+                          {rejected ? <span className="text-red-700 no-underline">—</span> : fn(lead)}
+                          {!rejected && U.pf > 1 && !stale && (
                             <div className="text-[9px] text-[#B8A590] font-normal no-underline">
                               = {fmtNum(U.toRecipe(lead))} {U.recipeUnit}
                             </div>
@@ -1490,7 +1536,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                             </div>
                           )}
                         </td>
-                        <td className="py-1 px-2 font-bold text-[#2D1B0E]">{U.pu}</td>
+                        <td className="py-1 px-2 font-bold text-[#2D1B0E]">{stale ? (String(it.unit ?? '').trim() || 'no unit') : U.pu}</td>
                       </tr>
                     );
                   })}
@@ -1568,11 +1614,21 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 </tr>
                 {group.lines.map(it => {
                 const rejected = !!it.is_rejected;
+                // A line whose unit doesn't match its item (ruling 128): its
+                // Requested / HOD OK / Issued / To Purchase print AS STORED in
+                // the line's own unit ("2 PKT"), with no "= N g" hint — the
+                // purchase-unit reading below would print 2 PKT as "0.002 kg
+                // = 2 g". On Hand and Avg ₹ are the item's own and stay as
+                // they are. Every other line renders exactly as before.
+                const stale = isStaleLineUnit(it);
+                const storedQ = (q: Q) => fmtStoredLineQty(Number(q) || 0, it.unit);
                 // Stock is in recipe units; the request may be in the purchase
                 // unit (e.g. BTL) — convert before comparing.
                 // Not on a routed line (ruling #45): it is never served from
                 // the central shelf, so a ⚠ against that shelf would be noise.
-                const short = !isRoutedLine(it) && (it.current_stock < it.quantity_requested * reqPackFactor(it));
+                // Nor on a stale-unit line: its figure is in a unit the item
+                // does not use, so it cannot be compared with the shelf.
+                const short = !isRoutedLine(it) && !stale && (it.current_stock < it.quantity_requested * reqPackFactor(it));
                 // Purchase-unit context for display: stock is stored in recipe
                 // units (g/ml) and average_price is ₹/recipe-unit — both are
                 // unreadable raw (18,000 / ₹0). Convert to the ordering unit.
@@ -1622,17 +1678,22 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                         <div className="mt-0.5 no-underline"><MergeLineBadge line={it as unknown as MergeLineFields} pu={puLbl} /></div>
                       )}
                       {!rejected && <RoutedLineNote it={it} />}
+                      <StaleLineNote it={it} status={detail.status} />
                       {it.chef_note && <div className="text-[9px] text-amber-700 no-underline">Chef: {it.chef_note}</div>}
                     </td>
                     <td className="py-1 px-2 text-right font-mono">
+                      {stale ? storedQ(it.quantity_requested) : <>
                       {fmtNum(U.toPU(it.quantity_requested))} {puLbl}
                       {hint(it.quantity_requested)}
+                      </>}
                     </td>
                     <td className="py-1 px-2 text-right font-mono">
                       {rejected
                         ? <span className="text-red-700 no-underline">—</span>
                         : it.chef_approved_qty != null
-                          ? <><span className="text-amber-700">{fmtNum(U.toPU(it.chef_approved_qty))} {puLbl}</span>{hint(Number(it.chef_approved_qty))}</>
+                          ? (stale
+                            ? <span className="text-amber-700">{storedQ(it.chef_approved_qty)}</span>
+                            : <><span className="text-amber-700">{fmtNum(U.toPU(it.chef_approved_qty))} {puLbl}</span>{hint(Number(it.chef_approved_qty))}</>)
                           : <span className="text-[#C0A98F]">—</span>}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${short ? 'text-red-700 font-semibold' : 'text-[#6B5744]'}`}>
@@ -1650,10 +1711,10 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     {storeHasIssued && (
                       <>
                         <td className="py-1 px-2 text-right font-mono text-emerald-700">
-                          {rejected ? '—' : <>{issuedLead(it.quantity_issued || 0)} {puLbl}{hint(it.quantity_issued || 0, issuedLead(it.quantity_issued || 0))}</>}
+                          {rejected ? '—' : stale ? storedQ(it.quantity_issued) : <>{issuedLead(it.quantity_issued || 0)} {puLbl}{hint(it.quantity_issued || 0, issuedLead(it.quantity_issued || 0))}</>}
                         </td>
                         <td className="py-1 px-2 text-right font-mono text-blue-700">
-                          {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_to_purchase))} {puLbl}{hint(it.quantity_to_purchase || 0)}</>}
+                          {rejected ? '—' : stale ? storedQ(it.quantity_to_purchase) : <>{fmtNum(U.toPU(it.quantity_to_purchase))} {puLbl}{hint(it.quantity_to_purchase || 0)}</>}
                         </td>
                       </>
                     )}
@@ -1774,14 +1835,30 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.department_id]);
   const [notes, setNotes] = useState(editDraft?.notes || '');
-  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; unit: string; notes: string }>>(
+  // `was` is set ONLY on a draft line saved in a unit the item no longer uses
+  // (STALE LINE UNIT, owner ruling 128): "edited requisitions always take the
+  // item's CURRENT unit". Such a line opens with the item's current unit (the
+  // one onPick stamps) and an EMPTY box — its saved figure is in a unit nobody
+  // can convert, so a person types it again; nothing is ever converted. Every
+  // other line maps exactly as before and carries no `was` key.
+  const [items, setItems] = useState<Array<{ material_id: string; quantity_requested: number; unit: string; notes: string; was?: string }>>(
     editDraft && (editDraft.items?.length || 0) > 0
-      ? editDraft.items!.map(it => ({
+      ? editDraft.items!.map(it => isStaleLineUnit(it)
+        ? {
+            material_id: it.material_id,
+            quantity_requested: 0,
+            unit: it.material_purchase_unit || it.material_unit || '',
+            notes: it.notes || '',
+            was: String(it.unit ?? '').trim()
+              ? `Saved as ${fmtStoredLineQty(it.quantity_requested, it.unit)}, a unit this item does not use`
+              : `Saved as ${fmtStoredLineQty(it.quantity_requested, it.unit)} with no unit`,
+          }
+        : {
           material_id: it.material_id,
           quantity_requested: it.quantity_requested,
           unit: it.unit || '',
           notes: it.notes || '',
-        }))
+        })
       : [{ material_id: '', quantity_requested: 1, unit: '', notes: '' }],
   );
   const [saving, setSaving] = useState(false);
@@ -1812,7 +1889,20 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
         : 'Your user has no home department set. Ask an admin to assign one on /users.');
       return;
     }
-    const cleaned = items.filter(i => i.material_id && i.quantity_requested > 0);
+    // A stale draft line (`was`) opened with an empty box: saving it empty would
+    // silently drop it from the draft, so ask for the figure first.
+    const retype = items.find(i => i.was !== undefined && i.material_id && !(i.quantity_requested > 0));
+    if (retype) {
+      const name = materials.find(m => m.id === retype.material_id)?.name
+        || editDraft?.items?.find(x => x.material_id === retype.material_id)?.material_name || 'this line';
+      alert(`Type the quantity again in ${retype.unit} for ${name}, or remove the line.`);
+      return;
+    }
+    // `was` is screen-only: a retyped stale line posts the same four fields as
+    // every other line (which have no `was` and pass through as they are).
+    const cleaned = items.filter(i => i.material_id && i.quantity_requested > 0)
+      .map(i => i.was === undefined ? i
+        : { material_id: i.material_id, quantity_requested: i.quantity_requested, unit: i.unit, notes: i.notes });
     if (cleaned.length === 0) { alert('Add at least one item'); return; }
     setSaving(true);
     try {
@@ -2091,6 +2181,12 @@ function CreateRequisitionModal({ departments, materials, me, editDraft, onClose
                               </div>
                             ) : null}
                           </>
+                        )}
+                        {/* STALE LINE UNIT (ruling 128): what the draft said, as stored. */}
+                        {it.was !== undefined && (
+                          <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-1.5 py-1 mt-1 leading-snug">
+                            {it.was} — type the quantity again in {it.unit}.
+                          </div>
                         )}
                       </div>
                       {!simple && (
@@ -2447,12 +2543,25 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   //      buys them, and they are not in the POST (store-process skips them and
   //      refuses a figure on one, code 'routed'). They are listed read-only
   //      above the form instead, with the server's sentence.
-  const visibleItems = (req.items || []).filter(it => !it.is_rejected && !isRoutedLine(it));
+  //   4) Leave STALE-UNIT lines out of the form too (owner ruling 128): a line
+  //      saved in a unit the item no longer uses is refused at hand-over and
+  //      moves no stock, so store-process refuses a figure or Buy on one (400,
+  //      code 'unit_review') and leaves it as it is. Listed read-only above the
+  //      form; the remedy is Reject on Issue Requisitions, then raise it again.
+  //      A routed line stays a routed line (its own branch and refusal).
+  const visibleItems = (req.items || []).filter(it => !it.is_rejected && !isRoutedLine(it) && !isStaleLineUnit(it));
   const rejectedCount = (req.items || []).filter(it => !!it.is_rejected).length;
   const routedItems = (req.items || []).filter(it => !it.is_rejected && isRoutedLine(it));
   /** Routed lines still owed (THE RULE) — what keeps the requisition open after
    *  this submit, and what a ticked PO's cascade would wrongly close. */
   const routedOwed = routedItems.filter(it => !Number((it as any).store_rejected || 0) && !lineIssueComplete(it));
+  /** Stale-unit lines (ruling 128) and those still owed — an owed one keeps the
+   *  requisition open after this submit, and a ticked PO's cascade would close
+   *  it (store-process refuses that tick, 409 'unit_review_open'). Both empty on
+   *  every requisition without such a line. */
+  const staleItems = (req.items || []).filter(it => !it.is_rejected && !isRoutedLine(it) && isStaleLineUnit(it));
+  const storeRejected = (it: ReqItem) => !!Number((it as { store_rejected?: number | null }).store_rejected || 0);
+  const staleOwed = staleItems.filter(it => !storeRejected(it) && !lineIssueComplete(it));
   const routedDepts = routedDeptNames(routedItems);
   const routedWho = routedDepts.length > 0 ? routedDepts.join(', ') : 'the routed department';
   /** A party requisition's goods move on the party rail, so the central-stock
@@ -2733,7 +2842,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
      would close it on arrival, though its department still has to send it;
      store-process refuses that gesture (409, code 'routed_open'). The tick is
      locked here with the reason, so the storekeeper is never sent into it. */
-  const tickLocked = mergedHeldLines.length > 0 || routedOwed.length > 0;
+  /* …AND WHILE A STALE-UNIT LINE IS STILL OWED (ruling 128): the cascade would
+     close a line the store can never issue (store-process: 409, code
+     'unit_review_open'). */
+  const tickLocked = mergedHeldLines.length > 0 || routedOwed.length > 0 || staleOwed.length > 0;
   // Lines whose central BOOK balance is BELOW zero — a data-quality fact, kept
   // separate from "the store cannot cover this line" because the remedy is
   // different: a negative book means issues have outrun recorded purchases and
@@ -4223,10 +4335,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             {unitReview.length > 0 && (
               <div className="px-3 py-2 rounded border-2 border-red-300 bg-red-50 text-red-900">
                 <div className="font-semibold">🚨 Stock was NOT adjusted on {unitReview.length} line{unitReview.length === 1 ? '' : 's'}</div>
+                {/* STALE LINE UNIT (ruling 128): the remedy is the LINE's, never the
+                    item's — changing the item's unit would re-base its stock. */}
                 <div className="text-[10px] mt-0.5">
-                  The hand-over is recorded against the requisition, but the line&apos;s unit could not be resolved
-                  safely, so central stock was left untouched for: <b>{unitReview.join(', ')}</b>. Fix the unit /
-                  pack size on the material and correct the count.
+                  The hand-over is recorded against the requisition, but the line&apos;s unit doesn&apos;t match the
+                  item, so no stock moved for: <b>{unitReview.join(', ')}</b>. Do not change the item&apos;s unit —
+                  reject the line and raise it again.
                 </div>
               </div>
             )}
@@ -4402,12 +4516,36 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           )}
 
-          {lines.length === 0 && routedItems.length === 0 && (
+          {/* STALE-UNIT LINES (ruling 128) — read-only, not in the form or the
+              POST. Each figure is printed as stored, in the line's own unit. */}
+          {staleItems.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-red-50 border border-red-200 rounded text-red-900 space-y-1">
+              <div>
+                <b>{staleItems.length}</b> line{staleItems.length === 1 ? ' is' : 's are'} not in the form below:{' '}
+                {staleItems.length === 1 ? STALE_UNIT_WORDS : "unit doesn't match the item — reject and raise again"}.
+                Nothing here issues or buys {staleItems.length === 1 ? 'it' : 'them'}; Reject is on Issue Requisitions.
+              </div>
+              <ul className="space-y-0.5">
+                {staleItems.map(it => (
+                  <li key={it.id} className="break-words">
+                    {/* unit-lock: a line whose unit doesn't match the item (ruling 128) prints
+                        AS STORED in the LINE's own unit (requisition_items.unit), never
+                        converted — this `it.unit` is the line's unit, not the recipe unit. */}
+                    <b>{it.material_name}</b> — {fmtStoredLineQty(effectiveQty(it), it.unit)}
+                    {storeRejected(it) ? <> — rejected by the store</> : null}
+                    {' · '}{staleUnitFacts(it.unit, { unit: it.material_unit, purchase_unit: it.material_purchase_unit })}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {lines.length === 0 && routedItems.length === 0 && staleItems.length === 0 && (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded text-amber-900">
               ⚠ Every line on this requisition was rejected by the chef. Nothing to issue — Cancel out and reject the whole requisition if appropriate.
             </div>
           )}
-          {lines.length === 0 && routedItems.length > 0 && (
+          {lines.length === 0 && routedItems.length > 0 && staleItems.length === 0 && (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded text-amber-900">
               ⚠ Nothing on this requisition is the store&apos;s to issue — {routedWho} sends {rejectedCount > 0 ? 'every line the HOD approved' : 'every line'}.
             </div>
@@ -4556,6 +4694,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               would close {mergedHeldLines.length === 1 ? 'that line' : 'those lines'} before {mergedHeldLines.length === 1 ? 'its' : 'their'} goods
               arrive on the merged PO. Issue what the store holds now; the merged lines are issued from Issue Requisitions
               when they arrive, and anything else still to buy can go on a merged PO (&quot;Merge into one PO&quot;).
+            </div>
+          )}
+          {staleOwed.length > 0 && mergedHeldLines.length === 0 && routedOwed.length === 0 && (
+            <div className="text-[11px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900">
+              <b>&quot;Also raise a vendor PO&quot; is not available on this requisition</b> — a vendor PO raised with it
+              completes the WHOLE requisition when it arrives, and would close{' '}
+              {staleOwed.map(it => it.material_name).join(', ')}, whose {staleOwed.length === 1
+                ? <>unit doesn&apos;t match the item</> : <>units don&apos;t match the items</>}; reject{' '}
+              {staleOwed.length === 1 ? 'it' : 'them'} on Issue Requisitions and raise {staleOwed.length === 1 ? 'it' : 'them'} again.
             </div>
           )}
           {routedOwed.length > 0 && mergedHeldLines.length === 0 && (
@@ -5598,7 +5745,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   sentence, byte for byte (round 8). */}
               {/* A routed line still owed (ruling #45) keeps the requisition open
                   whatever this submit does — its department still sends it. */}
-              {routedOwed.length > 0
+              {/* So does a stale-unit line still owed (ruling 128): store-process
+                  leaves it as it is, until the Store desk rejects it. */}
+              {staleOwed.length > 0
+                ? <>{lines.length > 0 && <>✓ Every line in the form is {lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
+                    ? 'complete' : 'fully issued'} on submit. </>}The requisition stays open until{' '}
+                    {staleOwed.map(it => it.material_name).join(', ')} {staleOwed.length === 1 ? 'is' : 'are'} rejected on Issue
+                    Requisitions —{' '}{staleOwed.length === 1 ? <>its unit doesn&apos;t match the item</> : <>their units don&apos;t match the items</>}
+                    {routedOwed.length > 0 && <>, and until {routedWho} sends {routedOwed.map(it => it.material_name).join(', ')}</>}.</>
+                : routedOwed.length > 0
                 ? <>✓ Every line the store serves is {lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
                     ? 'complete' : 'fully issued'} on submit. The requisition stays open until {routedWho} sends{' '}
                     {routedOwed.map(it => it.material_name).join(', ')}.</>
@@ -5626,9 +5781,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           const missingPrice  = raisePo ? buyLines.find(ln => !(priceOf(ln) > 0))  : undefined;
           const missingVendor = raisePo ? buyLines.find(ln => !hasVendor(ln))      : undefined;
           // Nothing for the store to record (ruling #45): every line is routed.
-          const nothingForStore = lines.length === 0 && routedItems.length > 0;
+          // Or (ruling 128) every line left is routed or has a unit that doesn't
+          // match its item — an empty submit would mark the requisition
+          // processed with nothing recorded.
+          const nothingForStore = lines.length === 0 && (routedItems.length > 0 || staleItems.length > 0);
           const poReady = !missingPrice && !missingVendor && !nothingForStore;
-          const blockedReason = nothingForStore
+          const staleNames = staleItems.map(it => it.material_name).join(', ');
+          const blockedReason = nothingForStore && staleItems.length > 0
+            ? `Nothing here can be issued — ${staleNames}: ${staleItems.length === 1 ? STALE_UNIT_WORDS : "unit doesn't match the item — reject and raise again"} (Reject is on Issue Requisitions)${routedItems.length > 0 ? `, and ${routedWho} sends ${routedItems.map(it => it.material_name).join(', ')} from its To send list` : ''}.`
+            : nothingForStore
             ? `Nothing here is the store's to issue — ${routedWho} sends ${routedItems.length === 1 ? 'the line' : 'every line'} from its To send list.`
             : missingPrice
             ? `"${missingPrice.material_name}" has a Buy qty but no unit price — a PO cannot be raised at ₹0, and the server would refuse the whole issue.`

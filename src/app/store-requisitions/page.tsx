@@ -101,6 +101,16 @@ import {
 import {
   isRoutedLine, routedLineOf, routedDeptWord, routedDeptNames, withDeptLabel,
 } from '@/app/department-transfers/routed-view';
+// STALE LINE UNIT (owner ruling 128, "Block it + stop new ones"): a line whose
+// own unit the server's converter refuses (issue-stock.ts lineFactor
+// needsReview — e.g. a 'PKT' line on an item now g / bought in kg ×1000) moves
+// no stock when issued, and /store-issue now refuses it. This desk shows such a
+// line AS STORED ("2 PKT", never read as grams), offers only Reject, and leaves
+// it out of Issue All / Issue Selected. The ONE client copy of the rule.
+import {
+  isStaleLineUnit, fmtStoredLineQty, staleUnitFacts, staleUnitNames,
+  STALE_UNIT_WORDS, STALE_UNIT_SHORT, STALE_UNIT_TITLE, STALE_UNIT_TITLE_SHORT,
+} from '@/lib/stale-line-unit';
 
 interface Department { id: string; name: string; }
 /* The merged-PO fields (MergeLineFields) ride on every line of the ?id= feed:
@@ -395,7 +405,21 @@ function lineUnits(line: ReqLine) {
      *  balance no float effect reaches — every live balance today — the figure
      *  is the one this column always printed. */
     stockPU: (q: any) => shownPurchaseQty(Number(q) || 0, meta),
+    /** STALE LINE UNIT (ruling 128) — additive; nothing above reads it. True
+     *  when the line's own unit is one the server refuses (a blank or unknown
+     *  unit on a packed item). Every figure of such a line is printed as
+     *  stored through fmtStoredLineQty(q, lineUnit) — toPU / toRecipe above
+     *  would read it as recipe units, which nobody can say it is. */
+    stale: isStaleLineUnit(line),
+    /** The line's stored unit, trimmed ('' when blank). */
+    lineUnit: String(line.unit ?? '').trim(),
   };
+}
+
+/** The facts sentence for a stale line: "The line says PKT; this item is
+ *  bought in kg and used in g." (stale-line-unit.ts staleUnitFacts). */
+function staleFactsOf(line: ReqLine): string {
+  return staleUnitFacts(line.unit, { unit: line.material_unit, purchase_unit: line.material_purchase_unit });
 }
 
 /**
@@ -424,6 +448,8 @@ function fmtHandOverPU(U: ReturnType<typeof lineUnits>, q: number): string {
  * 1,999.6 g (round-9 verifier, crumb-prompt).
  */
 function fmtPromptQty(U: ReturnType<typeof lineUnits>, q: number): string {
+  // A stale line (ruling 128) prints as stored: "2 PKT".
+  if (U.stale) return fmtStoredLineQty(q, U.lineUnit);
   const v = Number(q) || 0;
   const lead = `${fmtHandOverPU(U, v)}${U.pu ? ` ${U.pu}` : ''}`;
   if (U.pf > 1) return `${lead} (= ${fmtCapPU(U.toRecipe(v), 1)} ${U.recipeUnit})`;
@@ -520,6 +546,8 @@ function takeOutcomeWords(U: ReturnType<typeof lineUnits>, approved: number, tk:
  * plain lead, so an ordinary line's sentence is unchanged.
  */
 function fmtQtyExact(U: ReturnType<typeof lineUnits>, q: number): string {
+  // A stale line (ruling 128) prints as stored: "2,640 PKT".
+  if (U.stale) return fmtStoredLineQty(q, U.lineUnit);
   const v = Number(q) || 0;
   const leadNum = fmtHandOverPU(U, v);
   const lead = `${leadNum}${U.pu ? ` ${U.pu}` : ''}`;
@@ -2301,6 +2329,21 @@ export default function StoreRequisitionsPage() {
       if (whole || !batch.some(b => b.id in add)) alert(String(j?.error || '').trim() || fallback);
       return true;
     }
+    // STALE LINE UNIT (ruling 128), refused by the route: the line's unit
+    // doesn't match the item (this screen was opened before the item's units
+    // changed, or before this check shipped). The whole gesture was refused
+    // and nothing was written. The server's sentence verbatim, then re-read
+    // the list so the row shows the line as stored, with Reject only, and
+    // Issue All leaves it out from then on.
+    if (String(j?.code || '') === 'unit_review') {
+      // Only when the server sent no sentence: a one-line gesture names its
+      // line; a batch cannot say which of its lines it was.
+      const who = batch.length === 1 && batch[0].material_name ? batch[0].material_name : 'A line in this gesture';
+      alert(String(j?.error || '').trim()
+        || `${who}: ${STALE_UNIT_WORDS}. Nothing was issued and the requisition is unchanged.`);
+      setRefreshKey(k => k + 1);
+      return true;
+    }
     // DELIVERED DIRECT (ruling #68), refused by the route: this screen was
     // opened before the merged PO's Direct Issue receipt, so it still offered
     // the line. The server's sentence verbatim, then re-read the list so the
@@ -2320,6 +2363,14 @@ export default function StoreRequisitionsPage() {
       // one or several (round 10), each on its own row — and the pressed line
       // is usually not among them, so its row would otherwise say nothing.
       if (j?.error && (batch.length > 1 || !batch.some(b => b.id in short))) alert(String(j.error));
+      // The same refusal can also name a line whose unit doesn't match the
+      // item (ruling 128: a 'unit_review' row in `blocked`, which the reader
+      // above skips) — its item's units changed after this page loaded. Re-read
+      // the list so that row shows as stored, with Reject only; the panels
+      // above survive a reload (nothing was written, no line moved).
+      if (Array.isArray(j?.blocked) && (j!.blocked as Record<string, unknown>[]).some(b => String(b?.code || '') === 'unit_review')) {
+        setRefreshKey(k => k + 1);
+      }
       return true;
     }
     alert(j?.error || fallback);
@@ -2829,6 +2880,14 @@ export default function StoreRequisitionsPage() {
       alert(`${rv?.sentence || `${line.material_name} is sent by ${routedDeptWord(rv)} by department transfer, not issued from the central store.`} Nothing was issued.`);
       return;
     }
+    // Ruling 128 — a line whose unit doesn't match the item is never issued
+    // from here (the server refuses it too); its row offers only Reject, and
+    // this stops any other path (a held panel left from before the item's
+    // units changed) from posting one.
+    if (isStaleLineUnit(line)) {
+      alert(`${line.material_name}: ${STALE_UNIT_WORDS}. ${staleFactsOf(line)} Nothing was issued.`);
+      return;
+    }
     const outstanding = owedQty(line);
     // The box is in PURCHASE units; /store-issue adds the number to
     // quantity_issued verbatim, which lives in the LINE's own unit → convert
@@ -3314,7 +3373,14 @@ export default function StoreRequisitionsPage() {
         + `${line.on_po?.po_number ? ` on ${line.on_po.po_number}` : ''}`
         + `${line.delivered_direct_grn ? ` (${line.delivered_direct_grn})` : ''} — not issued from central`
       : '';
-    const reason = prompt(ask, directFacts);
+    // A line whose unit doesn't match the item (ruling 128): Reject is the
+    // store's only action on it, so the reason is pre-worded with what the
+    // department does next, in the unit the item is bought in. Editable.
+    const staleBuy = U.stale && !directFacts
+      ? staleUnitNames(line.unit, { unit: line.material_unit, purchase_unit: line.material_purchase_unit }).buy : '';
+    const staleFacts = U.stale && !directFacts
+      ? `${STALE_UNIT_TITLE_SHORT} — raise it again${staleBuy ? ` in ${staleBuy}` : ''}` : '';
+    const reason = prompt(ask, directFacts || staleFacts);
     if (reason === null) return;                       // cancelled
     const batch = [{ id: line.id, material_name: line.material_name }];
     setBusyLine(line.id);
@@ -4302,8 +4368,33 @@ function openIssuableLines(req: Requisition): Array<ReqLine & { remaining: numbe
     // Routed (ruling #45): its department sends it by department transfer —
     // never in a store batch. The server refuses it anyway (code 'routed').
     if (isRoutedLine(line)) continue;
+    // Its unit doesn't match the item (ruling 128): the store cannot issue
+    // it. The server holds such an entry and issues the rest (200,
+    // unit_review_held), or refuses the whole gesture when nothing else can go
+    // (400, code 'unit_review'), so Issue All / Issue Selected / select-all
+    // leave it out and the card says so (staleOpenLines). Every other line
+    // passes as before.
+    if (isStaleLineUnit(line)) continue;
     const remaining = owedQty(line);
     if (remaining > 0) out.push({ ...line, remaining });
+  }
+  return out;
+}
+
+/**
+ * Lines still owed whose unit doesn't match the item (ruling 128) — the lines
+ * openIssuableLines leaves out for that reason. The same skips as there
+ * (rejected by chef or store, delivered direct, routed — those keep their own
+ * words), but a deferred one is kept: it is owed and the store cannot issue it
+ * either. Empty on every requisition without such a line.
+ */
+function staleOpenLines(req: Requisition): ReqLine[] {
+  const out: ReqLine[] = [];
+  for (const line of req.items || []) {
+    if (line.is_rejected || line.store_rejected) continue;
+    if (isDeliveredDirect(line) || isRoutedLine(line)) continue;
+    if (!isStaleLineUnit(line)) continue;
+    if (owedQty(line) > 0) out.push(line);
   }
   return out;
 }
@@ -4623,6 +4714,14 @@ function partialSummary(req: Requisition): string | null {
   const l = partials[0];
   const U = lineUnits(l);
   const s = lineSplit(l);
+  // A line whose unit doesn't match the item (ruling 128): its figures as
+  // stored, in its own unit ("2,640 of 3,000 PKT issued — 360 PKT still open").
+  if (U.stale) {
+    const f = (v: number) => fmtStoredLineQty(v, '');
+    const lu = U.lineUnit ? ` ${U.lineUnit}` : '';
+    const rest = s.deferred > 0 ? `${f(s.deferred)}${lu} deferred` : `${f(s.open)}${lu} still open`;
+    return `${f(s.issued)} of ${f(s.effective)}${lu} issued — ${rest}`;
+  }
   // s.deferred / s.open are mutually exclusive per line (deferred_until is a
   // line flag), so exactly one of these two sentences is the true one.
   // EXACT BELOW ONE PRINTED STEP (round 10), as the rows under it are:
@@ -4687,6 +4786,9 @@ function ReqCard(props: {
   // Feature 3 — selection derived state. Open issuable lines are the only
   // selectable ones; the header checkbox reflects/controls all of them.
   const openLines = openIssuableLines(req);
+  // Owed lines whose unit doesn't match the item (ruling 128) — named under
+  // the Issue All bars. Empty on every requisition without one.
+  const staleOpen = staleOpenLines(req);
   const openIds = openLines.map(l => l.id);
   const selectedCount = openIds.filter(id => props.selectedIds.has(id)).length;
   const allOpenSelected = openIds.length > 0 && selectedCount === openIds.length;
@@ -5027,6 +5129,28 @@ function ReqCard(props: {
               </button>
             </div>
             <CentralHoldBanner forecast={allForecast} gesture="Issue All" scope="open line" />
+          </div>
+        );
+      })()}
+      {/* A LINE WHOSE UNIT DOESN'T MATCH THE ITEM (ruling 128). Its own row,
+          below the bars, which stay exactly as they were: the bars count only
+          the lines Issue All sends, and this says which owed line it leaves
+          out and why — visible on a collapsed card, where Issue All is
+          pressed. With no other line to issue, it says the store cannot issue
+          it. Absent on every requisition without such a line. */}
+      {staleOpen.length > 0 && (() => {
+        const one = staleOpen.length === 1;
+        const names = staleOpen.map(l => l.material_name).join(', ');
+        const barShown = !!props.showIssueAll && openLines.length > 0;
+        return (
+          <div className="px-4 py-2 border-t border-[#E8D5C4] bg-red-50 text-[11px] text-red-800 flex items-start gap-1.5">
+            <AlertCircle className="w-3.5 h-3.5 mt-[1px] shrink-0" />
+            <span>
+              <b>{names}</b>: {one ? STALE_UNIT_WORDS : "unit doesn't match the item — reject and raise again"}.{' '}
+              {barShown
+                ? (one ? 'Issue All leaves it out.' : 'Issue All leaves them out.')
+                : (one ? 'The store cannot issue it.' : 'The store cannot issue them.')}
+            </span>
           </div>
         );
       })()}
@@ -5375,12 +5499,19 @@ function LineRow(props: {
   // stay: a rejection closes the rest of the line, keeping what was sent.
   const routed = routedLineOf(line);
   const routedDept = routedDeptWord(routed);
-  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0 && !direct && !routed;
+  // STALE LINE UNIT (ruling 128): the line's unit doesn't match the item. Its
+  // quantities print as stored ("2 PKT" — storedQ), it has no checkbox, no
+  // issue box, no Issue Now / Defer / Issue part / undo, and it is never put
+  // on a merged PO (the merge refuses it too); Reject is its one action.
+  const stale = U.stale;
+  const storedQ = (q: number) => fmtStoredLineQty(q, U.lineUnit);
+  const isCheckable = !line.is_rejected && !line.store_rejected && !line.deferred_until && outstanding > 0 && !direct && !routed
+    && !stale;
   // "Add to a merged PO" — offered on a deferred line that is still owed and
   // is not already held by an open PO (the merge would refuse it). A vendor
   // closed without delivering frees the line, so it is offered again.
   const canAddToMerge = !!props.canMerge && !!props.onAddToMergedPo && !line.is_rejected && !line.store_rejected
-    && outstanding > 0 && !direct && !routed && (!onOpenPo(line) || isVendorClosed(line));
+    && outstanding > 0 && !direct && !routed && (!onOpenPo(line) || isVendorClosed(line)) && !stale;
   const hasMergeBadge = hasMergeState(line);
   return (
     <tr className={`border-t border-[#E8D5C4]/50 ${rowTone}`}>
@@ -5520,8 +5651,10 @@ function LineRow(props: {
         })()}
       </td>
       <td className="py-1.5 px-2 text-right font-mono">
-        {fmtNum(U.toPU(line.quantity_requested))}{unitTag}
-        {hint(line.quantity_requested)}
+        {stale ? storedQ(line.quantity_requested) : <>
+          {fmtNum(U.toPU(line.quantity_requested))}{unitTag}
+          {hint(line.quantity_requested)}
+        </>}
       </td>
       {/* IN STORE — what the CENTRAL STORE can actually give, read at the moment
           of deciding. Without it the storekeeper approved a hand-over blind and
@@ -5541,6 +5674,12 @@ function LineRow(props: {
           if (routed) return <span className="text-[#C0A98F]" title={`Not issued from the central store — ${routedDept} sends it`}>—</span>;
           const st = stockLevel(line, props.req);
           if (st.qty == null) return <span className="text-[#C0A98F]">—</span>;
+          // A line whose unit doesn't match the item (ruling 128): the item's
+          // own balance as always, but no red / amber / green — that judges
+          // the line's need, and nobody can say what its unit is in this one.
+          const tone = stale
+            ? { dot: 'bg-[#C0A98F]', text: 'text-[#6B5744]', title: `${STALE_UNIT_TITLE_SHORT} — the store cannot issue this line.` }
+            : { dot: st.dot, text: st.text, title: st.title };
           /* PROMISED ELSEWHERE (ruling #86a): "1 pcs · 1 pcs promised to
              REQ-2026-1388 (Kuldeep Sing) · free 0 pcs" — the purchase unit
              first; up to two requisitions named, the rest as "+k more" with
@@ -5565,9 +5704,9 @@ function LineRow(props: {
               + pr.claims.map(c => `${reqLabel(c)} — ${pFig(c.shown)}${U.pf > 1 ? ` (= ${fmtNum(c.recipe)} ${U.recipeUnit})` : ''}`).join('\n')
             : undefined;
           return (
-            <span title={st.title}>
-              <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle ${st.dot}`} />
-              <span className={st.text}>{fmtNum(U.stockPU(st.qty))}{unitTag}</span>
+            <span title={tone.title}>
+              <span className={`inline-block w-1.5 h-1.5 rounded-full mr-1 align-middle ${tone.dot}`} />
+              <span className={tone.text}>{fmtNum(U.stockPU(st.qty))}{unitTag}</span>
               {U.pf > 1 && (
                 <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(st.qty)} {U.recipeUnit}</div>
               )}
@@ -5598,7 +5737,7 @@ function LineRow(props: {
                 </div>
               )}
               {pr && (
-                <div className={`text-[9px] font-sans whitespace-nowrap ${st.text}`}>
+                <div className={`text-[9px] font-sans whitespace-nowrap ${tone.text}`}>
                   {/* "short N" only when N prints; a negative crumb is "free
                       0", never "short 0"; a positive crumb is "free less than
                       0.001 <unit>" — the store's own words for it
@@ -5614,17 +5753,21 @@ function LineRow(props: {
         {line.is_rejected
           ? <span className="text-red-600">rejected</span>
           : line.chef_approved_qty != null
-            ? <>
-                <span className="text-amber-700">{fmtNum(U.toPU(line.chef_approved_qty))}{unitTag}</span>
-                {hint(line.chef_approved_qty)}
-              </>
+            ? (stale
+                ? <span className="text-amber-700">{storedQ(line.chef_approved_qty)}</span>
+                : <>
+                    <span className="text-amber-700">{fmtNum(U.toPU(line.chef_approved_qty))}{unitTag}</span>
+                    {hint(line.chef_approved_qty)}
+                  </>)
             : '—'}
       </td>
       {/* Issued so far carries the recipe hint too — without it this cell was the
           odd one out on a row whose other three quantities all showed one. */}
       <td className="py-1.5 px-2 text-right font-mono">
-        {puNum(U.toPU(issued), issued)}{unitTag}
-        {hint(issued)}
+        {stale ? storedQ(issued) : <>
+          {puNum(U.toPU(issued), issued)}{unitTag}
+          {hint(issued)}
+        </>}
         {/* On a routed line this is what its department SENT (transfers net of
             any send-back), not a store hand-over. */}
         {routed && issued > 0 && <div className="text-[9px] text-indigo-700 font-normal">sent by {routedDept}</div>}
@@ -5647,28 +5790,28 @@ function LineRow(props: {
             quantity named under it. */}
         <span className={split.cancelled > 0 ? 'text-[#8B7355]'
                        : outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>
-          {puNum(outstandingPU, outstanding)}{unitTag}
+          {stale ? storedQ(outstanding) : <>{puNum(outstandingPU, outstanding)}{unitTag}</>}
         </span>
-        {hint(outstanding)}
+        {!stale && hint(outstanding)}
         {split.cancelled > 0 && (
           <div className="mt-0.5 font-normal text-[10px] text-red-700"
                title="The store rejected this line — the balance was cancelled, not delivered and not owed">
-            Cancelled {puNum(U.toPU(split.cancelled), split.cancelled)}{unitTag}
-            {hint(split.cancelled)}
+            Cancelled {stale ? storedQ(split.cancelled) : <>{puNum(U.toPU(split.cancelled), split.cancelled)}{unitTag}</>}
+            {!stale && hint(split.cancelled)}
           </div>
         )}
         {(split.isSplit || split.deferred > 0) && (
           <>
             {split.deferred > 0 && (
               <div className="mt-0.5 font-normal text-[10px] text-blue-700">
-                Deferred {puNum(U.toPU(split.deferred), split.deferred)}{unitTag}
-                {hint(split.deferred)}
+                Deferred {stale ? storedQ(split.deferred) : <>{puNum(U.toPU(split.deferred), split.deferred)}{unitTag}</>}
+                {!stale && hint(split.deferred)}
               </div>
             )}
             {split.open > 0 && (
               <div className="mt-0.5 font-normal text-[10px] text-[#af4408]">
-                Open {puNum(U.toPU(split.open), split.open)}{unitTag}
-                {hint(split.open)}
+                Open {stale ? storedQ(split.open) : <>{puNum(U.toPU(split.open), split.open)}{unitTag}</>}
+                {!stale && hint(split.open)}
               </div>
             )}
           </>
@@ -5839,7 +5982,11 @@ function LineRow(props: {
             reversal panel is one: the only useful thing in it is the NUMBER, and
             a number that fades three seconds later leaves the storekeeper in
             front of the same box with nothing to type. */}
-        {props.short && (() => {
+        {/* Not on a line whose unit doesn't match the item (ruling 128): the
+            server never holds such a line (it refuses it), so a panel here is
+            left from before the item's units changed, and its figures and its
+            "Issue …" button would read the line's quantity as recipe units. */}
+        {props.short && !stale && (() => {
           const s = props.short!;
           // The server's unit must be the unit THIS box is entered in before a
           // one-click issue is offered. They are read from the same
@@ -6192,6 +6339,41 @@ function LineRow(props: {
               )}
             </div>
           </div>
+        ) : stale && !line.store_rejected ? (
+          /* ITS UNIT DOESN'T MATCH THE ITEM (owner ruling 128). The line is
+             shown as stored ("2 PKT") and the store cannot issue it: the
+             server's converter cannot read its unit, so an issue would close
+             it and move no stock — /store-issue refuses it. No box, no Issue
+             Now, no Defer, no Issue part, no undo (an undo here moves no stock
+             either, whatever its prompt would say). The store's one action is
+             Reject; the department raises the line again in the item's unit.
+             min-w: on a phone the table squeezed this column to ~80 px and the
+             sentence stood one word to a line (measured at 375 px). */
+          <div className="flex flex-col gap-1 min-w-[10rem] max-w-[15rem] md:max-w-[22rem]">
+            <div className="rounded border border-red-300 bg-red-50 px-1.5 py-1 text-[10px] leading-snug text-red-900">
+              <div className="font-semibold flex items-start gap-1">
+                <AlertCircle className="w-3 h-3 mt-[1px] shrink-0" />
+                <span>{outstanding > 0 ? STALE_UNIT_TITLE : STALE_UNIT_TITLE_SHORT}</span>
+              </div>
+              <div className="mt-0.5">
+                {staleFactsOf(line)}{outstanding > 0 ? ' The store cannot issue it.' : ''}
+              </div>
+            </div>
+            {outstanding > 0 && (
+              <div className="flex flex-wrap items-center gap-1">
+                <button onClick={() => props.onReject(line)} disabled={busy}
+                        title={`Close this line — ${STALE_UNIT_SHORT}, so the store cannot issue it. The department raises it again in the item's unit.`}
+                        className="px-2 py-0.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 rounded text-[10px] flex items-center gap-1 disabled:opacity-50">
+                  {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <XCircle className="w-3 h-3" />} Reject
+                </button>
+              </div>
+            )}
+          </div>
+        ) : line.store_rejected && stale ? (
+          // Store-rejected with a unit that doesn't match the item (ruling
+          // 128): no Un-reject — it would re-open a line the store can never
+          // issue. The department raises it again instead.
+          <span className="text-[10px] text-[#8B7355]">no action — {STALE_UNIT_SHORT}</span>
         ) : line.store_rejected ? (
           // Store-rejected: only an un-reject action to put the line back in play.
           <button onClick={() => props.onUnreject(line)} disabled={busy}
@@ -6711,6 +6893,9 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
                   <tr key={i} className="border-t border-[#E8D5C4]/50">
                     <td className="py-1.5 px-2">{fmtDateTime(h.at)}</td>
                     <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
+                      {/* A line whose unit doesn't match the item (ruling 128):
+                          each entry as stored, in the line's own unit. */}
+                      {U.stale ? fmtStoredLineQty(Number(h.qty) || 0, U.lineUnit) : <>
                       {/* Exact below one printed step (round 10): the held panel's
                           own "Issue 0.0004 kg" read "0 kg" here. Signed — an
                           undo row is negative. Every other figure is unchanged. */}
@@ -6724,6 +6909,7 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
                       {U.pf > 1 && (Number(h.qty) || 0) > 0 && (
                         <div className="text-[9px] font-normal text-[#B8A590]">= {fmtNum(U.toRecipe(h.qty))} {U.recipeUnit}</div>
                       )}
+                      </>}
                     </td>
                     <td className="py-1.5 px-2 text-[#6B5744] flex items-center gap-1"><UserIcon className="w-3 h-3" /> {h.by}</td>
                     <td className="py-1.5 px-2 text-[#8B7355]">{h.note || '—'}</td>

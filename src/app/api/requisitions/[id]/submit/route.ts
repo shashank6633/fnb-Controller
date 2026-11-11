@@ -1,5 +1,7 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { lineUnitNeedsReview } from '@/lib/issue-stock';
+import { STALE_UNIT_SHORT, staleUnitFacts, staleUnitNames } from '@/lib/stale-line-unit';
 
 /**
  * Submit a draft requisition → moves to 'submitted'.
@@ -22,6 +24,41 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
     const items = db.prepare('SELECT COUNT(*) AS n FROM requisition_items WHERE req_id = ?').get(id) as any;
     if (!items || items.n === 0) return Response.json({ error: 'Cannot submit an empty requisition' }, { status: 400 });
+
+    // STALE LINE UNIT (owner ruling 128, "new or edited requisitions always take
+    // the item's CURRENT unit"). A draft started before an item's units changed
+    // keeps the old unit on its line (YELLOW CHEDDAR in 'PKT' after the item
+    // became g / kg / ×1000), and the detail row's Submit sends it on without
+    // going through the edit form. Such a line can never be issued: the stock
+    // writer cannot read its unit (issue-stock.ts lineUnitNeedsReview IS
+    // lineFactor().needsReview, the call that makes the issue record 0 and
+    // move nothing). So it is refused here, with the facts, and nothing is
+    // written — the draft stays a draft. No unit is converted or re-stamped:
+    // the person removes the line and adds it again. A draft whose every line
+    // reads is untouched.
+    {
+      const lines = db.prepare(`
+        SELECT ri.unit AS line_unit, rm.name, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.req_id = ?
+      `).all(id) as Array<{ line_unit: string | null; name: string | null; unit: string | null; purchase_unit: string | null; pack_size: number | null }>;
+      const stale = lines.filter(x => lineUnitNeedsReview(x.line_unit, x));
+      if (stale.length > 0) {
+        return Response.json({
+          error: stale.map(x => {
+            const buy = staleUnitNames(x.line_unit, x).buy;
+            return `${String(x.name || 'A line')}: ${STALE_UNIT_SHORT}. ${staleUnitFacts(x.line_unit, x)} `
+              + `Edit the draft, remove that line and add it again${buy ? ` in ${buy}` : ''}.`;
+          }).join(' ') + ' Nothing was submitted.',
+          code: 'unit_review',
+          lines: stale.map(x => ({
+            material: String(x.name || ''), line_unit: String(x.line_unit ?? ''),
+            unit: String(x.unit ?? ''), purchase_unit: String(x.purchase_unit ?? ''),
+          })),
+        }, { status: 400 });
+      }
+    }
 
     // Phase 1 §2 — submission time windows. Each department may declare allowed
     // submission slots ("11:00,18:30") with a grace window. Admins can override

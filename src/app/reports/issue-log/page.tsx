@@ -904,7 +904,9 @@ function skipWords(reason: SkipReason): string {
   switch (reason) {
     case 'flag_off':    return 'recorded, stock not moved — deduct-at-issue is off';
     case 'party':       return 'recorded, stock not moved — party requisition (stock moves at party fulfilment)';
-    case 'unit_review': return 'recorded, stock not moved — unit needs review on this material';
+    // Owner ruling 128: the ITEM's units are right; the LINE's unit is the one
+    // that does not match. The old words sent staff to change the item.
+    case 'unit_review': return "recorded, stock not moved — the line's unit doesn't match this item";
     case '':            return '';
     default:            return `recorded, stock not moved — ${reason}`;
   }
@@ -1032,7 +1034,7 @@ function LogRow({ r }: { r: IssueLogRow }) {
           </span>
         )}
         {r.needs_unit_review && (
-          <span className="block text-[10px] text-amber-800 mt-0.5">unit needs review</span>
+          <span className="block text-[10px] text-amber-800 mt-0.5">unit doesn&apos;t match item</span>
         )}
       </td>
       <td className="py-2 px-3 text-right tabular-nums">

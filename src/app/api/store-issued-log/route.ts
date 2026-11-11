@@ -3,6 +3,8 @@ import { getCurrentUser, canProcessAsStore } from '@/lib/auth';
 import { packFactor } from '@/lib/pack-units';
 import { rateMap, materialRate } from '@/lib/closing-valuation';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
+// Owner ruling 128: which hand-overs moved no stock (line unit did not match).
+import { noStockHandOverFilter } from '@/lib/issue-log';
 
 /**
  * Cross-requisition issued-items log.
@@ -155,6 +157,8 @@ export async function GET(request: Request) {
     // running its own per-material SELECT inside the loop. Direct rows ride the
     // same map, so both rails cost from one snapshot.
     const rates = (rows.length || directRows.length) ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
+    // One query for the whole log; see the history loop below.
+    const dropNoStock = noStockHandOverFilter(db);
 
     // ── LIQUOR ZERO-RATE LOCK for the derived GST columns ────────────────────
     // Both receiving routes hard-zero-rate store-mapped (TGBCL) materials —
@@ -308,6 +312,13 @@ export async function GET(request: Request) {
       let history: Array<{ qty: number; at: string; by: string; note?: string }> = [];
       try { history = JSON.parse(row.issue_history || '[]'); } catch { continue; }
       if (!Array.isArray(history) || history.length === 0) continue;
+      // Owner ruling 128: a hand-over on a line whose unit did not match the
+      // item moved no stock (2,640 PKT of cheddar kept in g), so it is not
+      // listed as goods that went to a department, and it adds no value. A
+      // line with no such hand-over gets its own array back untouched
+      // (issue-log.ts noStockHandOverFilter). The line-level columns above
+      // (requested / approved / issued to date) still state the line as stored.
+      history = dropNoStock(String(row.item_id), history);
 
       for (const h of history) {
         const at = String(h.at || '');

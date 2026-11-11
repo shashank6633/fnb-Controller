@@ -69,6 +69,10 @@ import {
  *
  *   legacy_line_qty = quantity_issued − SUM(recorded_recipe_qty / pack_factor)
  *
+ *   (a ledger row flagged needs_unit_review recorded 0 because its line unit
+ *   could not be read, so it is taken off as its own delta_line_qty instead:
+ *   owner ruling 128, see src/lib/issue-log.ts)
+ *
  * reversed through EACH ledger row's OWN stored pack_factor (a Unit Audit
  * rebase changes a material's factor later, so today's factor would give the
  * wrong remainder). Ledger rows plus the remainder therefore re-add to

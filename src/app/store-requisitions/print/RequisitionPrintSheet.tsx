@@ -34,6 +34,12 @@ import { packFactor } from '@/lib/pack-units';
 import { deskLineComplete } from '@/lib/desk-rule';
 import { fmtIST, fmtISTDate } from '@/lib/format-date';
 import { isDeliveredDirect, deliveredDirectDept } from '@/components/MergePoModal';
+// STALE LINE UNIT (owner ruling 128): a line whose own unit the server cannot
+// read for this item prints AS STORED — its unit in the Unit cell, its figures
+// unconverted — with a remark, never as a purchase-unit figure it is not.
+import {
+  isStaleLineUnit, fmtStoredLineQty, STALE_UNIT_TITLE, STALE_UNIT_TITLE_SHORT,
+} from '@/lib/stale-line-unit';
 
 import { MAX_PRINT_IDS } from '@/lib/requisition-print';
 
@@ -120,11 +126,20 @@ function slipUnits(line: SlipLine) {
   const pu = line.material_purchase_unit || recipeUnit;
   const lu = String(line.unit || '').toLowerCase().trim();
   const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
-  return { pf, pu, recipeUnit, isPU };
+  return {
+    pf, pu, recipeUnit, isPU,
+    /** The line's unit doesn't match the item (ruling 128) — the Store desk's
+     *  U.stale: its figures print as stored, in lineUnit. */
+    stale: isStaleLineUnit(line),
+    lineUnit: String(line.unit ?? '').trim(),
+  };
 }
 
-/** A line quantity in the purchase unit — fmtHandOverPU on the Store desk. */
+/** A line quantity in the purchase unit — fmtHandOverPU on the Store desk. A
+ *  line whose unit doesn't match the item prints its stored figure instead
+ *  (its unit is in the Unit cell). */
 function fmtPU(U: ReturnType<typeof slipUnits>, q: number | null | undefined): string {
+  if (U.stale) return fmtStoredLineQty(Number(q) || 0, '');
   const v = Number(q) || 0;
   const exact = U.isPU ? v : v / U.pf;
   if (exact > 0 && exact < 0.001) return fmtCapPU(exact, U.pf);
@@ -212,6 +227,13 @@ function lineRemarks(r: SlipReq, l: SlipLine): string[] {
   const out: string[] = [];
   if (l.is_rejected) out.push(`Rejected by HOD${l.chef_note ? `: ${l.chef_note}` : ''}`);
   else if (l.chef_note) out.push(`HOD note: ${l.chef_note}`);
+  // Its unit doesn't match the item (ruling 128): the store cannot issue it.
+  // The remedy is said only while the store still owes it on an approved
+  // requisition that is still open (not fulfilled, not cancelled).
+  if (isStaleLineUnit(l)) {
+    const open = isApproved(r) && r.status !== 'cancelled' && r.status !== 'fulfilled';
+    out.push(open && owedQty(l) > 0 ? STALE_UNIT_TITLE : STALE_UNIT_TITLE_SHORT);
+  }
   const direct = isDeliveredDirect(l as any);
   const dept = direct ? deliveredDirectDept(l as any) : '';
   const reason = l.store_reject_reason ? ` — ${l.store_reject_reason}` : '';
@@ -353,6 +375,9 @@ function Slip({ r, names, biz, viewer, printedAt, index, total, contextLine, req
     return d !== '' && d !== String(r.department_name || '').trim();
   });
   const issued = issuersOf(r, names);
+  // Any line whose unit doesn't match the item (ruling 128) — the footer then
+  // says why its Unit cell is not a purchase unit.
+  const hasStale = r.items.some(l => isStaleLineUnit(l));
   const raisedBy = nameOf(names, r.drafted_by);
   const hodBy = nameOf(names, r.chef_approved_by);
   const mgmtBy = nameOf(names, r.mgmt_approved_by);
@@ -436,8 +461,10 @@ function Slip({ r, names, biz, viewer, printedAt, index, total, contextLine, req
                       </td>
                       {showDept && <td className="py-1 pr-2">{l.item_department_name || r.department_name}</td>}
                       <td className="py-1 pr-2 whitespace-nowrap">
-                        {U.pu}
-                        {U.pf > 1 && <div className="text-[9px] text-[#666]">1 {U.pu} = {fmtNum(U.pf)} {U.recipeUnit}</div>}
+                        {U.stale ? (U.lineUnit || 'no unit') : <>
+                          {U.pu}
+                          {U.pf > 1 && <div className="text-[9px] text-[#666]">1 {U.pu} = {fmtNum(U.pf)} {U.recipeUnit}</div>}
+                        </>}
                       </td>
                       <td className="py-1 pr-2 text-right font-mono">{fmtPU(U, l.quantity_requested)}</td>
                       <td className="py-1 pr-2 text-right font-mono">
@@ -459,6 +486,7 @@ function Slip({ r, names, biz, viewer, printedAt, index, total, contextLine, req
       </div>
       <div className="text-[9px] text-[#555] mt-1">
         Quantities are in the purchase unit shown. Balance = HOD-approved quantity still to be given.
+        {hasStale && ` A line marked "${STALE_UNIT_TITLE_SHORT}" shows the unit it was saved in.`}
       </div>
 
       <div className="sign-grid grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">

@@ -1,7 +1,9 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
-import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
+import { requisitionHasMovedStock, lineIssueComplete, lineUnitNeedsReview, type LineCompletenessRow } from '@/lib/issue-stock';
+// STALE LINE UNIT (owner ruling 128): the owner's words and the unit names, one copy.
+import { STALE_UNIT_SHORT, staleUnitNames } from '@/lib/stale-line-unit';
 import { duplicateLineError, requisitionLinePoState } from '@/lib/po-helpers';
 import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
 import { centralFlowBlock } from '@/lib/store-engine';
@@ -630,6 +632,57 @@ export async function GET(request: Request) {
   }
 }
 
+/**
+ * STALE LINE UNIT — owner ruling 128, "Block it + stop new ones": a new or
+ * edited requisition always takes the item's CURRENT unit. A line saved in a
+ * unit the item no longer uses (a 'PKT' line on YELLOW CHEDDAR, now g / bought
+ * in kg ×1000) is refused by the store's own converter at hand-over
+ * (issue-stock.ts lineFactor().needsReview — lineUnitNeedsReview) and moves no
+ * stock, so POST and PUT refuse to SAVE one. Nothing is ever converted or
+ * re-stamped: the person removes the line and adds it again, and types the
+ * quantity in the item's unit.
+ *
+ * The check runs inside the existing insert loops, on the unit each loop has
+ * already resolved, and throws a marked error so db.transaction rolls the whole
+ * save back (header, DELETE and every line). A line in one of the item's
+ * current units — every normal line — never trips it.
+ */
+interface StaleSaveRow { material_id: string; material: string; line_unit: string; purchase_unit: string; unit: string }
+type MaterialUnits = { name: string; unit: string | null; purchase_unit: string | null; pack_size: number | null };
+const STALE_SAVE_MARK = 'staleUnitSave';
+
+function staleSaveRow(materialId: string, lineUnit: string | null | undefined, rm: MaterialUnits): StaleSaveRow {
+  return {
+    material_id: materialId,
+    material: rm.name,
+    line_unit: String(lineUnit ?? ''),
+    purchase_unit: String(rm.purchase_unit ?? ''),
+    unit: String(rm.unit ?? ''),
+  };
+}
+
+/** "YELLOW CHEDDAR BLOCK: unit doesn't match this item — it is bought in kg and
+ *  used in g, not PKT. <remedy>" A blank line unit reads "…, and the line has
+ *  no unit." The response adds "Nothing was saved." once, after every line. */
+function staleSaveSentence(r: StaleSaveRow, remedy: (buy: string) => string): string {
+  const { line, buy, use } = staleUnitNames(r.line_unit, { unit: r.unit, purchase_unit: r.purchase_unit });
+  const item = buy && use && buy.toLowerCase() !== use.toLowerCase()
+    ? `it is bought in ${buy} and used in ${use}`
+    : `it is used in ${use || buy}`;
+  return `${r.material}: ${STALE_UNIT_SHORT} — ${item}${line ? `, not ${line}` : ', and the line has no unit'}. ${remedy(buy || use)}`;
+}
+
+/** The 400 for a refused save, or null when the error is not one. */
+function staleSaveResponse(e: unknown, remedy: (buy: string) => string): Response | null {
+  const rows = (e as Record<string, unknown> | null)?.[STALE_SAVE_MARK];
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return Response.json({
+    error: `${(rows as StaleSaveRow[]).map(r => staleSaveSentence(r, remedy)).join(' ')} Nothing was saved.`,
+    code: 'unit_review',
+    lines: rows,
+  }, { status: 400 });
+}
+
 // ---------- POST (create draft) ----------
 export async function POST(request: Request) {
   try {
@@ -821,18 +874,30 @@ export async function POST(request: Request) {
       const unitOfMaterial = db.prepare(`
         SELECT COALESCE(NULLIF(TRIM(purchase_unit), ''), unit) AS u FROM raw_materials WHERE id = ?
       `);
+      // STALE LINE UNIT (ruling 128) — see staleSaveSentence above.
+      const matUnits = db.prepare('SELECT name, unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?');
+      const stale: StaleSaveRow[] = [];
       for (const it of validItems) {
         const unit = String(it.unit || '').trim()
           || String((unitOfMaterial.get(it.material_id) as any)?.u || '');
         insItem.run(generateId(), id, it.material_id, Number(it.quantity_requested),
                     unit, it.notes || '', it.department_id);
+        const rm = matUnits.get(it.material_id) as MaterialUnits | undefined;
+        if (rm && lineUnitNeedsReview(unit, rm)) stale.push(staleSaveRow(it.material_id, unit, rm));
       }
+      // Thrown INSIDE the transaction so the requisition row and every line
+      // roll back; req_number is read fresh on the next save, so none is used up.
+      if (stale.length > 0) throw Object.assign(new Error('unit_review'), { [STALE_SAVE_MARK]: stale });
     });
     txn();
 
     const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(id);
     return Response.json({ requisition: r }, { status: 201 });
   } catch (e: any) {
+    // A tab opened before the item's units changed still offers the old unit;
+    // a reload brings the item's current unit.
+    const refused = staleSaveResponse(e, buy => `Reload the page and add it again in ${buy}.`);
+    if (refused) return refused;
     console.error('[/api/requisitions POST]', e);
     return Response.json({ error: e.message }, { status: 500 });
   }
@@ -959,6 +1024,9 @@ export async function PUT(request: Request) {
           INSERT INTO requisition_items (id, req_id, material_id, quantity_requested, unit, notes, department_id)
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `);
+        // STALE LINE UNIT (ruling 128) — see staleSaveSentence above.
+        const matUnits = db.prepare('SELECT name, unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?');
+        const stale: StaleSaveRow[] = [];
         for (const it of items) {
           const qty = Number(it.quantity_requested) || 0;
           if (!it.material_id || qty <= 0) continue;
@@ -973,7 +1041,21 @@ export async function PUT(request: Request) {
           // Line dept: explicit from client → prior line dept → req-level dept.
           const deptId = it.department_id || prev?.department_id || r.department_id;
           ins.run(generateId(), id, it.material_id, qty, unit, it.notes || '', deptId);
+          const rm = matUnits.get(it.material_id) as MaterialUnits | undefined;
+          if (rm) {
+            // The unit this save resolved, or — when the client sent no unit
+            // and the line it replaces had a stale one — that stored unit. A
+            // blank stored unit on a packed item resolves above to the purchase
+            // unit; letting that through would silently change what the
+            // quantity means (×pack), so it is refused like any stale line.
+            const carried = (it.unit != null && String(it.unit).trim() !== '') || !prev ? null : prev.unit;
+            if (lineUnitNeedsReview(unit, rm)) stale.push(staleSaveRow(it.material_id, unit, rm));
+            else if (carried !== null && lineUnitNeedsReview(carried, rm)) stale.push(staleSaveRow(it.material_id, carried, rm));
+          }
         }
+        // Thrown INSIDE the transaction: the header UPDATE, the DELETE and every
+        // reinserted line roll back, so the requisition is exactly as it was.
+        if (stale.length > 0) throw Object.assign(new Error('unit_review'), { [STALE_SAVE_MARK]: stale });
         // ROUTED LINES (rulings #45/#74): an admin edit of a chef-APPROVED
         // requisition replaces its lines with new ones, so they are stamped
         // again by the approval's own rule (routed-requisitions.ts). No routed
@@ -987,6 +1069,10 @@ export async function PUT(request: Request) {
     const fresh = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(id);
     return Response.json({ requisition: fresh });
   } catch (e: any) {
+    // Not "reload": every editor that PUTs (this page's draft form, the staff
+    // picker, Party Approvals' edit) reloads the same stale line from the draft.
+    const refused = staleSaveResponse(e, buy => `Remove that line and add it again in ${buy}.`);
+    if (refused) return refused;
     console.error('[/api/requisitions PUT]', e);
     return Response.json({ error: e.message }, { status: 500 });
   }

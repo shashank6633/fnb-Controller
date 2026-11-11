@@ -1,6 +1,8 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canApproveAsChef } from '@/lib/auth';
-import { lineHasMovedStock } from '@/lib/issue-stock';
+import { lineHasMovedStock, lineUnitNeedsReview } from '@/lib/issue-stock';
+// STALE LINE UNIT (owner ruling 128): the owner's sentence and the facts, one copy.
+import { STALE_UNIT_WORDS, staleUnitFacts } from '@/lib/stale-line-unit';
 import { routedSendsOn, stampRequisitionRouting } from '@/lib/routed-requisitions';
 
 /**
@@ -63,6 +65,27 @@ export async function PUT(
         return Response.json({ error: 'chef_approved_qty must be >= 0 or null' }, { status: 400 });
       }
       if (n !== item.chef_approved_qty) {
+        // STALE LINE UNIT (owner ruling 128, "Block it + stop new ones"): an
+        // approved quantity is saved in the LINE's own unit, and a line whose
+        // unit the item no longer uses is refused at hand-over and moves no
+        // stock (issue-stock.ts lineFactor().needsReview). Saving a new figure
+        // in that unit is refused; the remedy is Reject, then raise it again.
+        // Clearing the figure (null) or setting 0 carries no unit and stays
+        // allowed, as do Reject, Un-reject and the note.
+        if (n !== null && n > 0) {
+          const su = db.prepare(`
+            SELECT ri.unit AS line_unit, rm.name, rm.unit, rm.purchase_unit, rm.pack_size
+            FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+            WHERE ri.id = ?
+          `).get(itemId) as { line_unit: string | null; name: string; unit: string | null; purchase_unit: string | null; pack_size: number | null } | undefined;
+          if (su && lineUnitNeedsReview(su.line_unit, su)) {
+            return Response.json({
+              error: `${su.name}: ${STALE_UNIT_WORDS}. ${staleUnitFacts(su.line_unit, su)} Nothing was saved.`,
+              code: 'unit_review',
+              req_item_id: itemId,
+            }, { status: 400 });
+          }
+        }
         changes.chef_approved_qty = n;
         before.chef_approved_qty = item.chef_approved_qty;
         after.chef_approved_qty = n;

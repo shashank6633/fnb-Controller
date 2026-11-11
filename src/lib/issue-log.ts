@@ -4,6 +4,9 @@ import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
 import { lineFactor, lineShownAs } from './issue-stock';
 import { issuedCoversAsk, shelfMarkHolds, qtyGrid, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
+// The one stored-figure formatter for a line whose unit cannot be read (owner
+// ruling 128): "2,640 PKT", never converted. Pure; no database.
+import { fmtStoredLineQty } from './stale-line-unit';
 // The ONE probe for the routed-requisition columns (owner rulings #45 + #74):
 // a leaf module, so this read-only report can ask without an import cycle.
 import { routedSchema } from './routed-schema';
@@ -65,7 +68,11 @@ import { routedSchema } from './routed-schema';
  *
  *       legacy_line_qty = quantity_issued - SUM(recorded_recipe_qty / pack_factor)
  *
- *       emitted only when that is positive.
+ *       emitted only when that is positive. A ledger row flagged
+ *       needs_unit_review (its line unit could not be read, so it recorded 0
+ *       and moved no stock — owner ruling 128) is taken off as its own
+ *       delta_line_qty instead of recorded_recipe_qty / pack_factor, or that
+ *       hand-over would come back here as an invented pre-ledger issue.
  *
  * Reversing each ledger row through ITS OWN stored pack_factor is what makes
  * the partition exact: pack_factor is stamped per row precisely because a later
@@ -1546,8 +1553,20 @@ function buildUnion(f: {
     stages.push('ISSUE_PRELEDGER');
     // Reversing each ledger row through ITS OWN pack_factor is the whole trick.
     // NULLIF guards a 0 factor (impossible from lineFactor, cheap to survive).
+    //
+    // EXCEPT A ROW FLAGGED needs_unit_review (owner ruling 128). Its line unit
+    // could not be read (a PKT line on an item kept in g and bought in kg), so
+    // applyIssueDelta recorded 0 and moved no stock, but the line still counts
+    // the hand-over in quantity_issued. Reversed as 0 / factor it fell straight
+    // into this remainder and came back as an invented ISSUE (pre-ledger) row,
+    // for example 2,640 PKT "handed over before the issue ledger existed" on a
+    // line issued today. Its own delta_line_qty is that hand-over in the line's
+    // unit, so it is the figure to take off. Every row not so flagged takes the
+    // identical term it always did, so every other line's remainder is unchanged.
     const LEDGER_IN_LINE_UNITS = `
-      COALESCE((SELECT SUM(l2.recorded_recipe_qty / NULLIF(l2.pack_factor, 0))
+      COALESCE((SELECT SUM(CASE WHEN COALESCE(l2.needs_unit_review, 0) = 1
+                                THEN l2.delta_line_qty
+                                ELSE l2.recorded_recipe_qty / NULLIF(l2.pack_factor, 0) END)
                   FROM requisition_issue_ledger l2
                  WHERE l2.req_item_id = ri.id), 0)`;
     const REMAINDER = `(COALESCE(ri.quantity_issued, 0) - ${LEDGER_IN_LINE_UNITS})`;
@@ -2460,10 +2479,18 @@ export function getIssueLog(
     // Line rows through lineR6 (see `qty` above); an ISSUE row restated into
     // recipe units by its own snapshot factor, on the recipe grid itself.
     const rowFig = (x: number) => (basis === 'line' ? lineR6(x, lineGrid) : r6(x * sf));
+    // A HAND-OVER WHOSE LINE UNIT COULD NOT BE READ (owner ruling 128): an ISSUE
+    // row flagged needs_unit_review. Its line figures are in a unit this item
+    // does not use (2,640 PKT on an item kept in g), and its pack_factor is the
+    // 1 lineFactor gives such a unit, so restating them "in recipe units" would
+    // print 2,640 PKT as 2,640 g, and a still-open balance as kilos. They are
+    // left blank here and stated in the line's own unit in the notes instead
+    // (unreadLineNote, below). Every other row takes exactly the old figures.
+    const unreadIssue = st === 'ISSUE' && Number(r.needs_unit_review) === 1;
     const requested = nullNum(r.requested_qty);
-    const effective = r.effective_qty === null || r.effective_qty === undefined
+    const effective = unreadIssue || r.effective_qty === null || r.effective_qty === undefined
       ? null : rowFig(Number(r.effective_qty));
-    const issued = r.issued_qty === null || r.issued_qty === undefined
+    const issued = unreadIssue || r.issued_qty === null || r.issued_qty === undefined
       ? null : rowFig(Number(r.issued_qty));
 
     // THE DESKS' "COMPLETE" — THE RULE, asked exactly as lineIssueComplete asks
@@ -2558,7 +2585,7 @@ export function getIssueLog(
       req_number: s(r.req_number),
       req_item_id: s(r.req_item_id),
       actor: s(r.actor),
-      notes: s(r.notes),
+      notes: unreadIssue ? unreadLineNote(s(r.notes), lineUnit, issuedLine, effLine) : s(r.notes),
       status: s(r.status),
       raised_at: s(r.raised_at),
       chef_approved_at: s(r.chef_approved_at),
@@ -2823,4 +2850,174 @@ export function issueLogToCsv(input: IssueLogRow[] | IssueLogResult): string {
 /** Filename the download must use: issue-log-<from>_<to>.csv */
 export function issueLogFilename(from: string, to: string): string {
   return `issue-log-${from}_${to}.csv`;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * NO-STOCK HAND-OVERS: owner ruling 128, "Block it + stop new ones"
+ * ═══════════════════════════════════════════════════════════════════════════
+ * A requisition line whose unit is neither the item's purchase unit nor its
+ * recipe unit (a YELLOW CHEDDAR line in PKT once the item is kept in g and
+ * bought in kg x1000) cannot be converted. applyIssueDelta (issue-stock.ts)
+ * then records 0, moves NO stock (central or department) and stamps its ledger
+ * row needs_unit_review = 1. The line itself still adds the figure to
+ * quantity_issued and issue_history ("2,640 PKT" at 3:36 pm on REQ-2026-1669),
+ * and the department reports counted that figure as if it had moved: 2,640 g
+ * of cheddar charged to Continental that never left the store's books. The
+ * owner's ruling: those reports stop counting such hand-overs. The helpers
+ * below are the one place that says which part of a line is such a hand-over;
+ * department-consumption and store-issued-log read them, never a copy.
+ *
+ * READ THE FLAG, NEVER RE-JUDGE. These helpers read the needs_unit_review
+ * stamp the server wrote at hand-over time. They do not call lineFactor or
+ * isStaleLineUnit on today's units: a hand-over made while its unit was valid
+ * moved stock and keeps counting, even if the item's units change later, and
+ * one that moved nothing stays out even if the item is later re-set.
+ *
+ * WHICH ROWS. needs_unit_review = 1 AND skip_reason 'unit_review' or 'party',
+ * the same set as the owner's re-issue-on-paper list (sizer q2-closed.sql):
+ *   unit_review   an ordinary line: neither side moved.
+ *   party         a party line: the party rail skips a unit-review line on
+ *                 both sides (party-fulfillment.ts), so nothing moved there.
+ *   NOT routed    those goods really moved, by department transfer; and
+ *                 department-consumption already leaves routed lines off.
+ *   NOT store_mapped  liquor on the TGBCL store rail: no requisition hand-over
+ *                 of it moves central or department stock whatever its unit,
+ *                 so the unit is not what made it a no-stock hand-over, and
+ *                 these reports keep treating it as they always did.
+ * The Issue Log's own pre-ledger remainder (above) is a different question,
+ * "which part of quantity_issued has a ledger row?", and so takes EVERY
+ * needs_unit_review row: each of them recorded 0 whatever its skip_reason.
+ *
+ * THE LINE'S CURRENT RUN. quantity_issued is what the line holds NOW. It was
+ * built from 0 starting at the line's last ledger row whose before_line_qty
+ * is 0 (an undo or a zeroing reject resets the line to 0, and the next issue
+ * starts from there). An undo that moved and recorded nothing writes NO
+ * ledger row at all (the zero-delta gate), so "rows after the last undo" would
+ * be wrong. Measured by the plan skeptic (window2.ts): a 2,640 PKT stale issue,
+ * the item re-set so PKT became its purchase unit, an undo that wrote no row,
+ * then a real 3 PKT issue that moved 3,000 g. Counting from the last undo row
+ * took 2,640 off a line that holds 3 and showed nothing; counting from the
+ * last before_line_qty = 0 row (inclusive) takes 0 off and keeps the 3.
+ * A line with no such row (quantity_issued from before the ledger, issued
+ * further since) counts all its rows.
+ */
+
+/** A ledger row (alias `a`) that is a no-stock hand-over. See the block above. */
+function noStockRowSql(a: string): string {
+  return `COALESCE(${a}.needs_unit_review, 0) = 1 AND COALESCE(${a}.skip_reason, '') IN ('unit_review', 'party')`;
+}
+
+/** Only ever a plain table alias written in code, never user input. */
+function sqlAlias(ri: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ri)) throw new Error(`issue-log: bad SQL alias ${JSON.stringify(ri)}`);
+  return ri;
+}
+
+/**
+ * SQL: the part of a requisition line's CURRENT quantity_issued (`ri` is the
+ * requisition_items alias) that came from no-stock hand-overs, in the line's
+ * own unit. 0 when there is none.
+ */
+export function noStockLineQtySql(riAlias: string): string {
+  const ri = sqlAlias(riAlias);
+  return `COALESCE((SELECT SUM(ns.delta_line_qty)
+                      FROM requisition_issue_ledger ns
+                     WHERE ns.req_item_id = ${ri}.id
+                       AND ${noStockRowSql('ns')}
+                       AND ns.rowid >= COALESCE((SELECT MAX(nz.rowid)
+                                                   FROM requisition_issue_ledger nz
+                                                  WHERE nz.req_item_id = ${ri}.id
+                                                    AND ABS(COALESCE(nz.before_line_qty, 0)) < 1e-9), 0)), 0)`;
+}
+
+/**
+ * SQL: a requisition line's quantity_issued WITHOUT its no-stock hand-overs,
+ * in the line's own unit. A drop-in for `ri.quantity_issued` in a report that
+ * counts what a department drew.
+ *
+ * A line that never had a no-stock hand-over takes the ELSE branch, which is
+ * the raw column itself, so every such line (every line on both local
+ * databases, 2026-11-11) reads exactly what it read before. Bounded to
+ * [0, quantity_issued], so a no-stock undo inside the run can never ADD to
+ * what the line holds.
+ */
+export function countedIssuedSql(riAlias: string): string {
+  const ri = sqlAlias(riAlias);
+  return `(CASE WHEN EXISTS (SELECT 1 FROM requisition_issue_ledger nx
+                             WHERE nx.req_item_id = ${ri}.id AND ${noStockRowSql('nx')})
+               THEN MAX(0, MIN(COALESCE(${ri}.quantity_issued, 0),
+                               COALESCE(${ri}.quantity_issued, 0) - ${noStockLineQtySql(ri)}))
+               ELSE ${ri}.quantity_issued END)`;
+}
+
+/**
+ * For reports that unroll requisition_items.issue_history (one entry per
+ * Store-desk hand-over): returns a filter that drops the entries that were
+ * no-stock hand-overs. ONE query, run once per request.
+ *
+ * MATCHING. Only the Store desk's 'issue' gesture appends to issue_history,
+ * and it writes exactly one ledger row (reason 'issue') per entry, in the same
+ * order (a unit-review hand-over always writes its row: issue-stock.ts
+ * writesLedgerRow). An undo or a zeroing reject blanks the whole history, and
+ * entries from before the ledger existed have no row. So the LAST k entries
+ * of the history are the LAST k 'issue' rows of the line, paired from the END;
+ * older 'issue' rows (whose entries were blanked) and older entries (written
+ * before the ledger) are left unpaired, and an unpaired entry is kept.
+ *
+ * A line with no no-stock hand-over gets back the SAME array it passed in,
+ * so every such line reads exactly what it read before. If the query fails,
+ * every line gets its array back unchanged (the old figure) and the failure
+ * is logged.
+ */
+export function noStockHandOverFilter(
+  db: DatabaseT.Database,
+): <T>(reqItemId: string, history: T[]) => T[] {
+  const flagsByLine = new Map<string, boolean[]>();
+  try {
+    const rows = db.prepare(`
+      SELECT l.req_item_id AS req_item_id,
+             CASE WHEN ${noStockRowSql('l')} THEN 1 ELSE 0 END AS no_stock
+        FROM requisition_issue_ledger l
+       WHERE l.reason = 'issue'
+         AND l.req_item_id IN (SELECT n.req_item_id FROM requisition_issue_ledger n
+                                WHERE ${noStockRowSql('n')})
+       ORDER BY l.req_item_id, l.rowid
+    `).all() as Array<{ req_item_id: string; no_stock: number }>;
+    for (const r of rows) {
+      const key = String(r.req_item_id);
+      let f = flagsByLine.get(key);
+      if (!f) { f = []; flagsByLine.set(key, f); }
+      f.push(Number(r.no_stock) === 1);
+    }
+  } catch (e) {
+    console.error('[issue-log] no-stock hand-over filter unavailable; issue history read unfiltered', e);
+    flagsByLine.clear();
+  }
+  return <T>(reqItemId: string, history: T[]): T[] => {
+    const f = flagsByLine.get(String(reqItemId));
+    if (!f || !Array.isArray(history) || history.length === 0) return history;
+    const drop = new Set<number>();
+    const n = Math.min(f.length, history.length);
+    for (let k = 1; k <= n; k++) {
+      if (f[f.length - k]) drop.add(history.length - k);
+    }
+    return drop.size === 0 ? history : history.filter((_, i) => !drop.has(i));
+  };
+}
+
+/**
+ * The notes of an ISSUE row flagged needs_unit_review, with the line's figures
+ * stated in the line's own unit (see `unreadIssue` in getIssueLog). Numbers
+ * through fmtStoredLineQty, the one stored-figure formatter (stale-line-unit.ts).
+ */
+function unreadLineNote(notes: string, lineUnit: string, issuedLine: number | null, effLine: number | null): string {
+  const lu = String(lineUnit || '').trim();
+  const why = lu
+    ? `no stock moved — the line's unit, ${lu}, did not match this item when this was recorded.`
+    : `no stock moved — the line had no unit when this was recorded, so it could not be read in this item's units.`;
+  const issuedTxt = fmtStoredLineQty(issuedLine ?? 0, effLine === null ? lu : '');
+  const onLine = effLine === null
+    ? ` On the line: ${issuedTxt} issued to date.`
+    : ` On the line: ${issuedTxt} of ${fmtStoredLineQty(effLine, lu)} issued to date.`;
+  return notes ? `${notes} | ${why}${onLine}` : `${why}${onLine}`;
 }

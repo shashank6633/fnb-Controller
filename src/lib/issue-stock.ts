@@ -330,6 +330,30 @@ export function lineFactor(
 }
 
 /**
+ * STALE LINE UNIT (owner ruling 128), SERVER SIDE: true exactly when lineFactor
+ * above refuses the line's unit — the same call that makes checkCentralIssue
+ * skip with 'unit_review' and applyIssueDelta record 0 and move nothing. It is
+ * lineFactor's own needsReview, not a second rule, so the two can never
+ * disagree. In plain words: the material is packed (packFactor > 1) and the
+ * line's unit, lower-cased and trimmed, is blank or is neither the material's
+ * purchase unit nor its recipe unit (YELLOW CHEDDAR g / kg / 1000: a 'PKT' or
+ * blank line is stale, a 'kg' or 'g' line is not; on an unpacked material no
+ * line unit is ever stale). Pass the material's CURRENT raw raw_materials
+ * columns (unit, purchase_unit, pack_size), exactly as lineFactor takes them.
+ *
+ * Pages cannot import this file (it imports the database). Their copy is
+ * isStaleLineUnit in src/lib/stale-line-unit.ts (desk-rule.ts deskLineBasis ===
+ * null). The names differ on purpose: a reader must always be able to tell
+ * which side of the wire a call is on (the rival-helper rule in desk-rule.ts).
+ */
+export function lineUnitNeedsReview(
+  lineUnit: string | null | undefined,
+  rm: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null },
+): boolean {
+  return lineFactor(lineUnit, rm).needsReview;
+}
+
+/**
  * The figure a desk SHOWS for a quantity of this LINE: line units → recipe
  * (lineFactor) → the purchase-unit figure shownPurchaseQty prints (round 8:
  * the 6-dp grid point, then integer half-up), the arithmetic of both desks'

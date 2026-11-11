@@ -41,6 +41,9 @@ import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 // The ONE "is this raw material switched off?" rule every picker shares (Raw
 // Materials → Active, owner ruling #78). A requisition is a NEW entry.
 import { offeredInPicker, isSwitchedOff } from '@/components/MaterialTypeahead';
+// STALE LINE UNIT (owner ruling 128): desk-rule.ts deskLineBasis === null, the
+// server's lineFactor().needsReview — never a second rule — and the owner's words.
+import { isStaleLineUnit, staleUnitNames, STALE_UNIT_SHORT, STALE_UNIT_TITLE_SHORT } from '@/lib/stale-line-unit';
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -221,6 +224,15 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
     Object.fromEntries((editDraft?.items || [])
       .filter(it => it.material_id)
       .map(it => [it.material_id, it.unit || it.material_unit])));
+  /** material_id → the unit a DRAFT line is STORED in (requisition_items.unit,
+   *  '' when blank), while that line is still in the cart. unitById above reads
+   *  a blank as the recipe unit for display and costing; the stale-unit check
+   *  (ruling 128) must test what is stored — a blank on a packed item is stale.
+   *  Removing the line drops it, and a line added again takes pu(m). */
+  const [draftUnitById, setDraftUnitById] = useState<Record<string, string>>(() =>
+    Object.fromEntries((editDraft?.items || [])
+      .filter(it => it.material_id)
+      .map(it => [it.material_id, String(it.unit ?? '')])));
   const [cartOpen, setCartOpen] = useState(false);
   const [notes, setNotes] = useState(editDraft?.notes || '');
   const [saving, setSaving] = useState(false);
@@ -349,6 +361,14 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
   }, [materials, cart, search]);
 
   const unitOf = (m: Material) => unitById[m.id] || pu(m);
+  /** A draft line still in the cart whose STORED unit the item no longer uses
+   *  (ruling 128). Only draft lines can be: a line added here takes pu(m). */
+  const isStaleDraftLine = (m: Material) => m.id in draftUnitById && isStaleLineUnit({
+    unit: draftUnitById[m.id],
+    material_unit: m.unit,
+    material_purchase_unit: m.purchase_unit,
+    material_pack_size: m.pack_size,
+  });
 
   const cartLines = useMemo(() =>
     Object.entries(cart)
@@ -389,6 +409,11 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
       if (qty <= 0) { const n = { ...prev }; delete n[m.id]; return n; }
       return prev[m.id] ? prev : { ...prev, [m.id]: pu(m) };
     });
+    // A removed draft line is gone; adding the item again is a new line.
+    if (qty <= 0) setDraftUnitById(prev => {
+      if (!(m.id in prev)) return prev;
+      const n = { ...prev }; delete n[m.id]; return n;
+    });
     // Party only: the header selector decides which dept a NEW line belongs to.
     if (!isParty) return;
     setDeptById(prev => {
@@ -412,6 +437,16 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
       return;
     }
     if (cartLines.length === 0) { setError('Add at least one item.'); return; }
+    // STALE LINE UNIT (ruling 128, "new or edited requisitions always take the
+    // item's CURRENT unit"): a draft line saved in a unit the item no longer
+    // uses is not sent — its figure cannot be converted, so the person removes
+    // it and adds it again in the current unit. The server refuses it too.
+    const stale = cartLines.find(l => isStaleDraftLine(l.m));
+    if (stale) {
+      const { line, buy } = staleUnitNames(draftUnitById[stale.m.id], { unit: stale.m.unit, purchase_unit: stale.m.purchase_unit });
+      setError(`${stale.m.name}: ${STALE_UNIT_SHORT} — it is saved ${line ? `in ${line}` : 'with no unit'}; this item is bought in ${buy}. Remove it from the cart and add it again.`);
+      return;
+    }
     if (isParty) {
       // A line whose unit is no longer one of the material's registered units
       // (legacy row, or the material was re-configured since) would be costed
@@ -756,8 +791,13 @@ export default function StaffCatalogPicker({ materials, me, departments, editDra
                       <div className="flex-1 min-w-0">
                         <div className="text-xs font-semibold text-[#2D1B0E] break-words">{m.name}</div>
                         <div className="text-[10px] text-[#8B7355]">
-                          {qty} {unitOf(m)} · {inr(lineValue(m, qty))}
+                          {qty} {isStaleDraftLine(m) && !draftUnitById[m.id].trim() ? '(no unit)' : unitOf(m)} · {inr(lineValue(m, qty))}
                         </div>
+                        {isStaleDraftLine(m) && (
+                          <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5 mt-0.5">
+                            {STALE_UNIT_TITLE_SHORT} — remove it and add it again.
+                          </div>
+                        )}
                         {isParty && mixedMode && (
                           // Mixed mode: the line's dept is editable here, so a
                           // line added under the wrong header dept (or seeded

@@ -6,8 +6,12 @@ import {
   isIssueGestureRecorded, isIssueTokenReplayError,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
   zeroEntriesSentence, lineShownAs, fmtLineQtyPU, issueLedgerWatermark, lineFactor,
+  lineUnitNeedsReview,
   type CentralStockShort,
 } from '@/lib/issue-stock';
+// Owner ruling 128 "Block it + stop new ones": the owner's words for a line
+// whose unit doesn't match its item — see STALE LINE UNIT below.
+import { STALE_UNIT_WORDS, staleUnitFacts } from '@/lib/stale-line-unit';
 // Owner ruling #86a "refuse" (2026-10-28): party stock already handed over on
 // another open party requisition — a SEPARATE pre-check, see PROMISED TO
 // ANOTHER PARTY below.
@@ -677,6 +681,82 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     }
 
+    // ── STALE LINE UNIT (owner ruling 128, "Block it + stop new ones") ───────
+    // A line whose unit doesn't match its item — YELLOW CHEDDAR raised in 'PKT'
+    // before the item became g / kg / ×1000 — is one the stock writer cannot
+    // read: lineFactor says needsReview, checkCentralIssue skips it
+    // ('unit_review') and applyIssueDelta records 0 and moves nothing, central
+    // or department. An Issue on it used to answer 200, CLOSE the line and move
+    // nothing (production: REQ-2026-1669, "issued 2640" PKT, no stock move).
+    // The owner's pick: the server refuses it with his sentence instead.
+    //
+    // THE RULE IS THE STOCK WRITER'S OWN: lineUnitNeedsReview (issue-stock.ts)
+    // IS lineFactor().needsReview on the line's stored unit and the material's
+    // CURRENT raw units — the call that makes the write record 0. So it matches
+    // exactly the 'issue' entries that move no stock today, and no other.
+    //
+    // HELD, LIKE A SHORT LINE (THE CENTRAL FLOOR below, "issue the 5, hold the
+    // 1"): such an 'issue' entry is dropped from the write loop — no
+    // quantity_issued, no issue_history, no ledger row, no audit row — and every
+    // other entry of the gesture runs exactly as it would have without it. The
+    // line keeps what it held (the store desk offers only Reject on it). It is
+    // named on the 200 (`unit_review_held`, and its
+    // sentence inside `held_message`, which both store-desk versions alert).
+    // When not one 'issue' entry of the gesture is left to hand over, the WHOLE
+    // gesture is refused, nothing written: 400, code 'unit_review', `blocked`
+    // (one row per line). The same stance as the floor's own refusal.
+    //
+    // MIRRORS THE WRITE LOOP'S FILTERS, entry by entry: unknown or vanished
+    // line, chef-rejected, routed (refused above), store-rejected unless an
+    // earlier 'unreject' of this gesture cleared it (the loop re-reads the line
+    // per entry, so [unreject, issue] does reach the issue), a zero or
+    // non-finite quantity (the loop skips it and writes nothing), and a gesture
+    // this client_token has already recorded (the loop answers it 200 "already
+    // done" through IssueTokenReplay, as before). Defer, Undo, Reject and
+    // Unreject are never held — none moves stock — and behave exactly as today.
+    //
+    // No await sits between this read and the transaction, so the units cannot
+    // change in between within this process (the same reasoning as the
+    // delivered-direct block below). A gesture with no such entry is
+    // untouched: every set below stays empty.
+    const staleHeldEntries = new Set<number>();
+    const staleHeld: Array<Record<string, unknown> & { req_item_id: string; message: string }> = [];
+    {
+      const rejectedNow = new Map<string, boolean>();
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        const lineId = String(ln?.id ?? '');
+        if (!itemMap.get(lineId)) continue;
+        const cur = selLine.get(lineId, id) as {
+          is_rejected: number | null; store_rejected: number | null; line_unit: string | null;
+          unit: string | null; purchase_unit: string | null; pack_size: number | null;
+          routed_department_id: string | null;
+        } | undefined;
+        if (!cur || cur.is_rejected || isRoutedRow(cur)) continue;
+        const act = String(ln?.action || '').toLowerCase();
+        const rejected = rejectedNow.has(lineId) ? !!rejectedNow.get(lineId) : !!cur.store_rejected;
+        if (act === 'unreject') { rejectedNow.set(lineId, false); continue; }
+        if (rejected) continue;
+        if (act === 'reject') { rejectedNow.set(lineId, true); continue; }
+        if (act !== 'issue') continue;
+        const q = Number(ln?.quantity);
+        if (!Number.isFinite(q) || q <= 0) continue;
+        if (!lineUnitNeedsReview(cur.line_unit, cur)) continue;
+        if (isIssueGestureRecorded(db, clientToken, lineId)) continue;
+        staleHeldEntries.add(li);
+        if (staleHeld.some(x => x.req_item_id === lineId)) continue;
+        const it = itemMap.get(lineId);
+        const name = String(it?.material_name || 'a line');
+        staleHeld.push({
+          code: 'unit_review', line_id: lineId, req_item_id: lineId,
+          material: name, material_id: String(it?.material_id || ''),
+          line_unit: String(cur.line_unit ?? ''),
+          unit: String(cur.unit ?? ''), purchase_unit: String(cur.purchase_unit ?? ''),
+          message: `${name}: ${STALE_UNIT_WORDS}. ${staleUnitFacts(cur.line_unit, cur)}`,
+        });
+      }
+    }
+
     // ── DELIVERED DIRECT (owner rulings #68 + #73) ───────────────────────────
     // A merged PO received through a Direct Issue rule sent goods straight to
     // the rule's department; the central store never received them. Issuing
@@ -705,7 +785,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // is not in `caps` and is never refused here.
     {
       const sim = new Map<string, { after: number; raised: boolean }>();
-      for (const ln of lines) {
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        // A held stale-unit entry never runs (STALE LINE UNIT above), so it
+        // reaches into nothing. Every other entry is simulated as before.
+        if (staleHeldEntries.has(li)) continue;
         const lineId = String(ln?.id ?? '');
         if (!itemMap.get(lineId)) continue;
         const act = String(ln?.action || '').toLowerCase();
@@ -988,6 +1072,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const heldShare = new Map<string, { recipe: number; lines: number }>();
       for (let li = 0; li < lines.length; li++) {
         const ln = lines[li];
+        // A held stale-unit entry (STALE LINE UNIT above) never runs, so the
+        // floor has nothing to bound and it is not an entry left to issue.
+        if (staleHeldEntries.has(li)) continue;
         if (!itemMap.get(ln.id)) continue;
         const cur = selLine.get(ln.id, id) as any;
         if (!cur) continue;
@@ -1111,6 +1198,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         heldRowOf.set(li, row);
       }
     }
+    // STALE LINE UNIT, NOTHING ELSE LEFT TO HAND OVER (ruling 128) ⇒ the whole
+    // gesture is refused, nothing written: the held stale lines are named, and
+    // so are any short lines held beside them. Only reached when a stale-unit
+    // entry was held, so every other gesture goes on to the floor's refusal
+    // below exactly as before. With a short line too, the floor's envelope is
+    // kept (code 'central_stock_short', its panels) and the stale rows ride in
+    // `blocked` under their own code, which the desks' central reader skips.
+    if (staleHeld.length > 0 && issuableEntries === 0) {
+      const staleWords = `${staleHeld.map(s => s.message).join(' ')} `
+        + `Nothing was issued and the requisition is unchanged. Reload the page.`;
+      if (centralShort.length === 0) {
+        return Response.json({
+          error: staleWords,
+          code: 'unit_review',
+          blocked: staleHeld,
+          applied: 0,
+        }, { status: 400 });
+      }
+      return Response.json({
+        error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
+          + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
+          + `so nothing was issued and the requisition is unchanged. `
+          + centralShort.map(s => s.message).join(' ')
+          + ` ${staleWords}`,
+        code: 'central_stock_short',
+        blocked: [...centralShort, ...staleHeld],
+        applied: 0,
+      }, { status: 400 });
+    }
+    // A held stale-unit entry is dropped from the write loop exactly as a held
+    // short entry is (see heldEntries) — no-op when none was held.
+    for (const li of staleHeldEntries) heldEntries.add(li);
+
     // NOTHING LEFT TO HAND OVER ⇒ THE WHOLE GESTURE IS REFUSED, unchanged in
     // wording, envelope and status from the day the floor was added. Every
     // 'issue' entry in the batch is short, so there is no partial hand-over to
@@ -2056,13 +2176,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         out.party_short_message = shortRows.map(x => x.message).join(' ');
       }
     }
-    if (centralShort.length > 0) {
-      const n = centralShort.length;
-      out.held = centralShort;
-      out.held_message =
-        `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
-        + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
-        + centralShort.map(s => s.message).join(' ')
+    // STALE-UNIT LINES HELD (ruling 128) go on the same 200: their rows as
+    // `unit_review_held` (never in `held`, which both desks read as the
+    // central-short list), and their sentence inside `held_message` after the
+    // short lines', so a desk that alerts held_message says it. With no stale
+    // line held, `held` and `held_message` are written exactly as before.
+    if (centralShort.length > 0 || staleHeld.length > 0) {
+      const heldParts: string[] = [];
+      if (centralShort.length > 0) {
+        const n = centralShort.length;
+        out.held = centralShort;
+        heldParts.push(
+          `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
+          + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
+          + centralShort.map(s => s.message).join(' '),
+        );
+      }
+      if (staleHeld.length > 0) {
+        const k = staleHeld.length;
+        out.unit_review_held = staleHeld;
+        heldParts.push(
+          `${k} line${k === 1 ? '' : 's'} ${k === 1 ? 'was' : 'were'} NOT issued — `
+          + `the store cannot issue ${k === 1 ? 'it' : 'them'}. `
+          + staleHeld.map(s => s.message).join(' '),
+        );
+      }
+      out.held_message = heldParts.join(' ')
         + zeroEntriesSentence(zeroEntryNames)
         + ` Everything else in this gesture was issued.`;
     }

@@ -2,6 +2,8 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { DEPT_TRANSFER_TYPES_SQL } from '@/lib/dept-ledger';
 import { routedColSql } from '@/lib/routed-schema';
+// Owner ruling 128: what a stale-unit hand-over (no stock moved) adds to a line.
+import { countedIssuedSql, noStockHandOverFilter } from '@/lib/issue-log';
 
 /**
  * Department-wise material consumption analytics.
@@ -221,7 +223,7 @@ export async function GET(request: Request) {
       if (categoryF)    { rw.push('rm.category = ?'); rp.push(categoryF); }
       if (materialId)   { rw.push('ri.material_id = ?'); rp.push(materialId); }
       const rows = db.prepare(`
-        SELECT ri.req_id, ri.material_id, ri.issue_history, ri.unit AS req_unit,
+        SELECT ri.id AS req_item_id, ri.req_id, ri.material_id, ri.issue_history, ri.unit AS req_unit,
                rm.name AS material_name, rm.unit, rm.category, rm.average_price,
                rm.purchase_unit, rm.pack_size,
                r.req_number,
@@ -238,10 +240,16 @@ export async function GET(request: Request) {
       const map = new Map<string, any>();
       const days = new Set<string>(), depts = new Set<string>(), mats = new Set<string>();
       let totQty = 0, totVal = 0;
+      // Owner ruling 128: a hand-over on a line whose unit did not match the
+      // item moved no stock, so it is not a department's draw. Its history
+      // entry is dropped; a line with no such hand-over gets its own array
+      // back untouched (issue-log.ts noStockHandOverFilter).
+      const dropNoStock = noStockHandOverFilter(db);
       for (const row of rows) {
         let hist: any[] = [];
         try { hist = JSON.parse(row.issue_history || '[]'); } catch { continue; }
         if (!Array.isArray(hist)) continue;
+        hist = dropNoStock(String(row.req_item_id), hist);
         // VALUE BASIS (deliberate — do not "simplify" back):
         // issue_history entries' qty are written by the store-issue route in the
         // line's REQUESTED unit (ri.unit): store-issue pushes {qty: addQty} where
@@ -391,16 +399,24 @@ export async function GET(request: Request) {
     // factor the requisition screens use (reqPackFactor, same CASE as
     // party-events/pnl): × pack_size only when the line was requested in the
     // purchase unit OR is blank (legacy purchase-unit era — matches dept-stock).
+    //
+    // QI, not the raw column (owner ruling 128): quantity_issued WITHOUT the
+    // hand-overs that moved no stock because the line's unit did not match the
+    // item (a PKT line on cheddar kept in g: "2,640 PKT" issued, nothing left
+    // the store, and the CASE below read it x1 as 2,640 g charged to the
+    // department). A line with no such hand-over gets the raw column itself
+    // (issue-log.ts countedIssuedSql), so every other figure is unchanged.
+    const QI = countedIssuedSql('ri');
     const summary = db.prepare(`
       SELECT
         COUNT(DISTINCT r.id)             AS requisition_count,
         COUNT(DISTINCT r.department_id)  AS departments,
         COUNT(DISTINCT ri.material_id)   AS materials,
-        COALESCE(SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+        COALESCE(SUM(${QI} * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                        AND COALESCE(rm.pack_size,1) > 1
                   THEN rm.pack_size ELSE 1 END)), 0)                          AS total_qty,
-        COALESCE(SUM(ri.quantity_issued
+        COALESCE(SUM(${QI}
           * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                        AND COALESCE(rm.pack_size,1) > 1
@@ -417,11 +433,11 @@ export async function GET(request: Request) {
              COUNT(DISTINCT r.id)              AS requisition_count,
              COUNT(DISTINCT ri.material_id)    AS material_count,
              COUNT(*)                          AS line_count,
-             COALESCE(SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+             COALESCE(SUM(${QI} * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                        AND COALESCE(rm.pack_size,1) > 1
                   THEN rm.pack_size ELSE 1 END)), 0)                     AS total_qty,
-             COALESCE(SUM(ri.quantity_issued
+             COALESCE(SUM(${QI}
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                             AND COALESCE(rm.pack_size,1) > 1
@@ -440,11 +456,11 @@ export async function GET(request: Request) {
       SELECT d.id AS department_id, d.name AS department_name,
              rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku, rm.unit AS material_unit, rm.category,
              COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit, COALESCE(rm.pack_size, 1) AS material_pack_size,
-             SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+             SUM(${QI} * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                        AND COALESCE(rm.pack_size,1) > 1
                   THEN rm.pack_size ELSE 1 END))                         AS qty,
-             SUM(ri.quantity_issued
+             SUM(${QI}
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                             AND COALESCE(rm.pack_size,1) > 1
@@ -464,11 +480,11 @@ export async function GET(request: Request) {
       SELECT rm.id AS material_id, rm.name AS material_name, rm.sku AS material_sku,
              rm.unit AS material_unit, rm.category, rm.average_price,
              COALESCE(NULLIF(TRIM(rm.purchase_unit),''), rm.unit) AS material_purchase_unit, COALESCE(rm.pack_size, 1) AS material_pack_size,
-             SUM(ri.quantity_issued * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
+             SUM(${QI} * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                        AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                        AND COALESCE(rm.pack_size,1) > 1
                   THEN rm.pack_size ELSE 1 END))                   AS total_qty,
-             SUM(ri.quantity_issued
+             SUM(${QI}
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                             AND COALESCE(rm.pack_size,1) > 1
@@ -486,7 +502,7 @@ export async function GET(request: Request) {
 
     const trendByDay = db.prepare(`
       SELECT r.date,
-             SUM(ri.quantity_issued
+             SUM(${QI}
                * (CASE WHEN (COALESCE(TRIM(ri.unit),'') = '' OR ri.unit = rm.purchase_unit)
                             AND COALESCE(TRIM(rm.purchase_unit),'') <> '' AND rm.unit <> rm.purchase_unit
                             AND COALESCE(rm.pack_size,1) > 1

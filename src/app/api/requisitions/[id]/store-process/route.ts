@@ -8,8 +8,12 @@ import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
   zeroEntriesSentence, fmtLineQtyPU, issueLedgerWatermark, lineFactor,
+  lineUnitNeedsReview,
   type CentralStockShort, type LineCompletenessRow,
 } from '@/lib/issue-stock';
+// Owner ruling 128 "Block it + stop new ones": the owner's words for a line
+// whose unit doesn't match its item — see STALE LINE UNIT below.
+import { STALE_UNIT_WORDS, staleUnitFacts } from '@/lib/stale-line-unit';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
 // Owner ruling #86a "refuse" (2026-10-28) and its addendum "Yes, guard it too"
@@ -174,6 +178,11 @@ function partyPromisedError(rows: PartyPromisedRow[]): Error & { partyPromised: 
  *   stock_held_note?,                      // the same list as one printable sentence; also
  *                                          // folded into po_note, the field every shipped
  *                                          // caller prints verbatim.
+ *   unit_review_lines?: [{                 // (ruling 128) lines whose unit doesn't match
+ *     code: 'unit_review', req_item_id,    // their item, left exactly as found — every one
+ *     material, line_unit, held, message   // still owed, and any this submit posted a figure
+ *   }],                                    // for (held: true). Absent = none.
+ *   unit_review_note?,                     // the same list as one sentence; folded into po_note.
  * }
  *
  * Errors (400) that name the offending row, so a caller can point at it rather
@@ -204,6 +213,15 @@ function partyPromisedError(rows: PartyPromisedRow[]): Error & { partyPromised: 
  *                                          the write lock.
  *   po_price_required | po_vendor_required | po_unit_unrecognised
  *   po_qty_too_small                     → { code, material, req_item_id }
+ *   unit_review                          → { code, blocked: [unit_review_lines rows],
+ *                                            req_item_ids, applied: 0 } (ruling 128): a
+ *                                          figure posted on a line whose unit doesn't
+ *                                          match its item with nothing else to hand
+ *                                          over, or a submit that changes no line while
+ *                                          such a line is owed.
+ *
+ * Error (409) unit_review_open (ruling 128): "Also raise a vendor PO" while a line
+ * whose unit doesn't match its item is owed — { code, blocked, req_item_ids }.
  *
  * Error (409) on a PARTY requisition only (owner ruling #86a + addendum
  * 2026-10-29), store-issue's envelope exactly — nothing written:
@@ -460,6 +478,90 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }
     }
 
+    // ── STALE LINE UNIT (owner ruling 128, "Block it + stop new ones") ───────
+    // A line whose unit doesn't match its item — YELLOW CHEDDAR raised in 'PKT'
+    // before the item became g / kg / ×1000 — is one the stock writer cannot
+    // read: lineFactor says needsReview, so applyIssueDelta records 0 and moves
+    // nothing, central or department. This absolute route used to write the
+    // posted figure onto it anyway, which CLOSED the line with no stock moved
+    // (reported only as issue_unit_review). The owner's pick: the line is never
+    // issued here, and the server says so with his sentence.
+    //
+    // THE RULE IS THE STOCK WRITER'S OWN: lineUnitNeedsReview (issue-stock.ts)
+    // IS lineFactor().needsReview, on the line's stored unit and the material's
+    // CURRENT raw units (read fresh here — `items` carries a COALESCEd purchase
+    // unit, which is not what applyIssueDelta reads). Routed lines keep their
+    // own rule above.
+    //
+    // WHAT CHANGES, AND ONLY FOR SUCH A LINE:
+    //   · The write loop leaves it EXACTLY as found — no UPDATE, no
+    //     applyIssueDelta, no ledger row — whether it was posted or omitted
+    //     (`staleSkip`; the same carve-out as a routed line). While it is still
+    //     owed the requisition stays 'store_processed' and the store desk
+    //     offers Reject on it. Every other line is scored, written and moved
+    //     exactly as before.
+    //   · A figure posted on it is HELD, like a short line ("issue the 5, hold
+    //     the 1"): the rest of the submit goes ahead and the 200 names it
+    //     (`unit_review_lines`, `unit_review_note`, folded into po_note, the
+    //     field the window prints verbatim). Only when no other line hands
+    //     goods over is the submit refused whole, nothing written: 400, code
+    //     'unit_review'.
+    //   · The tick is refused while it is owed (409 'unit_review_open', THE
+    //     TICK GUARD below): a ticked PO completes the WHOLE requisition on
+    //     arrival (po-requisition-fulfil.ts) and would close it silently.
+    //   · A submit that changes no line while it is owed is refused (400
+    //     'unit_review'), so the window never reports an issue that did not
+    //     happen.
+    // A requisition with no such line never meets any of this: every set
+    // below stays empty.
+    type StaleLine = LineCompletenessRow & {
+      id: string; material_name: string; is_rejected: number | null; store_rejected: number | null;
+    };
+    const selStaleLines = db.prepare(`
+      SELECT ri.id, ri.unit AS line_unit, ri.quantity_issued, ri.quantity_requested, ri.chef_approved_qty,
+             ri.shelf_emptied_qty, ri.is_rejected, ri.store_rejected,
+             rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      JOIN raw_materials rm ON rm.id = ri.material_id
+      WHERE ri.req_id = ?
+    `);
+    const routedIds = new Set(items.filter(isRoutedItem).map(it => String(it.id)));
+    /** The stale-unit lines of this requisition that this route would write
+     *  (on `items`, not routed), as they stand now. */
+    const readStaleLines = (): Map<string, StaleLine> => {
+      const out = new Map<string, StaleLine>();
+      for (const x of selStaleLines.all(id) as StaleLine[]) {
+        const rid = String(x.id);
+        if (!knownItemIds.has(rid) || routedIds.has(rid)) continue;
+        if (lineUnitNeedsReview(x.line_unit, x)) out.set(rid, x);
+      }
+      return out;
+    };
+    const staleLines = readStaleLines();
+    /** Every line the write loop must leave as found. Grows (never shrinks) at
+     *  the re-read before the transaction. */
+    const staleSkip = new Set<string>(staleLines.keys());
+    /** A figure posted on the line that would hand goods over or change it —
+     *  the routed rule's own test. */
+    const stalePosted = (x: StaleLine): boolean => {
+      const ln = lineMap.get(String(x.id));
+      if (!ln) return false;
+      const want = Number(ln.quantity_issued) || 0;
+      return want > 0 && Math.abs(want - (Number(x.quantity_issued) || 0)) > 1e-9;
+    };
+    /** Still owed: neither rejection, and not complete by THE RULE. */
+    const staleOwes = (x: StaleLine): boolean =>
+      !x.is_rejected && Number(x.store_rejected || 0) !== 1 && !lineIssueComplete(x);
+    const staleRow = (x: StaleLine) => ({
+      code: 'unit_review' as const, req_item_id: String(x.id), material: String(x.material_name || 'a line'),
+      line_unit: String(x.line_unit ?? ''), held: stalePosted(x),
+      message: `${String(x.material_name || 'a line')}: ${STALE_UNIT_WORDS}. ${staleUnitFacts(x.line_unit, x)}`,
+    });
+    /** Stale lines matching `pred`, in the order of `items`. */
+    const staleInOrder = (pred: (x: StaleLine) => boolean): StaleLine[] =>
+      items.map(it => staleLines.get(String(it.id))).filter((x): x is StaleLine => !!x && pred(x));
+    const staleHeldRows = staleInOrder(stalePosted).map(staleRow);
+
     // ── DELIVERED DIRECT (owner rulings #68 + #73) ───────────────────────────
     // A merged PO received through a Direct Issue rule sent goods straight to
     // the rule's department; the central store never received them. Issuing
@@ -485,6 +587,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const deliveredDirectRefusal = (): Response | null => {
       const posted = new Map<string, number>();
       for (const it of items) {
+        // A stale-unit line is never written here (STALE LINE UNIT above).
+        if (staleSkip.has(String(it.id))) continue;
         const ln = lineMap.get(String(it.id));
         if (!ln) continue;
         const now = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
@@ -643,8 +747,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const heldShare = new Map<string, { recipe: number; lines: number }>();
       for (const it of items) {
         // A routed line is never written here (rulings #45/#74), so the floor
-        // has nothing to score for it.
-        if (isRoutedItem(it)) continue;
+        // has nothing to score for it. Nor is a stale-unit line (ruling 128,
+        // STALE LINE UNIT above) — and it is not a line that hands goods over.
+        if (isRoutedItem(it) || staleSkip.has(String(it.id))) continue;
         const ln = lineMap.get(it.id) || {};
         const beforeIssued = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
         const afterIssued = Number(ln.quantity_issued) || 0;
@@ -704,6 +809,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         centralShort.push(row);
         heldRowOf.set(String(it.id), row);
       }
+    }
+    // STALE LINE UNIT, NOTHING ELSE TO HAND OVER (ruling 128) ⇒ the submit is
+    // refused whole, nothing written. Only reached when a figure was posted on
+    // a stale-unit line, so every other submit goes on to the floor's refusal
+    // below exactly as before. With a short line too, the floor's envelope is
+    // kept (code 'central_stock_short') and the stale rows ride in `blocked`
+    // under their own code, which the window's central reader skips.
+    if (staleHeldRows.length > 0 && issuableLines === 0) {
+      const one = staleHeldRows.length === 1;
+      const staleWords = `${staleHeldRows.map(x => x.message).join(' ')} `
+        + `Leave ${one ? 'its' : 'their'} Issue box${one ? '' : 'es'} empty here and reject `
+        + `${one ? 'it' : 'them'} on Issue Requisitions.`;
+      if (centralShort.length === 0) {
+        return Response.json({
+          error: `Nothing was issued and ${r.req_number} is unchanged. ${staleWords}`,
+          code: 'unit_review',
+          blocked: staleHeldRows,
+          req_item_ids: staleHeldRows.map(x => x.req_item_id),
+          applied: 0,
+        }, { status: 400 });
+      }
+      return Response.json({
+        error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
+          + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
+          + `so nothing was issued and ${r.req_number} is unchanged. `
+          + centralShort.map(s => s.message).join(' ')
+          + ` ${staleWords}`,
+        code: 'central_stock_short',
+        blocked: [...centralShort, ...staleHeldRows],
+        req_item_ids: [...centralShort.map(s => s.req_item_id), ...staleHeldRows.map(x => x.req_item_id)],
+        applied: 0,
+      }, { status: 400 });
     }
     if (centralShort.length > 0 && issuableLines === 0) {
       return Response.json({
@@ -1309,6 +1446,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         (poMerged.some(m => m.ordered) ? ` Check the PO before approving it.` : '');
     }
 
+    // ── STALE LINE UNIT, READ AGAIN (ruling 128) — the outlet read above is an
+    // await, so an item's units may have changed since the first read. Every
+    // stale-unit line found now is left as found too (staleSkip only grows), and
+    // the figures below are the lines as they stand. A line that turned stale
+    // in between with a figure posted on it was scored above as an ordinary
+    // line, so the submit is refused whole, nothing written: the screen is out
+    // of date. No await from here to the transaction.
+    {
+      const now = readStaleLines();
+      const turned = items.map(it => now.get(String(it.id)))
+        .filter((x): x is StaleLine => !!x && !staleSkip.has(String(x.id)) && stalePosted(x));
+      for (const [rid, x] of now) { staleLines.set(rid, x); staleSkip.add(rid); }
+      if (turned.length > 0) {
+        const one = turned.length === 1;
+        return Response.json({
+          error: `Nothing was issued and ${r.req_number} is unchanged: ${one ? 'a line\'s' : `${turned.length} lines'`} `
+            + `unit stopped matching ${one ? 'its item' : 'their items'} while this screen was open. `
+            + `${turned.map(x => staleRow(x).message).join(' ')} Reload the requisition and issue the rest again.`,
+          code: 'unit_review',
+          blocked: turned.map(staleRow),
+          req_item_ids: turned.map(x => String(x.id)),
+          applied: 0,
+        }, { status: 400 });
+      }
+    }
+
     // ── RULING #68, ASKED AGAIN — no await from here to the transaction ──────
     {
       const refused = deliveredDirectRefusal();
@@ -1362,6 +1525,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }, { status: 409 });
       }
     }
+    // ── THE TICK GUARD, STALE LINE UNIT (ruling 128) ─────────────────────────
+    // The same rule for a line whose unit doesn't match its item: the tick's
+    // PO would close it on arrival with no stock moved — the silent close the
+    // owner ruled out. Fires ONLY when a PO would actually be written and such
+    // a line is still owed (this submit never writes one, so "owed" is the
+    // line as it stands); every other requisition gets the tick as before.
+    if (autoCreatePo && poLines.length > 0) {
+      const staleOwed = staleInOrder(staleOwes);
+      if (staleOwed.length > 0) {
+        const one = staleOwed.length === 1;
+        const names = staleOwed.map(x => String(x.material_name || 'a line'));
+        return Response.json({
+          error: `No vendor PO was raised and nothing was issued: a vendor PO raised with "Also raise a vendor PO" `
+            + `completes the WHOLE requisition on arrival and would close ${names.join(' and ')}, `
+            + `whose unit${one ? '' : 's'} ${one ? "doesn't" : "don't"} match the item${one ? '' : 's'}. `
+            + `Untick "Also raise a vendor PO" and issue again; reject ${one ? 'that line' : 'those lines'} `
+            + `on Issue Requisitions and raise ${one ? 'it' : 'them'} again.`,
+          code: 'unit_review_open',
+          blocked: staleOwed.map(staleRow),
+          req_item_ids: staleOwed.map(x => String(x.id)),
+        }, { status: 409 });
+      }
+    }
 
     if (autoCreatePo && poLines.length > 0) {
       const owedAfter = items.filter(it => {
@@ -1391,6 +1577,38 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           req_item_ids: holds.map(h => h.req_item_id),
           merged_pos: pos.map(p => ({ po_id: p.po_id, po_number: p.po_number, status: p.status })),
         }, { status: 409 });
+      }
+    }
+
+    // ── A SUBMIT THAT CHANGES NO LINE, WITH A STALE-UNIT LINE OWED (ruling 128)
+    // When every line the store could issue here is stale, the window has
+    // nothing to post, and this submit would only flip the requisition to
+    // 'store_processed' and answer "issued". Refused, nothing written: 400,
+    // code 'unit_review'. Only when no vendor PO is written (a tick that does
+    // write one is answered by THE TICK GUARD above; a tick with no Buy
+    // quantity writes no PO, so it changes nothing either and is refused here
+    // exactly like an unticked submit), only when no other line's figure
+    // changes, and only while such a line is owed — so no requisition without
+    // one, and no submit that issues anything, meets it.
+    if (!(autoCreatePo && poLines.length > 0)) {
+      const staleOwed = staleInOrder(staleOwes);
+      const changesALine = staleOwed.length > 0 && items.some(it => {
+        if (isRoutedItem(it) || staleSkip.has(String(it.id))) return false;
+        const now = Number((selIssuedNow.get(it.id) as { quantity_issued: number | null } | undefined)?.quantity_issued) || 0;
+        const posted = Number((lineMap.get(String(it.id)) || {}).quantity_issued) || 0;
+        return Math.abs(posted - now) > 1e-9;
+      });
+      if (staleOwed.length > 0 && !changesALine) {
+        const one = staleOwed.length === 1;
+        return Response.json({
+          error: `Nothing was issued and ${r.req_number} is unchanged — this submit changes no line. `
+            + `${staleOwed.map(x => staleRow(x).message).join(' ')} The store cannot issue ${one ? 'it' : 'them'}; `
+            + `reject ${one ? 'it' : 'them'} on Issue Requisitions.`,
+          code: 'unit_review',
+          blocked: staleOwed.map(staleRow),
+          req_item_ids: staleOwed.map(x => String(x.id)),
+          applied: 0,
+        }, { status: 400 });
       }
     }
 
@@ -1507,7 +1725,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // here — an omitted line posts 0 — would wipe what that department
         // sent. No UPDATE, no applyIssueDelta: the line is left exactly as it
         // stands. `allDone` below still reads it.
-        if (isRoutedItem(it)) continue;
+        // A STALE-UNIT LINE (ruling 128) is left exactly as found too: the
+        // stock writer would record 0 and move nothing on it, so writing a
+        // figure would only close it silently. `allDone` reads it as it stands.
+        if (isRoutedItem(it) || staleSkip.has(String(it.id))) continue;
         const ln = lineMap.get(it.id) || {};
         const issued   = Number(ln.quantity_issued)      || 0;
         const purchase = Number(ln.quantity_to_purchase) || 0;
@@ -2038,15 +2259,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           `${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} ${D}'s to send (Direct Issue), not the store's.`).join(' ');
       }
     }
+    // STALE-UNIT LINES (ruling 128) this submit left as found — every one still
+    // owed, and any it was sent a figure for — named on the 200 and, like the
+    // held lines, folded into po_note. Nothing when there is none, so every
+    // other 200 is byte-identical.
+    const staleAfter = staleInOrder(x => stalePosted(x) || staleOwes(x));
+    const staleNames = staleAfter.map(x => String(x.material_name || 'a line'));
+    // "Everything else … was issued" must not count them either. '' when none.
+    const staleExcept = staleNames.length === 0 ? ''
+      : ` except ${staleNames.length === 1 ? staleNames[0]
+        : `${staleNames.slice(0, -1).join(', ')} and ${staleNames[staleNames.length - 1]}`}`;
     if (centralShort.length > 0) {
       const n = centralShort.length;
       result.held_lines = centralShort;
       // Lines the storekeeper ENTERED AS 0 that still owe something: written
       // unchanged, nothing went out on them — so "everything else was issued"
       // must not count them (round 7 verifier). Only lines the POST named:
-      // an omitted line was not "entered".
+      // an omitted line was not "entered". A stale-unit line is named in its
+      // own sentence instead.
       const zeroNames = items
         .filter(it => !heldItemIds.has(String(it.id)) && !it.is_rejected && !isRoutedItem(it) && lineMap.has(it.id)
+          && !staleSkip.has(String(it.id))
           && (Number(lineMap.get(it.id)?.quantity_issued) || 0) <= 0
           && ((it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0) > 0)
         .map(it => String(it.material_name || 'a line'));
@@ -2056,8 +2289,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         + `hold the quantity asked. ${centralShort.map(s => s.message).join(' ')}`
         + `${zeroEntriesSentence(zeroNames)} `
         + (routedOwedSentence
-          ? `Everything else the store issues on this requisition was issued; ${routedOwedSentence}`
-          : `Everything else on this requisition was issued.`);
+          ? `Everything else the store issues on this requisition was issued${staleExcept}; ${routedOwedSentence}`
+          : `Everything else on this requisition was issued${staleExcept}.`);
+    }
+    if (staleAfter.length > 0) {
+      const k = staleAfter.length;
+      const owedK = staleAfter.filter(staleOwes).length;
+      result.unit_review_lines = staleAfter.map(staleRow);
+      result.unit_review_note =
+        `${k} line${k === 1 ? '' : 's'} on ${r.req_number} ${k === 1 ? 'was' : 'were'} NOT issued here — `
+        + `the store cannot issue ${k === 1 ? 'it' : 'them'}. ${staleAfter.map(x => staleRow(x).message).join(' ')}`
+        + (owedK === 0 ? ''
+          : ` Reject ${owedK === k ? (k === 1 ? 'it' : 'them') : 'the ones still owed'} on Issue Requisitions.`);
     }
     // `|| result.stock_held_note` so a plain issue (no PO asked for) that held a
     // line still reaches po_note. The `autoCreatePo &&` added to the
@@ -2067,7 +2310,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // when poSkipped.length > 0 — so the branch was already unreachable with
     // autoCreatePo false. Without it, a plain issue with a held line would be
     // told "No vendor PO was raised" about a PO it never asked for.
-    if (autoCreatePo || result.po_skipped_note || result.stock_held_note) {
+    if (autoCreatePo || result.po_skipped_note || result.stock_held_note || result.unit_review_note) {
       const parts: string[] = [];
       if (result.linked_po_number) {
         const n = result.po_line_count;
@@ -2089,6 +2332,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // fact about goods rather than paperwork: a line he thinks he just handed
       // over did not move.
       if (result.stock_held_note) parts.push(result.stock_held_note);
+      // The stale-unit lines (ruling 128) after it: also a fact about goods.
+      if (result.unit_review_note) parts.push(result.unit_review_note);
       result.po_note = parts.join(' ');
     }
 
