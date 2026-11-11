@@ -449,6 +449,10 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Purchase Report",    href: "/reports/purchases",      icon: ShoppingCart },
       { kind: "link", label: "Purchase Bill Summary", href: "/reports/purchase-bill-summary", icon: FileText },
       { kind: "link", label: "Purchase to Issue Log", href: "/reports/issue-log",   icon: ListChecks },
+      // Requested → Ordered → Received (owner, 2026-11-09). mgmtOnly in the
+      // page-catalog, so canAccessPage hides it for everyone else. Twin of the
+      // page-catalog.ts row with the same href — change both.
+      { kind: "link", label: "Requested vs Received", href: "/reports/requested-vs-received", icon: ClipboardList },
       // Return Report — both kinds of return in one list, and mgmtOnly in the
       // page-catalog because a vendor row carries the GRN line's unit price and
       // the credit note the vendor owes us, i.e. vendor money. It deliberately

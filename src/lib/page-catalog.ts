@@ -795,6 +795,15 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true, financeCap: true },         // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
       { path: '/reports/issue-log',   label: 'Purchase to Issue Log', mgmtOnly: true },   // mgmtOnly for the SAME reason as Purchase Report directly above: it joins vendor spend and purchase rates onto material rows. Do NOT "simplify" this to an open page — the store's own issue view (/store-requisitions, /api/store-issued-log) is untouched and still carries no money.
       { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
+      // Requested → Ordered → Received (owner, 2026-11-09): a department's
+      // requisitions vs purchase orders vs goods booked into stock, item by item,
+      // with ₹ at each step. mgmtOnly because it carries vendor money (PO rates,
+      // booked ₹) like the Purchase Report above. NO financeCap — the owner named
+      // management + store manager, not the finance capability. As everywhere in
+      // this file the flag is not the security boundary: /api/reports/requested-vs-received
+      // answers 401 / 403 itself (Admin, Manager tier or the store manager only).
+      // Twin of the Sidebar.tsx row with the same href — change both.
+      { path: '/reports/requested-vs-received', label: 'Requested vs Ordered vs Received', mgmtOnly: true },
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
       { path: '/variance-report',     label: 'Variance Report' },
       // Department variance — issued-to-a-department vs what recipe consumption
